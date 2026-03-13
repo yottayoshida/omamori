@@ -1,0 +1,14 @@
+[package]
+name = "omamori"
+version = "0.1.0"
+edition = "2024"
+description = "AI Agent's Omamori — protect your system from dangerous commands executed via AI CLI tools"
+license = "MIT"
+repository = "https://github.com/yottayoshida/omamori"
+homepage = "https://github.com/yottayoshida/omamori"
+keywords = ["ai", "agent", "safety", "claude-code", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["Iori Yoshida <yotta@users.noreply.github.com>"]
+readme = "README.md"
+
+[dependencies]
