@@ -2,6 +2,7 @@ pub mod actions;
 pub mod audit;
 pub mod config;
 pub mod detector;
+pub mod installer;
 pub mod rules;
 
 use std::env;
@@ -12,6 +13,7 @@ use actions::{ActionExecutor, ActionOutcome, SystemOps};
 use audit::{AuditEvent, AuditLogger};
 use config::{ConfigLoadResult, load_config};
 use detector::evaluate_detectors;
+use installer::{InstallOptions, default_base_dir, install, uninstall};
 use rules::{CommandInvocation, match_rule};
 
 #[derive(Debug)]
@@ -53,6 +55,8 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(1).and_then(|item| item.to_str()) {
         Some("test") => run_policy_test_command(args),
         Some("exec") => run_exec_command(args),
+        Some("install") => run_install_command(args),
+        Some("uninstall") => run_uninstall_command(args),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(0)
@@ -111,6 +115,97 @@ fn run_exec_command(args: &[OsString]) -> Result<i32, AppError> {
         .ok_or_else(|| AppError::Usage("missing command after `--`".to_string()))?;
     let command_args = &args[(position + 2)..];
     run_command(binary_name(program), command_args, config_path.as_deref())
+}
+
+fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
+    let mut base_dir = default_base_dir();
+    let mut source_exe = env::current_exe()?;
+    let mut generate_hooks = false;
+    let mut index = 2usize;
+
+    while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
+        match arg {
+            "--base-dir" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    AppError::Usage("install requires a path after --base-dir".to_string())
+                })?;
+                base_dir = PathBuf::from(value);
+                index += 2;
+            }
+            "--source" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    AppError::Usage("install requires a path after --source".to_string())
+                })?;
+                source_exe = PathBuf::from(value);
+                index += 2;
+            }
+            "--hooks" => {
+                generate_hooks = true;
+                index += 1;
+            }
+            _ => {
+                return Err(AppError::Usage(format!(
+                    "unknown install flag: {arg}\n\n{}",
+                    usage_text()
+                )));
+            }
+        }
+    }
+
+    let result = install(&InstallOptions {
+        base_dir,
+        source_exe,
+        generate_hooks,
+    })?;
+
+    println!("Installed omamori shims in {}", result.shim_dir.display());
+    println!(
+        "Add this directory to PATH manually:\n  export PATH=\"{}:$PATH\"",
+        result.shim_dir.display()
+    );
+    if let Some(script) = result.hook_script {
+        println!("Generated Claude Code hook script: {}", script.display());
+    }
+    if let Some(snippet) = result.settings_snippet {
+        println!(
+            "Generated Claude settings snippet (apply manually): {}",
+            snippet.display()
+        );
+    }
+    println!("Linked commands: {}", result.linked_commands.join(", "));
+
+    Ok(0)
+}
+
+fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> {
+    let mut base_dir = default_base_dir();
+    let mut index = 2usize;
+
+    while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
+        match arg {
+            "--base-dir" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    AppError::Usage("uninstall requires a path after --base-dir".to_string())
+                })?;
+                base_dir = PathBuf::from(value);
+                index += 2;
+            }
+            _ => {
+                return Err(AppError::Usage(format!(
+                    "unknown uninstall flag: {arg}\n\n{}",
+                    usage_text()
+                )));
+            }
+        }
+    }
+
+    let result = uninstall(&base_dir)?;
+    println!(
+        "Removed omamori install artifacts from {}",
+        result.shim_dir.display()
+    );
+    println!("Removed {} file(s)", result.removed_entries.len());
+    Ok(0)
 }
 
 fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError> {
@@ -189,6 +284,8 @@ fn usage_text() -> &'static str {
     "omamori usage:
   omamori test [--config PATH]
   omamori exec [--config PATH] -- <command> [args...]
+  omamori install [--base-dir PATH] [--source PATH] [--hooks]
+  omamori uninstall [--base-dir PATH]
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."

@@ -2,14 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
 ### Added
 
-- Project scaffolding (Cargo.toml, CI-ready structure)
-- Implementation plan (`PLAN.md`) with full design rationale
+- Round 1 core policy engine for detector, rules, actions, audit, and CLI test flows.
+- Round 2 installer and uninstall commands for shim generation.
+- Claude Code hook template generation via `omamori install --hooks`.
+- Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
 [Unreleased]: https://github.com/yottayoshida/omamori/commits/main
