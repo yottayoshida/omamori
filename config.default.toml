@@ -1,0 +1,57 @@
+[[detectors]]
+name = "claude-code"
+type = "env_var"
+env_key = "CLAUDECODE"
+env_value = "1"
+
+[[detectors]]
+name = "codex-cli"
+type = "env_var"
+env_key = "AI_GUARD"
+env_value = "1"
+
+[[detectors]]
+name = "cursor"
+type = "env_var"
+env_key = "AI_GUARD"
+env_value = "1"
+
+[[rules]]
+name = "rm-recursive-to-trash"
+command = "rm"
+action = "trash"
+match_any = ["-r", "-rf", "-fr", "--recursive"]
+message = "omamori moved the recursive rm targets to Trash instead of deleting them"
+
+[[rules]]
+name = "git-reset-hard-stash"
+command = "git"
+action = "stash-then-exec"
+match_all = ["reset", "--hard"]
+message = "omamori stashed changes before running git reset --hard"
+
+[[rules]]
+name = "git-push-force-block"
+command = "git"
+action = "block"
+match_all = ["push"]
+match_any = ["--force", "-f"]
+message = "omamori blocked a force push"
+
+[[rules]]
+name = "git-clean-force-block"
+command = "git"
+action = "block"
+match_all = ["clean"]
+match_any = ["-fd", "-fdx"]
+message = "omamori blocked git clean because it would remove untracked files"
+
+[[rules]]
+name = "chmod-777-block"
+command = "chmod"
+action = "block"
+match_any = ["777"]
+message = "omamori blocked chmod 777"
+
+[audit]
+enabled = false

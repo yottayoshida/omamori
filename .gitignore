@@ -11,5 +11,8 @@ Cargo.lock
 .vscode/
 .idea/
 
+# PoC / manual test scripts
+tests/poc.sh
+
 # OS
 .DS_Store
