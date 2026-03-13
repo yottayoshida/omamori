@@ -143,7 +143,7 @@ set -eu
 INPUT="$(cat)"
 
 case "$INPUT" in
-  *"/bin/rm"*|*"/usr/bin/rm"*)
+  *"/bin/rm "*|*"/bin/rm\""*|*"/usr/bin/rm "*|*"/usr/bin/rm\""*)
     echo "omamori hook: blocked direct rm path that bypasses PATH shim" >&2
     exit 2
     ;;
@@ -160,9 +160,13 @@ esac
 }
 
 fn render_settings_snippet(script_path: &Path) -> String {
+    let escaped = script_path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
     format!(
-        "{{\n  \"hooks\": {{\n    \"PreToolUse\": [{{\n      \"matcher\": \"*\",\n      \"command\": \"{}\"\n    }}]\n  }}\n}}\n",
-        script_path.display()
+        "{{\n  \"hooks\": {{\n    \"PreToolUse\": [{{\n      \"matcher\": \"*\",\n      \"command\": \"{escaped}\"\n    }}]\n  }}\n}}\n"
     )
 }
 
@@ -189,5 +193,23 @@ mod tests {
         assert!(result.settings_snippet.unwrap().exists());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hook_script_blocks_bin_rm_but_not_rmdir() {
+        let script = render_hook_script();
+        // Should match /bin/rm followed by space
+        assert!(script.contains(r#"*"/bin/rm "*"#));
+        assert!(script.contains(r#"*"/usr/bin/rm "*"#));
+        // Should NOT have unbounded /bin/rm that matches /bin/rmdir
+        assert!(!script.contains(r#"*"/bin/rm"*"#) || script.contains(r#"*"/bin/rm "*"#));
+    }
+
+    #[test]
+    fn settings_snippet_escapes_path() {
+        let path = std::path::Path::new(r#"/tmp/test "path"/hook.sh"#);
+        let snippet = render_settings_snippet(path);
+        assert!(snippet.contains(r#"\"path\""#));
+        assert!(!snippet.contains(r#"" "path""#));
     }
 }

@@ -25,6 +25,21 @@ When an AI CLI tool (Claude Code, Codex, Cursor, etc.) runs a shell command, oma
                             deleted normally
 ```
 
+## Quick Start
+
+```bash
+# 1. Build from source
+cargo install --path .
+
+# 2. Install shims + hook templates
+omamori install --hooks
+
+# 3. Add shim directory to PATH (add to .zshrc / .bashrc)
+export PATH="$HOME/.omamori/shim:$PATH"
+```
+
+After installation, run `omamori test` to verify your policy rules are working.
+
 ## How It Works
 
 **Layer 1 — PATH shim**: Symlinks for `rm`, `git`, `chmod` point to the omamori binary. When invoked, omamori checks for AI tool environment variables (e.g. `CLAUDECODE=1`) and applies rules only if an AI tool is detected.
@@ -40,6 +55,8 @@ When an AI CLI tool (Claude Code, Codex, Cursor, etc.) runs a shell command, oma
 | `git` | `push --force`, `push -f` | **block** |
 | `git` | `clean -fd`, `clean -fdx` | **block** |
 | `chmod` | `777` | **block** |
+
+Combined short flags are normalized: `rm -rfv` expands to match `-r` and `-rf` rules. The POSIX `--` separator is respected for target extraction.
 
 Rules are configurable via TOML. See `config.default.toml` for the full schema.
 
@@ -71,7 +88,7 @@ These are inherent to the PATH shim approach and documented honestly:
 - **`sudo`** changes PATH before the shim runs — omamori blocks when it detects elevated execution in-process
 - **Other interpreters** (`python -c "os.remove(...)"`, `perl -e`) are not intercepted
 - **Non-rm destructive commands** (`find -delete`, `rsync --delete`) are not covered in v0.1
-- **Combined short flags** (`rm -rfv`) are not normalized — matching is exact-token based in v0.1
+- **`-R` as alias for `-r`** is not yet normalized (tracked for v0.2)
 
 For the full security model, see [SECURITY.md](SECURITY.md).
 

@@ -8,7 +8,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::actions::ActionOutcome;
-use crate::rules::{CommandInvocation, RuleMatch};
+use crate::rules::{CommandInvocation, RuleConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuditConfig {
@@ -60,11 +60,11 @@ pub struct AuditEvent {
 impl AuditEvent {
     pub fn from_outcome(
         invocation: &CommandInvocation,
-        rule_match: Option<&RuleMatch>,
+        matched_rule: Option<&RuleConfig>,
         matched_detectors: &[String],
         outcome: &ActionOutcome,
     ) -> Self {
-        let targets = target_args(invocation);
+        let targets = invocation.target_args();
         Self {
             timestamp: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -74,9 +74,9 @@ impl AuditEvent {
                 .cloned()
                 .unwrap_or_else(|| "none".to_string()),
             command: invocation.program.clone(),
-            rule_id: rule_match.map(|item| item.rule.name.clone()),
-            action: rule_match
-                .map(|item| item.rule.action.as_str().to_string())
+            rule_id: matched_rule.map(|rule| rule.name.clone()),
+            action: matched_rule
+                .map(|rule| rule.action.as_str().to_string())
                 .unwrap_or_else(|| "passthrough".to_string()),
             result: outcome.label().to_string(),
             target_count: targets.len(),
@@ -93,15 +93,6 @@ fn default_audit_path() -> PathBuf {
         .join("share")
         .join("omamori")
         .join("audit.jsonl")
-}
-
-fn target_args(invocation: &CommandInvocation) -> Vec<&str> {
-    invocation
-        .args
-        .iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .map(String::as_str)
-        .collect()
 }
 
 fn hash_targets(targets: &[&str]) -> String {
@@ -124,19 +115,17 @@ mod tests {
             "rm".to_string(),
             vec!["secret.txt".to_string(), "another.txt".to_string()],
         );
-        let rule_match = RuleMatch {
-            rule: RuleConfig::new(
-                "rm-recursive",
-                "rm",
-                ActionKind::Trash,
-                Vec::new(),
-                Vec::new(),
-                None,
-            ),
-        };
+        let rule = RuleConfig::new(
+            "rm-recursive",
+            "rm",
+            ActionKind::Trash,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
         let event = AuditEvent::from_outcome(
             &invocation,
-            Some(&rule_match),
+            Some(&rule),
             &["claude-code".to_string()],
             &ActionOutcome::Trashed {
                 exit_code: 0,

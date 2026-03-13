@@ -240,8 +240,8 @@ fn run_command(
         blocked
     } else if !detection.protected {
         executor.exec_passthrough(&invocation)?
-    } else if let Some(rule_match) = matched_rule.clone() {
-        let outcome = executor.execute(&invocation, &rule_match)?;
+    } else if let Some(rule) = matched_rule {
+        let outcome = executor.execute(&invocation, rule)?;
         if matches!(
             outcome,
             ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. }
@@ -260,7 +260,7 @@ fn run_command(
     if let Some(logger) = audit_logger {
         let event = AuditEvent::from_outcome(
             &invocation,
-            matched_rule.as_ref(),
+            matched_rule,
             &detection.matched_detectors,
             &outcome,
         );
@@ -318,7 +318,7 @@ fn clone_lossy(value: &OsString) -> String {
 
 #[cfg(unix)]
 fn should_block_for_sudo() -> bool {
-    matches!(unsafe { libc_geteuid() }, 0) && env::var_os("SUDO_USER").is_some()
+    (unsafe { libc_geteuid() }) == 0 && env::var_os("SUDO_USER").is_some()
 }
 
 #[cfg(not(unix))]
@@ -442,7 +442,7 @@ pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult>
                 let detection = evaluate_detectors(&config.detectors, &env_map);
                 let matched = match_rule(&config.rules, &command);
                 let effective_action = if detection.protected {
-                    matched.as_ref().map(|item| item.rule.action.as_str())
+                    matched.map(|rule| rule.action.as_str())
                 } else {
                     None
                 };
@@ -494,8 +494,9 @@ mod tests {
     #[test]
     fn resolve_default_rule_for_rm() {
         let invocation = CommandInvocation::new("rm".to_string(), vec!["-rf".to_string()]);
-        let rule = match_rule(&Config::default().rules, &invocation).expect("rule should match");
-        assert_eq!(rule.rule.action, ActionKind::Trash);
+        let config = Config::default();
+        let rule = match_rule(&config.rules, &invocation).expect("rule should match");
+        assert_eq!(rule.action, ActionKind::Trash);
     }
 
     #[test]

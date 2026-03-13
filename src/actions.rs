@@ -1,8 +1,22 @@
 use std::io;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
-use crate::rules::{ActionKind, CommandInvocation, RuleMatch};
+use crate::rules::{ActionKind, CommandInvocation, RuleConfig};
+
+fn exit_code_from_status(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    1
+}
 
 #[derive(Debug, Clone)]
 pub enum ActionOutcome {
@@ -25,16 +39,14 @@ impl ActionOutcome {
         }
     }
 
-    pub fn message(&self) -> String {
+    pub fn message(&self) -> &str {
         match self {
-            Self::PassedThrough { .. } => {
-                "omamori allowed the command to run unchanged".to_string()
-            }
+            Self::PassedThrough { .. } => "omamori allowed the command to run unchanged",
             Self::Trashed { message, .. }
             | Self::ExecutedAfterStash { message, .. }
             | Self::LoggedOnly { message, .. }
             | Self::Blocked { message }
-            | Self::Failed { message } => message.clone(),
+            | Self::Failed { message } => message,
         }
     }
 
@@ -71,7 +83,7 @@ impl ExecOps for SystemOps {
         let status = Command::new(&self.real_program)
             .args(&invocation.args)
             .status()?;
-        Ok(status.code().unwrap_or(1))
+        Ok(exit_code_from_status(status))
     }
 
     fn move_to_trash(&mut self, targets: &[String]) -> Result<(), String> {
@@ -80,10 +92,14 @@ impl ExecOps for SystemOps {
     }
 
     fn git_stash(&mut self) -> Result<(), String> {
+        // Remove AI detector env vars so the internal git call does not
+        // trigger omamori's own protection (self-interference prevention).
         let status = Command::new("git")
             .arg("stash")
             .arg("push")
             .arg("--include-untracked")
+            .env_remove("CLAUDECODE")
+            .env_remove("AI_GUARD")
             .status()
             .map_err(|error| error.to_string())?;
         if status.success() {
@@ -114,22 +130,20 @@ impl<T: ExecOps> ActionExecutor<T> {
     pub fn execute(
         &mut self,
         invocation: &CommandInvocation,
-        rule_match: &RuleMatch,
+        rule: &RuleConfig,
     ) -> Result<ActionOutcome, io::Error> {
-        let message = rule_match
-            .rule
+        let message = rule
             .message
             .clone()
-            .unwrap_or_else(|| format!("omamori applied `{}`", rule_match.rule.name));
+            .unwrap_or_else(|| format!("omamori applied `{}`", rule.name));
 
-        let outcome = match rule_match.rule.action {
+        let outcome = match rule.action {
             ActionKind::Trash => {
-                let targets = invocation
-                    .args
-                    .iter()
-                    .filter(|arg| !arg.starts_with('-'))
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let targets: Vec<String> = invocation
+                    .target_args()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
                 if targets.is_empty() {
                     ActionOutcome::Failed {
                         message: "omamori could not identify any rm targets to move to Trash"
@@ -182,6 +196,7 @@ mod tests {
         passthrough_status: i32,
         trash_error: Option<String>,
         stash_error: Option<String>,
+        last_trash_targets: Vec<String>,
     }
 
     impl ExecOps for FakeOps {
@@ -190,7 +205,8 @@ mod tests {
             Ok(self.passthrough_status)
         }
 
-        fn move_to_trash(&mut self, _targets: &[String]) -> Result<(), String> {
+        fn move_to_trash(&mut self, targets: &[String]) -> Result<(), String> {
+            self.last_trash_targets = targets.to_vec();
             match &self.trash_error {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
@@ -205,17 +221,15 @@ mod tests {
         }
     }
 
-    fn rule(action: ActionKind, command: &str) -> RuleMatch {
-        RuleMatch {
-            rule: RuleConfig::new(
-                "test",
-                command,
-                action,
-                Vec::new(),
-                Vec::new(),
-                Some("message".to_string()),
-            ),
-        }
+    fn rule(action: ActionKind, command: &str) -> RuleConfig {
+        RuleConfig::new(
+            "test",
+            command,
+            action,
+            Vec::new(),
+            Vec::new(),
+            Some("message".to_string()),
+        )
     }
 
     #[test]
@@ -245,5 +259,32 @@ mod tests {
             .execute(&invocation, &rule(ActionKind::StashThenExec, "git"))
             .unwrap();
         assert!(matches!(outcome, ActionOutcome::ExecutedAfterStash { .. }));
+    }
+
+    #[test]
+    fn trash_with_double_dash_captures_dash_prefixed_targets() {
+        let mut executor = ActionExecutor::new(FakeOps::default());
+        let invocation = CommandInvocation::new(
+            "rm".to_string(),
+            vec!["-rf".to_string(), "--".to_string(), "-dangerous.txt".to_string()],
+        );
+        let outcome = executor
+            .execute(&invocation, &rule(ActionKind::Trash, "rm"))
+            .unwrap();
+        assert!(matches!(outcome, ActionOutcome::Trashed { .. }));
+        assert_eq!(executor.ops.last_trash_targets, vec!["-dangerous.txt"]);
+    }
+
+    #[test]
+    fn trash_with_only_double_dash_fails() {
+        let mut executor = ActionExecutor::new(FakeOps::default());
+        let invocation = CommandInvocation::new(
+            "rm".to_string(),
+            vec!["-rf".to_string(), "--".to_string()],
+        );
+        let outcome = executor
+            .execute(&invocation, &rule(ActionKind::Trash, "rm"))
+            .unwrap();
+        assert!(matches!(outcome, ActionOutcome::Failed { .. }));
     }
 }
