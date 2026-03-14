@@ -34,6 +34,7 @@ pub enum ActionKind {
     StashThenExec,
     Block,
     LogOnly,
+    MoveTo,
 }
 
 impl ActionKind {
@@ -43,8 +44,13 @@ impl ActionKind {
             Self::StashThenExec => "stash-then-exec",
             Self::Block => "block",
             Self::LogOnly => "log-only",
+            Self::MoveTo => "move-to",
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +63,10 @@ pub struct RuleConfig {
     #[serde(default)]
     pub match_any: Vec<String>,
     pub message: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub destination: Option<String>,
 }
 
 impl RuleConfig {
@@ -75,13 +85,29 @@ impl RuleConfig {
             match_all,
             match_any,
             message,
+            enabled: true,
+            destination: None,
         }
+    }
+
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn with_destination(mut self, destination: String) -> Self {
+        self.destination = Some(destination);
+        self
     }
 }
 
-pub fn match_rule<'a>(rules: &'a [RuleConfig], invocation: &CommandInvocation) -> Option<&'a RuleConfig> {
+pub fn match_rule<'a>(
+    rules: &'a [RuleConfig],
+    invocation: &CommandInvocation,
+) -> Option<&'a RuleConfig> {
     rules
         .iter()
+        .filter(|rule| rule.enabled)
         .find(|rule| rule_matches(rule, invocation))
 }
 
@@ -175,17 +201,19 @@ mod tests {
     fn target_args_respects_double_dash_separator() {
         let inv = CommandInvocation::new(
             "rm".to_string(),
-            vec!["-rf".to_string(), "--".to_string(), "-dangerous.txt".to_string()],
+            vec![
+                "-rf".to_string(),
+                "--".to_string(),
+                "-dangerous.txt".to_string(),
+            ],
         );
         assert_eq!(inv.target_args(), vec!["-dangerous.txt"]);
     }
 
     #[test]
     fn target_args_empty_after_double_dash() {
-        let inv = CommandInvocation::new(
-            "rm".to_string(),
-            vec!["-rf".to_string(), "--".to_string()],
-        );
+        let inv =
+            CommandInvocation::new("rm".to_string(), vec!["-rf".to_string(), "--".to_string()]);
         assert!(inv.target_args().is_empty());
     }
 
@@ -193,7 +221,12 @@ mod tests {
     fn target_args_all_after_double_dash() {
         let inv = CommandInvocation::new(
             "rm".to_string(),
-            vec!["--".to_string(), "-a".to_string(), "-b".to_string(), "-c".to_string()],
+            vec![
+                "--".to_string(),
+                "-a".to_string(),
+                "-b".to_string(),
+                "-c".to_string(),
+            ],
         );
         assert_eq!(inv.target_args(), vec!["-a", "-b", "-c"]);
     }
@@ -247,7 +280,12 @@ mod tests {
             "rm",
             ActionKind::Trash,
             Vec::new(),
-            vec!["-r".to_string(), "-rf".to_string(), "-fr".to_string(), "--recursive".to_string()],
+            vec![
+                "-r".to_string(),
+                "-rf".to_string(),
+                "-fr".to_string(),
+                "--recursive".to_string(),
+            ],
             None,
         );
         // -rfv should match because it expands to include -r
@@ -256,6 +294,57 @@ mod tests {
             vec!["-rfv".to_string(), "target/".to_string()],
         );
         assert!(match_rule(&[rule], &inv).is_some());
+    }
+
+    #[test]
+    fn disabled_rule_is_skipped() {
+        let rule = RuleConfig::new(
+            "git-push-force",
+            "git",
+            ActionKind::Block,
+            vec!["push".to_string()],
+            vec!["-f".to_string(), "--force".to_string()],
+            None,
+        )
+        .with_enabled(false);
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["push".to_string(), "--force".to_string()],
+        );
+        assert!(match_rule(&[rule], &inv).is_none());
+    }
+
+    #[test]
+    fn enabled_rule_still_matches() {
+        let rule = RuleConfig::new(
+            "git-push-force",
+            "git",
+            ActionKind::Block,
+            vec!["push".to_string()],
+            vec!["-f".to_string(), "--force".to_string()],
+            None,
+        )
+        .with_enabled(true);
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["push".to_string(), "--force".to_string()],
+        );
+        assert!(match_rule(&[rule], &inv).is_some());
+    }
+
+    #[test]
+    fn move_to_action_serializes_correctly() {
+        let rule = RuleConfig::new(
+            "rm-to-backup",
+            "rm",
+            ActionKind::MoveTo,
+            Vec::new(),
+            vec!["-rf".to_string()],
+            None,
+        )
+        .with_destination("/tmp/backup".to_string());
+        assert_eq!(rule.action.as_str(), "move-to");
+        assert_eq!(rule.destination.as_deref(), Some("/tmp/backup"));
     }
 
     #[test]
@@ -270,7 +359,12 @@ mod tests {
         );
         let inv = CommandInvocation::new(
             "git".to_string(),
-            vec!["push".to_string(), "-f".to_string(), "origin".to_string(), "main".to_string()],
+            vec![
+                "push".to_string(),
+                "-f".to_string(),
+                "origin".to_string(),
+                "main".to_string(),
+            ],
         );
         assert!(match_rule(&[rule], &inv).is_some());
     }

@@ -24,7 +24,10 @@ fn omamori_test_command_succeeds_with_defaults() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("policy tests passed"));
+    assert!(
+        stdout.contains("detection tests passed"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]

@@ -1,3 +1,9 @@
+# omamori default configuration
+#
+# Built-in rules are always inherited. This file shows the full schema.
+# To customize, create ~/.config/omamori/config.toml with only the rules
+# you want to change. Run `omamori init` to generate a starter template.
+
 [[detectors]]
 name = "claude-code"
 type = "env_var"
@@ -22,6 +28,7 @@ command = "rm"
 action = "trash"
 match_any = ["-r", "-rf", "-fr", "--recursive"]
 message = "omamori moved the recursive rm targets to Trash instead of deleting them"
+# enabled = true  # default; set to false to disable
 
 [[rules]]
 name = "git-reset-hard-stash"
@@ -52,6 +59,15 @@ command = "chmod"
 action = "block"
 match_any = ["777"]
 message = "omamori blocked chmod 777"
+
+# --- Example: move-to action (new in v0.2) ---
+# [[rules]]
+# name = "rm-to-backup"
+# command = "rm"
+# action = "move-to"
+# destination = "/tmp/omamori-quarantine/"
+# match_any = ["-r", "-rf", "-fr", "--recursive"]
+# message = "omamori moved targets to backup instead of deleting"
 
 [audit]
 enabled = false
