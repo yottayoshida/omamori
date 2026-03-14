@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.2.0] - 2026-03-14
+
+### Added
+
+- **Config merge model**: Built-in default rules are always inherited. User config overrides by rule `name` — write only the rules you want to change.
+- **`enabled` flag**: Disable individual rules with `enabled = false`. Defaults to `true` for backward compatibility (`#[serde(default = "default_true")]`).
+- **`move-to` action**: Move files to a user-specified directory instead of macOS Trash. Requires `destination` field.
+- **`omamori init` command**: Generates a commented TOML config template to stdout.
+- **`omamori test` improvements**: Shows rule status table with SKIP for disabled rules, full `match_any` pattern display, and summary line.
+- **Destination validation**: Absolute path required, blocked system prefix enforcement (`/usr`, `/etc`, `/System`, `/Library`, `/bin`, `/sbin`, `/var`, `/private`), symlink rejection at config load and runtime, cross-device move rejection.
+- **Runtime blocked-prefix re-check**: `move_to_dir()` re-validates via `canonicalize()` to catch paths created after config load (TOCTOU mitigation).
+- **Basename collision avoidance**: Dedup suffix (`_2`, `_3`, ...) prevents overwrite when multiple targets share the same filename.
+- **MIT LICENSE file**.
+- 16 new unit tests (total: 50).
+
+### Changed
+
+- Config file parsing now uses `UserConfig`/`UserRule` structs for partial overrides (all rule fields optional except `name`).
+- `BLOCKED_DESTINATION_PREFIXES` is now a public constant shared between `config.rs` and `actions.rs`.
+- `omamori test` output format changed from flat PASS/FAIL to structured Rules + Detection + Summary sections.
+- `config.default.toml` updated with `enabled` and `move-to` examples.
+
+### Fixed
+
+- Blocked destination paths now **enforce** rule disabling (previously only warned).
+
 ## [0.1.1] - 2026-03-13
 
 ### Fixed
@@ -37,5 +63,6 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.2.0]: https://github.com/yottayoshida/omamori/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yottayoshida/omamori/compare/v0.1.0...v0.1.1
 [Unreleased]: https://github.com/yottayoshida/omamori/commits/main
