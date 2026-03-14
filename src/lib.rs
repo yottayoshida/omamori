@@ -57,6 +57,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("exec") => run_exec_command(args),
         Some("install") => run_install_command(args),
         Some("uninstall") => run_uninstall_command(args),
+        Some("init") => run_init_command(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(0)
@@ -73,22 +74,58 @@ fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError> {
     let load_result = load_config(config_path.as_deref())?;
     emit_config_warnings(&load_result);
 
-    let results = run_policy_tests(&load_result);
-    let failures = results.iter().filter(|result| !result.passed).count();
+    // Rules section
+    let config = &load_result.config;
+    let active_count = config.rules.iter().filter(|r| r.enabled).count();
+    let disabled_count = config.rules.len() - active_count;
 
+    println!("\nRules:");
+    for rule in &config.rules {
+        if !rule.enabled {
+            println!("  SKIP  {:<28} (disabled by user config)", rule.name);
+        } else {
+            let action_display = match &rule.action {
+                rules::ActionKind::MoveTo => {
+                    let dest = rule.destination.as_deref().unwrap_or("(no destination)");
+                    format!("move-to {dest}")
+                }
+                other => other.as_str().to_string(),
+            };
+            let pattern = if !rule.match_all.is_empty() {
+                format!("{} {}", rule.command, rule.match_all.join(" "))
+            } else if !rule.match_any.is_empty() {
+                format!("{} {}", rule.command, rule.match_any.join("|"))
+            } else {
+                rule.command.clone()
+            };
+            println!(
+                "  PASS  {:<28} {:<24} -> {}",
+                rule.name, pattern, action_display
+            );
+        }
+    }
+
+    // Detection section
+    let results = run_policy_tests(&load_result);
+    let failures = results.iter().filter(|r| !r.passed).count();
+
+    println!("\nDetection:");
     for result in &results {
         let status = if result.passed { "PASS" } else { "FAIL" };
-        println!("{status} {}", result.name);
-        println!("  {}", result.details);
+        println!("  {status}  {:<28} {}", result.name, result.details);
     }
 
-    if failures == 0 {
-        println!("policy tests passed: {}", results.len());
-        Ok(0)
-    } else {
-        println!("policy tests failed: {failures}/{}", results.len());
-        Ok(1)
-    }
+    // Summary
+    println!(
+        "\nSummary: {} rules ({} active, {} disabled), {} detection tests {}",
+        config.rules.len(),
+        active_count,
+        disabled_count,
+        results.len(),
+        if failures == 0 { "passed" } else { "FAILED" }
+    );
+
+    if failures == 0 { Ok(0) } else { Ok(1) }
 }
 
 fn run_exec_command(args: &[OsString]) -> Result<i32, AppError> {
@@ -242,11 +279,14 @@ fn run_command(
         executor.exec_passthrough(&invocation)?
     } else if let Some(rule) = matched_rule {
         let outcome = executor.execute(&invocation, rule)?;
-        if matches!(
-            outcome,
-            ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. }
-        ) {
-            eprintln!("{}", outcome.message());
+        match &outcome {
+            ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. } => {
+                eprintln!("{}", outcome.message());
+            }
+            ActionOutcome::Trashed { message, .. } | ActionOutcome::MovedTo { message, .. } => {
+                eprintln!("{message}");
+            }
+            _ => {}
         }
         outcome
     } else {
@@ -280,12 +320,53 @@ fn print_usage() {
     println!("{}", usage_text());
 }
 
+fn run_init_command() -> Result<i32, AppError> {
+    let defaults = config::default_rules();
+    println!(
+        "# omamori config — only write the rules you want to change.\n\
+         # Built-in rules are inherited automatically.\n\
+         # To disable a rule: set enabled = false\n\
+         # To change an action: override the action field\n\
+         #\n\
+         # Usage:\n\
+         #   omamori init > ~/.config/omamori/config.toml\n\
+         #   chmod 600 ~/.config/omamori/config.toml\n\
+         #   omamori test\n\
+         #"
+    );
+    for rule in &defaults {
+        println!("\n# [[rules]]");
+        println!("# name = \"{}\"", rule.name);
+        println!("# command = \"{}\"", rule.command);
+        println!("# action = \"{}\"", rule.action.as_str());
+        if !rule.match_all.is_empty() {
+            println!("# match_all = {:?}", rule.match_all);
+        }
+        if !rule.match_any.is_empty() {
+            println!("# match_any = {:?}", rule.match_any);
+        }
+        println!("# # enabled = false  # uncomment to disable this rule");
+    }
+    println!(
+        "\n# --- Custom rule example ---\n\
+         # [[rules]]\n\
+         # name = \"rm-to-backup\"\n\
+         # command = \"rm\"\n\
+         # action = \"move-to\"\n\
+         # destination = \"/tmp/omamori-quarantine/\"\n\
+         # match_any = [\"-r\", \"-rf\", \"-fr\", \"--recursive\"]\n\
+         # message = \"omamori moved targets to backup instead of deleting\""
+    );
+    Ok(0)
+}
+
 fn usage_text() -> &'static str {
     "omamori usage:
   omamori test [--config PATH]
   omamori exec [--config PATH] -- <command> [args...]
   omamori install [--base-dir PATH] [--source PATH] [--hooks]
   omamori uninstall [--base-dir PATH]
+  omamori init
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."

@@ -1,7 +1,8 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use crate::config::BLOCKED_DESTINATION_PREFIXES;
 use crate::rules::{ActionKind, CommandInvocation, RuleConfig};
 
 fn exit_code_from_status(status: ExitStatus) -> i32 {
@@ -24,6 +25,7 @@ pub enum ActionOutcome {
     Trashed { exit_code: i32, message: String },
     ExecutedAfterStash { exit_code: i32, message: String },
     LoggedOnly { exit_code: i32, message: String },
+    MovedTo { exit_code: i32, message: String },
     Blocked { message: String },
     Failed { message: String },
 }
@@ -34,7 +36,8 @@ impl ActionOutcome {
             Self::PassedThrough { exit_code }
             | Self::Trashed { exit_code, .. }
             | Self::ExecutedAfterStash { exit_code, .. }
-            | Self::LoggedOnly { exit_code, .. } => *exit_code,
+            | Self::LoggedOnly { exit_code, .. }
+            | Self::MovedTo { exit_code, .. } => *exit_code,
             Self::Blocked { .. } | Self::Failed { .. } => 1,
         }
     }
@@ -45,6 +48,7 @@ impl ActionOutcome {
             Self::Trashed { message, .. }
             | Self::ExecutedAfterStash { message, .. }
             | Self::LoggedOnly { message, .. }
+            | Self::MovedTo { message, .. }
             | Self::Blocked { message }
             | Self::Failed { message } => message,
         }
@@ -56,6 +60,7 @@ impl ActionOutcome {
             Self::Trashed { .. } => "trash",
             Self::ExecutedAfterStash { .. } => "stash-then-exec",
             Self::LoggedOnly { .. } => "log-only",
+            Self::MovedTo { .. } => "move-to",
             Self::Blocked { .. } => "block",
             Self::Failed { .. } => "failed",
         }
@@ -65,6 +70,7 @@ impl ActionOutcome {
 pub trait ExecOps {
     fn passthrough(&mut self, invocation: &CommandInvocation) -> io::Result<i32>;
     fn move_to_trash(&mut self, targets: &[String]) -> Result<(), String>;
+    fn move_to_dir(&mut self, targets: &[String], destination: &Path) -> Result<usize, String>;
     fn git_stash(&mut self) -> Result<(), String>;
 }
 
@@ -89,6 +95,94 @@ impl ExecOps for SystemOps {
     fn move_to_trash(&mut self, targets: &[String]) -> Result<(), String> {
         let paths = targets.iter().map(PathBuf::from).collect::<Vec<_>>();
         trash::delete_all(paths).map_err(|error| error.to_string())
+    }
+
+    fn move_to_dir(&mut self, targets: &[String], destination: &Path) -> Result<usize, String> {
+        // Validate destination at execution time (fail-close)
+        if !destination.exists() {
+            return Err(format!(
+                "move-to directory `{}` does not exist; refusing to run the original command",
+                destination.display()
+            ));
+        }
+        if !destination.is_dir() {
+            return Err(format!(
+                "move-to path `{}` is not a directory",
+                destination.display()
+            ));
+        }
+
+        // Check for symlink at execution time (TOCTOU mitigation)
+        let meta = std::fs::symlink_metadata(destination).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "move-to directory `{}` is a symlink; refusing for security",
+                destination.display()
+            ));
+        }
+
+        // Re-check blocked prefixes at execution time (M1 fix: canonicalize may
+        // have failed at config-load time if the directory didn't exist yet)
+        if let Ok(canonical) = destination.canonicalize() {
+            let canonical_str = canonical.to_string_lossy();
+            for prefix in BLOCKED_DESTINATION_PREFIXES {
+                if canonical_str.starts_with(prefix) {
+                    return Err(format!(
+                        "move-to directory `{}` resolves to blocked system path `{canonical_str}`",
+                        destination.display()
+                    ));
+                }
+            }
+        }
+
+        // Create timestamped subdirectory to avoid filename collisions
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let sub_dir = destination.join(format!("{timestamp}"));
+        std::fs::create_dir_all(&sub_dir)
+            .map_err(|e| format!("failed to create subdirectory `{}`: {e}", sub_dir.display()))?;
+
+        let mut moved = 0usize;
+        let mut used_names = std::collections::HashSet::new();
+        for target in targets {
+            let src = PathBuf::from(target);
+            let base_name = src
+                .file_name()
+                .unwrap_or(src.as_os_str())
+                .to_string_lossy()
+                .into_owned();
+            // Deduplicate basenames: append _2, _3, etc. if collision
+            let unique_name = if used_names.contains(&base_name) {
+                let mut counter = 2u32;
+                loop {
+                    let candidate = format!("{base_name}_{counter}");
+                    if !used_names.contains(&candidate) {
+                        break candidate;
+                    }
+                    counter += 1;
+                }
+            } else {
+                base_name.clone()
+            };
+            used_names.insert(unique_name.clone());
+            let dest = sub_dir.join(&unique_name);
+
+            std::fs::rename(&src, &dest).map_err(|e| {
+                if e.raw_os_error() == Some(18) {
+                    // EXDEV: cross-device link
+                    format!(
+                        "cannot move `{target}` to `{}`: cross-device move is not supported (use a destination on the same volume)",
+                        destination.display()
+                    )
+                } else {
+                    format!("failed to move `{target}` to `{}`: {e}", dest.display())
+                }
+            })?;
+            moved += 1;
+        }
+        Ok(moved)
     }
 
     fn git_stash(&mut self) -> Result<(), String> {
@@ -174,6 +268,43 @@ impl<T: ExecOps> ActionExecutor<T> {
                     ),
                 },
             },
+            ActionKind::MoveTo => {
+                let destination = match &rule.destination {
+                    Some(dest) => PathBuf::from(dest),
+                    None => {
+                        return Ok(ActionOutcome::Failed {
+                            message: "omamori move-to rule has no destination configured"
+                                .to_string(),
+                        });
+                    }
+                };
+                let targets: Vec<String> = invocation
+                    .target_args()
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                if targets.is_empty() {
+                    ActionOutcome::Failed {
+                        message: "omamori could not identify any targets to move".to_string(),
+                    }
+                } else {
+                    match self.ops.move_to_dir(&targets, &destination) {
+                        Ok(count) => ActionOutcome::MovedTo {
+                            exit_code: 0,
+                            message: format!(
+                                "{message} ({count} target(s) moved to {})",
+                                destination.display()
+                            ),
+                        },
+                        Err(error) => ActionOutcome::Failed {
+                            message: format!(
+                                "omamori failed to move targets to `{}` and refused to run the original command: {error}",
+                                destination.display()
+                            ),
+                        },
+                    }
+                }
+            }
             ActionKind::Block => ActionOutcome::Blocked { message },
             ActionKind::LogOnly => {
                 let exit_code = self.ops.passthrough(invocation)?;
@@ -195,8 +326,11 @@ mod tests {
         passthrough_calls: usize,
         passthrough_status: i32,
         trash_error: Option<String>,
+        move_to_dir_error: Option<String>,
         stash_error: Option<String>,
         last_trash_targets: Vec<String>,
+        last_move_targets: Vec<String>,
+        last_move_destination: Option<PathBuf>,
     }
 
     impl ExecOps for FakeOps {
@@ -210,6 +344,15 @@ mod tests {
             match &self.trash_error {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
+            }
+        }
+
+        fn move_to_dir(&mut self, targets: &[String], destination: &Path) -> Result<usize, String> {
+            self.last_move_targets = targets.to_vec();
+            self.last_move_destination = Some(destination.to_path_buf());
+            match &self.move_to_dir_error {
+                Some(error) => Err(error.clone()),
+                None => Ok(targets.len()),
             }
         }
 
@@ -266,7 +409,11 @@ mod tests {
         let mut executor = ActionExecutor::new(FakeOps::default());
         let invocation = CommandInvocation::new(
             "rm".to_string(),
-            vec!["-rf".to_string(), "--".to_string(), "-dangerous.txt".to_string()],
+            vec![
+                "-rf".to_string(),
+                "--".to_string(),
+                "-dangerous.txt".to_string(),
+            ],
         );
         let outcome = executor
             .execute(&invocation, &rule(ActionKind::Trash, "rm"))
@@ -276,12 +423,74 @@ mod tests {
     }
 
     #[test]
-    fn trash_with_only_double_dash_fails() {
+    fn move_to_succeeds_with_destination() {
         let mut executor = ActionExecutor::new(FakeOps::default());
         let invocation = CommandInvocation::new(
             "rm".to_string(),
-            vec!["-rf".to_string(), "--".to_string()],
+            vec!["-rf".to_string(), "target/".to_string()],
         );
+        let rule = RuleConfig::new(
+            "rm-move",
+            "rm",
+            ActionKind::MoveTo,
+            Vec::new(),
+            Vec::new(),
+            Some("moved".to_string()),
+        )
+        .with_destination("/tmp/backup".to_string());
+        let outcome = executor.execute(&invocation, &rule).unwrap();
+        assert!(matches!(outcome, ActionOutcome::MovedTo { .. }));
+        assert_eq!(executor.ops.last_move_targets, vec!["target/"]);
+    }
+
+    #[test]
+    fn move_to_without_destination_fails() {
+        let mut executor = ActionExecutor::new(FakeOps::default());
+        let invocation = CommandInvocation::new(
+            "rm".to_string(),
+            vec!["-rf".to_string(), "target/".to_string()],
+        );
+        let rule = RuleConfig::new(
+            "rm-move",
+            "rm",
+            ActionKind::MoveTo,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let outcome = executor.execute(&invocation, &rule).unwrap();
+        assert!(matches!(outcome, ActionOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn move_to_failure_does_not_fall_back_to_passthrough() {
+        let mut executor = ActionExecutor::new(FakeOps {
+            move_to_dir_error: Some("disk full".to_string()),
+            ..Default::default()
+        });
+        let invocation = CommandInvocation::new(
+            "rm".to_string(),
+            vec!["-rf".to_string(), "target/".to_string()],
+        );
+        let rule = RuleConfig::new(
+            "rm-move",
+            "rm",
+            ActionKind::MoveTo,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .with_destination("/tmp/backup".to_string());
+        let outcome = executor.execute(&invocation, &rule).unwrap();
+        assert!(matches!(outcome, ActionOutcome::Failed { .. }));
+        assert_eq!(executor.ops.passthrough_calls, 0);
+    }
+
+    #[test]
+    fn trash_with_only_double_dash_fails() {
+        let mut executor = ActionExecutor::new(FakeOps::default());
+        let invocation =
+            CommandInvocation::new("rm".to_string(), vec!["-rf".to_string(), "--".to_string()]);
         let outcome = executor
             .execute(&invocation, &rule(ActionKind::Trash, "rm"))
             .unwrap();
