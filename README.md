@@ -37,17 +37,28 @@ When an AI CLI tool (Claude Code, Codex, Cursor, etc.) runs a shell command, oma
 
 ## Quick Start
 
-```bash
-# 1. Build from source
-cargo install --path .
+### Install via Homebrew (macOS)
 
-# 2. Install shims + hook templates
+```bash
+brew install yottayoshida/tap/omamori
+```
+
+### Or build from source
+
+```bash
+cargo install --path .
+```
+
+### Setup
+
+```bash
+# 1. Install shims + hook templates
 omamori install --hooks
 
-# 3. Add shim directory to PATH (add to .zshrc / .bashrc)
+# 2. Add shim directory to PATH (add to .zshrc / .bashrc)
 export PATH="$HOME/.omamori/shim:$PATH"
 
-# 4. Verify
+# 3. Verify
 omamori test
 ```
 
