@@ -299,8 +299,10 @@ fn default_config_path() -> Option<PathBuf> {
 fn default_detectors() -> Vec<DetectorConfig> {
     vec![
         DetectorConfig::env_var("claude-code", "CLAUDECODE", "1"),
-        DetectorConfig::env_var("codex-cli", "AI_GUARD", "1"),
-        DetectorConfig::env_var("cursor", "AI_GUARD", "1"),
+        DetectorConfig::env_var("codex-cli", "CODEX_CI", "1"),
+        // Provisional: based on Cursor Forum fix report (2025-08). Verify with future Cursor releases.
+        DetectorConfig::env_var("cursor", "CURSOR_AGENT", "1"),
+        DetectorConfig::env_var("ai-guard-fallback", "AI_GUARD", "1"),
     ]
 }
 
@@ -598,7 +600,7 @@ enabled = false
         assert!(user.detectors.is_none());
         let mut warnings = Vec::new();
         let config = build_merged_config(user, &mut warnings);
-        assert_eq!(config.detectors.len(), 3); // defaults
+        assert_eq!(config.detectors.len(), 4); // defaults
     }
 
     #[test]

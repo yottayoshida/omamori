@@ -76,11 +76,15 @@ pub trait ExecOps {
 
 pub struct SystemOps {
     real_program: PathBuf,
+    detector_env_keys: Vec<String>,
 }
 
 impl SystemOps {
-    pub fn new(real_program: PathBuf) -> Self {
-        Self { real_program }
+    pub fn new(real_program: PathBuf, detector_env_keys: Vec<String>) -> Self {
+        Self {
+            real_program,
+            detector_env_keys,
+        }
     }
 }
 
@@ -188,14 +192,12 @@ impl ExecOps for SystemOps {
     fn git_stash(&mut self) -> Result<(), String> {
         // Remove AI detector env vars so the internal git call does not
         // trigger omamori's own protection (self-interference prevention).
-        let status = Command::new("git")
-            .arg("stash")
-            .arg("push")
-            .arg("--include-untracked")
-            .env_remove("CLAUDECODE")
-            .env_remove("AI_GUARD")
-            .status()
-            .map_err(|error| error.to_string())?;
+        let mut cmd = Command::new("git");
+        cmd.arg("stash").arg("push").arg("--include-untracked");
+        for key in &self.detector_env_keys {
+            cmd.env_remove(key);
+        }
+        let status = cmd.status().map_err(|error| error.to_string())?;
         if status.success() {
             Ok(())
         } else {

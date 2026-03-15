@@ -264,7 +264,14 @@ fn run_command(
     let matched_rule = match_rule(&load_result.config.rules, &invocation);
 
     let resolved_program = resolve_real_command(&program)?;
-    let mut executor = ActionExecutor::new(SystemOps::new(resolved_program));
+    let detector_env_keys: Vec<String> = load_result
+        .config
+        .detectors
+        .iter()
+        .map(|d| d.env_key.clone())
+        .filter(|k| !k.is_empty() && !k.contains('='))
+        .collect();
+    let mut executor = ActionExecutor::new(SystemOps::new(resolved_program, detector_env_keys));
     let audit_logger = AuditLogger::from_config(&load_result.config.audit);
 
     let outcome = if should_block_for_sudo() {
@@ -470,7 +477,9 @@ pub struct PolicyTestResult {
 
 pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult> {
     let config = &load_result.config;
-    let protected_env = vec![("CLAUDECODE".to_string(), "1".to_string())];
+    let claude_env = vec![("CLAUDECODE".to_string(), "1".to_string())];
+    let codex_env = vec![("CODEX_CI".to_string(), "1".to_string())];
+    let cursor_env = vec![("CURSOR_AGENT".to_string(), "1".to_string())];
     let unprotected_env = Vec::new();
 
     let cases = vec![
@@ -480,7 +489,7 @@ pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult>
                 "rm".to_string(),
                 vec!["-rf".to_string(), "target".to_string()],
             ),
-            protected_env.clone(),
+            claude_env.clone(),
             Some("trash"),
             true,
         ),
@@ -500,7 +509,7 @@ pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult>
                 "git".to_string(),
                 vec!["reset".to_string(), "--hard".to_string()],
             ),
-            protected_env.clone(),
+            claude_env.clone(),
             Some("stash-then-exec"),
             true,
         ),
@@ -510,8 +519,28 @@ pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult>
                 "git".to_string(),
                 vec!["push".to_string(), "--force".to_string()],
             ),
-            protected_env,
+            claude_env,
             Some("block"),
+            true,
+        ),
+        (
+            "codex-cli-is-protected",
+            CommandInvocation::new(
+                "rm".to_string(),
+                vec!["-rf".to_string(), "target".to_string()],
+            ),
+            codex_env,
+            Some("trash"),
+            true,
+        ),
+        (
+            "cursor-is-protected",
+            CommandInvocation::new(
+                "rm".to_string(),
+                vec!["-rf".to_string(), "target".to_string()],
+            ),
+            cursor_env,
+            Some("trash"),
             true,
         ),
     ];

@@ -147,8 +147,11 @@ case "$INPUT" in
     echo "omamori hook: blocked direct rm path that bypasses PATH shim" >&2
     exit 2
     ;;
-  *"unset CLAUDECODE"*|*"env -u CLAUDECODE"*|*"CLAUDECODE="*)
-    echo "omamori hook: blocked attempt to unset the Claude detector env var" >&2
+  *"unset CLAUDECODE"*|*"env -u CLAUDECODE"*|*"CLAUDECODE="*|\
+  *"unset CODEX_CI"*|*"env -u CODEX_CI"*|*"CODEX_CI="*|\
+  *"unset CURSOR_AGENT"*|*"env -u CURSOR_AGENT"*|*"CURSOR_AGENT="*|\
+  *"unset AI_GUARD"*|*"env -u AI_GUARD"*|*"AI_GUARD="*)
+    echo "omamori hook: blocked attempt to unset a detector env var" >&2
     exit 2
     ;;
   *)
@@ -203,6 +206,18 @@ mod tests {
         assert!(script.contains(r#"*"/usr/bin/rm "*"#));
         // Should NOT have unbounded /bin/rm that matches /bin/rmdir
         assert!(!script.contains(r#"*"/bin/rm"*"#) || script.contains(r#"*"/bin/rm "*"#));
+    }
+
+    #[test]
+    fn hook_script_blocks_all_detector_env_var_unsets() {
+        let script = render_hook_script();
+        for var in &["CLAUDECODE", "CODEX_CI", "CURSOR_AGENT", "AI_GUARD"] {
+            assert!(
+                script.contains(&format!(r#"*"unset {var}"*"#)),
+                "hook script should block unset of {var}"
+            );
+        }
+        assert!(script.contains("blocked attempt to unset a detector env var"));
     }
 
     #[test]
