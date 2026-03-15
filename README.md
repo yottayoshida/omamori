@@ -4,6 +4,17 @@
 
 AI Agent's Omamori — protect your system from dangerous commands executed via AI CLI tools.
 
+### Supported AI CLI Tools
+
+| Tool | Detection | Status |
+|------|-----------|--------|
+| **Claude Code** | `CLAUDECODE=1` | Verified |
+| **Codex CLI** | `CODEX_CI=1` | Verified |
+| **Cursor** | `CURSOR_AGENT=1` | Provisional |
+| Any tool setting `AI_GUARD=1` | `AI_GUARD=1` | Fallback |
+
+Detection requires exact `=1` value match. Tools that set these environment variables when executing shell commands are automatically detected.
+
 ## What It Does
 
 When an AI CLI tool (Claude Code, Codex, Cursor, etc.) runs a shell command, omamori intercepts dangerous operations and replaces them with safe alternatives. **Terminal direct execution is not affected.**
@@ -179,4 +190,4 @@ For the full security model, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

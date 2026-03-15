@@ -96,6 +96,66 @@ mod tests {
     }
 
     #[test]
+    fn codex_detector_matches() {
+        let detectors = vec![DetectorConfig::env_var("codex-cli", "CODEX_CI", "1")];
+        let env_pairs = vec![("CODEX_CI".to_string(), "1".to_string())];
+        let result = evaluate_detectors(&detectors, &env_pairs);
+        assert!(result.protected);
+        assert_eq!(result.matched_detectors, vec!["codex-cli"]);
+    }
+
+    #[test]
+    fn cursor_detector_matches() {
+        let detectors = vec![DetectorConfig::env_var("cursor", "CURSOR_AGENT", "1")];
+        let env_pairs = vec![("CURSOR_AGENT".to_string(), "1".to_string())];
+        let result = evaluate_detectors(&detectors, &env_pairs);
+        assert!(result.protected);
+        assert_eq!(result.matched_detectors, vec!["cursor"]);
+    }
+
+    #[test]
+    fn ai_guard_fallback_matches() {
+        let detectors = vec![DetectorConfig::env_var(
+            "ai-guard-fallback",
+            "AI_GUARD",
+            "1",
+        )];
+        let env_pairs = vec![("AI_GUARD".to_string(), "1".to_string())];
+        let result = evaluate_detectors(&detectors, &env_pairs);
+        assert!(result.protected);
+        assert_eq!(result.matched_detectors, vec!["ai-guard-fallback"]);
+    }
+
+    #[test]
+    fn no_env_vars_means_unprotected() {
+        let detectors = vec![
+            DetectorConfig::env_var("claude-code", "CLAUDECODE", "1"),
+            DetectorConfig::env_var("codex-cli", "CODEX_CI", "1"),
+            DetectorConfig::env_var("cursor", "CURSOR_AGENT", "1"),
+        ];
+        let result = evaluate_detectors(&detectors, &[]);
+        assert!(!result.protected);
+        assert!(result.matched_detectors.is_empty());
+    }
+
+    #[test]
+    fn wrong_value_means_unprotected() {
+        let detectors = vec![DetectorConfig::env_var("cursor", "CURSOR_AGENT", "1")];
+        let env_pairs = vec![("CURSOR_AGENT".to_string(), "0".to_string())];
+        let result = evaluate_detectors(&detectors, &env_pairs);
+        assert!(!result.protected);
+    }
+
+    #[test]
+    fn claude_code_regression_guard() {
+        let detectors = vec![DetectorConfig::env_var("claude-code", "CLAUDECODE", "1")];
+        let env_pairs = vec![("CLAUDECODE".to_string(), "1".to_string())];
+        let result = evaluate_detectors(&detectors, &env_pairs);
+        assert!(result.protected);
+        assert_eq!(result.matched_detectors, vec!["claude-code"]);
+    }
+
+    #[test]
     fn malformed_detector_fails_closed() {
         let detectors = vec![DetectorConfig {
             name: "broken".to_string(),

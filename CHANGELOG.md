@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.2.1] - 2026-03-15
+
+### Fixed
+
+- **Codex CLI detection**: Changed env var from `AI_GUARD` to `CODEX_CI` (confirmed via source code, `codex-rs/core/src/unified_exec/process_manager.rs`).
+- **Cursor detection**: Changed env var from `AI_GUARD` to `CURSOR_AGENT` (provisional — based on Cursor Forum fix report, Aug 2025; verify with future Cursor releases).
+- **Self-interference prevention**: `git_stash()` now derives env_remove list from the active detector config instead of a hardcoded list, preventing recursive shim calls when new detectors are added.
+- **Hook script bypass protection**: Added `CODEX_CI`, `CURSOR_AGENT`, and `AI_GUARD` unset-block patterns to the Claude Code hook script.
+
+### Added
+
+- **`ai-guard-fallback` detector**: `AI_GUARD=1` retained as a low-trust fallback for unknown AI tools.
+- 2 new policy detection tests (`codex-cli-is-protected`, `cursor-is-protected`) in `omamori test` output.
+- 6 new unit tests for detector matching (positive + negative cases).
+
+### Changed
+
+- License changed from MIT to MIT OR Apache-2.0 (dual license, Rust crate convention).
+- Detector count increased from 3 to 4 (added `ai-guard-fallback`).
+- `SystemOps::new()` now accepts `detector_env_keys` parameter.
+
+### Important
+
+- **Existing users must re-run `omamori install --hooks`** to update the hook script with new bypass protection patterns.
+- Detection uses exact `=1` value matching. `CODEX_CI=true` or `CURSOR_AGENT=yes` will not trigger protection.
+
 ## [0.2.0] - 2026-03-14
 
 ### Added
@@ -63,6 +89,7 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.2.1]: https://github.com/yottayoshida/omamori/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yottayoshida/omamori/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yottayoshida/omamori/compare/v0.1.0...v0.1.1
 [Unreleased]: https://github.com/yottayoshida/omamori/commits/main
