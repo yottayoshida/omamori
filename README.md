@@ -1,7 +1,6 @@
 # omamori
 
-> **WIP — This project is under active development and not ready for general use.**
-> Do not install in production environments. Breaking changes will occur without notice.
+> **Pre-1.0** — Breaking changes may occur between minor versions.
 
 AI Agent's Omamori — protect your system from dangerous commands executed via AI CLI tools.
 
