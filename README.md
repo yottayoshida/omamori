@@ -52,27 +52,26 @@ cargo install --path .
 ### Setup
 
 ```bash
-# 1. Install shims + hook templates
+# 1. Install shims + hooks + config (all in one command)
 omamori install --hooks
 
 # 2. Add shim directory to PATH (add to .zshrc / .bashrc)
 export PATH="$HOME/.omamori/shim:$PATH"
-
-# 3. Verify
-omamori test
 ```
 
-After installation, `omamori test` shows which rules are active:
+That's it. `install --hooks` auto-generates `config.toml`, runs verification, and shows a checklist:
 
 ```
-Rules:
-  PASS  rm-recursive-to-trash        rm -r|-rf|-fr|--recursive -> trash
-  PASS  git-reset-hard-stash         git reset --hard         -> stash-then-exec
-  PASS  git-push-force-block         git push                 -> block
-  PASS  git-clean-force-block        git clean                -> block
-  PASS  chmod-777-block              chmod 777                -> block
+omamori setup complete:
 
-Summary: 5 rules (5 active, 0 disabled), 4 detection tests passed
+  [done] Shims installed: rm, git, chmod
+  [done] Hook script generated
+  [done] Config created: ~/.config/omamori/config.toml
+  [done] All rules verified: 5 active, 6 detection tests passed
+
+  [todo] Add to your shell profile (~/.zshrc or ~/.bashrc):
+
+    export PATH="$HOME/.omamori/shim:$PATH"
 ```
 
 ## How It Works
@@ -95,15 +94,23 @@ Combined short flags are normalized: `rm -rfv` expands to match `-r` and `-rf` r
 
 ## Configuration (v0.2+)
 
-Built-in rules are always inherited. Create a config file to customize:
+Built-in rules are always inherited. Config is auto-created by `install --hooks`. To regenerate manually:
 
 ```bash
-# Generate a starter template
-omamori init > ~/.config/omamori/config.toml
-chmod 600 ~/.config/omamori/config.toml
+omamori init              # Creates ~/.config/omamori/config.toml (chmod 600)
+omamori init --force      # Overwrite existing config
+omamori init --stdout     # Print template to stdout (backward compat)
 ```
 
-**Disable a rule** (e.g. allow force push):
+**Disable a rule** via CLI (v0.3+):
+
+```bash
+omamori config disable git-push-force-block
+omamori config enable git-push-force-block    # restore built-in default
+omamori config list                           # show all rules with status
+```
+
+Or edit `config.toml` directly:
 
 ```toml
 [[rules]]
@@ -178,9 +185,12 @@ Summary: 5 rules (4 active, 1 disabled), 4 detection tests passed
 ```
 omamori test [--config PATH]                          # Verify policy rules
 omamori exec [--config PATH] -- <command> [args...]   # Run through policy engine
-omamori install [--base-dir PATH] [--hooks]           # Create shims + hook templates
+omamori install [--base-dir PATH] [--hooks]           # Create shims + hooks + config
 omamori uninstall [--base-dir PATH]                   # Remove shims + hook files
-omamori init                                          # Print config template to stdout
+omamori init [--force] [--stdout]                     # Create/reset config file
+omamori config list                                   # Show all rules with status
+omamori config disable <rule>                         # Disable a built-in rule
+omamori config enable <rule>                          # Re-enable a disabled rule
 ```
 
 ## Structural Limitations
