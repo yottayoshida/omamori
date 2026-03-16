@@ -58,6 +58,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("install") => run_install_command(args),
         Some("uninstall") => run_uninstall_command(args),
         Some("init") => run_init_command(args),
+        Some("config") => run_config_command(args),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(0)
@@ -195,22 +196,73 @@ fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         generate_hooks,
     })?;
 
-    println!("Installed omamori shims in {}", result.shim_dir.display());
+    // --- Checklist output ---
+    println!("\nomamori setup complete:\n");
     println!(
-        "Add this directory to PATH manually:\n  export PATH=\"{}:$PATH\"",
-        result.shim_dir.display()
+        "  [done] Shims installed: {}",
+        result.linked_commands.join(", ")
     );
-    if let Some(script) = result.hook_script {
-        println!("Generated Claude Code hook script: {}", script.display());
+
+    if let Some(script) = &result.hook_script {
+        println!("  [done] Hook script generated: {}", script.display());
     }
-    if let Some(snippet) = result.settings_snippet {
+    if let Some(snippet) = &result.settings_snippet {
+        println!("  [done] Settings snippet generated: {}", snippet.display());
+    }
+
+    // Auto-generate config if it doesn't exist
+    let config_status = match config::default_config_path() {
+        Some(config_path) if !config_path.exists() => {
+            match config::write_default_config(&config_path, false) {
+                Ok(res) => format!("[done] Config created: {}", res.path.display()),
+                Err(e) => format!("[warn] Config not created: {e}"),
+            }
+        }
+        Some(config_path) => format!("[skip] Config already exists: {}", config_path.display()),
+        None => "[warn] Config not created: HOME/XDG_CONFIG_HOME not set".to_string(),
+    };
+    println!("  {config_status}");
+
+    // Auto-test
+    let load_result = load_config(None)?;
+    let test_results = run_policy_tests(&load_result);
+    let failures = test_results.iter().filter(|r| !r.passed).count();
+    let active_rules = load_result
+        .config
+        .rules
+        .iter()
+        .filter(|r| r.enabled)
+        .count();
+    if failures == 0 {
         println!(
-            "Generated Claude settings snippet (apply manually): {}",
-            snippet.display()
+            "  [done] All rules verified: {} active, {} detection tests passed",
+            active_rules,
+            test_results.len()
+        );
+    } else {
+        println!(
+            "  [FAIL] {} detection test(s) failed — run `omamori test` for details",
+            failures
         );
     }
-    println!("Linked commands: {}", result.linked_commands.join(", "));
 
+    // Remaining manual steps
+    println!(
+        "\n  [todo] Add to your shell profile (~/.zshrc or ~/.bashrc):\n\n    export PATH=\"{}:$PATH\"",
+        result.shim_dir.display()
+    );
+    if result.settings_snippet.is_some() {
+        println!(
+            "\n  [todo] Apply Claude Code hook (copy snippet to settings.json):\n\n    cat {}/claude-settings.snippet.json",
+            result
+                .hook_script
+                .as_ref()
+                .map(|p| p.parent().unwrap().display().to_string())
+                .unwrap_or_default()
+        );
+    }
+
+    println!();
     Ok(0)
 }
 
@@ -327,6 +379,87 @@ fn print_usage() {
     println!("{}", usage_text());
 }
 
+fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
+    match args.get(2).and_then(|item| item.to_str()) {
+        Some("list") => run_config_list(),
+        Some(other) => Err(AppError::Usage(format!(
+            "unknown config subcommand: {other}\n\n{}",
+            usage_text()
+        ))),
+        None => Err(AppError::Usage(format!(
+            "config requires a subcommand\n\n{}",
+            usage_text()
+        ))),
+    }
+}
+
+fn run_config_list() -> Result<i32, AppError> {
+    let load_result = load_config(None)?;
+    let config = &load_result.config;
+
+    // Emit any config warnings
+    emit_config_warnings(&load_result);
+
+    // Determine which rules were customized by user config
+    let default_rule_names: std::collections::HashSet<String> = config::default_rules()
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
+
+    println!(
+        "\n  {:<30} {:<16} {:<10} Source",
+        "Rule", "Action", "Status"
+    );
+    println!("  {}", "-".repeat(76));
+
+    for rule in &config.rules {
+        let status = if rule.enabled { "active" } else { "disabled" };
+        let source = if !default_rule_names.contains(&rule.name) {
+            "config"
+        } else if !rule.enabled {
+            "config (disabled)"
+        } else {
+            // Check if any field differs from default
+            "built-in"
+        };
+        let action_str = match &rule.action {
+            rules::ActionKind::MoveTo => {
+                let dest = rule.destination.as_deref().unwrap_or("?");
+                format!("move-to {dest}")
+            }
+            other => other.as_str().to_string(),
+        };
+        println!(
+            "  {:<30} {:<16} {:<10} {}",
+            rule.name, action_str, status, source
+        );
+    }
+
+    // Show config path
+    if let Some(path) = config::default_config_path() {
+        if path.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    println!(
+                        "\n  Config: {} (permissions: {:o})",
+                        path.display(),
+                        meta.mode() & 0o777
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            println!("\n  Config: {}", path.display());
+        } else {
+            println!("\n  Config: not found (run `omamori init` to create)");
+        }
+    }
+
+    println!();
+    Ok(0)
+}
+
 fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut force = false;
     let mut stdout_mode = false;
@@ -389,6 +522,7 @@ fn usage_text() -> &'static str {
   omamori install [--base-dir PATH] [--source PATH] [--hooks]
   omamori uninstall [--base-dir PATH]
   omamori init [--force] [--stdout]
+  omamori config list
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."
