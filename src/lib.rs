@@ -58,6 +58,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("install") => run_install_command(args),
         Some("uninstall") => run_uninstall_command(args),
         Some("init") => run_init_command(args),
+        Some("config") => run_config_command(args),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(0)
@@ -195,22 +196,73 @@ fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         generate_hooks,
     })?;
 
-    println!("Installed omamori shims in {}", result.shim_dir.display());
+    // --- Checklist output ---
+    println!("\nomamori setup complete:\n");
     println!(
-        "Add this directory to PATH manually:\n  export PATH=\"{}:$PATH\"",
-        result.shim_dir.display()
+        "  [done] Shims installed: {}",
+        result.linked_commands.join(", ")
     );
-    if let Some(script) = result.hook_script {
-        println!("Generated Claude Code hook script: {}", script.display());
+
+    if let Some(script) = &result.hook_script {
+        println!("  [done] Hook script generated: {}", script.display());
     }
-    if let Some(snippet) = result.settings_snippet {
+    if let Some(snippet) = &result.settings_snippet {
+        println!("  [done] Settings snippet generated: {}", snippet.display());
+    }
+
+    // Auto-generate config if it doesn't exist
+    let config_status = match config::default_config_path() {
+        Some(config_path) if !config_path.exists() => {
+            match config::write_default_config(&config_path, false) {
+                Ok(res) => format!("[done] Config created: {}", res.path.display()),
+                Err(e) => format!("[warn] Config not created: {e}"),
+            }
+        }
+        Some(config_path) => format!("[skip] Config already exists: {}", config_path.display()),
+        None => "[warn] Config not created: HOME/XDG_CONFIG_HOME not set".to_string(),
+    };
+    println!("  {config_status}");
+
+    // Auto-test
+    let load_result = load_config(None)?;
+    let test_results = run_policy_tests(&load_result);
+    let failures = test_results.iter().filter(|r| !r.passed).count();
+    let active_rules = load_result
+        .config
+        .rules
+        .iter()
+        .filter(|r| r.enabled)
+        .count();
+    if failures == 0 {
         println!(
-            "Generated Claude settings snippet (apply manually): {}",
-            snippet.display()
+            "  [done] All rules verified: {} active, {} detection tests passed",
+            active_rules,
+            test_results.len()
+        );
+    } else {
+        println!(
+            "  [FAIL] {} detection test(s) failed — run `omamori test` for details",
+            failures
         );
     }
-    println!("Linked commands: {}", result.linked_commands.join(", "));
 
+    // Remaining manual steps
+    println!(
+        "\n  [todo] Add to your shell profile (~/.zshrc or ~/.bashrc):\n\n    export PATH=\"{}:$PATH\"",
+        result.shim_dir.display()
+    );
+    if result.settings_snippet.is_some() {
+        println!(
+            "\n  [todo] Apply Claude Code hook (copy snippet to settings.json):\n\n    cat {}/claude-settings.snippet.json",
+            result
+                .hook_script
+                .as_ref()
+                .map(|p| p.parent().unwrap().display().to_string())
+                .unwrap_or_default()
+        );
+    }
+
+    println!();
     Ok(0)
 }
 
@@ -327,6 +379,295 @@ fn print_usage() {
     println!("{}", usage_text());
 }
 
+fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
+    match args.get(2).and_then(|item| item.to_str()) {
+        Some("list") => run_config_list(),
+        Some("disable") => {
+            let rule_name = args.get(3).and_then(|item| item.to_str()).ok_or_else(|| {
+                AppError::Usage("config disable requires a rule name".to_string())
+            })?;
+            run_config_disable(rule_name)
+        }
+        Some("enable") => {
+            let rule_name = args
+                .get(3)
+                .and_then(|item| item.to_str())
+                .ok_or_else(|| AppError::Usage("config enable requires a rule name".to_string()))?;
+            run_config_enable(rule_name)
+        }
+        Some(other) => Err(AppError::Usage(format!(
+            "unknown config subcommand: {other}\n\n{}",
+            usage_text()
+        ))),
+        None => Err(AppError::Usage(format!(
+            "config requires a subcommand\n\n{}",
+            usage_text()
+        ))),
+    }
+}
+
+fn validate_rule_name(name: &str) -> Result<(), AppError> {
+    let known_names: Vec<String> = config::default_rules()
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
+    if !known_names.contains(&name.to_string()) {
+        return Err(AppError::Config(format!(
+            "unknown rule `{name}`\n  Known rules: {}",
+            known_names.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_config_path_checked() -> Result<std::path::PathBuf, AppError> {
+    let path = config::default_config_path().ok_or_else(|| {
+        AppError::Config("cannot determine config path: HOME/XDG_CONFIG_HOME not set".to_string())
+    })?;
+    // P2 fix: reject symlinked config file before writing
+    if path.exists() {
+        config::reject_symlink_public(&path, "config path")?;
+    }
+    Ok(path)
+}
+
+fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
+    validate_rule_name(rule_name)?;
+
+    let config_path = resolve_config_path_checked()?;
+
+    // Auto-create config if it doesn't exist
+    if !config_path.exists() {
+        config::write_default_config(&config_path, false)?;
+    }
+
+    // Check current state via the config loader to detect all forms of disable
+    let load_result = load_config(None)?;
+    let rule = load_result
+        .config
+        .rules
+        .iter()
+        .find(|r| r.name == rule_name);
+    if let Some(r) = rule
+        && !r.enabled
+    {
+        eprintln!("Rule `{rule_name}` is already disabled.");
+        return Ok(2);
+    }
+
+    // Read current content
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // P1 fix: check if an existing [[rules]] entry for this rule exists in the file.
+    // If so, we need to add `enabled = false` to that entry rather than appending a new block.
+    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
+
+    // Check if an uncommented entry for this rule exists
+    let has_uncommented_entry = content.lines().any(|l| {
+        let trimmed = l.trim();
+        !trimmed.starts_with('#') && trimmed == format!("name = \"{rule_name}\"")
+    });
+
+    let new_content = if has_uncommented_entry {
+        // Existing entry — replace or add enabled = false in the block
+        // Find the block and ensure enabled = false is present
+        let mut result = String::new();
+        let mut in_target_block = false;
+        let mut added_enabled = false;
+        for line in content.lines() {
+            if line.trim() == "[[rules]]" {
+                if in_target_block && !added_enabled {
+                    result.push_str("enabled = false\n");
+                    added_enabled = true;
+                }
+                in_target_block = false;
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+            if line.trim() == format!("name = \"{rule_name}\"") {
+                in_target_block = true;
+            }
+            if in_target_block && line.trim().starts_with("enabled") {
+                result.push_str("enabled = false\n");
+                added_enabled = true;
+                continue;
+            }
+            result.push_str(line);
+            result.push('\n');
+        }
+        if in_target_block && !added_enabled {
+            result.push_str("enabled = false\n");
+        }
+        result
+    } else {
+        // No existing entry — append a new disable block
+        let mut new = content;
+        if !new.ends_with('\n') {
+            new.push('\n');
+        }
+        new.push('\n');
+        new.push_str(&disable_block);
+        new
+    };
+
+    // Validate the new TOML is parseable
+    if toml::from_str::<toml::Value>(&new_content).is_err() {
+        return Err(AppError::Config(
+            "modifying config would create invalid TOML; aborting".to_string(),
+        ));
+    }
+
+    std::fs::write(&config_path, &new_content)?;
+    eprintln!("Disabled: {rule_name}");
+
+    // Show updated config list
+    run_config_list()
+}
+
+fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
+    validate_rule_name(rule_name)?;
+
+    let config_path = resolve_config_path_checked()?;
+
+    if !config_path.exists() {
+        eprintln!("Rule `{rule_name}` is already enabled (built-in default).");
+        return Ok(2);
+    }
+
+    // Check current state
+    let load_result = load_config(None)?;
+    let rule = load_result
+        .config
+        .rules
+        .iter()
+        .find(|r| r.name == rule_name);
+    if let Some(r) = rule
+        && r.enabled
+    {
+        eprintln!("Rule `{rule_name}` is already enabled.");
+        return Ok(2);
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // Remove standalone disable blocks
+    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
+    let mut new_content = content.replace(&disable_block, "");
+
+    // Also handle entries where enabled = false is within a larger block
+    // by removing the `enabled = false` line
+    let enabled_false_line = "enabled = false";
+    let mut lines: Vec<&str> = new_content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == enabled_false_line {
+            // Check if we're in the target rule's block by looking backwards for the name
+            let mut in_target = false;
+            for j in (0..i).rev() {
+                let trimmed = lines[j].trim();
+                if trimmed == format!("name = \"{rule_name}\"") {
+                    in_target = true;
+                    break;
+                }
+                if trimmed == "[[rules]]" {
+                    break;
+                }
+            }
+            if in_target {
+                lines.remove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    new_content = lines.join("\n");
+
+    // Clean up trailing whitespace
+    let new_content = new_content.trim_end().to_string() + "\n";
+
+    std::fs::write(&config_path, &new_content)?;
+    eprintln!("Enabled: {rule_name} (restored to built-in default)");
+
+    // Show updated config list
+    run_config_list()
+}
+
+fn run_config_list() -> Result<i32, AppError> {
+    let load_result = load_config(None)?;
+    let config = &load_result.config;
+
+    // Emit any config warnings
+    emit_config_warnings(&load_result);
+
+    // Build default rules map for comparison (P3 fix)
+    let defaults: std::collections::HashMap<String, _> = config::default_rules()
+        .into_iter()
+        .map(|r| (r.name.clone(), r))
+        .collect();
+
+    println!(
+        "\n  {:<30} {:<16} {:<10} Source",
+        "Rule", "Action", "Status"
+    );
+    println!("  {}", "-".repeat(76));
+
+    for rule in &config.rules {
+        let status = if rule.enabled { "active" } else { "disabled" };
+        let source = if let Some(default) = defaults.get(&rule.name) {
+            if !rule.enabled {
+                "config (disabled)"
+            } else if rule.action != default.action
+                || rule.command != default.command
+                || rule.match_all != default.match_all
+                || rule.match_any != default.match_any
+                || rule.destination != default.destination
+            {
+                "config (modified)"
+            } else {
+                "built-in"
+            }
+        } else {
+            "config"
+        };
+        let action_str = match &rule.action {
+            rules::ActionKind::MoveTo => {
+                let dest = rule.destination.as_deref().unwrap_or("?");
+                format!("move-to {dest}")
+            }
+            other => other.as_str().to_string(),
+        };
+        println!(
+            "  {:<30} {:<16} {:<10} {}",
+            rule.name, action_str, status, source
+        );
+    }
+
+    // Show config path
+    if let Some(path) = config::default_config_path() {
+        if path.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    println!(
+                        "\n  Config: {} (permissions: {:o})",
+                        path.display(),
+                        meta.mode() & 0o777
+                    );
+                }
+            }
+            #[cfg(not(unix))]
+            println!("\n  Config: {}", path.display());
+        } else {
+            println!("\n  Config: not found (run `omamori init` to create)");
+        }
+    }
+
+    println!();
+    Ok(0)
+}
+
 fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut force = false;
     let mut stdout_mode = false;
@@ -389,6 +730,9 @@ fn usage_text() -> &'static str {
   omamori install [--base-dir PATH] [--source PATH] [--hooks]
   omamori uninstall [--base-dir PATH]
   omamori init [--force] [--stdout]
+  omamori config list
+  omamori config disable <rule>
+  omamori config enable <rule>
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."

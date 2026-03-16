@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.3.0] - 2026-03-16
+
+### Added
+
+- **`omamori init` file-write mode**: `init` now writes `config.toml` directly to `~/.config/omamori/` (or `$XDG_CONFIG_HOME/omamori/`) with chmod 600 applied automatically. No more `init > file && chmod 600` dance.
+- **`omamori install --hooks` auto-config**: Install now auto-generates `config.toml` if missing, runs policy verification, and displays a `[done]/[todo]` checklist.
+- **`omamori config list`**: New subcommand showing all rules with Name, Action, Status, and Source columns. Distinguishes `built-in`, `config (disabled)`, `config (modified)`, and `config` (custom rule).
+- **`omamori config disable <rule>`**: Disable a built-in rule from the CLI (no TOML editing needed).
+- **`omamori config enable <rule>`**: Re-enable a disabled rule (restores built-in default).
+- **`XDG_CONFIG_HOME` support**: Config path respects `$XDG_CONFIG_HOME` with absolute path validation (XDG spec compliance).
+- **`libc` dependency**: Added for `O_NOFOLLOW` flag in secure file creation.
+- 21 new tests (total: 76). Covers init file-write, symlink rejection, install auto-config, config disable/enable, and warning message format.
+
+### Changed
+
+- **`omamori init` default behavior**: Now writes file directly instead of stdout. Use `--stdout` for the previous behavior. Use `--force` to overwrite existing config.
+- **Warning messages**: Improved with 3-layer structure — what happened + current state + what to do (with copy-pasteable fix commands).
+- **`install` output**: Changed from flat text to structured `[done]/[skip]/[todo]` checklist format.
+- **Exit codes for `init`**: 0=success, 1=error, 2=file exists without `--force`.
+
+### Security
+
+- **Symlink hardening**: `init`, `install`, `config disable/enable` all reject symlinked config files, parent directories, and temp files. Uses `symlink_metadata()` + `O_NOFOLLOW` (double defense).
+- **TOCTOU prevention**: New file creation uses `OpenOptions::create_new(true)` for atomic check+create.
+- **Atomic writes**: `--force` mode uses temp file → `sync_all()` → rename for crash resilience.
+- **Directory permissions**: Config directory created with chmod 700.
+- **T4 safety**: `init` output is all-commented TOML — even `init --force` cannot neutralize built-in rules.
+
+### Important
+
+- **Breaking**: `omamori init` now writes a file instead of printing to stdout. Scripts using `omamori init > file` should switch to `omamori init` (direct) or `omamori init --stdout > file`.
+- **Existing users**: Run `omamori init` to create `config.toml` if you haven't already. `install --hooks` will auto-create it on next run.
+
 ## [0.2.1] - 2026-03-15
 
 ### Fixed
@@ -89,6 +122,7 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.3.0]: https://github.com/yottayoshida/omamori/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/yottayoshida/omamori/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yottayoshida/omamori/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yottayoshida/omamori/compare/v0.1.0...v0.1.1
