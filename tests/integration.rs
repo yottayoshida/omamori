@@ -257,3 +257,138 @@ fn config_list_shows_disabled_rule() {
 
     let _ = fs::remove_dir_all(config_dir);
 }
+
+// ---------------------------------------------------------------------------
+// config disable/enable tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_disable_adds_block() {
+    let binary = env!("CARGO_BIN_EXE_omamori");
+    let config_dir = unique_dir("cfg-disable");
+    let config_path = config_dir.join("omamori").join("config.toml");
+
+    // Init a fresh config
+    let output = Command::new(binary)
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    // Disable a rule
+    let output = Command::new(binary)
+        .args(["config", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Disabled: git-push-force-block"));
+
+    // Verify config file contains the disable block
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(content.contains("[[rules]]\nname = \"git-push-force-block\"\nenabled = false"));
+
+    // config list should show disabled
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("disabled"));
+
+    let _ = fs::remove_dir_all(&config_dir);
+}
+
+#[test]
+fn config_enable_removes_block() {
+    let binary = env!("CARGO_BIN_EXE_omamori");
+    let config_dir = unique_dir("cfg-enable");
+
+    // Init + disable
+    Command::new(binary)
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    Command::new(binary)
+        .args(["config", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    // Enable it back
+    let output = Command::new(binary)
+        .args(["config", "enable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Enabled: git-push-force-block"));
+
+    // Verify the active disable block is removed (commented lines may still have "enabled = false")
+    let config_path = config_dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !content.contains("[[rules]]\nname = \"git-push-force-block\"\nenabled = false"),
+        "disable block should be removed from config"
+    );
+
+    let _ = fs::remove_dir_all(&config_dir);
+}
+
+#[test]
+fn config_disable_already_disabled_returns_2() {
+    let binary = env!("CARGO_BIN_EXE_omamori");
+    let config_dir = unique_dir("cfg-disable-dup");
+
+    Command::new(binary)
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    Command::new(binary)
+        .args(["config", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    // Try to disable again
+    let output = Command::new(binary)
+        .args(["config", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already disabled"));
+
+    let _ = fs::remove_dir_all(&config_dir);
+}
+
+#[test]
+fn config_disable_unknown_rule_fails() {
+    let binary = env!("CARGO_BIN_EXE_omamori");
+
+    let output = Command::new(binary)
+        .args(["config", "disable", "nonexistent-rule"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown rule"));
+}

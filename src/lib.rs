@@ -382,6 +382,19 @@ fn print_usage() {
 fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(2).and_then(|item| item.to_str()) {
         Some("list") => run_config_list(),
+        Some("disable") => {
+            let rule_name = args.get(3).and_then(|item| item.to_str()).ok_or_else(|| {
+                AppError::Usage("config disable requires a rule name".to_string())
+            })?;
+            run_config_disable(rule_name)
+        }
+        Some("enable") => {
+            let rule_name = args
+                .get(3)
+                .and_then(|item| item.to_str())
+                .ok_or_else(|| AppError::Usage("config enable requires a rule name".to_string()))?;
+            run_config_enable(rule_name)
+        }
         Some(other) => Err(AppError::Usage(format!(
             "unknown config subcommand: {other}\n\n{}",
             usage_text()
@@ -391,6 +404,97 @@ fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
             usage_text()
         ))),
     }
+}
+
+fn validate_rule_name(name: &str) -> Result<(), AppError> {
+    let known_names: Vec<String> = config::default_rules()
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
+    if !known_names.contains(&name.to_string()) {
+        return Err(AppError::Config(format!(
+            "unknown rule `{name}`\n  Known rules: {}",
+            known_names.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
+    validate_rule_name(rule_name)?;
+
+    let config_path = config::default_config_path().ok_or_else(|| {
+        AppError::Config("cannot determine config path: HOME/XDG_CONFIG_HOME not set".to_string())
+    })?;
+
+    // Auto-create config if it doesn't exist
+    if !config_path.exists() {
+        config::write_default_config(&config_path, false)?;
+    }
+
+    // Read current content
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // Check if already disabled
+    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
+    if content.contains(&disable_block) {
+        eprintln!("Rule `{rule_name}` is already disabled.");
+        return Ok(2);
+    }
+
+    // Append disable block
+    let mut new_content = content;
+    if !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    new_content.push('\n');
+    new_content.push_str(&disable_block);
+
+    // Validate the new TOML is parseable
+    if toml::from_str::<toml::Value>(&new_content).is_err() {
+        return Err(AppError::Config(
+            "appending disable block would create invalid TOML; aborting".to_string(),
+        ));
+    }
+
+    std::fs::write(&config_path, &new_content)?;
+    eprintln!("Disabled: {rule_name}");
+
+    // Show updated config list
+    run_config_list()
+}
+
+fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
+    validate_rule_name(rule_name)?;
+
+    let config_path = config::default_config_path().ok_or_else(|| {
+        AppError::Config("cannot determine config path: HOME/XDG_CONFIG_HOME not set".to_string())
+    })?;
+
+    if !config_path.exists() {
+        eprintln!("Rule `{rule_name}` is already enabled (built-in default).");
+        return Ok(2);
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // Find and remove the disable block
+    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
+    if !content.contains(&disable_block) {
+        eprintln!("Rule `{rule_name}` is already enabled.");
+        return Ok(2);
+    }
+
+    let new_content = content.replace(&disable_block, "");
+
+    // Clean up trailing whitespace
+    let new_content = new_content.trim_end().to_string() + "\n";
+
+    std::fs::write(&config_path, &new_content)?;
+    eprintln!("Enabled: {rule_name} (restored to built-in default)");
+
+    // Show updated config list
+    run_config_list()
 }
 
 fn run_config_list() -> Result<i32, AppError> {
@@ -523,6 +627,8 @@ fn usage_text() -> &'static str {
   omamori uninstall [--base-dir PATH]
   omamori init [--force] [--stdout]
   omamori config list
+  omamori config disable <rule>
+  omamori config enable <rule>
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."
