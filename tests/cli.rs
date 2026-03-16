@@ -3,6 +3,16 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn unique_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("omamori-{name}-{nanos}"));
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 fn unique_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -11,10 +21,13 @@ fn unique_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("omamori-{name}-{nanos}.toml"))
 }
 
+fn binary() -> String {
+    env!("CARGO_BIN_EXE_omamori").to_string()
+}
+
 #[test]
 fn omamori_test_command_succeeds_with_defaults() {
-    let binary = env!("CARGO_BIN_EXE_omamori");
-    let output = Command::new(binary)
+    let output = Command::new(binary())
         .arg("test")
         .output()
         .expect("failed to run omamori test");
@@ -32,7 +45,6 @@ fn omamori_test_command_succeeds_with_defaults() {
 
 #[test]
 fn malformed_config_falls_back_to_defaults() {
-    let binary = env!("CARGO_BIN_EXE_omamori");
     let path = unique_path("broken");
     fs::write(&path, "[[rules]\nname = ").unwrap();
     #[cfg(unix)]
@@ -41,7 +53,7 @@ fn malformed_config_falls_back_to_defaults() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    let output = Command::new(binary)
+    let output = Command::new(binary())
         .arg("test")
         .arg("--config")
         .arg(&path)
@@ -55,5 +67,295 @@ fn malformed_config_falls_back_to_defaults() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("using built-in default rules"));
+    assert!(
+        stderr.contains("Built-in default rules are active"),
+        "stderr should contain actionable warning: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// init tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn init_stdout_mode_prints_template() {
+    let output = Command::new(binary())
+        .args(["init", "--stdout"])
+        .output()
+        .expect("failed to run omamori init --stdout");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("# omamori config"));
+    assert!(stdout.contains("rm-recursive-to-trash"));
+    assert!(stdout.contains("git-push-force-block"));
+}
+
+#[test]
+fn init_creates_config_file() {
+    let dir = unique_dir("init-create");
+    let config_path = dir.join("omamori").join("config.toml");
+
+    let output = Command::new(binary())
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init");
+
+    assert!(
+        output.status.success(),
+        "exit={} stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(config_path.exists(), "config.toml should be created");
+
+    // Verify content is the commented template
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(content.contains("# omamori config"));
+    assert!(content.contains("# [[rules]]"));
+    // Should NOT contain uncommented [[rules]] (T4 safety)
+    assert!(
+        !content
+            .lines()
+            .any(|l| l.trim_start().starts_with("[[rules]]")),
+        "config should have all rules commented out"
+    );
+
+    // Verify permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = fs::metadata(&config_path).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config should be chmod 600, got {mode:o}");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_refuses_overwrite_without_force() {
+    let dir = unique_dir("init-noforce");
+    let config_dir = dir.join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "# existing config\n").unwrap();
+
+    let output = Command::new(binary())
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init");
+
+    // Should exit with code 2
+    assert_eq!(output.status.code(), Some(2));
+
+    // Existing file should be unchanged
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(content, "# existing config\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_force_overwrites_existing() {
+    let dir = unique_dir("init-force");
+    let config_dir = dir.join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "# old config\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = Command::new(binary())
+        .args(["init", "--force"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init --force");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains("# omamori config"),
+        "should be new template"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_refuses_symlink_target() {
+    let dir = unique_dir("init-symlink");
+    let config_dir = dir.join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    let real_file = dir.join("real.toml");
+    fs::write(&real_file, "# real\n").unwrap();
+
+    let config_path = config_dir.join("config.toml");
+    std::os::unix::fs::symlink(&real_file, &config_path).unwrap();
+
+    let output = Command::new(binary())
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symlink"),
+        "should mention symlink: {stderr}"
+    );
+
+    // Real file should be unchanged
+    let content = fs::read_to_string(&real_file).unwrap();
+    assert_eq!(content, "# real\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn init_refuses_symlinked_parent_directory() {
+    let dir = unique_dir("init-symlink-dir");
+    let real_dir = dir.join("real_omamori");
+    fs::create_dir_all(&real_dir).unwrap();
+
+    // Make "omamori" a symlink to "real_omamori"
+    let symlink_dir = dir.join("omamori");
+    std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+
+    let output = Command::new(binary())
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symlink"),
+        "should mention symlink: {stderr}"
+    );
+
+    // No config.toml should be created in real_dir
+    assert!(!real_dir.join("config.toml").exists());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_fails_without_home_and_xdg() {
+    let output = Command::new(binary())
+        .args(["init"])
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("XDG_CONFIG_HOME") || stderr.contains("HOME"),
+        "should mention missing env: {stderr}"
+    );
+}
+
+#[test]
+fn init_written_config_loads_correctly() {
+    let dir = unique_dir("init-roundtrip");
+    let config_path = dir.join("omamori").join("config.toml");
+
+    // Create config via init
+    let output = Command::new(binary())
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init");
+    assert!(output.status.success());
+
+    // Use the created config with omamori test
+    let output = Command::new(binary())
+        .args(["test", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("failed to run omamori test");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("detection tests passed"));
+
+    // Should have no warnings (config exists and is valid)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("warning"),
+        "should have no warnings: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// warning message tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn warning_config_not_found_is_actionable() {
+    let nonexistent = unique_path("nonexistent");
+    let output = Command::new(binary())
+        .args(["test", "--config"])
+        .arg(&nonexistent)
+        .output()
+        .expect("failed to run omamori test");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("config not found"));
+    assert!(
+        stderr.contains("omamori init"),
+        "warning should suggest omamori init: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn warning_bad_permissions_is_actionable() {
+    let path = unique_path("badperms");
+    fs::write(&path, "# ok\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let output = Command::new(binary())
+        .args(["test", "--config"])
+        .arg(&path)
+        .output()
+        .expect("failed to run omamori test");
+
+    let _ = fs::remove_file(&path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("permissions are too open"));
+    assert!(
+        stderr.contains("chmod 600"),
+        "warning should suggest chmod 600: {stderr}"
+    );
 }
