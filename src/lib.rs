@@ -420,40 +420,101 @@ fn validate_rule_name(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn resolve_config_path_checked() -> Result<std::path::PathBuf, AppError> {
+    let path = config::default_config_path().ok_or_else(|| {
+        AppError::Config("cannot determine config path: HOME/XDG_CONFIG_HOME not set".to_string())
+    })?;
+    // P2 fix: reject symlinked config file before writing
+    if path.exists() {
+        config::reject_symlink_public(&path, "config path")?;
+    }
+    Ok(path)
+}
+
 fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     validate_rule_name(rule_name)?;
 
-    let config_path = config::default_config_path().ok_or_else(|| {
-        AppError::Config("cannot determine config path: HOME/XDG_CONFIG_HOME not set".to_string())
-    })?;
+    let config_path = resolve_config_path_checked()?;
 
     // Auto-create config if it doesn't exist
     if !config_path.exists() {
         config::write_default_config(&config_path, false)?;
     }
 
-    // Read current content
-    let content = std::fs::read_to_string(&config_path)?;
-
-    // Check if already disabled
-    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
-    if content.contains(&disable_block) {
+    // Check current state via the config loader to detect all forms of disable
+    let load_result = load_config(None)?;
+    let rule = load_result
+        .config
+        .rules
+        .iter()
+        .find(|r| r.name == rule_name);
+    if let Some(r) = rule
+        && !r.enabled
+    {
         eprintln!("Rule `{rule_name}` is already disabled.");
         return Ok(2);
     }
 
-    // Append disable block
-    let mut new_content = content;
-    if !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    new_content.push('\n');
-    new_content.push_str(&disable_block);
+    // Read current content
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // P1 fix: check if an existing [[rules]] entry for this rule exists in the file.
+    // If so, we need to add `enabled = false` to that entry rather than appending a new block.
+    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
+
+    // Check if an uncommented entry for this rule exists
+    let has_uncommented_entry = content.lines().any(|l| {
+        let trimmed = l.trim();
+        !trimmed.starts_with('#') && trimmed == format!("name = \"{rule_name}\"")
+    });
+
+    let new_content = if has_uncommented_entry {
+        // Existing entry — replace or add enabled = false in the block
+        // Find the block and ensure enabled = false is present
+        let mut result = String::new();
+        let mut in_target_block = false;
+        let mut added_enabled = false;
+        for line in content.lines() {
+            if line.trim() == "[[rules]]" {
+                if in_target_block && !added_enabled {
+                    result.push_str("enabled = false\n");
+                    added_enabled = true;
+                }
+                in_target_block = false;
+                result.push_str(line);
+                result.push('\n');
+                continue;
+            }
+            if line.trim() == format!("name = \"{rule_name}\"") {
+                in_target_block = true;
+            }
+            if in_target_block && line.trim().starts_with("enabled") {
+                result.push_str("enabled = false\n");
+                added_enabled = true;
+                continue;
+            }
+            result.push_str(line);
+            result.push('\n');
+        }
+        if in_target_block && !added_enabled {
+            result.push_str("enabled = false\n");
+        }
+        result
+    } else {
+        // No existing entry — append a new disable block
+        let mut new = content;
+        if !new.ends_with('\n') {
+            new.push('\n');
+        }
+        new.push('\n');
+        new.push_str(&disable_block);
+        new
+    };
 
     // Validate the new TOML is parseable
     if toml::from_str::<toml::Value>(&new_content).is_err() {
         return Err(AppError::Config(
-            "appending disable block would create invalid TOML; aborting".to_string(),
+            "modifying config would create invalid TOML; aborting".to_string(),
         ));
     }
 
@@ -467,25 +528,60 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
 fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
     validate_rule_name(rule_name)?;
 
-    let config_path = config::default_config_path().ok_or_else(|| {
-        AppError::Config("cannot determine config path: HOME/XDG_CONFIG_HOME not set".to_string())
-    })?;
+    let config_path = resolve_config_path_checked()?;
 
     if !config_path.exists() {
         eprintln!("Rule `{rule_name}` is already enabled (built-in default).");
         return Ok(2);
     }
 
-    let content = std::fs::read_to_string(&config_path)?;
-
-    // Find and remove the disable block
-    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
-    if !content.contains(&disable_block) {
+    // Check current state
+    let load_result = load_config(None)?;
+    let rule = load_result
+        .config
+        .rules
+        .iter()
+        .find(|r| r.name == rule_name);
+    if let Some(r) = rule
+        && r.enabled
+    {
         eprintln!("Rule `{rule_name}` is already enabled.");
         return Ok(2);
     }
 
-    let new_content = content.replace(&disable_block, "");
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // Remove standalone disable blocks
+    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
+    let mut new_content = content.replace(&disable_block, "");
+
+    // Also handle entries where enabled = false is within a larger block
+    // by removing the `enabled = false` line
+    let enabled_false_line = "enabled = false";
+    let mut lines: Vec<&str> = new_content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == enabled_false_line {
+            // Check if we're in the target rule's block by looking backwards for the name
+            let mut in_target = false;
+            for j in (0..i).rev() {
+                let trimmed = lines[j].trim();
+                if trimmed == format!("name = \"{rule_name}\"") {
+                    in_target = true;
+                    break;
+                }
+                if trimmed == "[[rules]]" {
+                    break;
+                }
+            }
+            if in_target {
+                lines.remove(i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    new_content = lines.join("\n");
 
     // Clean up trailing whitespace
     let new_content = new_content.trim_end().to_string() + "\n";
@@ -504,10 +600,10 @@ fn run_config_list() -> Result<i32, AppError> {
     // Emit any config warnings
     emit_config_warnings(&load_result);
 
-    // Determine which rules were customized by user config
-    let default_rule_names: std::collections::HashSet<String> = config::default_rules()
-        .iter()
-        .map(|r| r.name.clone())
+    // Build default rules map for comparison (P3 fix)
+    let defaults: std::collections::HashMap<String, _> = config::default_rules()
+        .into_iter()
+        .map(|r| (r.name.clone(), r))
         .collect();
 
     println!(
@@ -518,13 +614,21 @@ fn run_config_list() -> Result<i32, AppError> {
 
     for rule in &config.rules {
         let status = if rule.enabled { "active" } else { "disabled" };
-        let source = if !default_rule_names.contains(&rule.name) {
-            "config"
-        } else if !rule.enabled {
-            "config (disabled)"
+        let source = if let Some(default) = defaults.get(&rule.name) {
+            if !rule.enabled {
+                "config (disabled)"
+            } else if rule.action != default.action
+                || rule.command != default.command
+                || rule.match_all != default.match_all
+                || rule.match_any != default.match_any
+                || rule.destination != default.destination
+            {
+                "config (modified)"
+            } else {
+                "built-in"
+            }
         } else {
-            // Check if any field differs from default
-            "built-in"
+            "config"
         };
         let action_str = match &rule.action {
             rules::ActionKind::MoveTo => {

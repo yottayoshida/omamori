@@ -496,6 +496,11 @@ pub fn write_default_config(path: &Path, force: bool) -> Result<WriteConfigResul
     })
 }
 
+/// Public wrapper for symlink rejection (used by config enable/disable).
+pub fn reject_symlink_public(path: &Path, label: &str) -> Result<(), AppError> {
+    reject_symlink(path, label)
+}
+
 fn reject_symlink(path: &Path, label: &str) -> Result<(), AppError> {
     if let Ok(meta) = fs::symlink_metadata(path)
         && meta.file_type().is_symlink()
