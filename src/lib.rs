@@ -57,7 +57,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("exec") => run_exec_command(args),
         Some("install") => run_install_command(args),
         Some("uninstall") => run_uninstall_command(args),
-        Some("init") => run_init_command(),
+        Some("init") => run_init_command(args),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(0)
@@ -327,44 +327,59 @@ fn print_usage() {
     println!("{}", usage_text());
 }
 
-fn run_init_command() -> Result<i32, AppError> {
-    let defaults = config::default_rules();
-    println!(
-        "# omamori config — only write the rules you want to change.\n\
-         # Built-in rules are inherited automatically.\n\
-         # To disable a rule: set enabled = false\n\
-         # To change an action: override the action field\n\
-         #\n\
-         # Usage:\n\
-         #   omamori init > ~/.config/omamori/config.toml\n\
-         #   chmod 600 ~/.config/omamori/config.toml\n\
-         #   omamori test\n\
-         #"
-    );
-    for rule in &defaults {
-        println!("\n# [[rules]]");
-        println!("# name = \"{}\"", rule.name);
-        println!("# command = \"{}\"", rule.command);
-        println!("# action = \"{}\"", rule.action.as_str());
-        if !rule.match_all.is_empty() {
-            println!("# match_all = {:?}", rule.match_all);
+fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
+    let mut force = false;
+    let mut stdout_mode = false;
+    let mut index = 2usize;
+
+    while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
+        match arg {
+            "--force" => {
+                force = true;
+                index += 1;
+            }
+            "--stdout" => {
+                stdout_mode = true;
+                index += 1;
+            }
+            _ => {
+                return Err(AppError::Usage(format!(
+                    "unknown init flag: {arg}\n\n{}",
+                    usage_text()
+                )));
+            }
         }
-        if !rule.match_any.is_empty() {
-            println!("# match_any = {:?}", rule.match_any);
-        }
-        println!("# # enabled = false  # uncomment to disable this rule");
     }
-    println!(
-        "\n# --- Custom rule example ---\n\
-         # [[rules]]\n\
-         # name = \"rm-to-backup\"\n\
-         # command = \"rm\"\n\
-         # action = \"move-to\"\n\
-         # destination = \"/tmp/omamori-quarantine/\"\n\
-         # match_any = [\"-r\", \"-rf\", \"-fr\", \"--recursive\"]\n\
-         # message = \"omamori moved targets to backup instead of deleting\""
-    );
-    Ok(0)
+
+    // --stdout: backward-compatible stdout output
+    if stdout_mode {
+        print!("{}", config::config_template());
+        return Ok(0);
+    }
+
+    // File write mode (default)
+    let path = config::default_config_path().ok_or_else(|| {
+        AppError::Config(
+            "cannot determine config path: neither XDG_CONFIG_HOME nor HOME is set".to_string(),
+        )
+    })?;
+
+    match config::write_default_config(&path, force) {
+        Ok(result) => {
+            eprintln!("Created {}", result.path.display());
+            eprintln!("Run `omamori test` to verify your setup.");
+            Ok(0)
+        }
+        Err(AppError::Config(msg)) if msg.contains("already exists") => {
+            eprintln!("omamori: {msg}");
+            Ok(2)
+        }
+        Err(AppError::Config(msg)) if msg.contains("symlink") => {
+            eprintln!("omamori: {msg}");
+            Ok(1)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn usage_text() -> &'static str {
@@ -373,7 +388,7 @@ fn usage_text() -> &'static str {
   omamori exec [--config PATH] -- <command> [args...]
   omamori install [--base-dir PATH] [--source PATH] [--hooks]
   omamori uninstall [--base-dir PATH]
-  omamori init
+  omamori init [--force] [--stdout]
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."

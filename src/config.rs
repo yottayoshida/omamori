@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -84,13 +85,18 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
         Some(path) => {
             if !path.exists() {
                 warnings.push(format!(
-                    "config `{}` not found; using built-in default rules",
+                    "config not found at {}\n  \
+                     Built-in default rules are active (safe to use as-is).\n  \
+                     To create a config for customization, run: omamori init",
                     path.display()
                 ));
                 Config::default()
             } else if !permissions_are_safe(&path)? {
                 warnings.push(format!(
-                    "config `{}` permissions are not 600; using built-in default rules",
+                    "config permissions are too open at {}\n  \
+                     Built-in default rules are active for security.\n  \
+                     To fix, run: chmod 600 {}",
+                    path.display(),
                     path.display()
                 ));
                 Config::default()
@@ -100,7 +106,9 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
                     Ok(user_config) => build_merged_config(user_config, &mut warnings),
                     Err(error) => {
                         warnings.push(format!(
-                            "failed to parse `{}` ({error}); using built-in default rules",
+                            "failed to parse config at {} ({error})\n  \
+                             Built-in default rules are active for safety.\n  \
+                             Fix the syntax error or run: omamori init --force",
                             path.display()
                         ));
                         Config::default()
@@ -290,7 +298,17 @@ fn validate_destination(dest: &str, rule_name: &str, warnings: &mut Vec<String>)
 // Defaults
 // ---------------------------------------------------------------------------
 
-fn default_config_path() -> Option<PathBuf> {
+/// Returns the default config file path, respecting `XDG_CONFIG_HOME`.
+/// Priority: `$XDG_CONFIG_HOME/omamori/config.toml` → `$HOME/.config/omamori/config.toml`.
+pub fn default_config_path() -> Option<PathBuf> {
+    // XDG_CONFIG_HOME must be absolute if set
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let xdg_path = PathBuf::from(&xdg);
+        if xdg_path.is_absolute() {
+            return Some(xdg_path.join("omamori").join("config.toml"));
+        }
+        // Relative XDG_CONFIG_HOME is ignored (XDG spec requires absolute)
+    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".config").join("omamori").join("config.toml"))
@@ -357,6 +375,158 @@ pub fn default_rules() -> Vec<RuleConfig> {
             Some("omamori blocked chmod 777".to_string()),
         ),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Config file writing
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct WriteConfigResult {
+    pub path: PathBuf,
+    pub created: bool,
+}
+
+/// Generate the default config template as a string (all rules commented out).
+pub fn config_template() -> String {
+    let defaults = default_rules();
+    let mut out = String::new();
+    out.push_str(
+        "# omamori config — only write the rules you want to change.\n\
+         # Built-in rules are inherited automatically.\n\
+         # To disable a rule: set enabled = false\n\
+         # To change an action: override the action field\n\
+         #\n\
+         # Docs: https://github.com/yottayoshida/omamori\n\
+         #\n",
+    );
+    for rule in &defaults {
+        out.push_str("\n# [[rules]]\n");
+        out.push_str(&format!("# name = \"{}\"\n", rule.name));
+        out.push_str(&format!("# command = \"{}\"\n", rule.command));
+        out.push_str(&format!("# action = \"{}\"\n", rule.action.as_str()));
+        if !rule.match_all.is_empty() {
+            out.push_str(&format!("# match_all = {:?}\n", rule.match_all));
+        }
+        if !rule.match_any.is_empty() {
+            out.push_str(&format!("# match_any = {:?}\n", rule.match_any));
+        }
+        out.push_str("# # enabled = false  # uncomment to disable this rule\n");
+    }
+    out.push_str(
+        "\n# --- Custom rule example ---\n\
+         # [[rules]]\n\
+         # name = \"rm-to-backup\"\n\
+         # command = \"rm\"\n\
+         # action = \"move-to\"\n\
+         # destination = \"/tmp/omamori-quarantine/\"\n\
+         # match_any = [\"-r\", \"-rf\", \"-fr\", \"--recursive\"]\n\
+         # message = \"omamori moved targets to backup instead of deleting\"\n",
+    );
+    out
+}
+
+/// Write the default config template to the given path.
+///
+/// Safety features:
+/// - Refuses to write to symlinks (`O_NOFOLLOW` + `symlink_metadata` check)
+/// - `force=false`: uses `create_new(true)` to prevent TOCTOU races
+/// - `force=true`: atomic write via temp file + rename + fsync
+/// - Sets directory permissions to 700, file permissions to 600
+pub fn write_default_config(path: &Path, force: bool) -> Result<WriteConfigResult, AppError> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| AppError::Config(format!("invalid config path: {}", path.display())))?;
+
+    // Create directory with mode 700
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
+    } else {
+        // P2 fix: reject symlinked parent directory
+        reject_symlink(dir, "config directory")?;
+    }
+
+    // Check for symlink at target path
+    if path.exists() || path.symlink_metadata().is_ok() {
+        reject_symlink(path, "config path")?;
+
+        if !force {
+            return Err(AppError::Config(format!(
+                "config already exists at {}\n  Use `omamori init --force` to overwrite.",
+                path.display()
+            )));
+        }
+    }
+
+    let content = config_template();
+
+    if force && path.exists() {
+        // Atomic write: temp file → fsync → rename
+        let temp_path = path.with_extension("toml.tmp");
+        // P1 fix: reject symlink at temp path too
+        if temp_path.symlink_metadata().is_ok() {
+            reject_symlink(&temp_path, "temp config path")?;
+            // Remove stale temp file (non-symlink) if it exists
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_new_config(&temp_path, &content)?;
+        // fsync the file
+        let file = fs::File::open(&temp_path)?;
+        file.sync_all()?;
+        drop(file);
+        // Atomic rename
+        fs::rename(&temp_path, path)?;
+        // fsync the parent directory
+        if let Ok(dir_file) = fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+    } else {
+        // New file: use O_NOFOLLOW + create_new for TOCTOU safety
+        write_new_config(path, &content)?;
+    }
+
+    Ok(WriteConfigResult {
+        path: path.to_path_buf(),
+        created: true,
+    })
+}
+
+fn reject_symlink(path: &Path, label: &str) -> Result<(), AppError> {
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(AppError::Config(format!(
+            "{label} `{}` is a symlink; refusing to write for security",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_new_config(path: &Path, content: &str) -> Result<(), AppError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_new_config(path: &Path, content: &str) -> Result<(), AppError> {
+    fs::write(path, content)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
