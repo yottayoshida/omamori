@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::AppError;
 
-const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod"];
+const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
 
 #[derive(Debug, Clone)]
 pub struct InstallOptions {

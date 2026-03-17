@@ -374,6 +374,31 @@ pub fn default_rules() -> Vec<RuleConfig> {
             vec!["777".to_string()],
             Some("omamori blocked chmod 777".to_string()),
         ),
+        RuleConfig::new(
+            "find-delete-block",
+            "find",
+            ActionKind::Block,
+            Vec::new(),
+            vec!["-delete".to_string(), "--delete".to_string()],
+            Some("omamori blocked find with -delete flag".to_string()),
+        ),
+        RuleConfig::new(
+            "rsync-delete-block",
+            "rsync",
+            ActionKind::Block,
+            Vec::new(),
+            vec![
+                "--delete".to_string(),
+                "--del".to_string(),
+                "--delete-before".to_string(),
+                "--delete-during".to_string(),
+                "--delete-after".to_string(),
+                "--delete-excluded".to_string(),
+                "--delete-delay".to_string(),
+                "--remove-source-files".to_string(),
+            ],
+            Some("omamori blocked rsync with destructive flags".to_string()),
+        ),
     ]
 }
 
