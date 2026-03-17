@@ -288,6 +288,7 @@ fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
 }
 
 fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> {
+    guard_ai_config_modification("uninstall")?;
     let mut base_dir = default_base_dir();
     let mut index = 2usize;
 
@@ -537,6 +538,23 @@ fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
     }
 }
 
+/// Guard against AI agents modifying omamori's own configuration.
+/// Blocks when any AI detector env var is present (exact match via evaluate_detectors).
+fn guard_ai_config_modification(operation: &str) -> Result<(), AppError> {
+    let detectors = config::default_detectors();
+    let env_pairs: Vec<(String, String)> = std::env::vars().collect();
+    let detection = evaluate_detectors(&detectors, &env_pairs);
+    if detection.protected {
+        return Err(AppError::Config(format!(
+            "{operation} blocked — AI agent environment detected ({}).\n  \
+             Protection rules cannot be modified by AI tools.\n  \
+             To modify, run this command directly in your terminal (not via AI).",
+            detection.matched_detectors.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn validate_rule_name(name: &str) -> Result<(), AppError> {
     let known_names: Vec<String> = config::default_rules()
         .iter()
@@ -563,6 +581,7 @@ fn resolve_config_path_checked() -> Result<std::path::PathBuf, AppError> {
 }
 
 fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
+    guard_ai_config_modification("config disable")?;
     validate_rule_name(rule_name)?;
 
     let config_path = resolve_config_path_checked()?;
@@ -657,6 +676,7 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
 }
 
 fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
+    guard_ai_config_modification("config enable")?;
     validate_rule_name(rule_name)?;
 
     let config_path = resolve_config_path_checked()?;
@@ -821,6 +841,11 @@ fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
                 )));
             }
         }
+    }
+
+    // Guard: init --force can overwrite existing config → block in AI sessions
+    if force {
+        guard_ai_config_modification("init --force")?;
     }
 
     // --stdout: backward-compatible stdout output

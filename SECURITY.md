@@ -78,6 +78,33 @@ Hooks are **not a complete parser** and should be treated as partial coverage. P
 - Indirect execution via variables or heredocs
 - Commands constructed at runtime by the interpreter
 
+## AI Config Bypass Guard (v0.3.2+)
+
+Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) showed that AI agents (Gemini CLI) can autonomously discover and use `omamori config disable` to remove protection rules before executing dangerous commands.
+
+### Protection
+
+- `config disable`, `config enable`, `uninstall`, and `init --force` are blocked when AI detector env vars are present
+- Uses the same detector logic as the PATH shim (`evaluate_detectors()`)
+- Hooks also block these commands as string patterns (Claude Code + Cursor)
+- Claude Code PreToolUse hooks block direct `config.toml` file editing via Edit/Write tools
+
+### Known limitations
+
+| Attack vector | Protected | Notes |
+|--------------|-----------|-------|
+| `omamori config disable` | Yes — env var guard | All tools with known env vars |
+| `omamori uninstall` | Yes — env var guard | All tools with known env vars |
+| Direct config.toml editing (Edit/Write) | Claude Code only | PreToolUse hook blocks file_path match |
+| Direct config.toml editing (Bash: sed, echo >>) | Claude Code + Cursor | Hooks block Bash patterns containing config.toml |
+| Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
+| env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |
+| Unknown AI tool (no env var) | **No** | Guard depends on known env vars |
+
+### Design philosophy
+
+DCG (destructive_command_guard) explicitly states that adversarial AI bypass is out of scope. omamori chooses to address this attack surface, acknowledging that complete prevention is impossible in userspace but meaningful risk reduction is achievable through layered defense.
+
 ## Safe Defaults
 
 - Missing config → fail-close using built-in default rules

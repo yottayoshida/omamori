@@ -2,6 +2,15 @@ use std::fs;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn clean_ai_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("CLAUDECODE")
+        .env_remove("CODEX_CI")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("GEMINI_CLI")
+        .env_remove("CLINE_ACTIVE")
+        .env_remove("AI_GUARD")
+}
+
 fn unique_dir(name: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -64,7 +73,9 @@ fn uninstall_removes_generated_artifacts() {
         .expect("failed to run install");
     assert!(install_status.success());
 
-    let uninstall_output = Command::new(binary)
+    let mut uninstall_cmd = Command::new(binary);
+    clean_ai_env(&mut uninstall_cmd);
+    let uninstall_output = uninstall_cmd
         .arg("uninstall")
         .arg("--base-dir")
         .arg(&base_dir)
@@ -278,7 +289,9 @@ fn config_disable_adds_block() {
     assert!(output.status.success());
 
     // Disable a rule
-    let output = Command::new(binary)
+    let mut cmd = Command::new(binary);
+    clean_ai_env(&mut cmd);
+    let output = cmd
         .args(["config", "disable", "git-push-force-block"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env_remove("HOME")
@@ -316,15 +329,21 @@ fn config_enable_removes_block() {
         .env_remove("HOME")
         .output()
         .unwrap();
-    Command::new(binary)
-        .args(["config", "disable", "git-push-force-block"])
-        .env("XDG_CONFIG_HOME", &config_dir)
-        .env_remove("HOME")
-        .output()
-        .unwrap();
+    {
+        let mut c = Command::new(binary);
+        clean_ai_env(&mut c);
+        c
+    }
+    .args(["config", "disable", "git-push-force-block"])
+    .env("XDG_CONFIG_HOME", &config_dir)
+    .env_remove("HOME")
+    .output()
+    .unwrap();
 
     // Enable it back
-    let output = Command::new(binary)
+    let mut cmd = Command::new(binary);
+    clean_ai_env(&mut cmd);
+    let output = cmd
         .args(["config", "enable", "git-push-force-block"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env_remove("HOME")
@@ -357,15 +376,21 @@ fn config_disable_already_disabled_returns_2() {
         .env_remove("HOME")
         .output()
         .unwrap();
-    Command::new(binary)
-        .args(["config", "disable", "git-push-force-block"])
-        .env("XDG_CONFIG_HOME", &config_dir)
-        .env_remove("HOME")
-        .output()
-        .unwrap();
+    {
+        let mut c = Command::new(binary);
+        clean_ai_env(&mut c);
+        c
+    }
+    .args(["config", "disable", "git-push-force-block"])
+    .env("XDG_CONFIG_HOME", &config_dir)
+    .env_remove("HOME")
+    .output()
+    .unwrap();
 
     // Try to disable again
-    let output = Command::new(binary)
+    let mut cmd = Command::new(binary);
+    clean_ai_env(&mut cmd);
+    let output = cmd
         .args(["config", "disable", "git-push-force-block"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env_remove("HOME")
@@ -383,7 +408,9 @@ fn config_disable_already_disabled_returns_2() {
 fn config_disable_unknown_rule_fails() {
     let binary = env!("CARGO_BIN_EXE_omamori");
 
-    let output = Command::new(binary)
+    let mut cmd = Command::new(binary);
+    clean_ai_env(&mut cmd);
+    let output = cmd
         .args(["config", "disable", "nonexistent-rule"])
         .output()
         .unwrap();

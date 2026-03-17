@@ -176,6 +176,22 @@ case "$INPUT" in
     echo "omamori hook: blocked attempt to unset a detector env var" >&2
     exit 2
     ;;
+  *"config disable"*|*"config enable"*)
+    echo "omamori hook: blocked attempt to modify omamori rules" >&2
+    exit 2
+    ;;
+  *"omamori uninstall"*)
+    echo "omamori hook: blocked attempt to uninstall omamori" >&2
+    exit 2
+    ;;
+  *"omamori init --force"*)
+    echo "omamori hook: blocked attempt to overwrite omamori config" >&2
+    exit 2
+    ;;
+  *"omamori/config.toml"*|*"omamori"*"config.toml"*)
+    echo "omamori hook: blocked attempt to edit omamori config file directly" >&2
+    exit 2
+    ;;
   *"python "*"-c "*"shutil.rmtree"*|*"python3 "*"-c "*"shutil.rmtree"*|\
   *"python "*"-c "*"os.remove"*|*"python3 "*"-c "*"os.remove"*|\
   *"python "*"-c "*"os.rmdir"*|*"python3 "*"-c "*"os.rmdir"*|\
@@ -284,6 +300,14 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
             "blocked attempt to unset a detector env var",
         ),
         ("AI_GUARD=", "blocked attempt to unset a detector env var"),
+        // Config modification protection (#22)
+        ("config disable", "blocked attempt to modify omamori rules"),
+        ("config enable", "blocked attempt to modify omamori rules"),
+        ("omamori uninstall", "blocked attempt to uninstall omamori"),
+        (
+            "omamori init --force",
+            "blocked attempt to overwrite omamori config",
+        ),
     ]
 }
 
