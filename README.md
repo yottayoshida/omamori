@@ -4,33 +4,41 @@
 
 AI Agent's Omamori — protect your system from dangerous commands executed via AI CLI tools.
 
-### Supported AI CLI Tools
+### Support Tiers
 
-| Tool | Detection | Status |
-|------|-----------|--------|
-| **Claude Code** | `CLAUDECODE=1` | Verified |
-| **Codex CLI** | `CODEX_CI=1` | Verified |
-| **Cursor** | `CURSOR_AGENT=1` | Verified |
-| **Gemini CLI** | `GEMINI_CLI=1` | Verified |
-| **Cline** | `CLINE_ACTIVE=true` | Provisional |
-| Any tool setting `AI_GUARD=1` | `AI_GUARD=1` | Fallback |
+| Tier | Tools | What it means |
+|------|-------|---------------|
+| **Supported** | Claude Code, Codex CLI, Cursor | E2E tested every release. Issues investigated and fixed. |
+| **Community** | Gemini CLI, Cline, others | Env var detection included but not tested. No guaranteed support. |
+| **Fallback** | Any tool setting `AI_GUARD=1` | Generic detection. No tool-specific integration. |
 
-Detection uses **exact value matching** (e.g. `CLAUDECODE=1` only, not `CLAUDECODE=true`). Tools that set these environment variables when executing shell commands are automatically detected.
+### Detection Details
 
-### Protection Coverage by Tool
+| Tool | Environment Variable | Value |
+|------|---------------------|-------|
+| Claude Code | `CLAUDECODE` | `1` |
+| Codex CLI | `CODEX_CI` | `1` |
+| Cursor | `CURSOR_AGENT` | `1` |
+| Gemini CLI | `GEMINI_CLI` | `1` |
+| Cline | `CLINE_ACTIVE` | `true` |
+| Fallback | `AI_GUARD` | `1` |
 
-| Tool | Layer 1 (PATH shim) | Layer 2 (Hooks) | Config guard | Full-path bypass | config.toml edit guard |
-|------|---------------------|-----------------|-------------|-----------------|----------------------|
-| **Claude Code** | All rules | PreToolUse | env var block | Hooks block | PreToolUse block |
-| **Codex CLI** | All rules | Not available | env var block | **No** | **No** |
-| **Cursor** | All rules | beforeShellExecution | env var block | Hooks block | Bash only |
-| **Gemini CLI** | All rules | Not available | env var block | **No** | **No** |
-| **Cline** | All rules | Not verified | env var block | Not verified | Not verified |
+Detection uses **exact value matching** (e.g. `CLAUDECODE=1` only, not `CLAUDECODE=true`).
+
+### Protection Coverage (Supported Tools)
+
+| Protection | Claude Code | Codex CLI | Cursor |
+|-----------|------------|-----------|--------|
+| Layer 1 — PATH shim (all rules) | ✅ | ✅ | ✅ |
+| Layer 2 — Hooks (full-path bypass) | ✅ PreToolUse | ❌ | ✅ beforeShellExecution |
+| Layer 2 — Hooks (interpreter warnings) | ✅ warn | ❌ | ✅ ask |
+| Config guard (disable/uninstall blocked) | ✅ env var + hooks | ✅ env var | ✅ env var + hooks |
+| config.toml direct edit guard | ✅ PreToolUse | ❌ | Bash only |
 
 - **Layer 1 (PATH shim)**: Blocks dangerous commands when AI sets its env var. Bypassable via `/bin/rm` full-path execution.
-- **Layer 2 (Hooks)**: Catches full-path bypass, env var unset attempts, interpreter commands, and `config disable`/`uninstall` attempts. Only available for tools with hook APIs.
-- **Config guard** (v0.3.2+): `config disable`, `config enable`, `uninstall`, and `init --force` are blocked when AI detector env vars are present. Works for all tools.
-- **config.toml edit guard**: PreToolUse hook blocks direct file editing of config.toml (Claude Code only). Cursor blocks Bash-based edits. Tools without hooks cannot prevent direct file editing.
+- **Layer 2 (Hooks)**: Catches full-path bypass, env var unset, interpreter commands, and `config disable`/`uninstall`. Available for Claude Code and Cursor only.
+- **Config guard** (v0.3.2+): `config disable`, `config enable`, `uninstall`, and `init --force` are blocked when AI detector env vars are present. Works for all detected tools.
+- **config.toml edit guard**: PreToolUse hook blocks direct file editing (Claude Code only). Cursor blocks Bash-based edits.
 - See [SECURITY.md](SECURITY.md) for full details and known limitations.
 
 ## What It Does
