@@ -359,3 +359,96 @@ fn warning_bad_permissions_is_actionable() {
         "warning should suggest chmod 600: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// cursor-hook tests
+// ---------------------------------------------------------------------------
+
+use std::io::Write;
+use std::process::Stdio;
+
+fn run_cursor_hook(input: &str) -> (String, String, bool) {
+    let mut child = Command::new(binary())
+        .args(["cursor-hook"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn cursor-hook");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (stdout, stderr, output.status.success())
+}
+
+#[test]
+fn cursor_hook_blocks_bin_rm() {
+    let (stdout, _, success) = run_cursor_hook(
+        r#"{"command":"/bin/rm -rf /tmp/test","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#,
+    );
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["continue"], false);
+    assert_eq!(parsed["permission"], "deny");
+    assert!(parsed["userMessage"].as_str().unwrap().contains("omamori"));
+}
+
+#[test]
+fn cursor_hook_allows_safe_command() {
+    let (stdout, _, success) = run_cursor_hook(
+        r#"{"command":"ls /tmp","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#,
+    );
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["continue"], true);
+    assert_eq!(parsed["permission"], "allow");
+}
+
+#[test]
+fn cursor_hook_blocks_env_unset() {
+    let (stdout, _, success) = run_cursor_hook(
+        r#"{"command":"unset CLAUDECODE && rm -rf /","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#,
+    );
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["continue"], false);
+    assert_eq!(parsed["permission"], "deny");
+}
+
+#[test]
+fn cursor_hook_stdout_is_json_only() {
+    let (stdout, _, _) = run_cursor_hook(
+        r#"{"command":"echo hello","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#,
+    );
+    let trimmed = stdout.trim();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
+        "stdout must be valid JSON only, got: {trimmed}"
+    );
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "stdout must be exactly one JSON line, got: {trimmed}"
+    );
+}
+
+#[test]
+fn cursor_hook_handles_malformed_stdin() {
+    let (stdout, _, success) = run_cursor_hook("not json at all");
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON even on bad input");
+    assert_eq!(parsed["continue"], true);
+    assert_eq!(parsed["permission"], "allow");
+}

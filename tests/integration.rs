@@ -34,16 +34,16 @@ fn install_creates_shims_without_touching_shell_config() {
     assert!(base_dir.join("shim/git").exists());
     assert!(base_dir.join("hooks/claude-pretooluse.sh").exists());
     assert!(base_dir.join("hooks/claude-settings.snippet.json").exists());
+    assert!(base_dir.join("hooks/cursor-hooks.snippet.json").exists());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("[todo] Add to your shell profile"),
         "stdout: {stdout}"
     );
-    assert!(
-        stdout.contains("[done] Shims installed"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("Shims:"), "stdout: {stdout}");
+    assert!(stdout.contains("Hooks:"), "stdout: {stdout}");
+    assert!(stdout.contains("Cursor hook snippet"), "stdout: {stdout}");
 
     let _ = fs::remove_dir_all(base_dir);
 }
@@ -110,7 +110,7 @@ fn install_auto_creates_config_when_missing() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[done] Config created"),
+        stdout.contains("[done] Created"),
         "should auto-create config: {stdout}"
     );
     assert!(
@@ -152,7 +152,7 @@ fn install_skips_existing_config() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[skip] Config already exists"),
+        stdout.contains("[skip] Already exists"),
         "should skip existing config: {stdout}"
     );
 
@@ -185,7 +185,7 @@ fn install_runs_auto_test() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[done] All rules verified"),
+        stdout.contains("rules verified"),
         "should show auto-test results: {stdout}"
     );
 

@@ -59,6 +59,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("uninstall") => run_uninstall_command(args),
         Some("init") => run_init_command(args),
         Some("config") => run_config_command(args),
+        Some("cursor-hook") => run_cursor_hook(),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(0)
@@ -196,30 +197,39 @@ fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         generate_hooks,
     })?;
 
-    // --- Checklist output ---
+    // --- Categorized checklist output ---
     println!("\nomamori setup complete:\n");
-    println!(
-        "  [done] Shims installed: {}",
-        result.linked_commands.join(", ")
-    );
 
+    // Shims
+    println!("Shims:");
+    println!("  [done] {}", result.linked_commands.join(", "));
+
+    // Hooks
+    println!("\nHooks:");
     if let Some(script) = &result.hook_script {
-        println!("  [done] Hook script generated: {}", script.display());
+        println!("  [done] Claude Code hook: {}", script.display());
     }
     if let Some(snippet) = &result.settings_snippet {
-        println!("  [done] Settings snippet generated: {}", snippet.display());
+        println!(
+            "  [done] Claude Code settings snippet: {}",
+            snippet.display()
+        );
+    }
+    if let Some(cursor_snippet) = &result.cursor_hook_snippet {
+        println!("  [done] Cursor hook snippet: {}", cursor_snippet.display());
     }
 
-    // Auto-generate config if it doesn't exist
+    // Config
+    println!("\nConfig:");
     let config_status = match config::default_config_path() {
         Some(config_path) if !config_path.exists() => {
             match config::write_default_config(&config_path, false) {
-                Ok(res) => format!("[done] Config created: {}", res.path.display()),
-                Err(e) => format!("[warn] Config not created: {e}"),
+                Ok(res) => format!("[done] Created: {}", res.path.display()),
+                Err(e) => format!("[warn] Not created: {e}"),
             }
         }
-        Some(config_path) => format!("[skip] Config already exists: {}", config_path.display()),
-        None => "[warn] Config not created: HOME/XDG_CONFIG_HOME not set".to_string(),
+        Some(config_path) => format!("[skip] Already exists: {}", config_path.display()),
+        None => "[warn] Not created: HOME/XDG_CONFIG_HOME not set".to_string(),
     };
     println!("  {config_status}");
 
@@ -235,7 +245,7 @@ fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         .count();
     if failures == 0 {
         println!(
-            "  [done] All rules verified: {} active, {} detection tests passed",
+            "  [done] {} rules verified, {} detection tests passed",
             active_rules,
             test_results.len()
         );
@@ -246,19 +256,30 @@ fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         );
     }
 
-    // Remaining manual steps
+    // Next steps
+    println!("\nNext steps:");
     println!(
-        "\n  [todo] Add to your shell profile (~/.zshrc or ~/.bashrc):\n\n    export PATH=\"{}:$PATH\"",
+        "  [todo] Add to your shell profile (~/.zshrc or ~/.bashrc):\n\n    export PATH=\"{}:$PATH\"",
         result.shim_dir.display()
     );
     if result.settings_snippet.is_some() {
+        let hooks_dir = result
+            .hook_script
+            .as_ref()
+            .map(|p| p.parent().unwrap().display().to_string())
+            .unwrap_or_default();
         println!(
-            "\n  [todo] Apply Claude Code hook (copy snippet to settings.json):\n\n    cat {}/claude-settings.snippet.json",
-            result
-                .hook_script
-                .as_ref()
-                .map(|p| p.parent().unwrap().display().to_string())
-                .unwrap_or_default()
+            "\n  [todo] Apply Claude Code hook (copy snippet to settings.json):\n\n    cat {hooks_dir}/claude-settings.snippet.json"
+        );
+    }
+    if result.cursor_hook_snippet.is_some() {
+        let hooks_dir = result
+            .cursor_hook_snippet
+            .as_ref()
+            .map(|p| p.parent().unwrap().display().to_string())
+            .unwrap_or_default();
+        println!(
+            "\n  [todo] Merge Cursor hook into .cursor/hooks.json:\n\n    cat {hooks_dir}/cursor-hooks.snippet.json"
         );
     }
 
@@ -373,6 +394,77 @@ fn emit_config_warnings(load_result: &ConfigLoadResult) {
     for warning in &load_result.warnings {
         eprintln!("omamori warning: {warning}");
     }
+}
+
+/// Cursor `beforeShellExecution` hook handler.
+/// Reads JSON from stdin, checks command against blocked patterns,
+/// writes JSON response to stdout. All logs go to stderr only.
+fn run_cursor_hook() -> Result<i32, AppError> {
+    use std::io::Read;
+
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+
+    // Extract "command" field from JSON input
+    let command = match serde_json::from_str::<serde_json::Value>(&input) {
+        Ok(v) => v
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => {
+            // Can't parse → allow (don't block on malformed input)
+            eprintln!("omamori cursor-hook: failed to parse stdin JSON");
+            print_cursor_response(true, "allow", None, None);
+            return Ok(0);
+        }
+    };
+
+    eprintln!("omamori cursor-hook: command={command}");
+
+    // Check against shared blocked patterns
+    for (pattern, reason) in installer::blocked_command_patterns() {
+        if command.contains(pattern) {
+            eprintln!("omamori cursor-hook: BLOCKED ({reason})");
+            print_cursor_response(
+                false,
+                "deny",
+                Some(&format!("omamori hook: {reason}")),
+                Some(&format!(
+                    "This command was blocked by omamori safety guard: {reason}. Use a safer alternative."
+                )),
+            );
+            return Ok(0);
+        }
+    }
+
+    // Allow
+    print_cursor_response(true, "allow", None, None);
+    Ok(0)
+}
+
+fn print_cursor_response(
+    cont: bool,
+    permission: &str,
+    user_message: Option<&str>,
+    agent_message: Option<&str>,
+) {
+    let mut response = serde_json::json!({
+        "continue": cont,
+        "permission": permission,
+    });
+    if let Some(msg) = user_message {
+        response["userMessage"] = serde_json::json!(msg);
+    }
+    if let Some(msg) = agent_message {
+        response["agentMessage"] = serde_json::json!(msg);
+    }
+    // stdout is JSON only — never print anything else here
+    println!(
+        "{}",
+        serde_json::to_string(&response)
+            .unwrap_or_else(|_| { r#"{"continue":true,"permission":"allow"}"#.to_string() })
+    );
 }
 
 fn print_usage() {
@@ -733,6 +825,7 @@ fn usage_text() -> &'static str {
   omamori config list
   omamori config disable <rule>
   omamori config enable <rule>
+  omamori cursor-hook                                   # Cursor beforeShellExecution handler
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."
