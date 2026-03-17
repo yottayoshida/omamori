@@ -452,3 +452,42 @@ fn cursor_hook_handles_malformed_stdin() {
     assert_eq!(parsed["continue"], true);
     assert_eq!(parsed["permission"], "allow");
 }
+
+// ---------------------------------------------------------------------------
+// cursor-hook interpreter warning tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_hook_warns_python_rmtree() {
+    let (stdout, _, success) = run_cursor_hook(
+        r#"{"command":"python3 -c \"import shutil; shutil.rmtree('/tmp/test')\"","cwd":"/tmp"}"#,
+    );
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["continue"], true, "should not block, only warn");
+    assert_eq!(parsed["permission"], "ask");
+}
+
+#[test]
+fn cursor_hook_no_warn_safe_python() {
+    let (stdout, _, success) =
+        run_cursor_hook(r#"{"command":"python3 -c \"print('hello')\"","cwd":"/tmp"}"#);
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["continue"], true);
+    assert_eq!(parsed["permission"], "allow", "safe python should not warn");
+}
+
+#[test]
+fn cursor_hook_warns_node_rmsync() {
+    let (stdout, _, success) = run_cursor_hook(
+        r#"{"command":"node -e \"require('fs').rmSync('/tmp/test', {recursive: true})\"","cwd":"/tmp"}"#,
+    );
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["continue"], true);
+    assert_eq!(parsed["permission"], "ask");
+}

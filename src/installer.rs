@@ -170,9 +170,19 @@ case "$INPUT" in
   *"unset CLAUDECODE"*|*"env -u CLAUDECODE"*|*"CLAUDECODE="*|\
   *"unset CODEX_CI"*|*"env -u CODEX_CI"*|*"CODEX_CI="*|\
   *"unset CURSOR_AGENT"*|*"env -u CURSOR_AGENT"*|*"CURSOR_AGENT="*|\
+  *"unset GEMINI_CLI"*|*"env -u GEMINI_CLI"*|*"GEMINI_CLI="*|\
+  *"unset CLINE_ACTIVE"*|*"env -u CLINE_ACTIVE"*|*"CLINE_ACTIVE="*|\
   *"unset AI_GUARD"*|*"env -u AI_GUARD"*|*"AI_GUARD="*)
     echo "omamori hook: blocked attempt to unset a detector env var" >&2
     exit 2
+    ;;
+  *"python "*"-c "*"shutil.rmtree"*|*"python3 "*"-c "*"shutil.rmtree"*|\
+  *"python "*"-c "*"os.remove"*|*"python3 "*"-c "*"os.remove"*|\
+  *"python "*"-c "*"os.rmdir"*|*"python3 "*"-c "*"os.rmdir"*|\
+  *"node "*"-e "*"rmSync"*|*"node "*"-e "*"unlinkSync"*|\
+  *"bash "*"-c "*"rm -rf"*|*"sh "*"-c "*"rm -rf"*)
+    echo "omamori hook: warning — potentially destructive interpreter command detected" >&2
+    exit 0
     ;;
   *)
     exit 0
@@ -242,6 +252,27 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "CURSOR_AGENT=",
+            "blocked attempt to unset a detector env var",
+        ),
+        (
+            "unset GEMINI_CLI",
+            "blocked attempt to unset a detector env var",
+        ),
+        (
+            "env -u GEMINI_CLI",
+            "blocked attempt to unset a detector env var",
+        ),
+        ("GEMINI_CLI=", "blocked attempt to unset a detector env var"),
+        (
+            "unset CLINE_ACTIVE",
+            "blocked attempt to unset a detector env var",
+        ),
+        (
+            "env -u CLINE_ACTIVE",
+            "blocked attempt to unset a detector env var",
+        ),
+        (
+            "CLINE_ACTIVE=",
             "blocked attempt to unset a detector env var",
         ),
         (
@@ -320,13 +351,43 @@ mod tests {
     #[test]
     fn hook_script_blocks_all_detector_env_var_unsets() {
         let script = render_hook_script();
-        for var in &["CLAUDECODE", "CODEX_CI", "CURSOR_AGENT", "AI_GUARD"] {
+        for var in &[
+            "CLAUDECODE",
+            "CODEX_CI",
+            "CURSOR_AGENT",
+            "GEMINI_CLI",
+            "CLINE_ACTIVE",
+            "AI_GUARD",
+        ] {
             assert!(
                 script.contains(&format!(r#"*"unset {var}"*"#)),
                 "hook script should block unset of {var}"
             );
         }
         assert!(script.contains("blocked attempt to unset a detector env var"));
+    }
+
+    #[test]
+    fn hook_script_warns_on_interpreter_patterns() {
+        let script = render_hook_script();
+        // Should contain interpreter warning patterns (warn only, exit 0)
+        assert!(
+            script.contains("shutil.rmtree"),
+            "hook script should warn on shutil.rmtree"
+        );
+        assert!(
+            script.contains("os.remove"),
+            "hook script should warn on os.remove"
+        );
+        assert!(
+            script.contains("rmSync"),
+            "hook script should warn on rmSync"
+        );
+        // Should exit 0 for warnings (not exit 2)
+        assert!(
+            script.contains("potentially destructive interpreter command"),
+            "hook script should have interpreter warning message"
+        );
     }
 
     #[test]
