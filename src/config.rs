@@ -320,6 +320,9 @@ fn default_detectors() -> Vec<DetectorConfig> {
         DetectorConfig::env_var("codex-cli", "CODEX_CI", "1"),
         // Provisional: based on Cursor Forum fix report (2025-08). Verify with future Cursor releases.
         DetectorConfig::env_var("cursor", "CURSOR_AGENT", "1"),
+        // Provisional: based on agents.md #136 reports. Verify with actual tool releases.
+        DetectorConfig::env_var("gemini-cli", "GEMINI_CLI", "1"),
+        DetectorConfig::env_var("cline", "CLINE_ACTIVE", "true"),
         DetectorConfig::env_var("ai-guard-fallback", "AI_GUARD", "1"),
     ]
 }
@@ -800,7 +803,7 @@ enabled = false
         assert!(user.detectors.is_none());
         let mut warnings = Vec::new();
         let config = build_merged_config(user, &mut warnings);
-        assert_eq!(config.detectors.len(), 4); // defaults
+        assert_eq!(config.detectors.len(), 6); // defaults (claude-code, codex-cli, cursor, gemini-cli, cline, ai-guard-fallback)
     }
 
     #[test]

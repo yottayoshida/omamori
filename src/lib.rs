@@ -438,6 +438,45 @@ fn run_cursor_hook() -> Result<i32, AppError> {
         }
     }
 
+    // Check for interpreter patterns (warn only, don't block)
+    let interpreter_patterns = [
+        ("shutil.rmtree", "python shutil.rmtree detected"),
+        ("os.remove", "python os.remove detected"),
+        ("os.rmdir", "python os.rmdir detected"),
+        ("rmSync", "node rmSync detected"),
+        ("unlinkSync", "node unlinkSync detected"),
+    ];
+    // Only check if command involves an interpreter with -c/-e flag
+    if (command.contains("python") && command.contains("-c"))
+        || (command.contains("node") && command.contains("-e"))
+        || (command.contains("bash") && command.contains("-c"))
+        || (command.contains("sh") && command.contains("-c"))
+    {
+        for (pattern, reason) in interpreter_patterns {
+            if command.contains(pattern) {
+                eprintln!("omamori cursor-hook: WARNING ({reason})");
+                print_cursor_response(
+                    true,
+                    "ask",
+                    Some(&format!("omamori warning: {reason}")),
+                    Some("This interpreter command may be destructive. Review before proceeding."),
+                );
+                return Ok(0);
+            }
+        }
+        // bash/sh -c "rm -rf" pattern
+        if command.contains("rm -rf") || command.contains("rm -r ") {
+            eprintln!("omamori cursor-hook: WARNING (shell rm -rf via interpreter)");
+            print_cursor_response(
+                true,
+                "ask",
+                Some("omamori warning: shell rm -rf via interpreter"),
+                Some("This interpreter command may be destructive. Review before proceeding."),
+            );
+            return Ok(0);
+        }
+    }
+
     // Allow
     print_cursor_response(true, "allow", None, None);
     Ok(0)
@@ -1042,6 +1081,26 @@ pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult>
                 vec!["-rf".to_string(), "target".to_string()],
             ),
             cursor_env,
+            Some("trash"),
+            true,
+        ),
+        (
+            "gemini-cli-is-protected",
+            CommandInvocation::new(
+                "rm".to_string(),
+                vec!["-rf".to_string(), "target".to_string()],
+            ),
+            vec![("GEMINI_CLI".to_string(), "1".to_string())],
+            Some("trash"),
+            true,
+        ),
+        (
+            "cline-is-protected",
+            CommandInvocation::new(
+                "rm".to_string(),
+                vec!["-rf".to_string(), "target".to_string()],
+            ),
+            vec![("CLINE_ACTIVE".to_string(), "true".to_string())],
             Some("trash"),
             true,
         ),
