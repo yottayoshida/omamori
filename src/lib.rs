@@ -971,8 +971,58 @@ pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult>
                 "git".to_string(),
                 vec!["push".to_string(), "--force".to_string()],
             ),
-            claude_env,
+            claude_env.clone(),
             Some("block"),
+            true,
+        ),
+        (
+            "find-delete-is-blocked",
+            CommandInvocation::new(
+                "find".to_string(),
+                vec![
+                    ".".to_string(),
+                    "-name".to_string(),
+                    "*.log".to_string(),
+                    "-delete".to_string(),
+                ],
+            ),
+            claude_env.clone(),
+            Some("block"),
+            true,
+        ),
+        (
+            "find-without-delete-passes",
+            CommandInvocation::new(
+                "find".to_string(),
+                vec![".".to_string(), "-name".to_string(), "*.txt".to_string()],
+            ),
+            claude_env.clone(),
+            None,
+            true,
+        ),
+        (
+            "rsync-delete-is-blocked",
+            CommandInvocation::new(
+                "rsync".to_string(),
+                vec![
+                    "--delete".to_string(),
+                    "-avz".to_string(),
+                    "src/".to_string(),
+                    "dest/".to_string(),
+                ],
+            ),
+            claude_env.clone(),
+            Some("block"),
+            true,
+        ),
+        (
+            "rsync-without-delete-passes",
+            CommandInvocation::new(
+                "rsync".to_string(),
+                vec!["-avz".to_string(), "src/".to_string(), "dest/".to_string()],
+            ),
+            claude_env,
+            None,
             true,
         ),
         (
