@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.3.1] - 2026-03-17
+
+### Added
+
+- **Cursor hooks support**: New `omamori cursor-hook` Rust subcommand for Cursor's `beforeShellExecution` protocol. Uses `serde_json` for safe JSON generation (avoids Cursor's malformed JSON fail-open bug).
+- **`install --hooks` generates Cursor snippet**: `.omamori/hooks/cursor-hooks.snippet.json` for manual merge into `.cursor/hooks.json`.
+- **find/rsync shim protection**: `find -delete` and `rsync --delete` (8 variants including `--del`, `--delete-before/during/after`, `--delete-excluded`, `--delete-delay`, `--remove-source-files`) are now blocked.
+- **Gemini CLI detector**: `GEMINI_CLI=1` (provisional, per agents.md #136).
+- **Cline detector**: `CLINE_ACTIVE=true` (provisional, per agents.md #136).
+- **Interpreter warnings** (Layer 2 hooks): `python -c "shutil.rmtree(...)"`, `node -e "rmSync(...)"`, `bash -c "rm -rf ..."` patterns are warned on (not blocked). Cursor hook uses `permission: "ask"` for user confirmation.
+- **Shared block patterns**: `blocked_command_patterns()` function ensures Claude Code and Cursor hooks use identical block conditions.
+- 9 new tests (total: 85). Covers cursor-hook JSON I/O, find/rsync rules, Gemini/Cline detectors, interpreter warnings.
+
+### Changed
+
+- **Install output**: Reorganized into categories (Shims / Hooks / Config / Next steps) for better readability.
+- **SHIM_COMMANDS**: Expanded from `[rm, git, chmod]` to `[rm, git, chmod, find, rsync]`.
+- **Detector count**: 4 → 6 (added gemini-cli, cline).
+- **Policy tests**: 6 → 10 detection tests in `omamori test`.
+- **rm path patterns**: Expanded to cover tab and single-quote token boundaries.
+
+### Security
+
+- **Cursor hook JSON safety**: Uses `serde_json` for all JSON generation. stdout is JSON only; logs go to stderr. Addresses Cursor's known malformed-JSON fail-open behavior.
+- **Interpreter warning honesty**: Warnings are clearly `exit 0` (not block). SECURITY.md explicitly states that obfuscated interpreter commands cannot be detected.
+- **find -exec /bin/rm**: Documented as a structural limitation in SECURITY.md.
+
+### Important
+
+- **Existing users**: Run `omamori install --hooks` to get new shims (find, rsync) and Cursor hook snippet.
+- **Cursor users**: Merge `.omamori/hooks/cursor-hooks.snippet.json` into `.cursor/hooks.json` manually.
+
 ## [0.3.0] - 2026-03-16
 
 ### Added
@@ -122,6 +154,7 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.3.1]: https://github.com/yottayoshida/omamori/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yottayoshida/omamori/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/yottayoshida/omamori/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/yottayoshida/omamori/compare/v0.1.1...v0.2.0

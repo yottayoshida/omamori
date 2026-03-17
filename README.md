@@ -11,9 +11,11 @@ AI Agent's Omamori — protect your system from dangerous commands executed via 
 | **Claude Code** | `CLAUDECODE=1` | Verified |
 | **Codex CLI** | `CODEX_CI=1` | Verified |
 | **Cursor** | `CURSOR_AGENT=1` | Provisional |
+| **Gemini CLI** | `GEMINI_CLI=1` | Provisional |
+| **Cline** | `CLINE_ACTIVE=true` | Provisional |
 | Any tool setting `AI_GUARD=1` | `AI_GUARD=1` | Fallback |
 
-Detection requires exact `=1` value match. Tools that set these environment variables when executing shell commands are automatically detected.
+Detection uses **exact value matching** (e.g. `CLAUDECODE=1` only, not `CLAUDECODE=true`). Tools that set these environment variables when executing shell commands are automatically detected.
 
 ## What It Does
 
@@ -64,21 +66,30 @@ That's it. `install --hooks` auto-generates `config.toml`, runs verification, an
 ```
 omamori setup complete:
 
-  [done] Shims installed: rm, git, chmod
-  [done] Hook script generated
-  [done] Config created: ~/.config/omamori/config.toml
-  [done] All rules verified: 5 active, 6 detection tests passed
+Shims:
+  [done] rm, git, chmod, find, rsync
 
-  [todo] Add to your shell profile (~/.zshrc or ~/.bashrc):
+Hooks:
+  [done] Claude Code hook script
+  [done] Cursor hook snippet
 
+Config:
+  [done] Created: ~/.config/omamori/config.toml
+  [done] 7 rules verified, 10 detection tests passed
+
+Next steps:
+  [todo] Add to your shell profile:
     export PATH="$HOME/.omamori/shim:$PATH"
+  [todo] Merge Cursor hook into .cursor/hooks.json
 ```
 
 ## How It Works
 
-**Layer 1 — PATH shim**: Symlinks for `rm`, `git`, `chmod` point to the omamori binary. When invoked, omamori checks for AI tool environment variables (e.g. `CLAUDECODE=1`) and applies rules only if an AI tool is detected.
+**Layer 1 — PATH shim**: Symlinks for `rm`, `git`, `chmod`, `find`, `rsync` point to the omamori binary. When invoked, omamori checks for AI tool environment variables (e.g. `CLAUDECODE=1`) and applies rules only if an AI tool is detected.
 
-**Layer 2 — Claude Code Hooks** (optional): A `PreToolUse` hook script catches bypass attempts like `/bin/rm` direct paths or `unset CLAUDECODE`.
+**Layer 2 — Hooks** (optional):
+- **Claude Code**: A `PreToolUse` hook script catches bypass attempts like `/bin/rm` direct paths, `unset CLAUDECODE`, and warns on interpreter commands (`python -c "shutil.rmtree(...)"`).
+- **Cursor**: A Rust-native `beforeShellExecution` handler (`omamori cursor-hook`) provides the same protection via Cursor's hook protocol.
 
 ## Default Rules
 
@@ -89,6 +100,8 @@ omamori setup complete:
 | `git` | `push --force`, `push -f` | **block** |
 | `git` | `clean -fd`, `clean -fdx` | **block** |
 | `chmod` | `777` | **block** |
+| `find` | `-delete`, `--delete` | **block** |
+| `rsync` | `--delete` and 7 variants | **block** |
 
 Combined short flags are normalized: `rm -rfv` expands to match `-r` and `-rf` rules. The POSIX `--` separator is respected for target extraction.
 
@@ -191,16 +204,17 @@ omamori init [--force] [--stdout]                     # Create/reset config file
 omamori config list                                   # Show all rules with status
 omamori config disable <rule>                         # Disable a built-in rule
 omamori config enable <rule>                          # Re-enable a disabled rule
+omamori cursor-hook                                   # Cursor beforeShellExecution handler
 ```
 
 ## Structural Limitations
 
 These are inherent to the PATH shim approach and documented honestly:
 
-- **Full-path execution** (`/bin/rm`, `/usr/bin/git`) bypasses the shim — partially mitigated by Layer 2 hooks
+- **Full-path execution** (`/bin/rm`, `/usr/bin/git`) bypasses the shim — mitigated by Layer 2 hooks (Claude Code + Cursor)
 - **`sudo`** changes PATH before the shim runs — omamori blocks when it detects elevated execution in-process
-- **Other interpreters** (`python -c "os.remove(...)"`, `perl -e`) are not intercepted
-- **Non-rm destructive commands** (`find -delete`, `rsync --delete`) are not covered
+- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — Layer 2 hooks **warn** on known destructive patterns, but obfuscated code (base64, heredoc, variable indirection) cannot be detected
+- **`find -exec /bin/rm`** bypasses the find shim because rm is invoked via absolute path — partially mitigated by Layer 2 hooks
 - **Cross-device moves** are not supported for `move-to` (use a destination on the same volume)
 
 For the full security model, see [SECURITY.md](SECURITY.md).

@@ -4,13 +4,15 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects In v0.2.0
+## What It Protects (v0.3.1)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
 - force pushes
 - destructive `git clean`
 - `chmod 777`
+- `find -delete` / `find --delete`
+- `rsync --delete` and 7 variants (`--del`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`, `--delete-delay`, `--remove-source-files`)
 - Custom rules defined via `config.toml`
 
 ### v0.2.0 Security Changes
@@ -32,22 +34,49 @@
 
 ## Structural Limits
 
-- Full-path execution such as `/bin/rm` or `/usr/bin/git` can bypass the PATH shim.
+- Full-path execution such as `/bin/rm` or `/usr/bin/git` can bypass the PATH shim. Mitigated by Layer 2 hooks (Claude Code + Cursor).
+- `find -exec /bin/rm {} \;` bypasses both the find shim and the rm shim because rm is invoked via absolute path. Partially mitigated by Layer 2 hooks.
 - `sudo` may change PATH before the shim runs.
-- Other interpreters or subprocess launchers can bypass the rules entirely.
+- Interpreter commands (`python -c "shutil.rmtree(...)"`) are warned on by Layer 2 hooks for known destructive patterns, but **obfuscated code** (base64 encoding, heredoc, variable indirection, string concatenation) **cannot be detected**. This is a fundamental limitation of string-based pattern matching.
 - Commands outside the curated default rules are not protected.
 - Non-existent `destination` paths skip `canonicalize()` validation at config load time (caught at runtime via fail-close).
 - macOS resolves `/etc` to `/private/etc` — the blocked prefix list includes `/private` to cover this.
 
-## Claude Code Hook Coverage
+## Environment Variable Detection
 
-The generated PreToolUse hook template is a second defensive layer for Claude Code only.
+Detection uses **exact value matching**:
+- `CLAUDECODE=1` is detected; `CLAUDECODE=true` or `CLAUDECODE=yes` is **not**
+- `CLINE_ACTIVE=true` is detected; `CLINE_ACTIVE=1` is **not**
 
-It is intended to catch:
+This is intentional: each detector's expected value is sourced from the actual tool implementation. If a tool changes its env var value in a future release, the detector must be updated.
+
+## Hook Coverage (Layer 2)
+
+### Claude Code Hooks
+
+The generated PreToolUse hook script is a second defensive layer.
+
+It catches:
 - direct `/bin/rm` or `/usr/bin/rm` (with boundary matching to avoid `/bin/rmdir` false positives)
-- attempts to unset `CLAUDECODE`
+- attempts to unset detector env vars (`CLAUDECODE`, `CODEX_CI`, `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE`, `AI_GUARD`)
+- **warns** on interpreter commands with known destructive patterns (`python -c "shutil.rmtree(...)"`, `node -e "rmSync(...)"`, `bash -c "rm -rf ..."`) — exit 0, not block
 
-It is not a complete parser and should be treated as partial coverage, not full enforcement.
+### Cursor Hooks
+
+The `omamori cursor-hook` subcommand is a Rust-native `beforeShellExecution` handler for Cursor.
+
+It provides the same protection as Claude Code hooks, using Cursor's JSON stdin/stdout protocol:
+- Block (`permission: "deny"`): direct rm paths, env var unset attempts
+- Warn (`permission: "ask"`): interpreter commands with destructive patterns
+
+The Cursor hook uses `serde_json` for JSON generation to avoid Cursor's known malformed-JSON fail-open behavior.
+
+### Hook Limitations
+
+Hooks are **not a complete parser** and should be treated as partial coverage. Pattern matching is string-based and cannot detect:
+- Obfuscated commands (base64 encoding, string concatenation)
+- Indirect execution via variables or heredocs
+- Commands constructed at runtime by the interpreter
 
 ## Safe Defaults
 
