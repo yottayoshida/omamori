@@ -10,12 +10,26 @@ AI Agent's Omamori — protect your system from dangerous commands executed via 
 |------|-----------|--------|
 | **Claude Code** | `CLAUDECODE=1` | Verified |
 | **Codex CLI** | `CODEX_CI=1` | Verified |
-| **Cursor** | `CURSOR_AGENT=1` | Provisional |
-| **Gemini CLI** | `GEMINI_CLI=1` | Provisional |
+| **Cursor** | `CURSOR_AGENT=1` | Verified |
+| **Gemini CLI** | `GEMINI_CLI=1` | Verified |
 | **Cline** | `CLINE_ACTIVE=true` | Provisional |
 | Any tool setting `AI_GUARD=1` | `AI_GUARD=1` | Fallback |
 
 Detection uses **exact value matching** (e.g. `CLAUDECODE=1` only, not `CLAUDECODE=true`). Tools that set these environment variables when executing shell commands are automatically detected.
+
+### Protection Coverage by Tool
+
+| Tool | Layer 1 (PATH shim) | Layer 2 (Hooks) | Full-path bypass protected | Interpreter warnings |
+|------|---------------------|-----------------|---------------------------|---------------------|
+| **Claude Code** | All rules | PreToolUse | Yes | Yes (warn) |
+| **Codex CLI** | All rules | Not available | **No** | No |
+| **Cursor** | All rules | beforeShellExecution | Yes | Yes (ask) |
+| **Gemini CLI** | All rules | Not available | **No** | No |
+| **Cline** | All rules | Not verified | Not verified | Not verified |
+
+- **Layer 1 (PATH shim)**: Blocks dangerous commands when AI sets its env var. Bypassable via `/bin/rm` full-path execution.
+- **Layer 2 (Hooks)**: Catches full-path bypass, env var unset attempts, and interpreter commands. Only available for tools with hook APIs.
+- Tools without Layer 2 have reduced protection — AI agents may discover and use bypass paths. See [SECURITY.md](SECURITY.md).
 
 ## What It Does
 
@@ -75,7 +89,7 @@ Hooks:
 
 Config:
   [done] Created: ~/.config/omamori/config.toml
-  [done] 7 rules verified, 10 detection tests passed
+  [done] 7 rules verified, 12 detection tests passed
 
 Next steps:
   [todo] Add to your shell profile:
@@ -104,6 +118,8 @@ Next steps:
 | `rsync` | `--delete` and 7 variants | **block** |
 
 Combined short flags are normalized: `rm -rfv` expands to match `-r` and `-rf` rules. The POSIX `--` separator is respected for target extraction.
+
+rsync variants blocked: `--delete`, `--del`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`, `--delete-delay`, `--remove-source-files`.
 
 ## Configuration (v0.2+)
 
@@ -159,7 +175,7 @@ Rules:
   PASS  rm-recursive-to-trash        rm -r|-rf|-fr|--recursive -> trash
   SKIP  git-push-force-block         (disabled by user config)
   ...
-Summary: 5 rules (4 active, 1 disabled), 4 detection tests passed
+Summary: 7 rules (6 active, 1 disabled), 12 detection tests passed
 ```
 
 ### Configuration notes
@@ -211,10 +227,11 @@ omamori cursor-hook                                   # Cursor beforeShellExecut
 
 These are inherent to the PATH shim approach and documented honestly:
 
-- **Full-path execution** (`/bin/rm`, `/usr/bin/git`) bypasses the shim — mitigated by Layer 2 hooks (Claude Code + Cursor)
+- **Full-path execution** (`/bin/rm`, `/usr/bin/git`) bypasses the shim — mitigated by Layer 2 hooks (Claude Code + Cursor). Tools without hooks (Codex, Gemini) are vulnerable.
 - **`sudo`** changes PATH before the shim runs — omamori blocks when it detects elevated execution in-process
 - **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — Layer 2 hooks **warn** on known destructive patterns, but obfuscated code (base64, heredoc, variable indirection) cannot be detected
 - **`find -exec /bin/rm`** bypasses the find shim because rm is invoked via absolute path — partially mitigated by Layer 2 hooks
+- **AI self-bypass**: AI agents without hooks may discover workarounds (full-path execution, `config disable`) — observed in real-world testing with Gemini CLI ([#22](https://github.com/yottayoshida/omamori/issues/22))
 - **Cross-device moves** are not supported for `move-to` (use a destination on the same volume)
 
 For the full security model, see [SECURITY.md](SECURITY.md).

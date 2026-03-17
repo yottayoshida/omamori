@@ -318,7 +318,7 @@ fn default_detectors() -> Vec<DetectorConfig> {
     vec![
         DetectorConfig::env_var("claude-code", "CLAUDECODE", "1"),
         DetectorConfig::env_var("codex-cli", "CODEX_CI", "1"),
-        // Provisional: based on Cursor Forum fix report (2025-08). Verify with future Cursor releases.
+        // Verified: Cursor sets CURSOR_AGENT=1. Confirmed via E2E testing (2026-03-17).
         DetectorConfig::env_var("cursor", "CURSOR_AGENT", "1"),
         // Provisional: based on agents.md #136 reports. Verify with actual tool releases.
         DetectorConfig::env_var("gemini-cli", "GEMINI_CLI", "1"),
