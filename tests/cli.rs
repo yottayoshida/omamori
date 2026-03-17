@@ -25,6 +25,17 @@ fn binary() -> String {
     env!("CARGO_BIN_EXE_omamori").to_string()
 }
 
+/// Remove all AI detector env vars from a Command to prevent
+/// guard_ai_config_modification() from blocking during tests.
+fn clean_ai_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("CLAUDECODE")
+        .env_remove("CODEX_CI")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("GEMINI_CLI")
+        .env_remove("CLINE_ACTIVE")
+        .env_remove("AI_GUARD")
+}
+
 #[test]
 fn omamori_test_command_succeeds_with_defaults() {
     let output = Command::new(binary())
@@ -171,7 +182,9 @@ fn init_force_overwrites_existing() {
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
-    let output = Command::new(binary())
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
         .args(["init", "--force"])
         .env("XDG_CONFIG_HOME", &dir)
         .env_remove("HOME")
@@ -490,4 +503,134 @@ fn cursor_hook_warns_node_rmsync() {
         serde_json::from_str(&stdout).expect("stdout must be valid JSON");
     assert_eq!(parsed["continue"], true);
     assert_eq!(parsed["permission"], "ask");
+}
+
+// ---------------------------------------------------------------------------
+// AI config bypass guard tests (#22)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_disable_blocked_in_ai_session() {
+    let dir = unique_dir("guard-disable");
+
+    // Init config first (no AI env var)
+    let mut init_cmd = Command::new(binary());
+    clean_ai_env(&mut init_cmd);
+    init_cmd
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    // Try config disable WITH AI env var → should be blocked
+    let output = Command::new(binary())
+        .args(["config", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .env("CLAUDECODE", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should be blocked, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"));
+    assert!(stderr.contains("CLAUDECODE") || stderr.contains("claude-code"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn config_enable_blocked_in_ai_session() {
+    let output = Command::new(binary())
+        .args(["config", "enable", "git-push-force-block"])
+        .env("CODEX_CI", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"));
+}
+
+#[test]
+fn uninstall_blocked_in_ai_session() {
+    let output = Command::new(binary())
+        .args(["uninstall"])
+        .env("CURSOR_AGENT", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"));
+}
+
+#[test]
+fn init_force_blocked_in_ai_session() {
+    let output = Command::new(binary())
+        .args(["init", "--force"])
+        .env("GEMINI_CLI", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"));
+}
+
+#[test]
+fn config_disable_allowed_without_ai_env() {
+    let dir = unique_dir("guard-allow");
+
+    let mut init_cmd = Command::new(binary());
+    clean_ai_env(&mut init_cmd);
+    init_cmd
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["config", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "should be allowed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Disabled"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn any_single_ai_env_var_blocks() {
+    // Even just CLINE_ACTIVE=true should block
+    let output = Command::new(binary())
+        .args(["config", "disable", "git-push-force-block"])
+        .env_remove("CLAUDECODE")
+        .env_remove("CODEX_CI")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("GEMINI_CLI")
+        .env_remove("AI_GUARD")
+        .env("CLINE_ACTIVE", "true")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"));
 }

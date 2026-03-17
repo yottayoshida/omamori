@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.3.2] - 2026-03-17
+
+### Security
+
+- **AI config bypass guard** (#22): `config disable`, `config enable`, `uninstall`, and `init --force` are now blocked when AI detector environment variables are present (CLAUDECODE, CODEX_CI, CURSOR_AGENT, etc.). This prevents AI agents from disabling their own safety rules — a bypass observed in real-world testing with Gemini CLI.
+- **Hooks protection expanded**: Claude Code and Cursor hooks now block `config disable/enable`, `uninstall`, `init --force`, and direct `config.toml` file editing attempts.
+- **`default_detectors()` made public**: Guard logic reuses the same detector list as the PATH shim, ensuring consistency.
+
+### Changed
+
+- **Protection Coverage table** in README now shows per-tool breakdown including config guard and config.toml edit guard columns.
+- **SECURITY.md** updated with AI Config Bypass Guard section, per-attack-vector protection matrix, and design philosophy statement.
+- Existing tests updated with `clean_ai_env()` helper to prevent false failures in Claude Code sessions.
+
+### Important
+
+- **Existing users**: Run `omamori install --hooks` to update hook scripts with new protection patterns.
+- **Human users are not affected**: Config changes work as before when run directly in the terminal (no AI env var present).
+
 ## [0.3.1] - 2026-03-17
 
 ### Added
@@ -154,6 +173,7 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.3.2]: https://github.com/yottayoshida/omamori/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yottayoshida/omamori/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yottayoshida/omamori/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/yottayoshida/omamori/compare/v0.2.0...v0.2.1

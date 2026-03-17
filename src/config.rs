@@ -314,7 +314,7 @@ pub fn default_config_path() -> Option<PathBuf> {
         .map(|home| home.join(".config").join("omamori").join("config.toml"))
 }
 
-fn default_detectors() -> Vec<DetectorConfig> {
+pub fn default_detectors() -> Vec<DetectorConfig> {
     vec![
         DetectorConfig::env_var("claude-code", "CLAUDECODE", "1"),
         DetectorConfig::env_var("codex-cli", "CODEX_CI", "1"),

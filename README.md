@@ -19,17 +19,19 @@ Detection uses **exact value matching** (e.g. `CLAUDECODE=1` only, not `CLAUDECO
 
 ### Protection Coverage by Tool
 
-| Tool | Layer 1 (PATH shim) | Layer 2 (Hooks) | Full-path bypass protected | Interpreter warnings |
-|------|---------------------|-----------------|---------------------------|---------------------|
-| **Claude Code** | All rules | PreToolUse | Yes | Yes (warn) |
-| **Codex CLI** | All rules | Not available | **No** | No |
-| **Cursor** | All rules | beforeShellExecution | Yes | Yes (ask) |
-| **Gemini CLI** | All rules | Not available | **No** | No |
-| **Cline** | All rules | Not verified | Not verified | Not verified |
+| Tool | Layer 1 (PATH shim) | Layer 2 (Hooks) | Config guard | Full-path bypass | config.toml edit guard |
+|------|---------------------|-----------------|-------------|-----------------|----------------------|
+| **Claude Code** | All rules | PreToolUse | env var block | Hooks block | PreToolUse block |
+| **Codex CLI** | All rules | Not available | env var block | **No** | **No** |
+| **Cursor** | All rules | beforeShellExecution | env var block | Hooks block | Bash only |
+| **Gemini CLI** | All rules | Not available | env var block | **No** | **No** |
+| **Cline** | All rules | Not verified | env var block | Not verified | Not verified |
 
 - **Layer 1 (PATH shim)**: Blocks dangerous commands when AI sets its env var. Bypassable via `/bin/rm` full-path execution.
-- **Layer 2 (Hooks)**: Catches full-path bypass, env var unset attempts, and interpreter commands. Only available for tools with hook APIs.
-- Tools without Layer 2 have reduced protection — AI agents may discover and use bypass paths. See [SECURITY.md](SECURITY.md).
+- **Layer 2 (Hooks)**: Catches full-path bypass, env var unset attempts, interpreter commands, and `config disable`/`uninstall` attempts. Only available for tools with hook APIs.
+- **Config guard** (v0.3.2+): `config disable`, `config enable`, `uninstall`, and `init --force` are blocked when AI detector env vars are present. Works for all tools.
+- **config.toml edit guard**: PreToolUse hook blocks direct file editing of config.toml (Claude Code only). Cursor blocks Bash-based edits. Tools without hooks cannot prevent direct file editing.
+- See [SECURITY.md](SECURITY.md) for full details and known limitations.
 
 ## What It Does
 
@@ -218,8 +220,8 @@ omamori install [--base-dir PATH] [--hooks]           # Create shims + hooks + c
 omamori uninstall [--base-dir PATH]                   # Remove shims + hook files
 omamori init [--force] [--stdout]                     # Create/reset config file
 omamori config list                                   # Show all rules with status
-omamori config disable <rule>                         # Disable a built-in rule
-omamori config enable <rule>                          # Re-enable a disabled rule
+omamori config disable <rule>                         # Disable a rule (blocked by AI tools)
+omamori config enable <rule>                          # Re-enable a rule (blocked by AI tools)
 omamori cursor-hook                                   # Cursor beforeShellExecution handler
 ```
 
@@ -231,7 +233,7 @@ These are inherent to the PATH shim approach and documented honestly:
 - **`sudo`** changes PATH before the shim runs — omamori blocks when it detects elevated execution in-process
 - **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — Layer 2 hooks **warn** on known destructive patterns, but obfuscated code (base64, heredoc, variable indirection) cannot be detected
 - **`find -exec /bin/rm`** bypasses the find shim because rm is invoked via absolute path — partially mitigated by Layer 2 hooks
-- **AI self-bypass**: AI agents without hooks may discover workarounds (full-path execution, `config disable`) — observed in real-world testing with Gemini CLI ([#22](https://github.com/yottayoshida/omamori/issues/22))
+- **AI self-bypass**: `config disable`, `uninstall`, and `init --force` are blocked when AI env vars are detected (v0.3.2+). AI agents may still attempt direct `config.toml` file editing — blocked by PreToolUse hooks in Claude Code only. See [#22](https://github.com/yottayoshida/omamori/issues/22)
 - **Cross-device moves** are not supported for `move-to` (use a destination on the same volume)
 
 For the full security model, see [SECURITY.md](SECURITY.md).
