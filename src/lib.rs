@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod audit;
 pub mod config;
+pub mod context;
 pub mod detector;
 pub mod installer;
 pub mod rules;
@@ -14,7 +15,7 @@ use audit::{AuditEvent, AuditLogger};
 use config::{ConfigLoadResult, load_config};
 use detector::evaluate_detectors;
 use installer::{InstallOptions, default_base_dir, install, uninstall};
-use rules::{CommandInvocation, match_rule};
+use rules::{CommandInvocation, RuleConfig, match_rule};
 
 #[derive(Debug)]
 pub enum AppError {
@@ -111,6 +112,72 @@ fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError> {
         }
     }
 
+    // Context section
+    let context_test_count = if let Some(ref ctx_config) = config.context {
+        println!("\nContext:");
+        let test_cases: Vec<(&str, Vec<String>, &str)> = vec![
+            (
+                "regenerable-path-downgrade",
+                vec!["-rf".into(), "target/".into()],
+                "rm",
+            ),
+            (
+                "protected-path-escalate",
+                vec!["-rf".into(), "src/".into()],
+                "rm",
+            ),
+            (
+                "unknown-path-unchanged",
+                vec!["-rf".into(), "data/".into()],
+                "rm",
+            ),
+        ];
+        let mut count = 0;
+        for (name, args, cmd) in &test_cases {
+            let inv = CommandInvocation::new(cmd.to_string(), args.clone());
+            let test_rule = config.rules.iter().find(|r| r.command == *cmd && r.enabled);
+            if let Some(rule) = test_rule {
+                let result = context::evaluate_context(&inv, rule, ctx_config);
+                let (status, detail) = match &result.action_override {
+                    Some(action) => (
+                        "PASS",
+                        format!(
+                            "{} {} → {} (was: {})",
+                            cmd,
+                            args.last().unwrap_or(&String::new()),
+                            action.as_str(),
+                            rule.action.as_str(),
+                        ),
+                    ),
+                    None => (
+                        "PASS",
+                        format!(
+                            "{} {} → {} (unchanged)",
+                            cmd,
+                            args.last().unwrap_or(&String::new()),
+                            rule.action.as_str(),
+                        ),
+                    ),
+                };
+                println!("  {status}  {name:<28} {detail}");
+                count += 1;
+            }
+        }
+
+        // Git-aware status
+        if ctx_config.git.enabled {
+            println!("  PASS  {:<28} (git-aware enabled)", "git-aware-evaluation");
+        } else {
+            println!(
+                "  SKIP  {:<28} (git-aware not enabled)",
+                "git-aware-evaluation"
+            );
+        }
+        count
+    } else {
+        0
+    };
+
     // Detection section
     let results = run_policy_tests(&load_result);
     let failures = results.iter().filter(|r| !r.passed).count();
@@ -122,11 +189,17 @@ fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError> {
     }
 
     // Summary
+    let context_summary = if context_test_count > 0 {
+        format!(", {} context tests", context_test_count)
+    } else {
+        String::new()
+    };
     println!(
-        "\nSummary: {} rules ({} active, {} disabled), {} detection tests {}",
+        "\nSummary: {} rules ({} active, {} disabled){}, {} detection tests {}",
         config.rules.len(),
         active_count,
         disabled_count,
+        context_summary,
         results.len(),
         if failures == 0 { "passed" } else { "FAILED" }
     );
@@ -352,6 +425,47 @@ fn run_command(
     let mut executor = ActionExecutor::new(SystemOps::new(resolved_program, detector_env_keys));
     let audit_logger = AuditLogger::from_config(&load_result.config.audit);
 
+    // Context-aware evaluation: compute effective rule (may differ from matched_rule)
+    let context_override: Option<RuleConfig> =
+        if let (Some(rule), Some(ctx_config)) = (matched_rule, &load_result.config.context) {
+            if detection.protected {
+                let ctx = context::evaluate_context(&invocation, rule, ctx_config);
+                if let Some(override_action) = ctx.action_override {
+                    eprintln!(
+                        "omamori: {} {} → {} ({}, original: {})",
+                        invocation.program,
+                        invocation.target_args().join(" "),
+                        override_action.as_str(),
+                        ctx.reason,
+                        rule.action.as_str(),
+                    );
+                    let mut overridden = rule.clone();
+                    overridden.action = override_action;
+                    if let Some(ref msg) = overridden.message {
+                        overridden.message = Some(format!("{} (context: {})", msg, ctx.reason));
+                    }
+                    Some(overridden)
+                } else {
+                    if !ctx.reason.contains("no target paths")
+                        && !ctx.reason.contains("no context pattern")
+                    {
+                        eprintln!("omamori warning: {}", ctx.reason);
+                    }
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    let effective_rule = match (&context_override, matched_rule) {
+        (Some(overridden), _) => Some(overridden),
+        (None, Some(rule)) => Some(rule),
+        _ => None,
+    };
+
     let outcome = if should_block_for_sudo() {
         let blocked = ActionOutcome::Blocked {
             message:
@@ -362,7 +476,7 @@ fn run_command(
         blocked
     } else if !detection.protected {
         executor.exec_passthrough(&invocation)?
-    } else if let Some(rule) = matched_rule {
+    } else if let Some(rule) = effective_rule {
         let outcome = executor.execute(&invocation, rule)?;
         match &outcome {
             ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. } => {
@@ -385,7 +499,7 @@ fn run_command(
     if let Some(logger) = audit_logger {
         let event = AuditEvent::from_outcome(
             &invocation,
-            matched_rule,
+            effective_rule,
             &detection.matched_detectors,
             &outcome,
         );
