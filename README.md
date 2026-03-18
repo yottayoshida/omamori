@@ -197,6 +197,50 @@ Summary: 7 rules (6 active, 1 disabled), 12 detection tests passed
 - Symlinks are rejected as destinations
 - `destination` directory must exist before use (omamori will not create it)
 
+## Context-Aware Evaluation (v0.4.0+)
+
+omamori can adjust protection actions based on command target paths and git status. This reduces false positives (e.g., `rm -rf target/` in a Rust project) while strengthening defense for critical paths.
+
+**Opt-in**: Add `[context]` to your `config.toml` to enable. Without it, behavior is identical to v0.3.
+
+### Quick setup
+
+```toml
+# Add to ~/.config/omamori/config.toml
+[context]
+# Built-in defaults activate:
+# - regenerable: target/, node_modules/, .next/, dist/, build/, __pycache__/, .cache/
+# - protected: src/, lib/, .git/, .env, .ssh/
+```
+
+### Custom paths
+
+```toml
+[context]
+regenerable_paths = ["my-cache/"]      # Added to built-in list
+protected_paths = ["secrets/"]          # Added to built-in list
+
+[context.git]
+enabled = true    # Check git status before acting (default: false)
+timeout_ms = 100  # Git status timeout in ms (default: 100)
+```
+
+### How it works
+
+| Command | Without context | With context |
+|---------|----------------|-------------|
+| `rm -rf target/` | trash | **log-only** (regenerable) |
+| `rm -rf src/` | trash | **block** (protected) |
+| `rm -rf data/` | trash | trash (unchanged) |
+| `git reset --hard` (no changes) | stash-then-exec | **log-only** (git-aware, opt-in) |
+
+### Security features
+
+- **Symlink defense**: `canonicalize()` resolves symlinks before matching — `ln -sf src/ target && rm -rf target` is caught
+- **Traversal defense**: `target/../src/` is normalized to `src/` before matching
+- **NEVER_REGENERABLE**: `src/`, `.git/`, `.env` etc. cannot be made regenerable even by misconfiguration
+- **Fail-close**: canonicalize failure or git timeout → original action preserved
+
 ## Available Actions
 
 | Action | Behavior |
