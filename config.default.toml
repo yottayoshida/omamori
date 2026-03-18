@@ -4,6 +4,8 @@
 # To customize, create ~/.config/omamori/config.toml with only the rules
 # you want to change. Run `omamori init` to generate a starter template.
 
+# --- Detectors (AI environment detection) ---
+
 [[detectors]]
 name = "claude-code"
 type = "env_var"
@@ -13,14 +15,34 @@ env_value = "1"
 [[detectors]]
 name = "codex-cli"
 type = "env_var"
-env_key = "AI_GUARD"
+env_key = "CODEX_CI"
 env_value = "1"
 
 [[detectors]]
 name = "cursor"
 type = "env_var"
+env_key = "CURSOR_AGENT"
+env_value = "1"
+
+[[detectors]]
+name = "gemini-cli"
+type = "env_var"
+env_key = "GEMINI_CLI"
+env_value = "1"
+
+[[detectors]]
+name = "cline"
+type = "env_var"
+env_key = "CLINE_ACTIVE"
+env_value = "true"
+
+[[detectors]]
+name = "ai-guard-fallback"
+type = "env_var"
 env_key = "AI_GUARD"
 env_value = "1"
+
+# --- Rules (protection policies) ---
 
 [[rules]]
 name = "rm-recursive-to-trash"
@@ -59,6 +81,20 @@ command = "chmod"
 action = "block"
 match_any = ["777"]
 message = "omamori blocked chmod 777"
+
+[[rules]]
+name = "find-delete-block"
+command = "find"
+action = "block"
+match_any = ["-delete", "--delete"]
+message = "omamori blocked find with -delete flag"
+
+[[rules]]
+name = "rsync-delete-block"
+command = "rsync"
+action = "block"
+match_any = ["--delete", "--del", "--delete-before", "--delete-during", "--delete-after", "--delete-excluded", "--delete-delay", "--remove-source-files"]
+message = "omamori blocked rsync with destructive flags"
 
 # --- Example: move-to action (new in v0.2) ---
 # [[rules]]
