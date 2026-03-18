@@ -60,6 +60,10 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("init") => run_init_command(args),
         Some("config") => run_config_command(args),
         Some("cursor-hook") => run_cursor_hook(),
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("omamori {}", env!("CARGO_PKG_VERSION"));
+            Ok(0)
+        }
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             Ok(0)
@@ -881,6 +885,7 @@ fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
 
 fn usage_text() -> &'static str {
     "omamori usage:
+  omamori --version                                      # Show version
   omamori test [--config PATH]
   omamori exec [--config PATH] -- <command> [args...]
   omamori install [--base-dir PATH] [--source PATH] [--hooks]
