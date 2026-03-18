@@ -422,43 +422,84 @@ fn run_command(
         .map(|d| d.env_key.clone())
         .filter(|k| !k.is_empty() && !k.contains('='))
         .collect();
-    let mut executor = ActionExecutor::new(SystemOps::new(resolved_program, detector_env_keys));
+    let mut executor =
+        ActionExecutor::new(SystemOps::new(resolved_program, detector_env_keys.clone()));
     let audit_logger = AuditLogger::from_config(&load_result.config.audit);
 
     // Context-aware evaluation: compute effective rule (may differ from matched_rule)
-    let context_override: Option<RuleConfig> =
-        if let (Some(rule), Some(ctx_config)) = (matched_rule, &load_result.config.context) {
-            if detection.protected {
-                let ctx = context::evaluate_context(&invocation, rule, ctx_config);
-                if let Some(override_action) = ctx.action_override {
-                    eprintln!(
-                        "omamori: {} {} → {} ({}, original: {})",
-                        invocation.program,
-                        invocation.target_args().join(" "),
-                        override_action.as_str(),
-                        ctx.reason,
-                        rule.action.as_str(),
-                    );
-                    let mut overridden = rule.clone();
-                    overridden.action = override_action;
-                    if let Some(ref msg) = overridden.message {
-                        overridden.message = Some(format!("{} (context: {})", msg, ctx.reason));
+    let context_override: Option<RuleConfig> = if let (Some(rule), Some(ctx_config)) =
+        (matched_rule, &load_result.config.context)
+    {
+        if detection.protected {
+            // Tier 1: path-based evaluation
+            let ctx = context::evaluate_context(&invocation, rule, ctx_config);
+            let tier1_override = if let Some(override_action) = ctx.action_override {
+                eprintln!(
+                    "omamori: {} {} → {} ({}, original: {})",
+                    invocation.program,
+                    invocation.target_args().join(" "),
+                    override_action.as_str(),
+                    ctx.reason,
+                    rule.action.as_str(),
+                );
+                let mut overridden = rule.clone();
+                overridden.action = override_action;
+                if let Some(ref msg) = overridden.message {
+                    overridden.message = Some(format!("{} (context: {})", msg, ctx.reason));
+                }
+                Some(overridden)
+            } else {
+                if !ctx.reason.contains("no target paths")
+                    && !ctx.reason.contains("no context pattern")
+                {
+                    eprintln!("omamori warning: {}", ctx.reason);
+                }
+                None
+            };
+
+            // Tier 2: git-aware evaluation (skip if Tier 1 already escalated to Block)
+            let is_escalated = tier1_override
+                .as_ref()
+                .is_some_and(|r| matches!(r.action, rules::ActionKind::Block));
+
+            if !is_escalated {
+                if let Some(git_ctx) =
+                    context::evaluate_git_context(&invocation, &ctx_config.git, &detector_env_keys)
+                {
+                    if let Some(git_action) = git_ctx.action_override {
+                        eprintln!(
+                            "omamori: {} {} → {} ({}, original: {})",
+                            invocation.program,
+                            invocation.args.join(" "),
+                            git_action.as_str(),
+                            git_ctx.reason,
+                            rule.action.as_str(),
+                        );
+                        let mut overridden = rule.clone();
+                        overridden.action = git_action;
+                        if let Some(ref msg) = overridden.message {
+                            overridden.message =
+                                Some(format!("{} (context: {})", msg, git_ctx.reason));
+                        }
+                        Some(overridden)
+                    } else {
+                        if !git_ctx.reason.contains("skipping") {
+                            eprintln!("omamori: {}", git_ctx.reason);
+                        }
+                        tier1_override
                     }
-                    Some(overridden)
                 } else {
-                    if !ctx.reason.contains("no target paths")
-                        && !ctx.reason.contains("no context pattern")
-                    {
-                        eprintln!("omamori warning: {}", ctx.reason);
-                    }
-                    None
+                    tier1_override
                 }
             } else {
-                None
+                tier1_override
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     let effective_rule = match (&context_override, matched_rule) {
         (Some(overridden), _) => Some(overridden),

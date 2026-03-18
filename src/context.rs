@@ -269,6 +269,159 @@ pub fn evaluate_context(
 }
 
 // ---------------------------------------------------------------------------
+// Git-aware evaluation (Tier 2)
+// ---------------------------------------------------------------------------
+
+/// Git env vars that must be removed from subprocess to prevent spoofing (T4).
+const GIT_SPOOFABLE_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// Query `git status --porcelain` with timeout and env var sanitization.
+/// Returns Ok(output) on success, Err(reason) on failure/timeout.
+fn git_status_porcelain(detector_env_keys: &[String], timeout_ms: u64) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut cmd = Command::new("git");
+    cmd.args(["status", "--porcelain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    // Remove AI detector env vars (self-interference prevention)
+    for key in detector_env_keys {
+        cmd.env_remove(key);
+    }
+    // Remove git spoofable env vars (T4 defense)
+    for key in GIT_SPOOFABLE_ENV_VARS {
+        cmd.env_remove(key);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+
+    let (tx, rx) = mpsc::channel();
+    let child_stdout = child.stdout.take();
+
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut output = String::new();
+        if let Some(mut stdout) = child_stdout {
+            let _ = stdout.read_to_string(&mut output);
+        }
+        let _ = tx.send(output);
+    });
+
+    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok(output) => {
+            let _ = child.wait(); // reap
+            Ok(output)
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait(); // reap zombie
+            Err(format!("git status timed out after {}ms", timeout_ms))
+        }
+    }
+}
+
+/// Check if we're inside a git repository.
+fn is_inside_git_repo(detector_env_keys: &[String]) -> bool {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--is-inside-work-tree"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    for key in detector_env_keys {
+        cmd.env_remove(key);
+    }
+    for key in GIT_SPOOFABLE_ENV_VARS {
+        cmd.env_remove(key);
+    }
+
+    cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Evaluate git context for a matched rule.
+/// Only applies to git commands (reset --hard, clean).
+/// Returns None if git-aware is disabled or not applicable.
+pub fn evaluate_git_context(
+    invocation: &CommandInvocation,
+    config: &GitContextConfig,
+    detector_env_keys: &[String],
+) -> Option<ContextEvaluation> {
+    if !config.enabled {
+        return None;
+    }
+
+    // Only evaluate git commands
+    if invocation.program != "git" {
+        return None;
+    }
+
+    // Not inside a git repo → skip (avoid false positives)
+    if !is_inside_git_repo(detector_env_keys) {
+        return Some(ContextEvaluation {
+            action_override: None,
+            reason: "not inside a git repository; skipping git-aware evaluation".to_string(),
+        });
+    }
+
+    let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+
+    // git reset --hard: check for uncommitted changes
+    if args.contains(&"reset") && args.contains(&"--hard") {
+        return match git_status_porcelain(detector_env_keys, config.timeout_ms) {
+            Ok(output) if output.trim().is_empty() => Some(ContextEvaluation {
+                action_override: Some(ActionKind::LogOnly),
+                reason: "no uncommitted changes detected".to_string(),
+            }),
+            Ok(_) => Some(ContextEvaluation {
+                action_override: None,
+                reason: "uncommitted changes present; keeping original action".to_string(),
+            }),
+            Err(reason) => Some(ContextEvaluation {
+                action_override: None,
+                reason: format!("git status failed ({}); keeping original action", reason),
+            }),
+        };
+    }
+
+    // git clean -fd/-fdx: check for untracked files
+    if args.contains(&"clean") && (args.contains(&"-fd") || args.contains(&"-fdx")) {
+        return match git_status_porcelain(detector_env_keys, config.timeout_ms) {
+            Ok(output) => {
+                let has_untracked = output.lines().any(|line| line.starts_with("??"));
+                if has_untracked {
+                    Some(ContextEvaluation {
+                        action_override: None,
+                        reason: "untracked files present; keeping original action".to_string(),
+                    })
+                } else {
+                    Some(ContextEvaluation {
+                        action_override: Some(ActionKind::LogOnly),
+                        reason: "no untracked files detected".to_string(),
+                    })
+                }
+            }
+            Err(reason) => Some(ContextEvaluation {
+                action_override: None,
+                reason: format!("git status failed ({}); keeping original action", reason),
+            }),
+        };
+    }
+
+    None // Not a git command we evaluate
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
