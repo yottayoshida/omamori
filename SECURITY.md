@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.3.1)
+## What It Protects (v0.4.0)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -104,6 +104,34 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 ### Design philosophy
 
 DCG (destructive_command_guard) explicitly states that adversarial AI bypass is out of scope. omamori chooses to address this attack surface, acknowledging that complete prevention is impossible in userspace but meaningful risk reduction is achievable through layered defense.
+
+## Context-Aware Evaluation (v0.4.0+)
+
+### Threat Model
+
+Context-aware evaluation introduces dynamic action adjustment based on target paths and git status. This changes the attack surface from "static rules only" to "static rules + contextual overrides."
+
+| Threat | DREAD | Mitigation |
+|--------|-------|------------|
+| **T2: Symlink downgrade** | 9.0 | `canonicalize()` resolves symlinks before matching. Failure → no downgrade (fail-close) |
+| **T1: Path traversal** | 8.0 | Lexical normalization (`.`, `..`, `//`, trailing `/`) before matching. Raw path matching prohibited |
+| **T10: TOCTOU** | 7.8 | Accepted residual risk. evaluate→execute window minimized. Cannot be eliminated in userspace |
+| **T4: Git status spoofing** | 7.2 | `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` removed from git subprocess |
+| **T3: Config poisoning** | 7.0 | AI config bypass guard (v0.3.2) + NEVER_REGENERABLE hardcoded list |
+
+### NEVER_REGENERABLE
+
+The following paths cannot be classified as regenerable regardless of config: `src`, `lib`, `app`, `.git`, `.env`, `.ssh`. If a user adds these to `regenerable_paths`, the pattern is silently ignored and a config load warning is emitted.
+
+### Residual Risks
+
+| Risk | Reason for acceptance |
+|------|----------------------|
+| TOCTOU between evaluate and execute | Atomic path-check + delete is impossible in userspace |
+| `trash` crate symlink behavior | Upstream dependency; monitor CHANGELOG |
+| Unicode normalization differences | macOS HFS+/APFS normalizes to NFD; practical impact is limited |
+| AI continuous path generation attempts | No rate limiting; mitigated by hooks |
+| Git-aware disabled by default | Opt-in design; documented trade-off |
 
 ## Safe Defaults
 

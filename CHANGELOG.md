@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.4.0] - 2026-03-18
+
+### Added
+
+- **Context-aware rule evaluation** (#13): omamori now evaluates command target paths and git status to dynamically adjust protection actions, reducing false positives while strengthening defense against truly dangerous operations.
+  - **Tier 1 — Path-based risk scoring**: `regenerable_paths` (e.g., `target/`, `node_modules/`) downgrade to `log-only`; `protected_paths` (e.g., `src/`, `.git/`) escalate to `block`.
+  - **Tier 2 — Git-aware evaluation** (opt-in): `git reset --hard` with no uncommitted changes → `log-only`; `git clean -fd` with no untracked files → `log-only`. Default off, enable via `[context.git] enabled = true`.
+  - **NEVER_REGENERABLE safety list**: `src/`, `lib/`, `.git/`, `.env`, `.ssh/` etc. cannot be classified as regenerable even if misconfigured.
+  - **Symlink attack defense** (T2, DREAD 9.0): `canonicalize()` resolves symlinks before pattern matching. Canonicalize failure → no downgrade (fail-close).
+  - **Path traversal defense** (T1, DREAD 8.0): Lexical normalization before matching prevents `target/../src/` bypass.
+  - **Git env var spoofing defense** (T4, DREAD 7.2): `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` removed from git subprocess.
+  - **Multi-target evaluation**: All targets are checked; the most severe action wins (`rm -rf target/ src/` → block, not log-only).
+  - **`omamori test`** now shows a Context evaluation section when `[context]` is configured.
+  - All context decisions are reported via stderr for transparency.
+- **`--version` subcommand** (#31): `omamori --version`, `-V`, and `version` now display the current version.
+
+### Fixed
+
+- **config.default.toml sync** (#32): Updated to match `default_detectors()` and `default_rules()`. Fixed stale env vars (codex-cli: `AI_GUARD` → `CODEX_CI`, cursor: `AI_GUARD` → `CURSOR_AGENT`), added missing detectors (gemini-cli, cline, ai-guard-fallback) and rules (find-delete-block, rsync-delete-block).
+
+### Important
+
+- **Opt-in activation**: Context-aware evaluation is disabled by default. Add `[context]` to your `config.toml` to enable it. Without `[context]`, behavior is identical to v0.3.2.
+- **Existing users**: Run `omamori install --hooks` to update hook scripts.
+
 ## [0.3.2] - 2026-03-17
 
 ### Security
