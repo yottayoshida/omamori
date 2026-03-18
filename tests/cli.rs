@@ -634,3 +634,47 @@ fn any_single_ai_env_var_blocks() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("blocked"));
 }
+
+// ---------------------------------------------------------------------------
+// --version subcommand
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_flag_prints_version() {
+    let output = Command::new(binary())
+        .arg("--version")
+        .output()
+        .expect("failed to run omamori --version");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("omamori "),
+        "expected 'omamori <version>', got: {stdout}"
+    );
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "version mismatch: {stdout}"
+    );
+}
+
+#[test]
+fn version_short_flag_works() {
+    let output = Command::new(binary())
+        .arg("-V")
+        .output()
+        .expect("failed to run omamori -V");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("omamori "));
+}
+
+#[test]
+fn version_subcommand_works() {
+    let output = Command::new(binary())
+        .arg("version")
+        .output()
+        .expect("failed to run omamori version");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("omamori "));
+}
