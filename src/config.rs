@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppError;
 use crate::audit::AuditConfig;
+use crate::context::ContextConfig;
 use crate::detector::DetectorConfig;
 use crate::rules::{ActionKind, RuleConfig};
 
@@ -22,6 +23,10 @@ pub struct Config {
     pub rules: Vec<RuleConfig>,
     #[serde(default)]
     pub audit: AuditConfig,
+    /// Context-aware evaluation config. None = context evaluation disabled (v0.3 compat).
+    /// Present (even empty) = built-in defaults active.
+    #[serde(default)]
+    pub context: Option<ContextConfig>,
 }
 
 impl Default for Config {
@@ -30,6 +35,7 @@ impl Default for Config {
             detectors: default_detectors(),
             rules: default_rules(),
             audit: AuditConfig::default(),
+            context: None,
         }
     }
 }
@@ -51,6 +57,8 @@ struct UserConfig {
     rules: Vec<UserRule>,
     #[serde(default)]
     audit: AuditConfig,
+    #[serde(default)]
+    context: Option<ContextConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,10 +138,18 @@ fn build_merged_config(user: UserConfig, warnings: &mut Vec<String>) -> Config {
     let detectors = user.detectors.unwrap_or_else(default_detectors);
     let mut rules = merge_rules(default_rules(), &user.rules, warnings);
     validate_rules(&mut rules, warnings);
+
+    // Validate context config if present
+    if let Some(ref ctx) = user.context {
+        let ctx_warnings = crate::context::validate_regenerable_paths(&ctx.regenerable_paths);
+        warnings.extend(ctx_warnings);
+    }
+
     Config {
         detectors,
         rules,
         audit: user.audit,
+        context: user.context,
     }
 }
 
