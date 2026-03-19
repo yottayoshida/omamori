@@ -32,10 +32,11 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
     let shim_dir = options.base_dir.join("shim");
     fs::create_dir_all(&shim_dir)?;
 
-    let source_exe = options
-        .source_exe
-        .canonicalize()
-        .unwrap_or_else(|_| options.source_exe.clone());
+    // Use the source path as-is (do not canonicalize). When installed via
+    // Homebrew, the source path is a stable symlink like /opt/homebrew/bin/omamori.
+    // Canonicalizing resolves it to /opt/homebrew/Cellar/omamori/<version>/bin/omamori,
+    // which breaks after `brew upgrade` + `brew cleanup` removes the old version (#42).
+    let source_exe = options.source_exe.clone();
     let mut linked_commands = Vec::new();
 
     for command in SHIM_COMMANDS {
@@ -72,10 +73,7 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
     let cursor_hook_snippet = if options.generate_hooks {
         let hooks_dir = options.base_dir.join("hooks");
         let cursor_snippet_path = hooks_dir.join("cursor-hooks.snippet.json");
-        let omamori_exe = options
-            .source_exe
-            .canonicalize()
-            .unwrap_or_else(|_| options.source_exe.clone());
+        let omamori_exe = options.source_exe.clone();
         atomic_write(
             &cursor_snippet_path,
             &render_cursor_hooks_snippet(&omamori_exe),
