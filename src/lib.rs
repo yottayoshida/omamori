@@ -397,7 +397,46 @@ fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> {
 }
 
 fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError> {
+    ensure_hooks_current();
     run_command(program.to_string(), args, None)
+}
+
+/// Check if hooks are current; if not, regenerate them.
+/// Runs at shim startup. Failures are non-fatal (warn only).
+fn ensure_hooks_current() {
+    let base_dir = default_base_dir();
+    let hook_path = base_dir.join("hooks/claude-pretooluse.sh");
+
+    let needs_update = match std::fs::read_to_string(&hook_path) {
+        Ok(content) => {
+            let hook_version = installer::parse_hook_version(&content);
+            hook_version != Some(env!("CARGO_PKG_VERSION"))
+        }
+        Err(_) => false, // No hooks file = not installed via install --hooks, skip
+    };
+
+    if needs_update {
+        let current = std::fs::read_to_string(&hook_path)
+            .ok()
+            .and_then(|c| installer::parse_hook_version(&c).map(|v| v.to_string()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        match installer::regenerate_hooks(&base_dir) {
+            Ok(()) => {
+                eprintln!(
+                    "omamori: hooks updated ({} → {})",
+                    current,
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "omamori: failed to update hooks ({}). Run: omamori install --hooks",
+                    e
+                );
+            }
+        }
+    }
 }
 
 fn run_command(
