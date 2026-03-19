@@ -115,6 +115,8 @@ Next steps:
 - **Claude Code**: A `PreToolUse` hook script catches bypass attempts like `/bin/rm` direct paths, `unset CLAUDECODE`, and warns on interpreter commands (`python -c "shutil.rmtree(...)"`).
 - **Cursor**: A Rust-native `beforeShellExecution` handler (`omamori cursor-hook`) provides the same protection via Cursor's hook protocol.
 
+**Hook auto-sync** (v0.4.1+): After `brew upgrade`, hooks are automatically updated on the next command invocation. No manual `install --hooks` needed.
+
 ## Default Rules
 
 | Command | Pattern | Action |

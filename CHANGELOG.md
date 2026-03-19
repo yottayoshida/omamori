@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.4.1] - 2026-03-19
+
+### Fixed
+
+- **Context override message accuracy** (#36): When context evaluation escalates an action (e.g. trash → block for `src/`), the user-facing message now reflects the actual action via `ActionKind::context_message()`. Previously, the original rule's message was preserved, leading to misleading feedback like "moved to Trash" when the command was actually blocked. This also fixes `message = None` rules silently losing context information.
+
+### Added
+
+- **Hook auto-sync after upgrade** (#26): The shim now detects hook version mismatch on startup and auto-regenerates hooks. After `brew upgrade omamori`, hooks are updated on the next shim invocation — no manual `install --hooks` needed. Uses a version comment (`# omamori hook v0.4.1`) embedded in the hook script.
+- **Atomic file writes**: All hook file writes (install and regenerate) now use temp file + flush + rename to prevent partial writes from concurrent execution or crashes.
+- **CI consistency checks**: Compile-time tests verify `config.default.toml` stays in sync with `default_rules()`, `default_detectors()`, and `NEVER_REGENERABLE ⊇ default_protected_paths()`.
+- **Bypass corpus tests**: Systematic test coverage for known attack patterns (P1–P4) and documented KNOWN_LIMIT attack vectors that omamori cannot detect by design (sudo, alias, env -i, obfuscation, export -n).
+- **`[context]` template** in `config.default.toml`: Commented-out section showing available context configuration options.
+
+### Changed
+
+- **Breaking**: Context override now always generates a new message matching the actual action. Custom `message` fields on rules are overridden during context evaluation. This prioritizes security accuracy over custom text preservation.
+
+### Important
+
+- **Existing users on v0.4.0**: Hook scripts will be auto-updated on next command. No action needed.
+
 ## [0.4.0] - 2026-03-18
 
 ### Added
@@ -27,7 +49,7 @@ The format is based on Keep a Changelog.
 ### Important
 
 - **Opt-in activation**: Context-aware evaluation is disabled by default. Add `[context]` to your `config.toml` to enable it. Without `[context]`, behavior is identical to v0.3.2.
-- **Existing users**: Run `omamori install --hooks` to update hook scripts.
+- **Existing users**: Run `omamori install --hooks` to update hook scripts. (v0.4.1+ auto-updates hooks on next shim invocation.)
 
 ## [0.3.2] - 2026-03-17
 
@@ -198,6 +220,8 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.4.1]: https://github.com/yottayoshida/omamori/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/yottayoshida/omamori/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/yottayoshida/omamori/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yottayoshida/omamori/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yottayoshida/omamori/compare/v0.2.1...v0.3.0
