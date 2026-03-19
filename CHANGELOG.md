@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.4.2] - 2026-03-19
+
+### Fixed
+
+- **Shim symlinks survive `brew upgrade`** (#42): Shim symlinks now point to the stable Homebrew-linked path (e.g. `/opt/homebrew/bin/omamori`) instead of the versioned Cellar path. Previously, `brew upgrade` + `brew cleanup` caused dangling symlinks, silently disabling all protection until `install --hooks` was re-run.
+
+### Changed
+
+- **README redesigned**: Restructured for first-time visitors — tagline, Quick Start, and "What It Blocks" now appear before detailed configuration. Detection tables and version-specific notes moved to later sections.
+
 ## [0.4.1] - 2026-03-19
 
 ### Fixed
@@ -220,6 +230,7 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.4.2]: https://github.com/yottayoshida/omamori/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/yottayoshida/omamori/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/yottayoshida/omamori/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/yottayoshida/omamori/compare/v0.3.1...v0.3.2
