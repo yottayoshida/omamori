@@ -678,4 +678,23 @@ mod tests {
         let result = evaluate_context(&inv, &test_rule(), &config);
         assert_eq!(result.action_override, Some(ActionKind::LogOnly));
     }
+
+    // --- CI consistency check: NEVER_REGENERABLE ⊃ default_protected_paths ---
+
+    #[test]
+    fn never_regenerable_covers_all_default_protected_paths() {
+        let protected = default_protected_paths();
+        let never: std::collections::HashSet<&str> = NEVER_REGENERABLE.iter().copied().collect();
+        let missing: Vec<&str> = protected
+            .iter()
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| !never.contains(p))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "default_protected_paths() contains entries not in NEVER_REGENERABLE: {:?}\n\
+             Either add them to NEVER_REGENERABLE or remove from default_protected_paths()",
+            missing,
+        );
+    }
 }

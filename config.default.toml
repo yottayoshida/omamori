@@ -105,5 +105,16 @@ message = "omamori blocked rsync with destructive flags"
 # match_any = ["-r", "-rf", "-fr", "--recursive"]
 # message = "omamori moved targets to backup instead of deleting"
 
+# --- Context-aware evaluation (new in v0.4) ---
+# Uncomment to enable context-aware rule evaluation.
+# When present (even empty), built-in defaults for protected/regenerable paths activate.
+#
+# [context]
+# protected_paths = ["src/", "lib/", ".git/", ".env", ".ssh/"]
+# regenerable_paths = ["target/", "dist/", "node_modules/", "build/", "__pycache__/", ".cache/"]
+#
+# [context.git]
+# uncommitted_escalation = "block"
+
 [audit]
 enabled = false
