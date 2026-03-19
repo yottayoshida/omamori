@@ -443,10 +443,8 @@ fn run_command(
                     rule.action.as_str(),
                 );
                 let mut overridden = rule.clone();
+                overridden.message = Some(override_action.context_message(&ctx.reason));
                 overridden.action = override_action;
-                if let Some(ref msg) = overridden.message {
-                    overridden.message = Some(format!("{} (context: {})", msg, ctx.reason));
-                }
                 Some(overridden)
             } else {
                 if !ctx.reason.contains("no target paths")
@@ -476,11 +474,8 @@ fn run_command(
                             rule.action.as_str(),
                         );
                         let mut overridden = rule.clone();
+                        overridden.message = Some(git_action.context_message(&git_ctx.reason));
                         overridden.action = git_action;
-                        if let Some(ref msg) = overridden.message {
-                            overridden.message =
-                                Some(format!("{} (context: {})", msg, git_ctx.reason));
-                        }
                         Some(overridden)
                     } else {
                         if !git_ctx.reason.contains("skipping") {
