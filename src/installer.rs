@@ -156,7 +156,7 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn render_hook_script() -> String {
+pub(crate) fn render_hook_script() -> String {
     r#"#!/bin/sh
 set -eu
 
@@ -421,4 +421,117 @@ mod tests {
         assert!(snippet.contains(r#"\"path\""#));
         assert!(!snippet.contains(r#"" "path""#));
     }
+
+    // --- Bypass corpus: P1 (highest priority) ---
+
+    #[test]
+    fn hook_script_covers_rm_path_core_variants() {
+        let script = render_hook_script();
+        // Hook script (shell case) covers space and quote boundaries
+        for path in &["/bin/rm", "/usr/bin/rm"] {
+            assert!(
+                script.contains(&format!("{path} ")),
+                "hook script should block '{path} '"
+            );
+            assert!(
+                script.contains(&format!("{path}\\\"")),
+                "hook script should block '{path}\\\"'"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_command_patterns_cover_all_rm_boundaries() {
+        let patterns = blocked_command_patterns();
+        // blocked_command_patterns (used by cursor-hook) covers all boundary variants
+        for path in &["/bin/rm", "/usr/bin/rm"] {
+            for boundary in &[" ", "\"", "\t", "'"] {
+                let needle = format!("{path}{boundary}");
+                assert!(
+                    patterns.iter().any(|(p, _)| *p == needle),
+                    "blocked_command_patterns should cover: {path}{boundary:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hook_script_covers_all_env_var_unset_patterns() {
+        let script = render_hook_script();
+        let detector_vars = [
+            "CLAUDECODE",
+            "CODEX_CI",
+            "CURSOR_AGENT",
+            "GEMINI_CLI",
+            "CLINE_ACTIVE",
+            "AI_GUARD",
+        ];
+        for var in &detector_vars {
+            assert!(
+                script.contains(&format!("unset {var}")),
+                "hook script should block 'unset {var}'"
+            );
+            assert!(
+                script.contains(&format!("env -u {var}")),
+                "hook script should block 'env -u {var}'"
+            );
+            assert!(
+                script.contains(&format!("{var}=")),
+                "hook script should block '{var}=' reassignment"
+            );
+        }
+    }
+
+    // --- Bypass corpus: P2 ---
+
+    #[test]
+    fn hook_script_covers_config_modification_patterns() {
+        let script = render_hook_script();
+        assert!(script.contains("config disable"));
+        assert!(script.contains("config enable"));
+        assert!(script.contains("omamori uninstall"));
+        assert!(script.contains("omamori init --force"));
+        assert!(script.contains("config.toml"));
+    }
+
+    // --- Bypass corpus: P3 ---
+
+    #[test]
+    fn hook_script_warns_bash_c_rm() {
+        let script = render_hook_script();
+        assert!(
+            script.contains(r#"*"bash "*"-c "*"rm -rf"*"#),
+            "hook script should warn on bash -c rm -rf"
+        );
+        assert!(
+            script.contains(r#"*"sh "*"-c "*"rm -rf"*"#),
+            "hook script should warn on sh -c rm -rf"
+        );
+    }
+
+    // --- Bypass corpus: P4 (boundary variants) ---
+
+    #[test]
+    fn hook_script_does_not_false_positive_on_rmdir() {
+        let patterns = blocked_command_patterns();
+        // None of the patterns should match "rmdir" without also requiring
+        // a boundary char after "rm"
+        for (pattern, _) in &patterns {
+            assert!(
+                !pattern.contains("/bin/rmdir"),
+                "pattern should not match rmdir: {pattern}"
+            );
+        }
+    }
+
+    // --- KNOWN_LIMIT documentation ---
+    // These are attack vectors that omamori CANNOT detect by design.
+    // They are documented here as tests to maintain awareness.
+
+    // KNOWN_LIMIT: sudo changes PATH before shim runs → shim never invoked
+    // KNOWN_LIMIT: alias/function overrides bypass string matching
+    // KNOWN_LIMIT: env -i clears all env vars (undetectable by hooks)
+    // KNOWN_LIMIT: obfuscated commands (base64, hex, variable expansion) cannot be detected
+    // KNOWN_LIMIT: export -n VAR removes export attribute without unsetting
+    // See SECURITY.md for the full Known Limitations table.
 }
