@@ -47,6 +47,19 @@ impl ActionKind {
             Self::MoveTo => "move-to",
         }
     }
+
+    /// Generate a context-aware message that always matches the actual action.
+    /// Used when context evaluation overrides the original rule's action,
+    /// ensuring the user sees accurate feedback (e.g. "blocked" not "moved to Trash").
+    pub fn context_message(&self, reason: &str) -> String {
+        match self {
+            Self::Block => format!("omamori blocked this command ({})", reason),
+            Self::LogOnly => format!("omamori allowed this command ({})", reason),
+            Self::Trash => format!("omamori moved targets to Trash ({})", reason),
+            Self::StashThenExec => format!("omamori stashed changes first ({})", reason),
+            Self::MoveTo => format!("omamori moved targets to backup ({})", reason),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -367,5 +380,39 @@ mod tests {
             ],
         );
         assert!(match_rule(&[rule], &inv).is_some());
+    }
+
+    // --- context_message tests (#36) ---
+
+    #[test]
+    fn context_message_matches_action_kind() {
+        let reason = "NEVER_REGENERABLE path";
+        assert_eq!(
+            ActionKind::Block.context_message(reason),
+            "omamori blocked this command (NEVER_REGENERABLE path)"
+        );
+        assert_eq!(
+            ActionKind::LogOnly.context_message(reason),
+            "omamori allowed this command (NEVER_REGENERABLE path)"
+        );
+        assert_eq!(
+            ActionKind::Trash.context_message(reason),
+            "omamori moved targets to Trash (NEVER_REGENERABLE path)"
+        );
+        assert_eq!(
+            ActionKind::StashThenExec.context_message(reason),
+            "omamori stashed changes first (NEVER_REGENERABLE path)"
+        );
+        assert_eq!(
+            ActionKind::MoveTo.context_message(reason),
+            "omamori moved targets to backup (NEVER_REGENERABLE path)"
+        );
+    }
+
+    #[test]
+    fn context_message_includes_reason() {
+        let msg = ActionKind::Block.context_message("git working tree has uncommitted changes");
+        assert!(msg.contains("blocked"));
+        assert!(msg.contains("git working tree has uncommitted changes"));
     }
 }
