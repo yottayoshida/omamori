@@ -855,4 +855,42 @@ action = "block"
         let parsed: Wrapper = toml::from_str(toml_str).unwrap();
         assert!(parsed.rules[0].enabled);
     }
+
+    // --- CI consistency checks (PR 2: config.default.toml ↔ code sync) ---
+
+    #[test]
+    fn config_default_toml_rules_match_default_rules() {
+        let toml_str = include_str!("../config.default.toml");
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        let toml_names: HashSet<&str> = parsed.rules.iter().map(|r| r.name.as_str()).collect();
+        let code_rules = default_rules();
+        let code_names: HashSet<&str> = code_rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            toml_names,
+            code_names,
+            "config.default.toml rules and default_rules() are out of sync.\n\
+             In TOML only: {:?}\n\
+             In code only: {:?}",
+            toml_names.difference(&code_names).collect::<Vec<_>>(),
+            code_names.difference(&toml_names).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn config_default_toml_detectors_match_default_detectors() {
+        let toml_str = include_str!("../config.default.toml");
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        let toml_names: HashSet<&str> = parsed.detectors.iter().map(|d| d.name.as_str()).collect();
+        let code_detectors = default_detectors();
+        let code_names: HashSet<&str> = code_detectors.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            toml_names,
+            code_names,
+            "config.default.toml detectors and default_detectors() are out of sync.\n\
+             In TOML only: {:?}\n\
+             In code only: {:?}",
+            toml_names.difference(&code_names).collect::<Vec<_>>(),
+            code_names.difference(&toml_names).collect::<Vec<_>>(),
+        );
+    }
 }
