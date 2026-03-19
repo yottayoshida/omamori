@@ -7,16 +7,16 @@
 
 > Safety guard for AI CLI tools. Blocks dangerous commands — and resists being disabled.
 
-When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori intercepts destructive operations and replaces them with safe alternatives. It also defends itself against AI agents attempting to disable or bypass its protection.
+When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori intercepts destructive operations and replaces them with safe alternatives. It also defends itself against AI agents attempting to disable or bypass its protection ([#22](https://github.com/yottayoshida/omamori/issues/22)).
 
-**Terminal commands are never affected** — omamori only activates when it detects an AI tool's environment variable.
+**macOS only. Terminal commands are never affected** — omamori only activates when it detects an AI tool's environment variable.
 
 ![omamori demo](demo.svg)
 
 ## Quick Start
 
 ```bash
-# Install
+# Install (macOS)
 brew install yottayoshida/tap/omamori
 
 # Setup (shims + hooks + config — all in one)
@@ -26,7 +26,7 @@ omamori install --hooks
 export PATH="$HOME/.omamori/shim:$PATH"
 ```
 
-That's it. After `brew upgrade`, hooks are auto-updated on the next command.
+That's it. After `brew upgrade`, hooks and shims are auto-updated on the next command — no manual re-install needed.
 
 ## What It Blocks
 
@@ -38,7 +38,14 @@ That's it. After `brew upgrade`, hooks are auto-updated on the next command.
 | `git` | `clean -fd`, `clean -fdx` | **block** |
 | `chmod` | `777` | **block** |
 | `find` | `-delete`, `--delete` | **block** |
-| `rsync` | `--delete` and 7 variants | **block** |
+| `rsync` | `--delete` + 7 variants | **block** |
+
+<details>
+<summary>rsync blocked variants</summary>
+
+`--delete`, `--del`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`, `--delete-delay`, `--remove-source-files`
+
+</details>
 
 All rules are customizable via TOML config. See [Configuration](#configuration) below.
 
@@ -62,7 +69,9 @@ Terminal → rm -rf src/
 
 **Layer 2 — Hooks**: Catches bypass attempts (`/bin/rm` direct paths, `unset CLAUDECODE`, interpreter commands). Available for Claude Code and Cursor.
 
-**Self-defense**: AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. See [SECURITY.md](SECURITY.md) for the full threat model.
+**Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting and direct config file editing. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
+
+**Auto-sync**: After `brew upgrade`, the shim detects version mismatch and auto-regenerates hooks on the next invocation. No manual intervention needed.
 
 ## Supported Tools
 
@@ -86,10 +95,13 @@ omamori can adjust actions based on what the command targets:
 
 ```toml
 [context]
-# Built-in defaults activate. Customize:
-# regenerable_paths = ["my-cache/"]
-# protected_paths = ["secrets/"]
+# Built-in defaults activate with just [context].
+# To customize, specify your own lists (replaces built-in defaults):
+# regenerable_paths = ["target/", "node_modules/", "my-cache/"]
+# protected_paths = ["src/", "lib/", ".git/", ".env", ".ssh/", "secrets/"]
 ```
+
+> **Note**: Specifying `regenerable_paths` or `protected_paths` **replaces** the built-in defaults (not appends). Include the built-in entries you want to keep.
 
 Security features: symlink defense via `canonicalize()`, path traversal normalization, NEVER_REGENERABLE hardcoded list, fail-close on errors.
 
@@ -150,6 +162,7 @@ omamori config enable <rule>             # Re-enable a rule
 omamori init [--force] [--stdout]        # Create/reset config
 omamori uninstall                        # Remove shims + hooks
 omamori cursor-hook                      # Cursor hook handler
+omamori --version                        # Show version
 ```
 
 ## Structural Limitations
@@ -159,7 +172,7 @@ These are inherent to the PATH shim approach and documented honestly:
 - **Full-path execution** (`/bin/rm`) bypasses the shim — mitigated by Layer 2 hooks
 - **`sudo`** changes PATH — omamori blocks when it detects elevated execution
 - **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — hooks warn on known patterns, but obfuscated code cannot be detected
-- **AI self-bypass** — `config disable`/`uninstall` are blocked; direct file editing blocked by hooks (Claude Code only). See [#22](https://github.com/yottayoshida/omamori/issues/22)
+- **AI self-bypass** — `config disable`/`uninstall` are blocked; direct file editing blocked by hooks (Claude Code only)
 
 For the full security model, bypass corpus, and known limitations, see [SECURITY.md](SECURITY.md).
 
