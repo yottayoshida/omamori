@@ -11,7 +11,7 @@ When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori int
 
 **Terminal commands are never affected** — omamori only activates when it detects an AI tool's environment variable.
 
-![omamori demo](demo.gif)
+![omamori demo](demo.svg)
 
 ## Quick Start
 
