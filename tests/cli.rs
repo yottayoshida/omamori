@@ -584,8 +584,8 @@ fn init_force_blocked_in_ai_session() {
 }
 
 #[test]
-fn config_disable_allowed_without_ai_env() {
-    let dir = unique_dir("guard-allow");
+fn config_disable_core_rule_rejected() {
+    let dir = unique_dir("guard-core-reject");
 
     let mut init_cmd = Command::new(binary());
     clean_ai_env(&mut init_cmd);
@@ -596,10 +596,52 @@ fn config_disable_allowed_without_ai_env() {
         .output()
         .unwrap();
 
+    // `config disable` on a core rule should fail with actionable error
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
     let output = cmd
         .args(["config", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should be rejected, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("core safety rule"),
+        "should mention core safety rule: {stderr}"
+    );
+    assert!(
+        stderr.contains("omamori override disable"),
+        "should suggest override command: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn override_disable_core_rule_works() {
+    let dir = unique_dir("override-allow");
+
+    let mut init_cmd = Command::new(binary());
+    clean_ai_env(&mut init_cmd);
+    init_cmd
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    // `override disable` on a core rule should succeed
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["override", "disable", "git-push-force-block"])
         .env("XDG_CONFIG_HOME", &dir)
         .env_remove("HOME")
         .output()
@@ -611,7 +653,81 @@ fn config_disable_allowed_without_ai_env() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Disabled"));
+    assert!(stderr.contains("Override"));
+
+    // Config list should show the rule as overridden
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("core (overridden)"),
+        "should show core (overridden) in config list: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn override_disable_blocked_in_ai_session() {
+    let output = Command::new(binary())
+        .args(["override", "disable", "git-push-force-block"])
+        .env("CLAUDECODE", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"));
+}
+
+#[test]
+fn override_enable_restores_core_rule() {
+    let dir = unique_dir("override-restore");
+
+    let mut init_cmd = Command::new(binary());
+    clean_ai_env(&mut init_cmd);
+    init_cmd
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    // First disable
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(["override", "disable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    // Then re-enable
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["override", "enable", "git-push-force-block"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "should be allowed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Restored"));
+
+    // Config list should show the rule as core (active), not overridden
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let push_force_line = stdout
+        .lines()
+        .find(|l| l.contains("git-push-force-block"))
+        .unwrap_or("");
+    assert!(
+        push_force_line.contains("core") && !push_force_line.contains("overridden"),
+        "should show core (active): {push_force_line}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }

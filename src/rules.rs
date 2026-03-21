@@ -48,6 +48,16 @@ impl ActionKind {
         }
     }
 
+    /// Defense level: higher = stronger protection.
+    /// Used to prevent downgrade of core rules' action via config.
+    pub fn defense_level(&self) -> u8 {
+        match self {
+            Self::LogOnly => 0,
+            Self::Trash | Self::MoveTo | Self::StashThenExec => 1,
+            Self::Block => 2,
+        }
+    }
+
     /// Generate a context-aware message that always matches the actual action.
     /// Used when context evaluation overrides the original rule's action,
     /// ensuring the user sees accurate feedback (e.g. "blocked" not "moved to Trash").
@@ -80,6 +90,9 @@ pub struct RuleConfig {
     pub enabled: bool,
     #[serde(default)]
     pub destination: Option<String>,
+    /// True for the 7 built-in core safety rules. Cannot be injected via config.toml.
+    #[serde(skip)]
+    pub is_builtin: bool,
 }
 
 impl RuleConfig {
@@ -100,6 +113,7 @@ impl RuleConfig {
             message,
             enabled: true,
             destination: None,
+            is_builtin: false,
         }
     }
 
@@ -110,6 +124,11 @@ impl RuleConfig {
 
     pub fn with_destination(mut self, destination: String) -> Self {
         self.destination = Some(destination);
+        self
+    }
+
+    pub fn with_builtin(mut self, is_builtin: bool) -> Self {
+        self.is_builtin = is_builtin;
         self
     }
 }
