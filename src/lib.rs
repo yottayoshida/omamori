@@ -4,6 +4,7 @@ pub mod config;
 pub mod context;
 pub mod detector;
 pub mod installer;
+pub mod integrity;
 pub mod rules;
 
 use std::env;
@@ -61,6 +62,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("init") => run_init_command(args),
         Some("config") => run_config_command(args),
         Some("override") => run_override_command(args),
+        Some("status") => run_status_command(args),
         Some("cursor-hook") => run_cursor_hook(),
         Some("version") | Some("--version") | Some("-V") => {
             println!("omamori {}", env!("CARGO_PKG_VERSION"));
@@ -424,24 +426,48 @@ fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> {
 }
 
 fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError> {
-    ensure_hooks_current();
+    let base_dir = default_base_dir();
+
+    // Step 1: Lightweight integrity canary (stat + readlink, ~0.05ms)
+    if let Some(warning) = integrity::canary(&base_dir, program) {
+        eprintln!("omamori[health]: {warning}");
+    }
+
+    // Step 1b: v0.4 → v0.5 migration — create baseline if missing
+    if !integrity::baseline_path(&base_dir).exists() && base_dir.join("shim").exists() {
+        update_baseline_silent(&base_dir);
+        eprintln!(
+            "omamori[health]: integrity baseline created. Run `omamori status` for full check."
+        );
+    }
+
+    // Step 2: Hook version + content hash check, regenerate if needed
+    let hooks_regenerated = ensure_hooks_current();
+
+    // Step 3: If hooks were regenerated, update baseline to prevent false positives
+    if hooks_regenerated {
+        update_baseline_silent(&base_dir);
+    }
+
+    // Step 4: Run the actual command
     run_command(program.to_string(), args, None)
 }
 
 /// Check if hooks are current; if not, regenerate them.
 /// Runs at shim startup. Failures are non-fatal (warn only).
+/// Returns `true` if hooks were regenerated.
 ///
 /// Two-level check:
 /// 1. Version mismatch → regenerate (existing behavior, e.g. after upgrade)
 /// 2. Version match but content hash mismatch → regenerate (T2 attack: AI keeps
 ///    version comment but rewrites hook body, e.g. `exit 2` → `exit 0`)
-fn ensure_hooks_current() {
+fn ensure_hooks_current() -> bool {
     let base_dir = default_base_dir();
     let hook_path = base_dir.join("hooks/claude-pretooluse.sh");
 
     let content = match std::fs::read_to_string(&hook_path) {
         Ok(c) => c,
-        Err(_) => return, // No hooks file = not installed via install --hooks, skip
+        Err(_) => return false, // No hooks file = not installed via install --hooks, skip
     };
 
     let hook_version = installer::parse_hook_version(&content);
@@ -460,6 +486,7 @@ fn ensure_hooks_current() {
                     current,
                     env!("CARGO_PKG_VERSION")
                 );
+                return true;
             }
             Err(e) => {
                 eprintln!(
@@ -468,7 +495,7 @@ fn ensure_hooks_current() {
                 );
             }
         }
-        return;
+        return false;
     }
 
     // Level 2: version matches → check content hash (T2 attack detection)
@@ -480,6 +507,7 @@ fn ensure_hooks_current() {
         match installer::regenerate_hooks(&base_dir) {
             Ok(()) => {
                 eprintln!("omamori: hooks content mismatch detected — regenerated");
+                return true;
             }
             Err(e) => {
                 eprintln!(
@@ -487,6 +515,23 @@ fn ensure_hooks_current() {
                     e
                 );
             }
+        }
+    }
+
+    false
+}
+
+/// Silently update integrity baseline. Used after hook regen or config changes.
+/// Failures are non-fatal (warn to stderr).
+fn update_baseline_silent(base_dir: &Path) {
+    match integrity::generate_baseline(base_dir) {
+        Ok(baseline) => {
+            if let Err(e) = integrity::write_baseline(base_dir, &baseline) {
+                eprintln!("omamori[health]: failed to update baseline: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("omamori[health]: failed to generate baseline: {e}");
         }
     }
 }
@@ -640,6 +685,90 @@ fn emit_config_warnings(load_result: &ConfigLoadResult) {
     for warning in &load_result.warnings {
         eprintln!("omamori warning: {warning}");
     }
+}
+
+fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
+    let mut base_dir = default_base_dir();
+    let mut refresh = false;
+    let mut index = 2usize;
+
+    while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
+        match arg {
+            "--base-dir" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    AppError::Usage("status requires a path after --base-dir".to_string())
+                })?;
+                base_dir = PathBuf::from(value);
+                index += 2;
+            }
+            "--refresh" => {
+                refresh = true;
+                index += 1;
+            }
+            _ => {
+                return Err(AppError::Usage(format!(
+                    "unknown status flag: {arg}\n\n{}",
+                    usage_text()
+                )));
+            }
+        }
+    }
+
+    println!("\nomamori v{} — health check\n", env!("CARGO_PKG_VERSION"));
+
+    let report = integrity::full_check(&base_dir);
+
+    // Group items by category and print
+    let categories = [
+        "Shims",
+        "Hooks",
+        "Config",
+        "Core Policy",
+        "PATH",
+        "Baseline",
+    ];
+    for cat in &categories {
+        let cat_items: Vec<_> = report.items.iter().filter(|i| i.category == *cat).collect();
+        if cat_items.is_empty() {
+            continue;
+        }
+        println!("{}:", cat);
+        for item in &cat_items {
+            println!(
+                "  {:<6} {:<36} {}",
+                item.status.label(),
+                item.name,
+                item.detail
+            );
+        }
+        println!();
+    }
+
+    let exit_code = report.exit_code();
+    match exit_code {
+        0 => println!("All layers healthy."),
+        2 => println!("Some warnings detected. Review above."),
+        _ => println!("Issues detected. Run suggested commands to repair."),
+    }
+
+    // --refresh: regenerate baseline from current state
+    if refresh {
+        match integrity::generate_baseline(&base_dir) {
+            Ok(baseline) => {
+                integrity::write_baseline(&base_dir, &baseline)?;
+                println!(
+                    "\nBaseline refreshed (v{}, {}).",
+                    baseline.version, baseline.generated_at
+                );
+            }
+            Err(e) => {
+                eprintln!("\nomamori: failed to refresh baseline: {e}");
+            }
+        }
+    }
+
+    println!();
+    Ok(exit_code)
 }
 
 /// Cursor `beforeShellExecution` hook handler.
@@ -928,6 +1057,7 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
 
     std::fs::write(&config_path, &new_content)?;
     eprintln!("Disabled: {rule_name}");
+    update_baseline_silent(&default_base_dir());
 
     // Show updated config list
     run_config_list()
@@ -997,6 +1127,7 @@ fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
 
     std::fs::write(&config_path, &new_content)?;
     eprintln!("Enabled: {rule_name} (restored to built-in default)");
+    update_baseline_silent(&default_base_dir());
 
     // Show updated config list
     run_config_list()
@@ -1077,6 +1208,7 @@ fn run_override_disable(rule_name: &str) -> Result<i32, AppError> {
     std::fs::write(&config_path, &new_content)?;
     eprintln!("Override: disabled core rule `{rule_name}`");
     eprintln!("To restore: omamori override enable {rule_name}");
+    update_baseline_silent(&default_base_dir());
 
     run_config_list()
 }
@@ -1140,6 +1272,7 @@ fn run_override_enable(rule_name: &str) -> Result<i32, AppError> {
 
     std::fs::write(&config_path, &new_content)?;
     eprintln!("Restored: core rule `{rule_name}` is active again.");
+    update_baseline_silent(&default_base_dir());
 
     run_config_list()
 }
@@ -1271,6 +1404,7 @@ fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
         Ok(result) => {
             eprintln!("Created {}", result.path.display());
             eprintln!("Run `omamori test` to verify your setup.");
+            update_baseline_silent(&default_base_dir());
             Ok(0)
         }
         Err(AppError::Config(msg)) if msg.contains("already exists") => {
@@ -1296,6 +1430,7 @@ fn usage_text() -> &'static str {
   omamori config list
   omamori config disable <rule>
   omamori config enable <rule>
+  omamori status [--refresh]                              # Health check all defense layers
   omamori override disable <rule>                        # Override a core safety rule
   omamori override enable <rule>                         # Restore a core safety rule
   omamori cursor-hook                                   # Cursor beforeShellExecution handler

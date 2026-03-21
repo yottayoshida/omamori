@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::AppError;
 
-const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
+pub const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
 
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
@@ -85,6 +85,11 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         None
     };
 
+    // Generate integrity baseline after install
+    if let Err(e) = generate_install_baseline(&options.base_dir) {
+        eprintln!("omamori: warning — failed to generate integrity baseline: {e}");
+    }
+
     Ok(InstallResult {
         shim_dir,
         linked_commands,
@@ -116,6 +121,13 @@ pub fn uninstall(base_dir: &Path) -> Result<UninstallResult, AppError> {
             fs::remove_file(&path)?;
             removed_entries.push(path);
         }
+    }
+
+    // Remove integrity baseline
+    let integrity_path = base_dir.join(".integrity.json");
+    if integrity_path.exists() {
+        fs::remove_file(&integrity_path)?;
+        removed_entries.push(integrity_path);
     }
 
     remove_dir_if_empty(&hooks_dir)?;
@@ -199,7 +211,7 @@ impl Write for AtomicTempFile {
 
 /// Compute SHA-256 hash of the given content and return as hex string.
 /// Used to detect hook content tampering (T2 attack: version comment preserved but body changed).
-pub(crate) fn hook_content_hash(content: &str) -> String {
+pub fn hook_content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
@@ -207,7 +219,7 @@ pub(crate) fn hook_content_hash(content: &str) -> String {
 
 /// Parse the version from a hook script's version comment line.
 /// Expected format: `# omamori hook v0.4.1` (second line of the script).
-pub(crate) fn parse_hook_version(content: &str) -> Option<&str> {
+pub fn parse_hook_version(content: &str) -> Option<&str> {
     content
         .lines()
         .find(|line| line.starts_with("# omamori hook v"))
@@ -243,7 +255,7 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-pub(crate) fn render_hook_script() -> String {
+pub fn render_hook_script() -> String {
     format!(
         r#"#!/bin/sh
 # omamori hook v{}
@@ -285,6 +297,10 @@ case "$INPUT" in
     ;;
   *"omamori/config.toml"*|*"omamori"*"config.toml"*)
     echo "omamori hook: blocked attempt to edit omamori config file directly" >&2
+    exit 2
+    ;;
+  *".integrity.json"*)
+    echo "omamori hook: blocked attempt to edit integrity baseline" >&2
     exit 2
     ;;
   *"python "*"-c "*"shutil.rmtree"*|*"python3 "*"-c "*"shutil.rmtree"*|\
@@ -406,6 +422,11 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
             "omamori override",
             "blocked attempt to override omamori core rules",
         ),
+        // Integrity baseline protection
+        (
+            ".integrity.json",
+            "blocked attempt to edit integrity baseline",
+        ),
     ]
 }
 
@@ -422,6 +443,13 @@ fn render_cursor_hooks_snippet(omamori_exe: &Path) -> String {
         }
     });
     serde_json::to_string_pretty(&snippet).unwrap() + "\n"
+}
+
+/// Generate integrity baseline after install. Non-fatal on failure.
+fn generate_install_baseline(base_dir: &Path) -> Result<(), crate::AppError> {
+    let baseline = crate::integrity::generate_baseline(base_dir)?;
+    crate::integrity::write_baseline(base_dir, &baseline)?;
+    Ok(())
 }
 
 fn render_settings_snippet(script_path: &Path) -> String {
