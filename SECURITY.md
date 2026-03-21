@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.4.1)
+## What It Protects (v0.5.0)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -31,6 +31,70 @@
 - **Basename collision avoidance**: When `move-to` processes multiple targets, a dedup suffix (`_2`, `_3`, ...) prevents same-named files from overwriting each other.
 
 - **Cross-device move rejection**: `move-to` uses `rename(2)` which is atomic on the same filesystem. Cross-device moves (`EXDEV`) are rejected to avoid the TOCTOU window that copy+delete would introduce.
+
+## Integrity Monitoring (v0.5.0+)
+
+omamori verifies that its own defense layers are intact. This addresses the question: "who guards the guard?"
+
+### Two-Tier Check
+
+| Tier | When | What | Cost | Catches |
+|------|------|------|------|---------|
+| **Canary** | Every shim invocation | `.integrity.json` exists + own symlink target = omamori binary | ~0.05ms (stat + readlink) | Shim deletion/replacement |
+| **Full check** (`omamori status`) | On-demand | All shims, hook content hash, config perms + hash, core policy, PATH order | ~5-10ms | All tampering including subtle hook edits |
+
+### `.integrity.json` Baseline
+
+- **Location**: `~/.omamori/.integrity.json`
+- **Protection**: chmod 600, `O_NOFOLLOW`, atomic write (temp → fsync → rename), hook block list
+- **Contents**: SHA-256 hashes of hooks and config, shim symlink targets, version, timestamp
+- **Trusted transitions**: Auto-updates only from omamori-initiated operations (install, hook regen, config CLI). External edits produce WARN on next check, not auto-update
+
+### Hook Content Hash (T2 fix, DREAD 9.0)
+
+`ensure_hooks_current()` compares the SHA-256 of `render_hook_script()` (implementation-derived expected content) against the actual file on disk. This detects attacks where the version comment is preserved but the hook body is rewritten (e.g. `exit 2` → `exit 0`).
+
+Using implementation-derived content as source of truth (not stored baseline) eliminates baseline tampering as an attack vector for hook verification.
+
+### TOCTOU Risk (accepted)
+
+Canary checks point-in-time state. Tampering between checks is not detected until the next shim invocation. This is a structural limitation of the no-daemon design. A filesystem watcher or daemon would eliminate this gap but contradicts omamori's zero-daemon philosophy.
+
+### Self-Defense for Baseline
+
+| Attack | Protection |
+|--------|-----------|
+| AI edits `.integrity.json` (Claude Code Edit/Write) | Hook block pattern: `".integrity.json"` |
+| AI edits `.integrity.json` (Cursor Bash) | `blocked_command_patterns()` match |
+| AI deletes `.integrity.json` | Canary detects missing file; auto-regenerates on next shim invocation |
+| AI tampers baseline to match tampered state | Implementation-derived hook hash ignores baseline for hook verification |
+
+## Core Policy Immutability (v0.5.0+)
+
+The 7 built-in safety rules are structurally enforced in the binary. Config.toml cannot disable or weaken them.
+
+### Immutability Scope
+
+| Field | User can override? | Rationale |
+|-------|-------------------|-----------|
+| `enabled` | **No** | Core purpose of immutability |
+| `action` | **No** (downgrade blocked; upgrade allowed) | `log-only` downgrade = effective disable |
+| `command` | **No** | Changed command = rule never matches |
+| `match_all` / `match_any` | **No** | Empty arrays = unexpected match behavior |
+| `destination` | **No** | Tied to action semantics |
+| `message` | **Yes** | Localization / customization. No security impact |
+
+### Override Mechanism
+
+For legitimate use cases (CI environments, solo developers), `omamori override disable <rule>`:
+- Writes to `[overrides]` section in config.toml
+- Blocked by `guard_ai_config_modification()` in AI context
+- Blocked by hook patterns (`omamori override` string match)
+- Restores with `omamori override enable <rule>`
+
+### Design Decision: Structural > Detection
+
+Core immutability uses structural enforcement (binary ignores config overrides for core rules) rather than detection-based approaches (HMAC signing of config). "Tampering is meaningless" is stronger than "tampering is detected."
 
 ## Structural Limits
 

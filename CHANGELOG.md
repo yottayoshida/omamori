@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.5.0] - 2026-03-21
+
+### Added
+
+- **Integrity monitoring** (#28): Two-tier defense layer verification that detects tampering of omamori's own infrastructure.
+  - **Canary check** (every shim invocation): `stat` + `readlink` (~0.05ms) verifies `.integrity.json` exists and shim symlink points to omamori binary.
+  - **Full check** (`omamori status`): Verifies all shims, hook content hash, config permissions, core policy state, PATH order, and baseline integrity.
+  - **`.integrity.json` baseline**: SHA-256 hashes of hooks and config, shim symlink targets, stored with chmod 600 + O_NOFOLLOW + atomic write.
+  - **Auto-update**: Baseline refreshes after hook regen, config changes, install, and init. No false positives from legitimate operations.
+  - **v0.4 migration**: First shim invocation auto-generates baseline with stderr info message.
+- **`omamori status [--refresh]`**: Health check subcommand with grouped output (Shims / Hooks / Config / Core Policy / PATH / Baseline). Exit codes: 0=healthy, 1=FAIL, 2=WARN. `--refresh` regenerates baseline from current state.
+- **Core policy immutability** (#48): 7 built-in safety rules cannot be disabled or weakened via `config.toml`. All fields except `message` are enforced. `config disable` on a core rule returns an error with guidance.
+  - **`omamori override disable/enable <rule>`**: Explicit override mechanism for legitimate use cases (CI, solo dev). Blocked by AI guard + hooks.
+  - **`[overrides]` section** in config.toml for persistent overrides.
+  - **`config list`** now shows `core` vs `config` source and `(overridden)` status.
+  - **`omamori test`** now includes Core Policy section.
+- **Hook content hash verification** (#49, T2 fix, DREAD 9.0): `ensure_hooks_current()` now compares SHA-256 of `render_hook_script()` output against the actual file — detects AI attacks that keep the version comment but rewrite hook body (e.g. `exit 2` → `exit 0`).
+- **Self-defense**: `.integrity.json` protected by hook block list (Claude Code + Cursor) and `blocked_command_patterns()`. `omamori override` blocked by hooks.
+- 29 new tests (total: 160). Covers integrity canary, status output, baseline roundtrip, install baseline generation, hook block patterns, core policy immutability, override mechanism.
+
+### Changed
+
+- `SHIM_COMMANDS` visibility changed from `const` to `pub const` (needed by integrity module).
+- `render_hook_script()`, `hook_content_hash()`, `parse_hook_version()` visibility changed from `pub(crate)` to `pub`.
+- `ensure_hooks_current()` now returns `bool` indicating whether hooks were regenerated.
+- `uninstall` now removes `.integrity.json`.
+
+### Security
+
+- **Implementation-derived hash**: Hook integrity uses `render_hook_script()` output as source of truth, not stored baseline. Eliminates baseline tampering as an attack vector for hook verification.
+- **Trusted transitions only**: Baseline auto-updates restricted to omamori-initiated operations (install, hook regen, config CLI commands). External edits produce WARN, not auto-update.
+- **TOCTOU**: Canary checks point-in-time state. Tampering between checks is not detected until the next invocation. Accepted structural limitation of no-daemon design.
+
+### Important
+
+- **Existing users**: Run `omamori install --hooks` to generate `.integrity.json` baseline and update hooks with new block patterns. Or simply use any shim command — baseline auto-generates on first invocation.
+- **Core rules can no longer be disabled via config**: Use `omamori override disable <rule>` for legitimate overrides. AI agents cannot use this command.
+
 ## [0.4.2] - 2026-03-19
 
 ### Fixed
@@ -230,6 +268,7 @@ The format is based on Keep a Changelog.
 - Claude Code hook template generation via `omamori install --hooks`.
 - Expanded README and SECURITY documentation for protected and unprotected command coverage.
 
+[0.5.0]: https://github.com/yottayoshida/omamori/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/yottayoshida/omamori/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/yottayoshida/omamori/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/yottayoshida/omamori/compare/v0.3.2...v0.4.0
