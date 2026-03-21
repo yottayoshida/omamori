@@ -182,10 +182,10 @@ pub fn write_baseline(base_dir: &Path, baseline: &IntegrityBaseline) -> Result<(
         file.sync_all()?;
         drop(file);
         fs::rename(&temp_path, &path)?;
-        if let Some(dir) = path.parent() {
-            if let Ok(dir_file) = fs::File::open(dir) {
-                let _ = dir_file.sync_all();
-            }
+        if let Some(dir) = path.parent()
+            && let Ok(dir_file) = fs::File::open(dir)
+        {
+            let _ = dir_file.sync_all();
         }
     } else {
         write_new_file(&path, &content)?;
