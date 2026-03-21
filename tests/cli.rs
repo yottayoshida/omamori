@@ -794,3 +794,119 @@ fn version_subcommand_works() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.starts_with("omamori "));
 }
+
+// ---------------------------------------------------------------------------
+// Integrity monitoring / status tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn status_command_outputs_health_check() {
+    let output = Command::new(binary())
+        .arg("status")
+        .output()
+        .expect("failed to run omamori status");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should contain the health check header and category sections
+    assert!(
+        stdout.contains("health check"),
+        "stdout should contain health check header: {stdout}"
+    );
+    assert!(
+        stdout.contains("Shims:"),
+        "stdout should contain Shims section: {stdout}"
+    );
+    assert!(
+        stdout.contains("Core Policy:"),
+        "stdout should contain Core Policy section: {stdout}"
+    );
+}
+
+#[test]
+fn status_refresh_creates_baseline() {
+    let dir = unique_dir("status-refresh");
+    let shim_dir = dir.join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+
+    // Create a fake shim symlink
+    let fake_bin = dir.join("omamori");
+    fs::write(&fake_bin, "binary").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&fake_bin, shim_dir.join("rm")).unwrap();
+
+    let output = Command::new(binary())
+        .arg("status")
+        .arg("--base-dir")
+        .arg(dir.to_str().unwrap())
+        .arg("--refresh")
+        .output()
+        .expect("failed to run omamori status --refresh");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Baseline refreshed"),
+        "stdout should confirm baseline refresh: {stdout}"
+    );
+
+    // Verify .integrity.json was created
+    assert!(
+        dir.join(".integrity.json").exists(),
+        ".integrity.json should exist after --refresh"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn install_generates_integrity_baseline() {
+    let dir = unique_dir("install-baseline");
+    let fake_bin = dir.join("omamori");
+    fs::write(&fake_bin, "binary").unwrap();
+
+    let output = Command::new(binary())
+        .arg("install")
+        .arg("--base-dir")
+        .arg(dir.to_str().unwrap())
+        .arg("--source")
+        .arg(fake_bin.to_str().unwrap())
+        .arg("--hooks")
+        .output()
+        .expect("failed to run omamori install");
+    assert!(
+        output.status.success(),
+        "install should succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        dir.join(".integrity.json").exists(),
+        ".integrity.json should exist after install"
+    );
+
+    // Verify it's valid JSON
+    let content = fs::read_to_string(dir.join(".integrity.json")).unwrap();
+    let baseline: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert!(baseline.get("version").is_some());
+    assert!(baseline.get("shims").is_some());
+    assert!(baseline.get("hooks").is_some());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hook_block_list_includes_integrity_json() {
+    // Verify the hook script blocks .integrity.json editing
+    let script = omamori::installer::render_hook_script();
+    assert!(
+        script.contains(".integrity.json"),
+        "hook script should block .integrity.json editing"
+    );
+}
+
+#[test]
+fn blocked_patterns_include_integrity_json() {
+    let patterns = omamori::installer::blocked_command_patterns();
+    let has_integrity = patterns.iter().any(|(p, _)| p.contains(".integrity.json"));
+    assert!(
+        has_integrity,
+        "blocked_command_patterns should include .integrity.json"
+    );
+}
