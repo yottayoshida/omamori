@@ -2,6 +2,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::AppError;
 
 const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
@@ -195,6 +197,14 @@ impl Write for AtomicTempFile {
     }
 }
 
+/// Compute SHA-256 hash of the given content and return as hex string.
+/// Used to detect hook content tampering (T2 attack: version comment preserved but body changed).
+pub(crate) fn hook_content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 /// Parse the version from a hook script's version comment line.
 /// Expected format: `# omamori hook v0.4.1` (second line of the script).
 pub(crate) fn parse_hook_version(content: &str) -> Option<&str> {
@@ -267,6 +277,10 @@ case "$INPUT" in
     ;;
   *"omamori init --force"*)
     echo "omamori hook: blocked attempt to overwrite omamori config" >&2
+    exit 2
+    ;;
+  *"omamori override"*)
+    echo "omamori hook: blocked attempt to override omamori core rules" >&2
     exit 2
     ;;
   *"omamori/config.toml"*|*"omamori"*"config.toml"*)
@@ -387,6 +401,10 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
         (
             "omamori init --force",
             "blocked attempt to overwrite omamori config",
+        ),
+        (
+            "omamori override",
+            "blocked attempt to override omamori core rules",
         ),
     ]
 }
@@ -680,5 +698,91 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "hello world");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- Hook content hash tests (T2 attack detection) ---
+
+    #[test]
+    fn hook_content_hash_is_deterministic() {
+        let content = "#!/bin/sh\necho hello\n";
+        let hash1 = hook_content_hash(content);
+        let hash2 = hook_content_hash(content);
+        assert_eq!(hash1, hash2, "same content should produce same hash");
+    }
+
+    #[test]
+    fn hook_content_hash_differs_for_different_content() {
+        let hash1 = hook_content_hash("exit 2");
+        let hash2 = hook_content_hash("exit 0");
+        assert_ne!(
+            hash1, hash2,
+            "different content should produce different hash"
+        );
+    }
+
+    #[test]
+    fn render_hook_script_produces_stable_hash() {
+        let script1 = render_hook_script();
+        let script2 = render_hook_script();
+        let hash1 = hook_content_hash(&script1);
+        let hash2 = hook_content_hash(&script2);
+        assert_eq!(hash1, hash2, "render_hook_script() should be deterministic");
+    }
+
+    #[test]
+    fn t2_attack_version_preserved_content_changed_hash_differs() {
+        let original = render_hook_script();
+        let original_hash = hook_content_hash(&original);
+
+        // Simulate T2 attack: keep version comment but change exit codes
+        let tampered = original.replace("exit 2", "exit 0");
+        let tampered_hash = hook_content_hash(&tampered);
+
+        assert_ne!(
+            original_hash, tampered_hash,
+            "T2 attack (exit 2 → exit 0) should be detected by hash mismatch"
+        );
+
+        // Verify version comment is still intact (attacker preserved it)
+        assert_eq!(
+            parse_hook_version(&tampered),
+            parse_hook_version(&original),
+            "T2 attack preserves version comment"
+        );
+    }
+
+    #[test]
+    fn hook_content_hash_returns_hex_string() {
+        let hash = hook_content_hash("test");
+        // SHA-256 produces 64 hex chars
+        assert_eq!(hash.len(), 64, "SHA-256 hex string should be 64 chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash should contain only hex characters"
+        );
+    }
+
+    // --- omamori override block pattern tests ---
+
+    #[test]
+    fn hook_script_blocks_omamori_override() {
+        let script = render_hook_script();
+        assert!(
+            script.contains("omamori override"),
+            "hook script should block 'omamori override'"
+        );
+        assert!(
+            script.contains("blocked attempt to override omamori core rules"),
+            "hook script should have override block message"
+        );
+    }
+
+    #[test]
+    fn blocked_command_patterns_include_omamori_override() {
+        let patterns = blocked_command_patterns();
+        assert!(
+            patterns.iter().any(|(p, _)| *p == "omamori override"),
+            "blocked_command_patterns should include 'omamori override'"
+        );
     }
 }

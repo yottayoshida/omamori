@@ -430,22 +430,27 @@ fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError> {
 
 /// Check if hooks are current; if not, regenerate them.
 /// Runs at shim startup. Failures are non-fatal (warn only).
+///
+/// Two-level check:
+/// 1. Version mismatch → regenerate (existing behavior, e.g. after upgrade)
+/// 2. Version match but content hash mismatch → regenerate (T2 attack: AI keeps
+///    version comment but rewrites hook body, e.g. `exit 2` → `exit 0`)
 fn ensure_hooks_current() {
     let base_dir = default_base_dir();
     let hook_path = base_dir.join("hooks/claude-pretooluse.sh");
 
-    let needs_update = match std::fs::read_to_string(&hook_path) {
-        Ok(content) => {
-            let hook_version = installer::parse_hook_version(&content);
-            hook_version != Some(env!("CARGO_PKG_VERSION"))
-        }
-        Err(_) => false, // No hooks file = not installed via install --hooks, skip
+    let content = match std::fs::read_to_string(&hook_path) {
+        Ok(c) => c,
+        Err(_) => return, // No hooks file = not installed via install --hooks, skip
     };
 
-    if needs_update {
-        let current = std::fs::read_to_string(&hook_path)
-            .ok()
-            .and_then(|c| installer::parse_hook_version(&c).map(|v| v.to_string()))
+    let hook_version = installer::parse_hook_version(&content);
+    let version_matches = hook_version == Some(env!("CARGO_PKG_VERSION"));
+
+    if !version_matches {
+        // Level 1: version mismatch → regenerate
+        let current = hook_version
+            .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         match installer::regenerate_hooks(&base_dir) {
@@ -459,6 +464,26 @@ fn ensure_hooks_current() {
             Err(e) => {
                 eprintln!(
                     "omamori: failed to update hooks ({}). Run: omamori install --hooks",
+                    e
+                );
+            }
+        }
+        return;
+    }
+
+    // Level 2: version matches → check content hash (T2 attack detection)
+    let expected = installer::render_hook_script();
+    let expected_hash = installer::hook_content_hash(&expected);
+    let actual_hash = installer::hook_content_hash(&content);
+
+    if expected_hash != actual_hash {
+        match installer::regenerate_hooks(&base_dir) {
+            Ok(()) => {
+                eprintln!("omamori: hooks content mismatch detected — regenerated");
+            }
+            Err(e) => {
+                eprintln!(
+                    "omamori: failed to regenerate hooks ({}). Run: omamori install --hooks",
                     e
                 );
             }
