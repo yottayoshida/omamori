@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -59,6 +59,9 @@ struct UserConfig {
     audit: AuditConfig,
     #[serde(default)]
     context: Option<ContextConfig>,
+    /// `[overrides]` section: `rule_name = false` allows disabling core rules.
+    #[serde(default)]
+    overrides: HashMap<String, bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,7 +139,7 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
 
 fn build_merged_config(user: UserConfig, warnings: &mut Vec<String>) -> Config {
     let detectors = user.detectors.unwrap_or_else(default_detectors);
-    let mut rules = merge_rules(default_rules(), &user.rules, warnings);
+    let mut rules = merge_rules(default_rules(), &user.rules, &user.overrides, warnings);
     validate_rules(&mut rules, warnings);
 
     // Validate context config if present
@@ -156,6 +159,7 @@ fn build_merged_config(user: UserConfig, warnings: &mut Vec<String>) -> Config {
 fn merge_rules(
     defaults: Vec<RuleConfig>,
     user_rules: &[UserRule],
+    overrides: &HashMap<String, bool>,
     warnings: &mut Vec<String>,
 ) -> Vec<RuleConfig> {
     // Check for duplicate names in user config
@@ -180,7 +184,7 @@ fn merge_rules(
 
         if let Some(existing) = merged.iter_mut().find(|r| r.name == ur.name) {
             // Override existing rule fields
-            apply_user_overrides(existing, ur);
+            apply_user_overrides(existing, ur, overrides, warnings);
         } else {
             // New rule — must have command + action
             match (&ur.command, &ur.action) {
@@ -211,10 +215,90 @@ fn merge_rules(
         }
     }
 
+    // Apply [overrides] section: disable core rules that have explicit override
+    for (rule_name, &enabled) in overrides {
+        if !enabled
+            && let Some(rule) = merged.iter_mut().find(|r| r.name == *rule_name)
+            && rule.is_builtin
+        {
+            rule.enabled = false;
+        }
+    }
+
     merged
 }
 
-fn apply_user_overrides(rule: &mut RuleConfig, ur: &UserRule) {
+fn apply_user_overrides(
+    rule: &mut RuleConfig,
+    ur: &UserRule,
+    overrides: &HashMap<String, bool>,
+    warnings: &mut Vec<String>,
+) {
+    if rule.is_builtin {
+        // Core rule immutability: only `message` can be customized.
+        // `enabled` immutability can be bypassed via [overrides] section.
+        let has_non_message = ur.command.is_some()
+            || ur.action.is_some()
+            || ur.match_all.is_some()
+            || ur.match_any.is_some()
+            || ur.destination.is_some();
+
+        let has_enabled_override = ur.enabled.is_some();
+
+        // Check if [overrides] section has an explicit entry for this rule
+        let has_overrides_entry = overrides.contains_key(&rule.name);
+
+        if has_non_message {
+            // Check action specifically for upgrade vs downgrade
+            if let Some(action) = &ur.action {
+                if action.defense_level() < rule.action.defense_level() {
+                    warnings.push(format!(
+                        "rule `{}` is a core safety rule — action downgrade from `{}` to `{}` \
+                         is not allowed. Override ignored.",
+                        rule.name,
+                        rule.action.as_str(),
+                        action.as_str()
+                    ));
+                } else if action.defense_level() >= rule.action.defense_level()
+                    && action != &rule.action
+                {
+                    // Same or higher defense level — allow action upgrade
+                    rule.action = action.clone();
+                }
+                // Same action — no warning needed
+            }
+
+            // Warn about other non-message field overrides
+            if ur.command.is_some()
+                || ur.match_all.is_some()
+                || ur.match_any.is_some()
+                || ur.destination.is_some()
+            {
+                warnings.push(format!(
+                    "rule `{}` is a core safety rule. Only `message` can be customized. \
+                     Other overrides (`command`, `match_all`, `match_any`, `destination`) are ignored.",
+                    rule.name
+                ));
+            }
+        }
+
+        if has_enabled_override && !has_overrides_entry && ur.enabled == Some(false) {
+            warnings.push(format!(
+                "rule `{}` is a core safety rule and cannot be disabled via config. \
+                 Ignored. To override: omamori override disable {}",
+                rule.name, rule.name
+            ));
+        }
+
+        // Only apply message override
+        if let Some(message) = &ur.message {
+            rule.message = Some(message.clone());
+        }
+
+        return;
+    }
+
+    // Non-core rules: apply all overrides as before
     if let Some(command) = &ur.command {
         rule.command = command.clone();
     }
@@ -360,7 +444,8 @@ pub fn default_rules() -> Vec<RuleConfig> {
                 "omamori moved the recursive rm targets to Trash instead of deleting them"
                     .to_string(),
             ),
-        ),
+        )
+        .with_builtin(true),
         RuleConfig::new(
             "git-reset-hard-stash",
             "git",
@@ -368,7 +453,8 @@ pub fn default_rules() -> Vec<RuleConfig> {
             vec!["reset".to_string(), "--hard".to_string()],
             Vec::new(),
             Some("omamori stashed changes before running git reset --hard".to_string()),
-        ),
+        )
+        .with_builtin(true),
         RuleConfig::new(
             "git-push-force-block",
             "git",
@@ -376,7 +462,8 @@ pub fn default_rules() -> Vec<RuleConfig> {
             vec!["push".to_string()],
             vec!["--force".to_string(), "-f".to_string()],
             Some("omamori blocked a force push".to_string()),
-        ),
+        )
+        .with_builtin(true),
         RuleConfig::new(
             "git-clean-force-block",
             "git",
@@ -384,7 +471,8 @@ pub fn default_rules() -> Vec<RuleConfig> {
             vec!["clean".to_string()],
             vec!["-fd".to_string(), "-fdx".to_string()],
             Some("omamori blocked git clean because it would remove untracked files".to_string()),
-        ),
+        )
+        .with_builtin(true),
         RuleConfig::new(
             "chmod-777-block",
             "chmod",
@@ -392,7 +480,8 @@ pub fn default_rules() -> Vec<RuleConfig> {
             Vec::new(),
             vec!["777".to_string()],
             Some("omamori blocked chmod 777".to_string()),
-        ),
+        )
+        .with_builtin(true),
         RuleConfig::new(
             "find-delete-block",
             "find",
@@ -400,7 +489,8 @@ pub fn default_rules() -> Vec<RuleConfig> {
             Vec::new(),
             vec!["-delete".to_string(), "--delete".to_string()],
             Some("omamori blocked find with -delete flag".to_string()),
-        ),
+        )
+        .with_builtin(true),
         RuleConfig::new(
             "rsync-delete-block",
             "rsync",
@@ -417,7 +507,21 @@ pub fn default_rules() -> Vec<RuleConfig> {
                 "--remove-source-files".to_string(),
             ],
             Some("omamori blocked rsync with destructive flags".to_string()),
-        ),
+        )
+        .with_builtin(true),
+    ]
+}
+
+/// Names of the 7 core (built-in) safety rules.
+pub fn core_rule_names() -> Vec<&'static str> {
+    vec![
+        "rm-recursive-to-trash",
+        "git-reset-hard-stash",
+        "git-push-force-block",
+        "git-clean-force-block",
+        "chmod-777-block",
+        "find-delete-block",
+        "rsync-delete-block",
     ]
 }
 
@@ -603,8 +707,13 @@ fn permissions_are_safe(_path: &Path) -> Result<bool, AppError> {
 mod tests {
     use super::*;
 
+    fn no_overrides() -> HashMap<String, bool> {
+        HashMap::new()
+    }
+
     #[test]
-    fn merge_override_disables_rule() {
+    fn merge_core_rule_ignores_disable_without_override() {
+        // Core rule `enabled = false` in config is ignored (immutability)
         let user_rules = vec![UserRule {
             name: "git-push-force-block".to_string(),
             command: None,
@@ -616,15 +725,45 @@ mod tests {
             message: None,
         }];
         let mut warnings = Vec::new();
-        let merged = merge_rules(default_rules(), &user_rules, &mut warnings);
+        let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
 
         let rule = merged
             .iter()
             .find(|r| r.name == "git-push-force-block")
             .unwrap();
-        assert!(!rule.enabled);
-        assert_eq!(rule.action, ActionKind::Block); // action preserved
-        assert!(warnings.is_empty());
+        assert!(rule.enabled); // core rule stays enabled
+        assert_eq!(rule.action, ActionKind::Block);
+        assert!(
+            warnings.iter().any(
+                |w: &String| w.contains("core safety rule") && w.contains("cannot be disabled")
+            ),
+            "expected immutability warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn merge_core_rule_disabled_via_overrides_section() {
+        // [overrides] section allows disabling core rules
+        let user_rules = vec![UserRule {
+            name: "git-push-force-block".to_string(),
+            command: None,
+            action: None,
+            enabled: Some(false),
+            destination: None,
+            match_all: None,
+            match_any: None,
+            message: None,
+        }];
+        let mut overrides = HashMap::new();
+        overrides.insert("git-push-force-block".to_string(), false);
+        let mut warnings = Vec::new();
+        let merged = merge_rules(default_rules(), &user_rules, &overrides, &mut warnings);
+
+        let rule = merged
+            .iter()
+            .find(|r| r.name == "git-push-force-block")
+            .unwrap();
+        assert!(!rule.enabled); // overrides section allows disable
     }
 
     #[test]
@@ -640,7 +779,7 @@ mod tests {
             message: Some("custom".to_string()),
         }];
         let mut warnings = Vec::new();
-        let merged = merge_rules(default_rules(), &user_rules, &mut warnings);
+        let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
 
         let rule = merged.iter().find(|r| r.name == "custom-rm").unwrap();
         assert_eq!(rule.action, ActionKind::MoveTo);
@@ -661,13 +800,13 @@ mod tests {
             message: None,
         }];
         let mut warnings = Vec::new();
-        let merged = merge_rules(default_rules(), &user_rules, &mut warnings);
+        let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
 
         assert!(merged.iter().all(|r| r.name != "bad-rule"));
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("missing `command` or `action`"))
+                .any(|w: &String| w.contains("missing `command` or `action`"))
         );
     }
 
@@ -696,47 +835,106 @@ mod tests {
             },
         ];
         let mut warnings = Vec::new();
-        let merged = merge_rules(default_rules(), &user_rules, &mut warnings);
+        let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
 
         let rule = merged
             .iter()
             .find(|r| r.name == "git-push-force-block")
             .unwrap();
-        assert!(!rule.enabled); // first occurrence wins
-        assert!(warnings.iter().any(|w| w.contains("duplicate rule name")));
+        // Core rule: enabled = false is ignored, so it stays enabled
+        assert!(rule.enabled);
+        assert!(
+            warnings
+                .iter()
+                .any(|w: &String| w.contains("duplicate rule name"))
+        );
     }
 
     #[test]
     fn merge_preserves_all_defaults_when_no_user_rules() {
         let mut warnings = Vec::new();
-        let merged = merge_rules(default_rules(), &[], &mut warnings);
+        let merged = merge_rules(default_rules(), &[], &no_overrides(), &mut warnings);
         assert_eq!(merged.len(), default_rules().len());
         assert!(warnings.is_empty());
     }
 
     #[test]
-    fn merge_override_changes_action() {
+    fn merge_core_rule_action_downgrade_rejected() {
+        // Trying to downgrade rm-recursive-to-trash from trash to log-only
         let user_rules = vec![UserRule {
             name: "rm-recursive-to-trash".to_string(),
             command: None,
-            action: Some(ActionKind::MoveTo),
+            action: Some(ActionKind::LogOnly),
             enabled: None,
-            destination: Some("/tmp/quarantine".to_string()),
+            destination: None,
             match_all: None,
             match_any: None,
             message: None,
         }];
         let mut warnings = Vec::new();
-        let merged = merge_rules(default_rules(), &user_rules, &mut warnings);
+        let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
 
         let rule = merged
             .iter()
             .find(|r| r.name == "rm-recursive-to-trash")
             .unwrap();
-        assert_eq!(rule.action, ActionKind::MoveTo);
-        assert_eq!(rule.destination.as_deref(), Some("/tmp/quarantine"));
-        // match_any is preserved from default
-        assert!(!rule.match_any.is_empty());
+        assert_eq!(rule.action, ActionKind::Trash); // stays at original
+        assert!(
+            warnings
+                .iter()
+                .any(|w: &String| w.contains("action downgrade")),
+            "expected downgrade warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn merge_core_rule_action_upgrade_allowed() {
+        // Upgrading rm-recursive-to-trash from trash to block is allowed
+        let user_rules = vec![UserRule {
+            name: "rm-recursive-to-trash".to_string(),
+            command: None,
+            action: Some(ActionKind::Block),
+            enabled: None,
+            destination: None,
+            match_all: None,
+            match_any: None,
+            message: None,
+        }];
+        let mut warnings = Vec::new();
+        let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
+
+        let rule = merged
+            .iter()
+            .find(|r| r.name == "rm-recursive-to-trash")
+            .unwrap();
+        assert_eq!(rule.action, ActionKind::Block); // upgraded
+    }
+
+    #[test]
+    fn merge_core_rule_message_override_allowed() {
+        let user_rules = vec![UserRule {
+            name: "git-push-force-block".to_string(),
+            command: None,
+            action: None,
+            enabled: None,
+            destination: None,
+            match_all: None,
+            match_any: None,
+            message: Some("my custom message".to_string()),
+        }];
+        let mut warnings = Vec::new();
+        let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
+
+        let rule = merged
+            .iter()
+            .find(|r| r.name == "git-push-force-block")
+            .unwrap();
+        assert_eq!(rule.message.as_deref(), Some("my custom message"));
+        // No warnings for message-only override
+        assert!(
+            warnings.is_empty(),
+            "no warnings for message override: {warnings:?}"
+        );
     }
 
     #[test]

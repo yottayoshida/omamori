@@ -60,6 +60,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("uninstall") => run_uninstall_command(args),
         Some("init") => run_init_command(args),
         Some("config") => run_config_command(args),
+        Some("override") => run_override_command(args),
         Some("cursor-hook") => run_cursor_hook(),
         Some("version") | Some("--version") | Some("-V") => {
             println!("omamori {}", env!("CARGO_PKG_VERSION"));
@@ -109,6 +110,22 @@ fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError> {
                 "  PASS  {:<28} {:<24} -> {}",
                 rule.name, pattern, action_display
             );
+        }
+    }
+
+    // Core Policy section
+    println!("\nCore Policy:");
+    let core_rules: Vec<&RuleConfig> = config.rules.iter().filter(|r| r.is_builtin).collect();
+    let mut core_overridden = 0;
+    for rule in &core_rules {
+        if rule.enabled {
+            println!("  PASS  {:<28} core rule active", rule.name);
+        } else {
+            println!(
+                "  WARN  {:<28} core rule overridden (disabled by user)",
+                rule.name
+            );
+            core_overridden += 1;
         }
     }
 
@@ -194,11 +211,21 @@ fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError> {
     } else {
         String::new()
     };
+    let core_summary = if core_overridden > 0 {
+        format!(
+            ", {} core rules ({} overridden)",
+            core_rules.len(),
+            core_overridden
+        )
+    } else {
+        format!(", {} core rules active", core_rules.len())
+    };
     println!(
-        "\nSummary: {} rules ({} active, {} disabled){}, {} detection tests {}",
+        "\nSummary: {} rules ({} active, {} disabled){}{}, {} detection tests {}",
         config.rules.len(),
         active_count,
         disabled_count,
+        core_summary,
         context_summary,
         results.len(),
         if failures == 0 { "passed" } else { "FAILED" }
@@ -773,9 +800,22 @@ fn resolve_config_path_checked() -> Result<std::path::PathBuf, AppError> {
     Ok(path)
 }
 
+fn is_core_rule(name: &str) -> bool {
+    config::core_rule_names().contains(&name)
+}
+
 fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     guard_ai_config_modification("config disable")?;
     validate_rule_name(rule_name)?;
+
+    // Core rules cannot be disabled via `config disable`
+    if is_core_rule(rule_name) {
+        return Err(AppError::Config(format!(
+            "`{rule_name}` is a core safety rule and cannot be disabled.\n\n  \
+             To override: omamori override disable {rule_name}\n  \
+             To see core vs custom rules: omamori config list"
+        )));
+    }
 
     let config_path = resolve_config_path_checked()?;
 
@@ -937,6 +977,148 @@ fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
     run_config_list()
 }
 
+fn run_override_command(args: &[OsString]) -> Result<i32, AppError> {
+    match args.get(2).and_then(|item| item.to_str()) {
+        Some("disable") => {
+            let rule_name = args.get(3).and_then(|item| item.to_str()).ok_or_else(|| {
+                AppError::Usage("override disable requires a rule name".to_string())
+            })?;
+            run_override_disable(rule_name)
+        }
+        Some("enable") => {
+            let rule_name = args.get(3).and_then(|item| item.to_str()).ok_or_else(|| {
+                AppError::Usage("override enable requires a rule name".to_string())
+            })?;
+            run_override_enable(rule_name)
+        }
+        Some(other) => Err(AppError::Usage(format!(
+            "unknown override subcommand: {other}\n\n{}",
+            usage_text()
+        ))),
+        None => Err(AppError::Usage(format!(
+            "override requires a subcommand (disable|enable)\n\n{}",
+            usage_text()
+        ))),
+    }
+}
+
+fn run_override_disable(rule_name: &str) -> Result<i32, AppError> {
+    guard_ai_config_modification("override disable")?;
+    validate_rule_name(rule_name)?;
+
+    if !is_core_rule(rule_name) {
+        return Err(AppError::Config(format!(
+            "`{rule_name}` is not a core rule. Use `omamori config disable {rule_name}` instead."
+        )));
+    }
+
+    let config_path = resolve_config_path_checked()?;
+
+    // Auto-create config if it doesn't exist
+    if !config_path.exists() {
+        config::write_default_config(&config_path, false)?;
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // Check if [overrides] section exists
+    let new_content = if content.contains("[overrides]") {
+        // Check if already has this rule
+        if content.contains(&format!("{rule_name} = false"))
+            || content.contains(&format!("{rule_name}=false"))
+        {
+            eprintln!("Rule `{rule_name}` is already overridden (disabled).");
+            return Ok(2);
+        }
+        // Add entry after [overrides] line
+        content.replace("[overrides]", &format!("[overrides]\n{rule_name} = false"))
+    } else {
+        // Append [overrides] section
+        let mut new = content;
+        if !new.ends_with('\n') {
+            new.push('\n');
+        }
+        new.push_str(&format!("\n[overrides]\n{rule_name} = false\n"));
+        new
+    };
+
+    // Validate TOML
+    if toml::from_str::<toml::Value>(&new_content).is_err() {
+        return Err(AppError::Config(
+            "modifying config would create invalid TOML; aborting".to_string(),
+        ));
+    }
+
+    std::fs::write(&config_path, &new_content)?;
+    eprintln!("Override: disabled core rule `{rule_name}`");
+    eprintln!("To restore: omamori override enable {rule_name}");
+
+    run_config_list()
+}
+
+fn run_override_enable(rule_name: &str) -> Result<i32, AppError> {
+    guard_ai_config_modification("override enable")?;
+    validate_rule_name(rule_name)?;
+
+    if !is_core_rule(rule_name) {
+        return Err(AppError::Config(format!(
+            "`{rule_name}` is not a core rule. Use `omamori config enable {rule_name}` instead."
+        )));
+    }
+
+    let config_path = resolve_config_path_checked()?;
+
+    if !config_path.exists() {
+        eprintln!("Rule `{rule_name}` is already active (core default).");
+        return Ok(2);
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+
+    // Remove the override entry
+    let patterns = [
+        format!("{rule_name} = false\n"),
+        format!("{rule_name}=false\n"),
+        format!("{rule_name} = false"),
+        format!("{rule_name}=false"),
+    ];
+
+    let mut new_content = content.clone();
+    for pat in &patterns {
+        new_content = new_content.replace(pat, "");
+    }
+
+    // Clean up empty [overrides] section
+    let new_content = new_content
+        .replace("[overrides]\n\n", "[overrides]\n")
+        .trim_end()
+        .to_string()
+        + "\n";
+
+    // Check if [overrides] section is now empty and remove it
+    let new_content = if new_content.contains("[overrides]\n")
+        && !new_content
+            .split("[overrides]\n")
+            .nth(1)
+            .unwrap_or("")
+            .lines()
+            .any(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#') && !t.starts_with('[')
+            }) {
+        new_content.replace("[overrides]\n", "")
+    } else {
+        new_content
+    };
+
+    let new_content = new_content.trim_end().to_string() + "\n";
+
+    std::fs::write(&config_path, &new_content)?;
+    eprintln!("Restored: core rule `{rule_name}` is active again.");
+
+    run_config_list()
+}
+
 fn run_config_list() -> Result<i32, AppError> {
     let load_result = load_config(None)?;
     let config = &load_result.config;
@@ -958,7 +1140,13 @@ fn run_config_list() -> Result<i32, AppError> {
 
     for rule in &config.rules {
         let status = if rule.enabled { "active" } else { "disabled" };
-        let source = if let Some(default) = defaults.get(&rule.name) {
+        let source = if rule.is_builtin {
+            if !rule.enabled {
+                "core (overridden)"
+            } else {
+                "core"
+            }
+        } else if let Some(default) = defaults.get(&rule.name) {
             if !rule.enabled {
                 "config (disabled)"
             } else if rule.action != default.action
@@ -1083,6 +1271,8 @@ fn usage_text() -> &'static str {
   omamori config list
   omamori config disable <rule>
   omamori config enable <rule>
+  omamori override disable <rule>                        # Override a core safety rule
+  omamori override enable <rule>                         # Restore a core safety rule
   omamori cursor-hook                                   # Cursor beforeShellExecution handler
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
