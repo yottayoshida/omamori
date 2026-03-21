@@ -73,6 +73,10 @@ Terminal → rm -rf src/
 
 **Auto-sync**: After `brew upgrade`, the shim detects version mismatch and auto-regenerates hooks on the next invocation. No manual intervention needed.
 
+**Core policy**: The 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is silently ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
+
+**Integrity monitoring** (`omamori status`): Verifies all defense layers are intact — shims, hooks, config, core policy, PATH order. Detects tampering including subtle hook edits where the version comment is preserved but the body is rewritten.
+
 ## Supported Tools
 
 | Tier | Tools | Coverage |
@@ -155,10 +159,15 @@ destination = "/tmp/omamori-quarantine/"
 ```
 omamori install [--hooks]                # Setup shims + hooks + config
 omamori test [--config PATH]             # Verify policy rules
+omamori status [--refresh]               # Health check all defense layers
 omamori exec [--config PATH] -- CMD      # Run command through policy engine
+
 omamori config list                      # Show rules with status
 omamori config disable <rule>            # Disable a rule
 omamori config enable <rule>             # Re-enable a rule
+omamori override disable <rule>          # Override a core safety rule
+omamori override enable <rule>           # Restore a core safety rule
+
 omamori init [--force] [--stdout]        # Create/reset config
 omamori uninstall                        # Remove shims + hooks
 omamori cursor-hook                      # Cursor hook handler
