@@ -67,7 +67,7 @@ Terminal → rm -rf src/
 
 **Layer 1 — PATH shim**: Symlinks for `rm`, `git`, `chmod`, `find`, `rsync` point to omamori. Rules apply only when an AI environment variable is detected.
 
-**Layer 2 — Hooks**: Catches bypass attempts (`/bin/rm` direct paths, `unset CLAUDECODE`, interpreter commands). Available for Claude Code and Cursor.
+**Layer 2 — Hooks**: Recursively unwraps shell wrappers (`sudo env bash -c "..."` → extracts inner command) and evaluates against the same rules as Layer 1. Also blocks pipe-to-shell (`curl | bash`) and dynamic generation (`bash -c "$(cmd)"`). Available for Claude Code and Cursor.
 
 **Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting and direct config file editing. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
@@ -170,6 +170,7 @@ omamori override enable <rule>           # Restore a core safety rule
 
 omamori init [--force] [--stdout]        # Create/reset config
 omamori uninstall                        # Remove shims + hooks
+omamori hook-check [--provider NAME]     # Hook detection engine (used internally by hooks)
 omamori cursor-hook                      # Cursor hook handler
 omamori --version                        # Show version
 ```
@@ -180,7 +181,8 @@ These are inherent to the PATH shim approach and documented honestly:
 
 - **Full-path execution** (`/bin/rm`) bypasses the shim — mitigated by Layer 2 hooks
 - **`sudo`** changes PATH — omamori blocks when it detects elevated execution
-- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — hooks warn on known patterns, but obfuscated code cannot be detected
+- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected (bash/sh/zsh/dash/ksh only)
+- **Obfuscated commands** (base64, variable indirection) — cannot be detected by static analysis
 - **AI self-bypass** — `config disable`/`uninstall` are blocked; direct file editing blocked by hooks (Claude Code only)
 
 For the full security model, bypass corpus, and known limitations, see [SECURITY.md](SECURITY.md).

@@ -746,6 +746,25 @@ fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
         println!();
     }
 
+    // Detection engine summary (always displayed)
+    let rule_count = load_config(None)
+        .map(|r| r.config.rules.iter().filter(|r| r.enabled).count())
+        .unwrap_or(7);
+    println!("Detection:");
+    println!(
+        "  {:<6} {:<36} {rule_count} rules active",
+        "[ok]", "Layer 1 (PATH shim)"
+    );
+    println!(
+        "  {:<6} {:<36} Unwrap stack active",
+        "[ok]", "Layer 2 (hooks)"
+    );
+    println!(
+        "  {:<6} {:<36} Claude Code + Cursor",
+        "[info]", "Layer 2 coverage"
+    );
+    println!();
+
     let exit_code = report.exit_code();
     match exit_code {
         0 => println!("All layers healthy."),

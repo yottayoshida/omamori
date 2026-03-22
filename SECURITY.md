@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.5.0)
+## What It Protects (v0.6.0)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -101,7 +101,10 @@ Core immutability uses structural enforcement (binary ignores config overrides f
 - Full-path execution such as `/bin/rm` or `/usr/bin/git` can bypass the PATH shim. Mitigated by Layer 2 hooks (Claude Code + Cursor).
 - `find -exec /bin/rm {} \;` bypasses both the find shim and the rm shim because rm is invoked via absolute path. Partially mitigated by Layer 2 hooks.
 - `sudo` may change PATH before the shim runs.
-- Interpreter commands (`python -c "shutil.rmtree(...)"`) are warned on by Layer 2 hooks for known destructive patterns, but **obfuscated code** (base64 encoding, heredoc, variable indirection, string concatenation) **cannot be detected**. This is a fundamental limitation of string-based pattern matching.
+- Interpreter commands (`python -c "shutil.rmtree(...)"`) are not currently detected by the unwrap stack (which handles bash/sh/zsh/dash/ksh only). Future versions may add interpreter-aware parsing.
+- **Dynamic command generation** (`bash -c "$(cmd)"`, backtick substitution) inside shell launchers is **blocked** (fail-close) because the inner content cannot be statically analyzed.
+- **Obfuscated commands** (base64 encoding, heredoc, variable indirection, string concatenation outside shell launchers) **cannot be detected**. This is a fundamental limitation of static analysis.
+- **Bypass-by-substitution**: AI agents may attempt alternative commands (e.g., `rmdir`, `unlink`, `python os.rmdir()`) when their primary method is blocked. The unwrap stack partially mitigates this for shell launcher wrapping, but cannot prevent all substitution patterns. Protocol-level enforcement (#14 MCP) is the structural answer.
 - Commands outside the curated default rules are not protected.
 - Non-existent `destination` paths skip `canonicalize()` validation at config load time (caught at runtime via fail-close).
 - macOS resolves `/etc` to `/private/etc` — the blocked prefix list includes `/private` to cover this.
@@ -116,31 +119,63 @@ This is intentional: each detector's expected value is sourced from the actual t
 
 ## Hook Coverage (Layer 2)
 
+### Recursive Unwrap Stack (v0.6.0+)
+
+Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (`src/unwrap.rs`). The hook pipeline runs in two phases:
+
+1. **Phase 1 — Meta-patterns** (string-level): Catches tamper attempts (env var unset, config editing, `/bin/rm` direct paths, `.integrity.json` editing). These are intentionally broad — `unset CLAUDECODE` appearing anywhere in a command is blocked, including inside `echo`.
+
+2. **Phase 2 — Unwrap Stack** (token-level): Tokenizes the command, strips shell wrappers, extracts inner commands from shell launchers, and evaluates each extracted command against the same rules as Layer 1.
+
+| Capability | Detection |
+|-----------|-----------|
+| Shell wrappers (`sudo`, `env`, `nohup`, `timeout`, `nice`, `exec`, `command`) | Stripped recursively to expose inner command |
+| Shell launchers (`bash -c`, `sh -c`, `zsh -c`, `dash -c`, `ksh -c`) | Inner command extracted and recursively parsed |
+| Full-path shells (`/usr/local/bin/bash -c`) | Recognized via basename matching |
+| Combined flags (`bash -lc`) | Detected via flag suffix matching |
+| Compound commands (`cmd1 && cmd2`) | Split and each segment checked independently |
+| Pipe-to-shell (`curl url \| bash`) | **Blocked** unconditionally |
+| Process substitution (`bash <(...)`) | **Blocked** |
+| Dynamic generation (`bash -c "$(cmd)"`) | **Blocked** (fail-close) |
+| `env KEY=VAL cmd` | KEY=VAL pairs skipped; actual command evaluated |
+
+### Supported Shell List
+
+`bash`, `sh`, `zsh`, `dash`, `ksh`. Detected by basename (full paths recognized). `fish` and `nushell` are not currently supported — they may be added based on real-world bypass reports (corpus-driven).
+
 ### Claude Code Hooks
 
-The generated PreToolUse hook script is a second defensive layer.
+The generated PreToolUse hook script is a thin wrapper that delegates to `omamori hook-check`:
 
-It catches:
-- direct `/bin/rm` or `/usr/bin/rm` (with boundary matching to avoid `/bin/rmdir` false positives)
-- attempts to unset detector env vars (`CLAUDECODE`, `CODEX_CI`, `CURSOR_AGENT`, `GEMINI_CLI`, `CLINE_ACTIVE`, `AI_GUARD`)
-- **warns** on interpreter commands with known destructive patterns (`python -c "shutil.rmtree(...)"`, `node -e "rmSync(...)"`, `bash -c "rm -rf ..."`) — exit 0, not block
+```sh
+cat | omamori hook-check --provider claude-code
+exit $?
+```
 
 ### Cursor Hooks
 
-The `omamori cursor-hook` subcommand is a Rust-native `beforeShellExecution` handler for Cursor.
+The `omamori cursor-hook` subcommand uses the same `check_command_for_hook()` pipeline internally, with Cursor's JSON stdin/stdout protocol.
 
-It provides the same protection as Claude Code hooks, using Cursor's JSON stdin/stdout protocol:
-- Block (`permission: "deny"`): direct rm paths, env var unset attempts
-- Warn (`permission: "ask"`): interpreter commands with destructive patterns
+### Fail-Close Guarantees
 
-The Cursor hook uses `serde_json` for JSON generation to avoid Cursor's known malformed-JSON fail-open behavior.
+| Failure mode | Behavior |
+|-------------|----------|
+| Parse error (unclosed quote, etc.) | BLOCK |
+| Recursion depth > 5 | BLOCK |
+| Token count > 1000 | BLOCK |
+| Segment count > 20 | BLOCK |
+| Input size > 1 MB | BLOCK |
+| `$(...)` or backtick in shell launcher inner | BLOCK |
+| OOM / panic | Process exit (hook failure = AI tool blocks) |
 
 ### Hook Limitations
 
-Hooks are **not a complete parser** and should be treated as partial coverage. Pattern matching is string-based and cannot detect:
-- Obfuscated commands (base64 encoding, string concatenation)
-- Indirect execution via variables or heredocs
-- Commands constructed at runtime by the interpreter
+The unwrap stack is a static analyzer, not a shell interpreter. It cannot detect:
+- Obfuscated commands (base64 encoding, hex encoding)
+- Variable indirection (`CMD=rm; $CMD -rf /`)
+- Commands constructed at runtime by interpreters (`python -c`, `node -e`)
+- Heredoc content
+- Encoded payloads decoded at execution time
 
 ## Hook Auto-Sync (v0.4.1+)
 
@@ -172,11 +207,14 @@ omamori maintains a bypass corpus — a set of tests that verify both "what we b
 
 | Priority | Pattern | Verified by |
 |----------|---------|-------------|
-| P1 | `/bin/rm` + `/usr/bin/rm` path variants (space, quote, tab, single-quote) | `hook_script_covers_rm_path_core_variants`, `blocked_command_patterns_cover_all_rm_boundaries` |
-| P1 | All 6 detector env vars × 3 unset patterns | `hook_script_covers_all_env_var_unset_patterns` |
-| P2 | `config disable/enable`, `uninstall`, `init --force`, `config.toml` edit | `hook_script_covers_config_modification_patterns` |
-| P3 | `bash -c "rm -rf"`, `sh -c "rm -rf"` | `hook_script_warns_bash_c_rm` |
-| P4 | `/bin/rmdir` false-positive regression | `hook_script_does_not_false_positive_on_rmdir` |
+| P1 | `/bin/rm` + `/usr/bin/rm` path variants | `meta_patterns_cover_rm_path_boundaries` |
+| P1 | All 6 detector env vars × 3 unset patterns | `meta_patterns_cover_all_detector_env_vars` |
+| P2 | `config disable/enable`, `uninstall`, `init --force` | `meta_patterns_cover_config_modification` |
+| P3 | `bash -c "rm -rf"`, `sudo env bash -c "rm -rf"` | `unwrap::tests::bash_c_*`, `unwrap::tests::chained_wrappers` |
+| P3 | Pipe-to-shell (`curl \| bash`) | `unwrap::tests::curl_pipe_bash` |
+| P3 | Dynamic generation (`bash -c "$(cmd)"`) | `unwrap::tests::dollar_paren_*` |
+| P4 | False positive: `echo "rm -rf"`, `env NODE_ENV=production npm start` | `unwrap::tests::echo_with_dangerous_string`, `unwrap::tests::env_production_start` |
+| P4 | `/bin/rmdir` false-positive regression | `meta_patterns_do_not_false_positive_on_rmdir` |
 
 ### Known limitations (KNOWN_LIMIT)
 
@@ -187,8 +225,10 @@ These attack vectors **cannot** be detected by omamori's design. They are docume
 | `sudo rm -rf` | sudo changes PATH before shim runs; shim is never invoked |
 | `alias rm='/bin/rm'` | Alias/function overrides bypass string matching in hooks |
 | `env -i rm -rf` | Clears all env vars including detectors; undetectable by hooks |
-| Obfuscated commands (base64, hex, variable expansion) | String-based pattern matching cannot decode runtime-constructed commands |
+| Obfuscated commands (base64, hex, variable expansion) | Static analysis cannot decode runtime-constructed commands |
 | `export -n CLAUDECODE` | Removes export attribute without unsetting; not caught by `unset` patterns |
+| `python -c "shutil.rmtree(...)"` | Python/Node interpreters not in shell list; future interpreter-aware parsing planned |
+| `bash -c "$VAR"` where VAR is set earlier | Variable expansion requires runtime evaluation |
 
 ## AI Config Bypass Guard (v0.3.2+)
 
