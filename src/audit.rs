@@ -55,6 +55,15 @@ pub struct AuditEvent {
     pub result: String,
     pub target_count: usize,
     pub target_hash: String,
+    /// Detection layer: "layer1" (PATH shim) or "layer2" (hook).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detection_layer: Option<String>,
+    /// Unwrap chain showing how the command was extracted (e.g., ["sudo", "bash -c", "rm -rf /"]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwrap_chain: Option<Vec<String>>,
+    /// SHA-256 hash of the raw hook input (before parsing), for non-repudiation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_input_hash: Option<String>,
 }
 
 impl AuditEvent {
@@ -81,6 +90,9 @@ impl AuditEvent {
             result: outcome.label().to_string(),
             target_count: targets.len(),
             target_hash: hash_targets(&targets),
+            detection_layer: Some("layer1".to_string()),
+            unwrap_chain: None,
+            raw_input_hash: None,
         }
     }
 }

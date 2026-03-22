@@ -175,8 +175,8 @@ fn poc3b_tampered_hook_detected_by_hash() {
     let expected = omamori::installer::render_hook_script();
     let expected_hash = sha256_hex(&expected);
 
-    // Simulate T2 attack: keep version comment, change exit codes
-    let tampered = expected.replace("exit 2", "exit 0");
+    // Simulate T2 attack: keep version comment, bypass hook-check
+    let tampered = expected.replace("omamori hook-check", "true");
     let tampered_hash = sha256_hex(&tampered);
 
     // Version comment is preserved

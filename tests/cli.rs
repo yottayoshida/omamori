@@ -471,15 +471,18 @@ fn cursor_hook_handles_malformed_stdin() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cursor_hook_warns_python_rmtree() {
+fn cursor_hook_allows_python_rmtree() {
+    // python interpreter patterns are not blocked by meta-patterns or unwrap stack.
+    // The old warn-only (exit 0, ask) behavior was security theater.
+    // Future: python -c detection via interpreter-aware unwrap.
     let (stdout, _, success) = run_cursor_hook(
         r#"{"command":"python3 -c \"import shutil; shutil.rmtree('/tmp/test')\"","cwd":"/tmp"}"#,
     );
     assert!(success);
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("stdout must be valid JSON");
-    assert_eq!(parsed["continue"], true, "should not block, only warn");
-    assert_eq!(parsed["permission"], "ask");
+    assert_eq!(parsed["continue"], true);
+    assert_eq!(parsed["permission"], "allow");
 }
 
 #[test]
@@ -494,7 +497,9 @@ fn cursor_hook_no_warn_safe_python() {
 }
 
 #[test]
-fn cursor_hook_warns_node_rmsync() {
+fn cursor_hook_allows_node_rmsync() {
+    // node interpreter patterns are not blocked by meta-patterns or unwrap stack.
+    // Future: node -e detection via interpreter-aware unwrap.
     let (stdout, _, success) = run_cursor_hook(
         r#"{"command":"node -e \"require('fs').rmSync('/tmp/test', {recursive: true})\"","cwd":"/tmp"}"#,
     );
@@ -502,7 +507,7 @@ fn cursor_hook_warns_node_rmsync() {
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("stdout must be valid JSON");
     assert_eq!(parsed["continue"], true);
-    assert_eq!(parsed["permission"], "ask");
+    assert_eq!(parsed["permission"], "allow");
 }
 
 // ---------------------------------------------------------------------------
@@ -892,12 +897,13 @@ fn install_generates_integrity_baseline() {
 }
 
 #[test]
-fn hook_block_list_includes_integrity_json() {
-    // Verify the hook script blocks .integrity.json editing
-    let script = omamori::installer::render_hook_script();
+fn hook_check_blocks_integrity_json() {
+    // Verify meta-patterns block .integrity.json editing
+    // (previously checked in hook script, now delegated to hook-check via meta-patterns)
+    let patterns = omamori::installer::blocked_command_patterns();
     assert!(
-        script.contains(".integrity.json"),
-        "hook script should block .integrity.json editing"
+        patterns.iter().any(|(p, _)| p.contains(".integrity.json")),
+        "meta-patterns should block .integrity.json editing"
     );
 }
 
