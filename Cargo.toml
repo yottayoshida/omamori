@@ -19,3 +19,4 @@ sha2 = "0.10"
 time = { version = "0.3", features = ["formatting"] }
 toml = "0.8"
 trash = "5.2"
+shell-words = "1.1"
