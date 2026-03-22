@@ -6,6 +6,7 @@ pub mod detector;
 pub mod installer;
 pub mod integrity;
 pub mod rules;
+pub mod unwrap;
 
 use std::env;
 use std::ffi::OsString;
