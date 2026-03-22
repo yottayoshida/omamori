@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.0] - 2026-03-22
+
+### Added
+
+- **Recursive Unwrap Stack** (#30): Token-aware command parser for Layer 2 hooks. Recursively strips shell wrappers (sudo, env, nohup, timeout, nice, exec, command) and extracts inner commands from shell launchers (bash/sh/zsh/dash/ksh -c) for rule matching.
+  - **`omamori hook-check`**: New subcommand — unified hook detection engine. Reads stdin, runs 2-phase check (meta-patterns → unwrap stack → rule match), exits 0 (allow) or 2 (block).
+  - **Compound command splitting**: `echo ok && rm -rf /` — each segment checked independently. Quote-aware pre-normalization handles `a&&b` (no spaces).
+  - **Pipe-to-shell detection**: `curl url | bash` — unconditionally blocked.
+  - **Process substitution**: `bash <(...)` — blocked.
+  - **Dynamic generation**: `bash -c "$(cmd)"` — blocked (fail-close).
+  - **Full-path shell recognition**: `/usr/local/bin/bash -c` detected via basename matching.
+  - **Combined flag support**: `bash -lc` recognized as `-c` variant.
+  - **env special handling**: `env NODE_ENV=production npm start` correctly parsed (KEY=VAL skipped).
+  - **Fail-close limits**: depth > 5, tokens > 1000, segments > 20, input > 1MB, parse error — all BLOCK.
+  - `shell-words` v1.1 dependency added (zero-dep, POSIX-compliant tokenizer).
+  - 70 new unit tests for unwrap stack.
+- **AuditEvent extension**: `detection_layer`, `unwrap_chain`, `raw_input_hash` fields added for #29 compatibility.
+
+### Changed
+
+- **Claude Code hook script**: Converted from 60-line shell `case` statement to 5-line thin wrapper delegating to `omamori hook-check`. All detection logic now in Rust.
+- **Cursor hook**: Refactored to use shared `check_command_for_hook()` pipeline. Same detection for both providers.
+- **`bash -c "rm -rf /"` is now BLOCKED** (was warn-only exit 0). The unwrap stack extracts `rm -rf /` and matches it against rules.
+- **`sudo env bash -c "rm -rf /"` is now BLOCKED** (was pass-through). Wrappers are recursively stripped.
+
+### Removed
+
+- **Python/Node interpreter warn patterns**: `shutil.rmtree`, `rmSync`, etc. were previously warn-only (exit 0, "ask" permission) — effectively security theater since the command still executed. Removed in favor of future interpreter-aware unwrap.
+
+### Security
+
+- **Unified pipeline**: Claude Code and Cursor now share identical detection logic. No more dual-implementation sync risk.
+- **Exit code contract**: 0 = allow, 2 = block, non-zero = fail-close.
+- **T2 attack test updated**: Simulates replacing `omamori hook-check` with `true` in thin wrapper (previously simulated `exit 2` → `exit 0`).
+
 ## [0.5.0] - 2026-03-21
 
 ### Added
