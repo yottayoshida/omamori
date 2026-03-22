@@ -65,6 +65,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("override") => run_override_command(args),
         Some("status") => run_status_command(args),
         Some("cursor-hook") => run_cursor_hook(),
+        Some("hook-check") => run_hook_check(args),
         Some("version") | Some("--version") | Some("-V") => {
             println!("omamori {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
@@ -773,7 +774,7 @@ fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
 }
 
 /// Cursor `beforeShellExecution` hook handler.
-/// Reads JSON from stdin, checks command against blocked patterns,
+/// Reads JSON from stdin, checks command via shared hook pipeline,
 /// writes JSON response to stdout. All logs go to stderr only.
 fn run_cursor_hook() -> Result<i32, AppError> {
     use std::io::Read;
@@ -781,7 +782,6 @@ fn run_cursor_hook() -> Result<i32, AppError> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
-    // Extract "command" field from JSON input
     let command = match serde_json::from_str::<serde_json::Value>(&input) {
         Ok(v) => v
             .get("command")
@@ -789,73 +789,256 @@ fn run_cursor_hook() -> Result<i32, AppError> {
             .unwrap_or("")
             .to_string(),
         Err(_) => {
-            // Can't parse → allow (don't block on malformed input)
             eprintln!("omamori cursor-hook: failed to parse stdin JSON");
             print_cursor_response(true, "allow", None, None);
             return Ok(0);
         }
     };
 
+    if command.is_empty() {
+        print_cursor_response(true, "allow", None, None);
+        return Ok(0);
+    }
+
     eprintln!("omamori cursor-hook: command={command}");
 
-    // Check against shared blocked patterns
-    for (pattern, reason) in installer::blocked_command_patterns() {
-        if command.contains(pattern) {
+    match check_command_for_hook(&command) {
+        HookCheckResult::Allow => {
+            print_cursor_response(true, "allow", None, None);
+        }
+        HookCheckResult::BlockMeta(reason) => {
             eprintln!("omamori cursor-hook: BLOCKED ({reason})");
             print_cursor_response(
                 false,
                 "deny",
                 Some(&format!("omamori hook: {reason}")),
                 Some(&format!(
-                    "This command was blocked by omamori safety guard: {reason}. Use a safer alternative."
+                    "This command was blocked by omamori: {reason}. Use a safer alternative."
                 )),
             );
-            return Ok(0);
         }
-    }
-
-    // Check for interpreter patterns (warn only, don't block)
-    let interpreter_patterns = [
-        ("shutil.rmtree", "python shutil.rmtree detected"),
-        ("os.remove", "python os.remove detected"),
-        ("os.rmdir", "python os.rmdir detected"),
-        ("rmSync", "node rmSync detected"),
-        ("unlinkSync", "node unlinkSync detected"),
-    ];
-    // Only check if command involves an interpreter with -c/-e flag
-    if (command.contains("python") && command.contains("-c"))
-        || (command.contains("node") && command.contains("-e"))
-        || (command.contains("bash") && command.contains("-c"))
-        || (command.contains("sh") && command.contains("-c"))
-    {
-        for (pattern, reason) in interpreter_patterns {
-            if command.contains(pattern) {
-                eprintln!("omamori cursor-hook: WARNING ({reason})");
-                print_cursor_response(
-                    true,
-                    "ask",
-                    Some(&format!("omamori warning: {reason}")),
-                    Some("This interpreter command may be destructive. Review before proceeding."),
-                );
-                return Ok(0);
-            }
-        }
-        // bash/sh -c "rm -rf" pattern
-        if command.contains("rm -rf") || command.contains("rm -r ") {
-            eprintln!("omamori cursor-hook: WARNING (shell rm -rf via interpreter)");
+        HookCheckResult::BlockRule {
+            message,
+            unwrap_chain,
+            ..
+        } => {
+            let chain_str = unwrap_chain
+                .as_deref()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            eprintln!("omamori cursor-hook: BLOCKED ({message}{chain_str})");
             print_cursor_response(
-                true,
-                "ask",
-                Some("omamori warning: shell rm -rf via interpreter"),
-                Some("This interpreter command may be destructive. Review before proceeding."),
+                false,
+                "deny",
+                Some(&format!("omamori hook: blocked — {message}{chain_str}")),
+                Some("This command was blocked by omamori safety guard. Use a safer alternative."),
             );
-            return Ok(0);
+        }
+        HookCheckResult::BlockStructural(message) => {
+            eprintln!("omamori cursor-hook: BLOCKED ({message})");
+            print_cursor_response(
+                false,
+                "deny",
+                Some(&message),
+                Some("This command was blocked by omamori safety guard. Use a safer alternative."),
+            );
         }
     }
 
-    // Allow
-    print_cursor_response(true, "allow", None, None);
     Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Shared hook check logic (used by both hook-check and cursor-hook)
+// ---------------------------------------------------------------------------
+
+/// Result of checking a command string through the hook pipeline.
+enum HookCheckResult {
+    /// Command is allowed.
+    Allow,
+    /// Command is blocked by a meta-pattern (string-level).
+    BlockMeta(&'static str),
+    /// Command is blocked by the unwrap stack (token-level rule match).
+    BlockRule {
+        rule_name: String,
+        message: String,
+        unwrap_chain: Option<String>,
+    },
+    /// Command is blocked by the unwrap stack (structural block: pipe-to-shell, etc.).
+    BlockStructural(String),
+}
+
+/// Two-phase hook check:
+/// Phase 1: Meta-pattern string-level check (env var unset, config tamper, /bin/rm, etc.)
+/// Phase 2: Token-level unwrap stack → rule matching
+fn check_command_for_hook(command: &str) -> HookCheckResult {
+    // Phase 1: Meta-patterns (string-level, intentionally broad)
+    for (pattern, reason) in installer::blocked_command_patterns() {
+        if command.contains(pattern) {
+            return HookCheckResult::BlockMeta(reason);
+        }
+    }
+
+    // Phase 2: Unwrap stack → rule matching
+    let parse_result = unwrap::parse_command_string(command);
+
+    match parse_result {
+        unwrap::ParseResult::Block(reason) => HookCheckResult::BlockStructural(format!(
+            "omamori hook: blocked — {}",
+            reason.message()
+        )),
+        unwrap::ParseResult::Commands(invocations) => {
+            // Load config to get rules
+            let load_result = match load_config(None) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Config load failure → use default rules (fail-safe, not fail-open)
+                    ConfigLoadResult {
+                        config: config::Config::default(),
+                        warnings: vec![],
+                    }
+                }
+            };
+
+            for inv in &invocations {
+                if let Some(rule) = match_rule(&load_result.config.rules, inv) {
+                    let chain_desc = format_unwrap_chain(command, inv);
+                    let msg = rule
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| format!("matched rule: {}", rule.name));
+                    return HookCheckResult::BlockRule {
+                        rule_name: rule.name.clone(),
+                        message: msg,
+                        unwrap_chain: chain_desc,
+                    };
+                }
+            }
+
+            HookCheckResult::Allow
+        }
+    }
+}
+
+/// Format the unwrap chain for display: "rm -rf / (via bash -c)"
+fn format_unwrap_chain(original: &str, invocation: &CommandInvocation) -> Option<String> {
+    // If the original command doesn't start with the matched program,
+    // there was unwrapping involved — show the wrapper context
+    let trimmed = original.trim();
+    if !trimmed.starts_with(&invocation.program) {
+        // Extract the first word of the original as the outermost wrapper
+        let outer = trimmed.split_whitespace().next().unwrap_or("");
+        let outer_base = outer.rsplit('/').next().unwrap_or(outer);
+        // Check if bash -c style
+        if trimmed.contains("-c") {
+            Some(format!("via {} -c", outer_base))
+        } else {
+            Some(format!("via {}", outer_base))
+        }
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hook-check subcommand (Claude Code PreToolUse thin wrapper target)
+// ---------------------------------------------------------------------------
+
+/// `omamori hook-check [--provider NAME]`
+/// Reads command string from stdin, checks against meta-patterns + unwrap stack + rules.
+/// Exit 0 = allow, exit 2 = block.
+fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
+    use std::io::Read;
+
+    let provider = parse_provider_flag(args);
+
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+
+    // Claude Code sends JSON with tool_input.command; extract it
+    let command = extract_command_from_hook_input(&input);
+
+    if command.is_empty() {
+        return Ok(0); // empty command = allow
+    }
+
+    let verbose = std::env::var("OMAMORI_VERBOSE").is_ok();
+
+    match check_command_for_hook(&command) {
+        HookCheckResult::Allow => Ok(0),
+        HookCheckResult::BlockMeta(reason) => {
+            eprintln!("omamori hook: blocked — {reason}");
+            if verbose {
+                eprintln!("  provider: {provider}");
+                eprintln!("  layer: meta-pattern (string-level)");
+            }
+            Ok(2)
+        }
+        HookCheckResult::BlockRule {
+            rule_name,
+            message,
+            unwrap_chain,
+        } => {
+            let chain_str = unwrap_chain
+                .as_deref()
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            eprintln!("omamori hook: blocked — {message}{chain_str}");
+            if verbose {
+                eprintln!("  provider: {provider}");
+                eprintln!("  rule: {rule_name}");
+                eprintln!("  layer: unwrap-stack (token-level)");
+            }
+            eprintln!(
+                "  hint: if intentional, run the command directly in your terminal (not via AI agent)"
+            );
+            Ok(2)
+        }
+        HookCheckResult::BlockStructural(message) => {
+            eprintln!("{message}");
+            if verbose {
+                eprintln!("  provider: {provider}");
+                eprintln!("  layer: unwrap-stack (structural)");
+            }
+            eprintln!(
+                "  hint: if intentional, run the command directly in your terminal (not via AI agent)"
+            );
+            Ok(2)
+        }
+    }
+}
+
+/// Extract the command string from Claude Code's PreToolUse hook JSON input.
+/// Falls back to treating the entire input as the command if JSON parsing fails.
+fn extract_command_from_hook_input(input: &str) -> String {
+    // Claude Code PreToolUse sends: { "tool_name": "Bash", "tool_input": { "command": "..." } }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(cmd) = v
+            .get("tool_input")
+            .and_then(|ti| ti.get("command"))
+            .and_then(|c| c.as_str())
+        {
+            return cmd.to_string();
+        }
+        // Cursor format: { "command": "..." }
+        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+            return cmd.to_string();
+        }
+    }
+    // Fallback: treat raw input as command
+    input.trim().to_string()
+}
+
+/// Parse --provider flag from args. Defaults to "unknown".
+fn parse_provider_flag(args: &[OsString]) -> String {
+    for (i, arg) in args.iter().enumerate() {
+        if arg.to_str() == Some("--provider")
+            && let Some(val) = args.get(i + 1)
+        {
+            return val.to_string_lossy().to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 fn print_cursor_response(
@@ -1434,6 +1617,7 @@ fn usage_text() -> &'static str {
   omamori status [--refresh]                              # Health check all defense layers
   omamori override disable <rule>                        # Override a core safety rule
   omamori override enable <rule>                         # Restore a core safety rule
+  omamori hook-check [--provider NAME]                   # Hook detection engine (stdin → exit code)
   omamori cursor-hook                                   # Cursor beforeShellExecution handler
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori

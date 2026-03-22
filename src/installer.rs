@@ -258,64 +258,14 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
 pub fn render_hook_script() -> String {
     format!(
         r#"#!/bin/sh
-# omamori hook v{}
-set -eu"#,
-        env!("CARGO_PKG_VERSION")
-    ) + r#"
-
-INPUT="$(cat)"
-
-case "$INPUT" in
-  *"/bin/rm "*|*"/bin/rm\""*|*"/usr/bin/rm "*|*"/usr/bin/rm\""*)
-    echo "omamori hook: blocked direct rm path that bypasses PATH shim" >&2
-    exit 2
-    ;;
-  *"unset CLAUDECODE"*|*"env -u CLAUDECODE"*|*"CLAUDECODE="*|\
-  *"unset CODEX_CI"*|*"env -u CODEX_CI"*|*"CODEX_CI="*|\
-  *"unset CURSOR_AGENT"*|*"env -u CURSOR_AGENT"*|*"CURSOR_AGENT="*|\
-  *"unset GEMINI_CLI"*|*"env -u GEMINI_CLI"*|*"GEMINI_CLI="*|\
-  *"unset CLINE_ACTIVE"*|*"env -u CLINE_ACTIVE"*|*"CLINE_ACTIVE="*|\
-  *"unset AI_GUARD"*|*"env -u AI_GUARD"*|*"AI_GUARD="*)
-    echo "omamori hook: blocked attempt to unset a detector env var" >&2
-    exit 2
-    ;;
-  *"config disable"*|*"config enable"*)
-    echo "omamori hook: blocked attempt to modify omamori rules" >&2
-    exit 2
-    ;;
-  *"omamori uninstall"*)
-    echo "omamori hook: blocked attempt to uninstall omamori" >&2
-    exit 2
-    ;;
-  *"omamori init --force"*)
-    echo "omamori hook: blocked attempt to overwrite omamori config" >&2
-    exit 2
-    ;;
-  *"omamori override"*)
-    echo "omamori hook: blocked attempt to override omamori core rules" >&2
-    exit 2
-    ;;
-  *"omamori/config.toml"*|*"omamori"*"config.toml"*)
-    echo "omamori hook: blocked attempt to edit omamori config file directly" >&2
-    exit 2
-    ;;
-  *".integrity.json"*)
-    echo "omamori hook: blocked attempt to edit integrity baseline" >&2
-    exit 2
-    ;;
-  *"python "*"-c "*"shutil.rmtree"*|*"python3 "*"-c "*"shutil.rmtree"*|\
-  *"python "*"-c "*"os.remove"*|*"python3 "*"-c "*"os.remove"*|\
-  *"python "*"-c "*"os.rmdir"*|*"python3 "*"-c "*"os.rmdir"*|\
-  *"node "*"-e "*"rmSync"*|*"node "*"-e "*"unlinkSync"*|\
-  *"bash "*"-c "*"rm -rf"*|*"sh "*"-c "*"rm -rf"*)
-    echo "omamori hook: warning — potentially destructive interpreter command detected" >&2
-    exit 0
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-"#
+# omamori hook v{version}
+# Thin wrapper: delegates all detection to `omamori hook-check`
+set -eu
+cat | omamori hook-check --provider claude-code
+exit $?
+"#,
+        version = env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// Blocked command patterns shared between Claude Code hooks and Cursor hooks.
@@ -489,54 +439,16 @@ mod tests {
     }
 
     #[test]
-    fn hook_script_blocks_bin_rm_but_not_rmdir() {
+    fn hook_script_is_thin_wrapper() {
         let script = render_hook_script();
-        // Should match /bin/rm followed by space
-        assert!(script.contains(r#"*"/bin/rm "*"#));
-        assert!(script.contains(r#"*"/usr/bin/rm "*"#));
-        // Should NOT have unbounded /bin/rm that matches /bin/rmdir
-        assert!(!script.contains(r#"*"/bin/rm"*"#) || script.contains(r#"*"/bin/rm "*"#));
-    }
-
-    #[test]
-    fn hook_script_blocks_all_detector_env_var_unsets() {
-        let script = render_hook_script();
-        for var in &[
-            "CLAUDECODE",
-            "CODEX_CI",
-            "CURSOR_AGENT",
-            "GEMINI_CLI",
-            "CLINE_ACTIVE",
-            "AI_GUARD",
-        ] {
-            assert!(
-                script.contains(&format!(r#"*"unset {var}"*"#)),
-                "hook script should block unset of {var}"
-            );
-        }
-        assert!(script.contains("blocked attempt to unset a detector env var"));
-    }
-
-    #[test]
-    fn hook_script_warns_on_interpreter_patterns() {
-        let script = render_hook_script();
-        // Should contain interpreter warning patterns (warn only, exit 0)
         assert!(
-            script.contains("shutil.rmtree"),
-            "hook script should warn on shutil.rmtree"
+            script.contains("omamori hook-check"),
+            "hook script should delegate to omamori hook-check"
         );
+        // Thin wrapper should NOT contain case statements
         assert!(
-            script.contains("os.remove"),
-            "hook script should warn on os.remove"
-        );
-        assert!(
-            script.contains("rmSync"),
-            "hook script should warn on rmSync"
-        );
-        // Should exit 0 for warnings (not exit 2)
-        assert!(
-            script.contains("potentially destructive interpreter command"),
-            "hook script should have interpreter warning message"
+            !script.contains("case \"$INPUT\""),
+            "hook script should not contain case statements (now a thin wrapper)"
         );
     }
 
@@ -548,28 +460,11 @@ mod tests {
         assert!(!snippet.contains(r#"" "path""#));
     }
 
-    // --- Bypass corpus: P1 (highest priority) ---
+    // --- Meta-pattern tests (blocked_command_patterns, Phase 1) ---
 
     #[test]
-    fn hook_script_covers_rm_path_core_variants() {
-        let script = render_hook_script();
-        // Hook script (shell case) covers space and quote boundaries
-        for path in &["/bin/rm", "/usr/bin/rm"] {
-            assert!(
-                script.contains(&format!("{path} ")),
-                "hook script should block '{path} '"
-            );
-            assert!(
-                script.contains(&format!("{path}\\\"")),
-                "hook script should block '{path}\\\"'"
-            );
-        }
-    }
-
-    #[test]
-    fn blocked_command_patterns_cover_all_rm_boundaries() {
+    fn meta_patterns_cover_rm_path_boundaries() {
         let patterns = blocked_command_patterns();
-        // blocked_command_patterns (used by cursor-hook) covers all boundary variants
         for path in &["/bin/rm", "/usr/bin/rm"] {
             for boundary in &[" ", "\"", "\t", "'"] {
                 let needle = format!("{path}{boundary}");
@@ -582,66 +477,54 @@ mod tests {
     }
 
     #[test]
-    fn hook_script_covers_all_env_var_unset_patterns() {
-        let script = render_hook_script();
-        let detector_vars = [
+    fn meta_patterns_cover_all_detector_env_vars() {
+        let patterns = blocked_command_patterns();
+        for var in &[
             "CLAUDECODE",
             "CODEX_CI",
             "CURSOR_AGENT",
             "GEMINI_CLI",
             "CLINE_ACTIVE",
             "AI_GUARD",
-        ];
-        for var in &detector_vars {
+        ] {
             assert!(
-                script.contains(&format!("unset {var}")),
-                "hook script should block 'unset {var}'"
+                patterns
+                    .iter()
+                    .any(|(p, _)| p.contains(&format!("unset {var}"))),
+                "should block unset {var}"
             );
             assert!(
-                script.contains(&format!("env -u {var}")),
-                "hook script should block 'env -u {var}'"
+                patterns
+                    .iter()
+                    .any(|(p, _)| p.contains(&format!("env -u {var}"))),
+                "should block env -u {var}"
             );
             assert!(
-                script.contains(&format!("{var}=")),
-                "hook script should block '{var}=' reassignment"
+                patterns.iter().any(|(p, _)| p.contains(&format!("{var}="))),
+                "should block {var}= reassignment"
             );
         }
     }
 
-    // --- Bypass corpus: P2 ---
-
     #[test]
-    fn hook_script_covers_config_modification_patterns() {
-        let script = render_hook_script();
-        assert!(script.contains("config disable"));
-        assert!(script.contains("config enable"));
-        assert!(script.contains("omamori uninstall"));
-        assert!(script.contains("omamori init --force"));
-        assert!(script.contains("config.toml"));
-    }
-
-    // --- Bypass corpus: P3 ---
-
-    #[test]
-    fn hook_script_warns_bash_c_rm() {
-        let script = render_hook_script();
-        assert!(
-            script.contains(r#"*"bash "*"-c "*"rm -rf"*"#),
-            "hook script should warn on bash -c rm -rf"
-        );
-        assert!(
-            script.contains(r#"*"sh "*"-c "*"rm -rf"*"#),
-            "hook script should warn on sh -c rm -rf"
-        );
-    }
-
-    // --- Bypass corpus: P4 (boundary variants) ---
-
-    #[test]
-    fn hook_script_does_not_false_positive_on_rmdir() {
+    fn meta_patterns_cover_config_modification() {
         let patterns = blocked_command_patterns();
-        // None of the patterns should match "rmdir" without also requiring
-        // a boundary char after "rm"
+        for keyword in &[
+            "config disable",
+            "config enable",
+            "omamori uninstall",
+            "omamori init --force",
+        ] {
+            assert!(
+                patterns.iter().any(|(p, _)| p.contains(keyword)),
+                "should block: {keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn meta_patterns_do_not_false_positive_on_rmdir() {
+        let patterns = blocked_command_patterns();
         for (pattern, _) in &patterns {
             assert!(
                 !pattern.contains("/bin/rmdir"),
@@ -762,13 +645,13 @@ mod tests {
         let original = render_hook_script();
         let original_hash = hook_content_hash(&original);
 
-        // Simulate T2 attack: keep version comment but change exit codes
-        let tampered = original.replace("exit 2", "exit 0");
+        // Simulate T2 attack: keep version comment but bypass hook-check
+        let tampered = original.replace("omamori hook-check", "true");
         let tampered_hash = hook_content_hash(&tampered);
 
         assert_ne!(
             original_hash, tampered_hash,
-            "T2 attack (exit 2 → exit 0) should be detected by hash mismatch"
+            "T2 attack (hook-check → true) should be detected by hash mismatch"
         );
 
         // Verify version comment is still intact (attacker preserved it)
@@ -793,15 +676,11 @@ mod tests {
     // --- omamori override block pattern tests ---
 
     #[test]
-    fn hook_script_blocks_omamori_override() {
-        let script = render_hook_script();
+    fn meta_patterns_block_omamori_override() {
+        let patterns = blocked_command_patterns();
         assert!(
-            script.contains("omamori override"),
-            "hook script should block 'omamori override'"
-        );
-        assert!(
-            script.contains("blocked attempt to override omamori core rules"),
-            "hook script should have override block message"
+            patterns.iter().any(|(p, _)| p.contains("omamori override")),
+            "meta-patterns should block 'omamori override'"
         );
     }
 
