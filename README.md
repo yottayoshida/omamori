@@ -26,7 +26,7 @@ omamori install --hooks
 export PATH="$HOME/.omamori/shim:$PATH"
 ```
 
-That's it. After `brew upgrade`, hooks and shims are auto-updated on the next command — no manual re-install needed.
+That's it. After `brew upgrade`, shims and Claude Code hooks auto-update on the next command. **Cursor users**: re-merge the hook snippet after upgrades (see [Auto-sync](#how-it-works)).
 
 ## What It Blocks
 
@@ -71,7 +71,10 @@ Terminal → rm -rf src/
 
 **Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting and direct config file editing. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
-**Auto-sync**: After `brew upgrade`, the shim detects version mismatch and auto-regenerates hooks on the next invocation. No manual intervention needed.
+**Auto-sync**: After `brew upgrade`, the shim detects version mismatch and auto-regenerates hook files on the next invocation.
+
+- **Claude Code**: Hooks are applied automatically. No action needed.
+- **Cursor**: Run `omamori install --hooks` to regenerate the snippet, then merge `~/.omamori/hooks/cursor-hooks.snippet.json` into your `.cursor/hooks.json`.
 
 **Core policy**: The 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is silently ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
 
@@ -157,7 +160,7 @@ destination = "/tmp/omamori-quarantine/"
 ## CLI Reference
 
 ```
-omamori install [--hooks]                # Setup shims + hooks + config
+omamori install [--hooks]                # Setup shims + hooks + config (re-run after brew upgrade for Cursor)
 omamori test [--config PATH]             # Verify policy rules
 omamori status [--refresh]               # Health check all defense layers
 omamori exec [--config PATH] -- CMD      # Run command through policy engine
