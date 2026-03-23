@@ -266,7 +266,7 @@ fn run_exec_command(args: &[OsString]) -> Result<i32, AppError> {
 
 fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut base_dir = default_base_dir();
-    let mut source_exe = env::current_exe()?;
+    let mut source_exe = installer::resolve_stable_exe_path(&env::current_exe()?);
     let mut generate_hooks = false;
     let mut index = 2usize;
 

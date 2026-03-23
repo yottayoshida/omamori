@@ -11,6 +11,8 @@ pub const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub base_dir: PathBuf,
+    /// Path to the omamori binary. Must be a stable path (not a versioned Cellar path).
+    /// Callers should pass the result of `resolve_stable_exe_path()` when using `current_exe()`.
     pub source_exe: PathBuf,
     pub generate_hooks: bool,
 }
@@ -182,9 +184,21 @@ fn atomic_write(target: &Path, content: &str) -> Result<(), std::io::Error> {
 }
 
 /// Create a named temp file in the given directory.
-/// Returns a wrapper that tracks the path for rename.
+/// Uses O_NOFOLLOW on Unix to prevent symlink-following attacks on the predictable
+/// temp path (symmetric with integrity.rs write_new_file). See: #56, T7.
 fn tempfile_in(dir: &Path) -> Result<AtomicTempFile, std::io::Error> {
     let path = dir.join(format!(".omamori-tmp-{}", std::process::id()));
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?
+    };
+    #[cfg(not(unix))]
     let file = fs::File::create(&path)?;
     Ok(AtomicTempFile { file, path })
 }
@@ -246,10 +260,11 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
     let snippet_path = hooks_dir.join("claude-settings.snippet.json");
     atomic_write(&snippet_path, &render_settings_snippet(&script_path))?;
 
-    // Cursor hooks need the omamori exe path; use current_exe as best effort
+    // Cursor hooks: resolve to stable Homebrew path to survive brew upgrade (#56)
     if let Ok(exe) = std::env::current_exe() {
+        let stable_exe = resolve_stable_exe_path(&exe);
         let cursor_path = hooks_dir.join("cursor-hooks.snippet.json");
-        atomic_write(&cursor_path, &render_cursor_hooks_snippet(&exe))?;
+        atomic_write(&cursor_path, &render_cursor_hooks_snippet(&stable_exe))?;
     }
 
     Ok(())
@@ -380,7 +395,42 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-fn render_cursor_hooks_snippet(omamori_exe: &Path) -> String {
+/// Extract the stable Homebrew-linked path from a versioned Cellar path.
+/// Pure function — no filesystem access. Returns `None` for non-Cellar paths.
+///
+/// Pattern: `<prefix>/Cellar/<formula>/<version>/bin/<binary>` → `<prefix>/bin/<binary>`
+fn cellar_to_stable_path(exe: &Path) -> Option<PathBuf> {
+    let s = exe.to_string_lossy();
+    let cellar_idx = s.find("/Cellar/")?;
+    let prefix = &s[..cellar_idx];
+    let bin_idx = s.rfind("/bin/")?;
+    let binary = &s[bin_idx + 5..];
+    (!binary.is_empty()).then(|| PathBuf::from(format!("{prefix}/bin/{binary}")))
+}
+
+/// Resolve a stable executable path for generated config files.
+///
+/// On Homebrew installs, `std::env::current_exe()` resolves symlinks to the versioned
+/// Cellar path, which breaks after `brew upgrade` + `brew cleanup`. This function
+/// converts it to the stable symlink path. See: #42 (shim fix), #56 (cursor hooks fix).
+///
+/// The `exists()` check has a TOCTOU window; this is acceptable because the worst case
+/// is writing a Cellar path — the same as pre-fix behavior, caught by `omamori status`.
+pub(crate) fn resolve_stable_exe_path(exe: &Path) -> PathBuf {
+    if let Some(stable) = cellar_to_stable_path(exe) {
+        if stable.exists() {
+            return stable;
+        }
+        eprintln!(
+            "omamori warning: Cellar path detected but stable path {} does not exist; \
+             using versioned path (may break after brew upgrade)",
+            stable.display()
+        );
+    }
+    exe.to_path_buf()
+}
+
+pub(crate) fn render_cursor_hooks_snippet(omamori_exe: &Path) -> String {
     // Use serde_json to generate correct JSON (handles path escaping properly)
     let command = format!("\"{}\" cursor-hook", omamori_exe.display());
     let snippet = serde_json::json!({
@@ -671,6 +721,99 @@ mod tests {
             hash.chars().all(|c| c.is_ascii_hexdigit()),
             "hash should contain only hex characters"
         );
+    }
+
+    // --- Cellar path resolution tests (#56) ---
+
+    #[test]
+    fn cellar_to_stable_apple_silicon() {
+        let p = Path::new("/opt/homebrew/Cellar/omamori/0.6.0/bin/omamori");
+        assert_eq!(
+            cellar_to_stable_path(p).unwrap(),
+            PathBuf::from("/opt/homebrew/bin/omamori")
+        );
+    }
+
+    #[test]
+    fn cellar_to_stable_intel() {
+        let p = Path::new("/usr/local/Cellar/omamori/0.6.0/bin/omamori");
+        assert_eq!(
+            cellar_to_stable_path(p).unwrap(),
+            PathBuf::from("/usr/local/bin/omamori")
+        );
+    }
+
+    #[test]
+    fn cellar_to_stable_linuxbrew() {
+        let p = Path::new("/home/linuxbrew/.linuxbrew/Cellar/omamori/0.6.0/bin/omamori");
+        assert_eq!(
+            cellar_to_stable_path(p).unwrap(),
+            PathBuf::from("/home/linuxbrew/.linuxbrew/bin/omamori")
+        );
+    }
+
+    #[test]
+    fn cellar_to_stable_cargo_install_returns_none() {
+        assert!(cellar_to_stable_path(Path::new("/Users/dev/.cargo/bin/omamori")).is_none());
+    }
+
+    #[test]
+    fn cellar_to_stable_manual_copy_returns_none() {
+        assert!(cellar_to_stable_path(Path::new("/usr/local/bin/omamori")).is_none());
+    }
+
+    #[test]
+    fn cellar_to_stable_formula_name_irrelevant() {
+        // Binary name is extracted from /bin/<binary>, not from formula dir
+        let p = Path::new("/opt/homebrew/Cellar/some-other-formula/1.0/bin/omamori");
+        assert_eq!(
+            cellar_to_stable_path(p).unwrap(),
+            PathBuf::from("/opt/homebrew/bin/omamori")
+        );
+    }
+
+    #[test]
+    fn cellar_to_stable_relative_path_returns_none() {
+        assert!(cellar_to_stable_path(Path::new("Cellar/omamori/0.6.0/bin/omamori")).is_none());
+    }
+
+    #[test]
+    fn cellar_to_stable_empty_path_returns_none() {
+        assert!(cellar_to_stable_path(Path::new("")).is_none());
+    }
+
+    #[test]
+    fn cellar_to_stable_incomplete_cellar_returns_none() {
+        // Has /Cellar/ but no /bin/
+        assert!(cellar_to_stable_path(Path::new("/opt/homebrew/Cellar/omamori/0.6.0/")).is_none());
+    }
+
+    #[test]
+    fn resolve_stable_uses_cellar_path_when_stable_missing() {
+        // Stable path won't exist → should fall back to input
+        let cellar = PathBuf::from("/nonexistent/Cellar/omamori/0.6.0/bin/omamori");
+        assert_eq!(resolve_stable_exe_path(&cellar), cellar);
+    }
+
+    #[test]
+    fn resolve_stable_passes_through_non_cellar() {
+        let cargo = PathBuf::from("/Users/dev/.cargo/bin/omamori");
+        assert_eq!(resolve_stable_exe_path(&cargo), cargo);
+    }
+
+    #[test]
+    fn resolve_stable_returns_stable_when_exists() {
+        let dir = std::env::temp_dir().join(format!("omamori-stable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("omamori"), "binary").unwrap();
+
+        let cellar = dir.join("Cellar/omamori/0.6.0/bin/omamori");
+        let expected = bin_dir.join("omamori");
+        assert_eq!(resolve_stable_exe_path(&cellar), expected);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     // --- omamori override block pattern tests ---
