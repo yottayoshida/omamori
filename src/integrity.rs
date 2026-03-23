@@ -108,9 +108,9 @@ pub fn generate_baseline(base_dir: &Path) -> Result<IntegrityBaseline, AppError>
     let shim_dir = base_dir.join("shim");
     let hooks_dir = base_dir.join("hooks");
 
-    // Resolve omamori exe path (stable symlink, not canonicalized)
+    // Resolve omamori exe path: use stable Homebrew path, not versioned Cellar path (#56)
     let omamori_exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
+        .map(|p| installer::resolve_stable_exe_path(&p).display().to_string())
         .unwrap_or_default();
 
     // Shims
@@ -255,6 +255,77 @@ pub fn canary(base_dir: &Path, program: &str) -> Option<String> {
 // Full check (omamori status)
 // ---------------------------------------------------------------------------
 
+/// Extract the omamori exe path embedded in a cursor hooks snippet.
+fn cursor_snippet_exe_path(content: &str) -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let cmd = v["hooks"]["beforeShellExecution"][0]["command"].as_str()?;
+    let path = cmd.strip_prefix('"')?.split('"').next()?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Validate cursor hooks snippet: hash comparison + dangling path detection.
+/// Byte-exact comparison against `render_cursor_hooks_snippet()` output;
+/// any difference (including formatting) is treated as a mismatch (#56, T8).
+fn check_cursor_snippet(path: &Path) -> CheckItem {
+    let name = "cursor-hooks.snippet.json".to_string();
+    let category = "Hooks";
+
+    if !path.exists() {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Warn,
+            detail: "(not installed — run `omamori install --hooks`)".to_string(),
+        };
+    }
+
+    let actual = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => {
+            return CheckItem {
+                category,
+                name,
+                status: CheckStatus::Fail,
+                detail: "(unreadable)".to_string(),
+            };
+        }
+    };
+
+    // Hash comparison: generate expected content from current stable exe path
+    let hash_ok = std::env::current_exe().ok().map(|exe| {
+        let stable = installer::resolve_stable_exe_path(&exe);
+        let expected = installer::render_cursor_hooks_snippet(&stable);
+        installer::hook_content_hash(&expected) == installer::hook_content_hash(&actual)
+    });
+
+    // Dangling path detection: check if the exe in the snippet actually exists
+    let dangling = cursor_snippet_exe_path(&actual).is_some_and(|p| !p.exists());
+
+    let (status, detail) = match (hash_ok, dangling) {
+        (Some(true), false) => (CheckStatus::Ok, "(hash match)"),
+        (Some(true), true) => (
+            CheckStatus::Warn,
+            "(path dangling — run `omamori install --hooks`)",
+        ),
+        (Some(false), _) => (
+            CheckStatus::Fail,
+            "(hash MISMATCH — run `omamori install --hooks`)",
+        ),
+        (None, false) => (CheckStatus::Warn, "(present, hash check skipped)"),
+        (None, true) => (
+            CheckStatus::Warn,
+            "(path dangling — run `omamori install --hooks`)",
+        ),
+    };
+
+    CheckItem {
+        category,
+        name,
+        status,
+        detail: detail.to_string(),
+    }
+}
+
 /// Run a full integrity check of all defense layers.
 pub fn full_check(base_dir: &Path) -> IntegrityReport {
     let mut items = Vec::new();
@@ -333,25 +404,27 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
         });
     }
 
-    // Check snippet files exist (content correctness is less critical)
-    for snippet in &["claude-settings.snippet.json", "cursor-hooks.snippet.json"] {
-        let path = hooks_dir.join(snippet);
-        if path.exists() {
-            items.push(CheckItem {
-                category: "Hooks",
-                name: snippet.to_string(),
-                status: CheckStatus::Ok,
-                detail: "(present)".to_string(),
-            });
-        } else {
-            items.push(CheckItem {
-                category: "Hooks",
-                name: snippet.to_string(),
-                status: CheckStatus::Warn,
-                detail: "(not installed)".to_string(),
-            });
+    // claude-settings.snippet.json — existence check only
+    let settings_snippet = hooks_dir.join("claude-settings.snippet.json");
+    items.push(if settings_snippet.exists() {
+        CheckItem {
+            category: "Hooks",
+            name: "claude-settings.snippet.json".to_string(),
+            status: CheckStatus::Ok,
+            detail: "(present)".to_string(),
         }
-    }
+    } else {
+        CheckItem {
+            category: "Hooks",
+            name: "claude-settings.snippet.json".to_string(),
+            status: CheckStatus::Warn,
+            detail: "(not installed)".to_string(),
+        }
+    });
+
+    // cursor-hooks.snippet.json — hash comparison + dangling path detection (#56, T8)
+    let cursor_snippet = hooks_dir.join("cursor-hooks.snippet.json");
+    items.push(check_cursor_snippet(&cursor_snippet));
 
     // --- Config ---
     if let Some(entry) = read_config_entry() {
@@ -680,5 +753,91 @@ mod tests {
         assert!(shim_items.iter().all(|i| i.status == CheckStatus::Fail));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Cursor snippet validation tests (#56) ---
+
+    #[test]
+    fn cursor_snippet_exe_path_extracts_path() {
+        let snippet =
+            installer::render_cursor_hooks_snippet(Path::new("/opt/homebrew/bin/omamori"));
+        let exe = cursor_snippet_exe_path(&snippet).unwrap();
+        assert_eq!(exe, PathBuf::from("/opt/homebrew/bin/omamori"));
+    }
+
+    #[test]
+    fn cursor_snippet_exe_path_returns_none_for_invalid_json() {
+        assert!(cursor_snippet_exe_path("not json").is_none());
+    }
+
+    #[test]
+    fn cursor_snippet_exe_path_returns_none_for_empty_command() {
+        let json = r#"{"hooks":{"beforeShellExecution":[{"command":""}]}}"#;
+        assert!(cursor_snippet_exe_path(json).is_none());
+    }
+
+    #[test]
+    fn check_cursor_snippet_detects_hash_match() {
+        let dir = std::env::temp_dir().join(format!("omamori-cursor-t1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write snippet using the same resolved path that check_cursor_snippet uses
+        let exe = installer::resolve_stable_exe_path(&std::env::current_exe().unwrap());
+        let content = installer::render_cursor_hooks_snippet(&exe);
+        let path = dir.join("cursor-hooks.snippet.json");
+        fs::write(&path, &content).unwrap();
+
+        let item = check_cursor_snippet(&path);
+        assert_eq!(item.status, CheckStatus::Ok);
+        assert!(item.detail.contains("hash match"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_cursor_snippet_detects_tampered_content() {
+        let dir = std::env::temp_dir().join(format!("omamori-cursor-t2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("cursor-hooks.snippet.json");
+        fs::write(
+            &path,
+            r#"{"hooks":{"beforeShellExecution":[{"command":"exit 0"}]}}"#,
+        )
+        .unwrap();
+
+        let item = check_cursor_snippet(&path);
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert!(item.detail.contains("MISMATCH"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_cursor_snippet_detects_dangling_path() {
+        let dir = std::env::temp_dir().join(format!("omamori-cursor-t3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Write snippet pointing to a nonexistent binary
+        let content = installer::render_cursor_hooks_snippet(Path::new("/nonexistent/bin/omamori"));
+        let path = dir.join("cursor-hooks.snippet.json");
+        fs::write(&path, &content).unwrap();
+
+        let item = check_cursor_snippet(&path);
+        // Either FAIL (hash mismatch) or WARN (dangling) — either way, not Ok
+        assert_ne!(item.status, CheckStatus::Ok);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn check_cursor_snippet_missing_returns_warn() {
+        let path = Path::new("/nonexistent/cursor-hooks.snippet.json");
+        let item = check_cursor_snippet(path);
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(item.detail.contains("not installed"));
     }
 }
