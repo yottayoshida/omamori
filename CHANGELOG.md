@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.1] - 2026-03-23
+
+### Fixed
+
+- **Cursor hook Cellar path resolution** (#56): `render_cursor_hooks_snippet()` and `regenerate_hooks()` now use `resolve_stable_exe_path()` to convert versioned Homebrew Cellar paths to stable symlink paths. Previously, `brew upgrade` + `brew cleanup` would silently break Cursor Layer 2 protection.
+- **`omamori install` Cellar path**: `run_install_command()` now resolves the stable path before passing to `InstallOptions`.
+- **`generate_baseline()` Cellar path**: Baseline `omamori_exe` field now records the stable path instead of the versioned Cellar path.
+
+### Security
+
+- **Cursor snippet integrity check** (T8): Upgraded from existence-only to SHA-256 hash comparison + dangling path detection. `omamori status` now reports FAIL on tampered snippets and WARN on dangling executable paths.
+- **`atomic_write` O_NOFOLLOW** (T7): Temp file creation now uses `O_NOFOLLOW` to prevent symlink-following attacks on the predictable temp path, symmetric with `integrity.rs::write_new_file()`.
+
+### Changed
+
+- README: Clarified that Cursor hooks require manual re-merge after `brew upgrade`, unlike Claude Code hooks which auto-sync.
+
 ## [0.6.0] - 2026-03-22
 
 ### Added
