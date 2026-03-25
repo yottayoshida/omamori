@@ -896,6 +896,170 @@ fn install_generates_integrity_baseline() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// hook-check Auto mode compatibility tests (#62)
+// ---------------------------------------------------------------------------
+
+/// Run `omamori hook-check --provider claude-code` with given stdin input.
+/// Returns (stdout, stderr, exit_code).
+fn run_hook_check(input: &str) -> (String, String, i32) {
+    let mut child = Command::new(binary())
+        .args(["hook-check", "--provider", "claude-code"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hook-check");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, exit_code)
+}
+
+/// Build a Claude Code PreToolUse JSON input for a Bash command.
+fn pretooluse_bash_json(command: &str) -> String {
+    serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command }
+    })
+    .to_string()
+}
+
+/// V-001, V-002, V-003, V-007: ALLOW returns valid hookSpecificOutput JSON
+#[test]
+fn hook_check_allow_returns_permission_decision_json() {
+    let (stdout, _, exit_code) = run_hook_check(&pretooluse_bash_json("ls /tmp"));
+    assert_eq!(exit_code, 0);
+    let trimmed = stdout.trim();
+    // V-001: valid JSON, single line
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "stdout must be exactly one JSON line"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(trimmed).expect("stdout must be valid JSON");
+    let hso = &parsed["hookSpecificOutput"];
+    // V-003: hookEventName
+    assert_eq!(hso["hookEventName"], "PreToolUse");
+    // V-002: permissionDecision
+    assert_eq!(hso["permissionDecision"], "allow");
+    // V-007: reason contains "omamori"
+    assert!(
+        hso["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("omamori"),
+        "reason must contain 'omamori'"
+    );
+}
+
+/// V-004, V-005: BLOCK (meta-pattern) — stdout empty, exit code 2
+#[test]
+fn hook_check_block_meta_has_empty_stdout_and_exit_2() {
+    let (stdout, stderr, exit_code) =
+        run_hook_check(&pretooluse_bash_json("/bin/rm -rf /tmp/test"));
+    assert_eq!(exit_code, 2, "BLOCK must exit with code 2");
+    assert!(stdout.trim().is_empty(), "BLOCK stdout must be empty");
+    assert!(
+        stderr.contains("omamori"),
+        "BLOCK stderr must contain block reason"
+    );
+}
+
+/// V-004, V-005: BLOCK (rule match) — stdout empty, exit code 2
+#[test]
+fn hook_check_block_rule_has_empty_stdout_and_exit_2() {
+    let (stdout, _, exit_code) = run_hook_check(&pretooluse_bash_json("rm -rf /"));
+    assert_eq!(exit_code, 2, "BLOCK must exit with code 2");
+    assert!(stdout.trim().is_empty(), "BLOCK stdout must be empty");
+}
+
+/// V-004, V-005: BLOCK (env unset tamper) — stdout empty, exit code 2
+#[test]
+fn hook_check_block_env_unset_has_empty_stdout_and_exit_2() {
+    let (stdout, _, exit_code) =
+        run_hook_check(&pretooluse_bash_json("unset CLAUDECODE && echo pwned"));
+    assert_eq!(exit_code, 2, "BLOCK must exit with code 2");
+    assert!(stdout.trim().is_empty(), "BLOCK stdout must be empty");
+}
+
+/// V-006: Empty command returns ALLOW JSON
+#[test]
+fn hook_check_empty_command_returns_allow_json() {
+    let (stdout, _, exit_code) = run_hook_check(&pretooluse_bash_json(""));
+    assert_eq!(exit_code, 0);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("empty command must return valid JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// V-008: OMAMORI_VERBOSE=1 does not pollute stdout (必須回帰テスト)
+#[test]
+fn hook_check_verbose_does_not_pollute_stdout() {
+    let mut child = Command::new(binary())
+        .args(["hook-check", "--provider", "claude-code"])
+        .env("OMAMORI_VERBOSE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hook-check");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(pretooluse_bash_json("ls /tmp").as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "verbose mode must not add lines to stdout"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(trimmed).is_ok(),
+        "stdout must remain valid JSON even in verbose mode"
+    );
+}
+
+/// V-010: Malformed (non-JSON) input still returns ALLOW JSON
+#[test]
+fn hook_check_malformed_input_returns_allow_json() {
+    let (stdout, _, exit_code) = run_hook_check("this is not json at all");
+    assert_eq!(exit_code, 0);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("malformed input must still return valid JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// V-006 variant: Completely empty stdin returns ALLOW JSON
+#[test]
+fn hook_check_empty_stdin_returns_allow_json() {
+    let (stdout, _, exit_code) = run_hook_check("");
+    assert_eq!(exit_code, 0);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("empty stdin must return valid JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+// ---------------------------------------------------------------------------
+// hook-check meta-pattern tests (pre-existing)
+// ---------------------------------------------------------------------------
+
 #[test]
 fn hook_check_blocks_integrity_json() {
     // Verify meta-patterns block .integrity.json editing
