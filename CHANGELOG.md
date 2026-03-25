@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.2] - 2026-03-25
+
+### Added
+
+- **Claude Code Auto mode compatibility** (#62): `hook-check` now returns `hookSpecificOutput` JSON with `permissionDecision: "allow"` on stdout when a command is allowed. This enables Claude Code Auto mode to skip user prompts for safe commands. Without this, every Bash command required manual confirmation in Auto mode.
+
+### Unchanged
+
+- **BLOCK path**: Exit code 2 + stderr message behavior is completely unchanged. `permissionDecision` JSON is only emitted on ALLOW — BLOCK uses exit code 2 which overrides all Claude Code permission rules.
+
 ## [0.6.1] - 2026-03-23
 
 ### Fixed
