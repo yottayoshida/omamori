@@ -26,7 +26,7 @@ omamori install --hooks
 export PATH="$HOME/.omamori/shim:$PATH"
 ```
 
-That's it. After `brew upgrade`, shims and Claude Code hooks auto-update on the next command. **Cursor users**: re-merge the hook snippet after upgrades (see [Auto-sync](#how-it-works)).
+That's it. Works with Claude Code Auto mode — no extra config needed. After `brew upgrade`, shims and Claude Code hooks auto-update on the next command. **Cursor users**: re-merge the hook snippet after upgrades (see [Auto-sync](#how-it-works)).
 
 ## What It Blocks
 
@@ -71,6 +71,8 @@ Terminal → rm -rf src/
 
 **Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting and direct config file editing. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
+**Auto mode compatible** (v0.6.2+): Works seamlessly with Claude Code's [Auto mode](https://claude.com/blog/auto-mode) — safe commands proceed without prompts, dangerous commands are still hard-blocked.
+
 **Auto-sync**: After `brew upgrade`, the shim detects version mismatch and auto-regenerates hook files on the next invocation.
 
 - **Claude Code**: Hooks are applied automatically. No action needed.
@@ -84,7 +86,7 @@ Terminal → rm -rf src/
 
 | Tier | Tools | Coverage |
 |------|-------|----------|
-| **Supported** | Claude Code, Codex CLI, Cursor | E2E tested. Layer 1 + Layer 2 (where available). |
+| **Supported** | Claude Code, Codex CLI, Cursor | E2E tested. Layer 1 + Layer 2 (where available). Auto mode compatible. |
 | **Community** | Gemini CLI, Cline, others | Layer 1 only. Not E2E tested. |
 | **Fallback** | Any tool setting `AI_GUARD=1` | Layer 1 only. |
 
@@ -189,10 +191,6 @@ These are inherent to the PATH shim approach and documented honestly:
 - **AI self-bypass** — `config disable`/`uninstall` are blocked; direct file editing blocked by hooks (Claude Code only)
 
 For the full security model, bypass corpus, and known limitations, see [SECURITY.md](SECURITY.md).
-
-## Related
-
-- **[nanika](https://github.com/yottayoshida/nanika)** — explains what AI commands will do. Complementary to omamori.
 
 ## License
 
