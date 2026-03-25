@@ -8,7 +8,7 @@ The format is based on Keep a Changelog.
 
 ### Added
 
-- **Claude Code Auto mode compatibility** (#62): `hook-check` now returns `hookSpecificOutput` JSON with `permissionDecision: "allow"` on stdout when a command is allowed. This enables Claude Code Auto mode to skip user prompts for safe commands. Without this, every Bash command required manual confirmation in Auto mode.
+- **Claude Code Auto mode compatibility** (#62): `hook-check` now returns `hookSpecificOutput` JSON with `permissionDecision: "allow"` on stdout when a command is allowed. This follows the Claude Code hook protocol, ensuring omamori explicitly signals permission decisions rather than relying on implicit behavior (exit 0 + empty stdout).
 
 ### Unchanged
 
