@@ -978,13 +978,17 @@ fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     let command = extract_command_from_hook_input(&input);
 
     if command.is_empty() {
-        return Ok(0); // empty command = allow
+        print_hook_check_allow_response("omamori: empty command");
+        return Ok(0);
     }
 
     let verbose = std::env::var("OMAMORI_VERBOSE").is_ok();
 
     match check_command_for_hook(&command) {
-        HookCheckResult::Allow => Ok(0),
+        HookCheckResult::Allow => {
+            print_hook_check_allow_response("omamori: no dangerous pattern detected");
+            Ok(0)
+        }
         HookCheckResult::BlockMeta(reason) => {
             eprintln!("omamori hook: blocked — {reason}");
             if verbose {
@@ -1058,6 +1062,25 @@ fn parse_provider_flag(args: &[OsString]) -> String {
         }
     }
     "unknown".to_string()
+}
+
+/// Print hookSpecificOutput JSON for Claude Code PreToolUse hook (Auto mode compatibility).
+/// Only used on ALLOW path — BLOCK uses exit code 2 (stdout ignored by Claude Code).
+fn print_hook_check_allow_response(reason: &str) {
+    let response = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason,
+        }
+    });
+    // Fallback: if serialization somehow fails, emit a hardcoded JSON string (fail-safe)
+    println!(
+        "{}",
+        serde_json::to_string(&response).unwrap_or_else(|_| {
+            r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"omamori: fallback"}}"#.to_string()
+        })
+    );
 }
 
 fn print_cursor_response(
