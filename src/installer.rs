@@ -6,6 +6,10 @@ use sha2::{Digest, Sha256};
 
 use crate::AppError;
 
+/// Marker used to identify omamori entries in Codex hooks.json.
+/// Codex displays `statusMessage` in the TUI, so this doubles as user feedback.
+const CODEX_STATUS_MESSAGE: &str = "omamori: checking command safety";
+
 pub const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
 
 #[derive(Debug, Clone)]
@@ -24,6 +28,33 @@ pub struct InstallResult {
     pub hook_script: Option<PathBuf>,
     pub settings_snippet: Option<PathBuf>,
     pub cursor_hook_snippet: Option<PathBuf>,
+    pub codex_wrapper: Option<PathBuf>,
+    pub codex_hooks_outcome: Option<CodexHooksOutcome>,
+    pub codex_config_outcome: Option<CodexConfigOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CodexHooksOutcome {
+    /// omamori entry merged into hooks.json
+    Merged,
+    /// hooks.json created from scratch
+    Created,
+    /// omamori entry already present and up to date
+    AlreadyPresent,
+    /// Skipped with reason (parse failure, symlink, etc.)
+    Skipped(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum CodexConfigOutcome {
+    /// `codex_hooks = true` added to config.toml
+    Added,
+    /// Already set to true
+    AlreadyEnabled,
+    /// User explicitly set false — not touched
+    ExplicitlyDisabled,
+    /// Skipped with reason (no file, parse failure, etc.)
+    Skipped(String),
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +118,13 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         None
     };
 
+    // Generate Codex CLI hook (wrapper → hooks.json → config.toml)
+    let (codex_wrapper, codex_hooks_outcome, codex_config_outcome) = if options.generate_hooks {
+        setup_codex_hooks(&options.base_dir, &options.source_exe)
+    } else {
+        (None, None, None)
+    };
+
     // Generate integrity baseline after install
     if let Err(e) = generate_install_baseline(&options.base_dir) {
         eprintln!("omamori: warning — failed to generate integrity baseline: {e}");
@@ -98,6 +136,9 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         hook_script,
         settings_snippet,
         cursor_hook_snippet,
+        codex_wrapper,
+        codex_hooks_outcome,
+        codex_config_outcome,
     })
 }
 
@@ -118,11 +159,18 @@ pub fn uninstall(base_dir: &Path) -> Result<UninstallResult, AppError> {
         hooks_dir.join("claude-pretooluse.sh"),
         hooks_dir.join("claude-settings.snippet.json"),
         hooks_dir.join("cursor-hooks.snippet.json"),
+        hooks_dir.join("codex-pretooluse.sh"),
+        hooks_dir.join("codex-hooks.snippet.json"),
     ] {
         if path.exists() {
             fs::remove_file(&path)?;
             removed_entries.push(path);
         }
+    }
+
+    // Remove omamori entry from Codex hooks.json (preserve other entries)
+    if let Err(e) = remove_codex_hooks_entry() {
+        eprintln!("omamori: warning — failed to clean Codex hooks.json: {e}");
     }
 
     // Remove integrity baseline
@@ -265,6 +313,23 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
         let stable_exe = resolve_stable_exe_path(&exe);
         let cursor_path = hooks_dir.join("cursor-hooks.snippet.json");
         atomic_write(&cursor_path, &render_cursor_hooks_snippet(&stable_exe))?;
+
+        // Codex hooks: regenerate wrapper + re-merge hooks.json
+        let codex_wrapper = hooks_dir.join("codex-pretooluse.sh");
+        if codex_wrapper.exists() {
+            atomic_write(&codex_wrapper, &render_codex_pretooluse_script(&stable_exe))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&codex_wrapper)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&codex_wrapper, perms)?;
+            }
+            let codex_dir = codex_home_dir();
+            if is_real_directory(&codex_dir) {
+                let _ = merge_codex_hooks(&codex_dir, &codex_wrapper);
+            }
+        }
     }
 
     Ok(())
@@ -392,6 +457,20 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
             ".integrity.json",
             "blocked attempt to edit integrity baseline",
         ),
+        // Codex CLI hook protection (#66, T2/T3)
+        (
+            ".codex/hooks.json",
+            "blocked attempt to edit Codex hooks config",
+        ),
+        (".codex/config.toml", "blocked attempt to edit Codex config"),
+        (
+            "config.toml.bak",
+            "blocked attempt to use Codex config backup",
+        ),
+        (
+            "codex_hooks",
+            "blocked attempt to modify Codex hooks feature flag",
+        ),
     ]
 }
 
@@ -461,6 +540,357 @@ fn render_settings_snippet(script_path: &Path) -> String {
     format!(
         "{{\n  \"hooks\": {{\n    \"PreToolUse\": [{{\n      \"matcher\": \"*\",\n      \"command\": \"{escaped}\"\n    }}]\n  }}\n}}\n"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Codex CLI hook support (#66)
+// ---------------------------------------------------------------------------
+
+/// Default Codex CLI config directory.
+fn codex_home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+}
+
+/// True only if `path` is a real directory (not a symlink to one).
+fn is_real_directory(path: &Path) -> bool {
+    path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// True only if `path` is a regular file (not a symlink to one).
+fn is_real_file(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+}
+
+/// Render the fail-close wrapper script for Codex CLI.
+///
+/// Codex treats exit 2 as BLOCK, but exit 1 as ALLOW (fail-open).
+/// This wrapper converts any non-zero exit from `hook-check` into exit 2.
+pub fn render_codex_pretooluse_script(omamori_exe: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+# omamori hook v{version} — Codex CLI fail-close wrapper
+# Codex: exit 0 = allow, exit 2 = block, exit 1 = allow (fail-open!)
+# This wrapper maps all non-zero exits to exit 2 for fail-close safety.
+set -u
+cat | "{exe}" hook-check --provider codex
+STATUS=$?
+if [ "$STATUS" -eq 0 ]; then exit 0; else exit 2; fi
+"#,
+        version = env!("CARGO_PKG_VERSION"),
+        exe = omamori_exe.display(),
+    )
+}
+
+/// Build the JSON value for one omamori entry inside `hooks.PreToolUse`.
+fn codex_hooks_entry(wrapper_path: &Path) -> serde_json::Value {
+    // Quote the path to handle spaces (Codex executes command via shell)
+    let command = shell_words::quote(&wrapper_path.display().to_string()).into_owned();
+    serde_json::json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": 30,
+            "statusMessage": CODEX_STATUS_MESSAGE
+        }]
+    })
+}
+
+/// Merge omamori's PreToolUse entry into `~/.codex/hooks.json`.
+///
+/// Strategy:
+/// - File missing → create with omamori entry only.
+/// - File exists, valid JSON → upsert by matching `statusMessage`.
+/// - File exists, invalid JSON → do nothing, return Skipped.
+pub(crate) fn merge_codex_hooks(
+    codex_dir: &Path,
+    wrapper_path: &Path,
+) -> Result<CodexHooksOutcome, std::io::Error> {
+    let hooks_path = codex_dir.join("hooks.json");
+    let entry = codex_hooks_entry(wrapper_path);
+
+    // --- No file: create from scratch ---
+    if !hooks_path.exists() && !hooks_path.is_symlink() {
+        let doc = serde_json::json!({
+            "hooks": { "PreToolUse": [entry] }
+        });
+        atomic_write(&hooks_path, &serde_json::to_string_pretty(&doc).unwrap())?;
+        return Ok(CodexHooksOutcome::Created);
+    }
+
+    // --- Symlink check: refuse to follow symlinks ---
+    if hooks_path.is_symlink() || !is_real_file(&hooks_path) {
+        return Ok(CodexHooksOutcome::Skipped(
+            "hooks.json is a symlink or not a regular file".into(),
+        ));
+    }
+
+    // --- Read & parse ---
+    let raw = fs::read_to_string(&hooks_path)?;
+    let mut doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => return Ok(CodexHooksOutcome::Skipped(format!("JSON parse error: {e}"))),
+    };
+
+    // Ensure hooks.PreToolUse is an array
+    let arr = doc
+        .as_object_mut()
+        .and_then(|o| {
+            o.entry("hooks")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        })
+        .and_then(|h| {
+            let pre = h
+                .entry("PreToolUse")
+                .or_insert_with(|| serde_json::json!([]));
+            pre.as_array_mut()
+        });
+
+    let arr = match arr {
+        Some(a) => a,
+        None => {
+            return Ok(CodexHooksOutcome::Skipped(
+                "hooks.PreToolUse is not an array".into(),
+            ));
+        }
+    };
+
+    // Find existing omamori entry by statusMessage (exact match)
+    let existing_idx = arr.iter().position(|e| {
+        e.pointer("/hooks/0/statusMessage").and_then(|v| v.as_str()) == Some(CODEX_STATUS_MESSAGE)
+    });
+
+    if let Some(idx) = existing_idx {
+        if arr[idx] == entry {
+            return Ok(CodexHooksOutcome::AlreadyPresent);
+        }
+        arr[idx] = entry;
+    } else {
+        arr.push(entry);
+    }
+
+    atomic_write(&hooks_path, &serde_json::to_string_pretty(&doc).unwrap())?;
+    Ok(CodexHooksOutcome::Merged)
+}
+
+/// Remove omamori's entry from `~/.codex/hooks.json` during uninstall.
+fn remove_codex_hooks_entry() -> Result<(), std::io::Error> {
+    let hooks_path = codex_home_dir().join("hooks.json");
+    if !hooks_path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&hooks_path)?;
+    let mut doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // Can't parse → leave alone
+    };
+
+    let modified = doc
+        .pointer_mut("/hooks/PreToolUse")
+        .and_then(|v| v.as_array_mut())
+        .map(|arr| {
+            let before = arr.len();
+            arr.retain(|e| {
+                e.pointer("/hooks/0/statusMessage").and_then(|v| v.as_str())
+                    != Some(CODEX_STATUS_MESSAGE)
+            });
+            arr.len() != before
+        })
+        .unwrap_or(false);
+
+    if modified {
+        atomic_write(&hooks_path, &serde_json::to_string_pretty(&doc).unwrap())?;
+    }
+    Ok(())
+}
+
+/// Ensure `[features] codex_hooks = true` in `~/.codex/config.toml`.
+///
+/// Uses `toml_edit` to preserve comments, formatting, and existing content.
+pub(crate) fn update_codex_config(codex_dir: &Path) -> Result<CodexConfigOutcome, std::io::Error> {
+    let config_path = codex_dir.join("config.toml");
+
+    if !config_path.exists() {
+        return Ok(CodexConfigOutcome::Skipped("config.toml not found".into()));
+    }
+    if config_path.is_symlink() || !is_real_file(&config_path) {
+        return Ok(CodexConfigOutcome::Skipped(
+            "config.toml is a symlink or not a regular file".into(),
+        ));
+    }
+
+    let raw = fs::read_to_string(&config_path)?;
+    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("TOML parse: {e}"))
+    })?;
+
+    // Check current state
+    if let Some(features) = doc.get("features") {
+        if !features.is_table() && !features.is_table_like() {
+            return Ok(CodexConfigOutcome::Skipped(
+                "features is not a table".into(),
+            ));
+        }
+        if let Some(item) = features.get("codex_hooks") {
+            if item.as_bool() == Some(true) {
+                return Ok(CodexConfigOutcome::AlreadyEnabled);
+            }
+            if item.as_bool() == Some(false) {
+                return Ok(CodexConfigOutcome::ExplicitlyDisabled);
+            }
+        }
+    }
+
+    // Backup before modifying
+    let backup_path = codex_dir.join("config.toml.bak");
+    fs::copy(&config_path, &backup_path)?;
+
+    // Set features.codex_hooks = true (creates [features] section if needed)
+    doc["features"]["codex_hooks"] = toml_edit::value(true);
+
+    atomic_write(&config_path, &doc.to_string())?;
+    Ok(CodexConfigOutcome::Added)
+}
+
+/// Orchestrate the full Codex hook setup.
+///
+/// Invariant: writes in order wrapper → hooks.json → config.toml
+/// so that hooks.json never references a non-existent wrapper.
+fn setup_codex_hooks(
+    base_dir: &Path,
+    source_exe: &Path,
+) -> (
+    Option<PathBuf>,
+    Option<CodexHooksOutcome>,
+    Option<CodexConfigOutcome>,
+) {
+    let codex_dir = codex_home_dir();
+    if !is_real_directory(&codex_dir) {
+        return (None, None, None); // Codex not installed
+    }
+
+    let hooks_dir = base_dir.join("hooks");
+    let wrapper_path = hooks_dir.join("codex-pretooluse.sh");
+
+    // Step 1: wrapper script (must exist before hooks.json references it)
+    if let Err(e) = atomic_write(&wrapper_path, &render_codex_pretooluse_script(source_exe)) {
+        eprintln!("omamori: warning — Codex wrapper: {e}");
+        return (None, None, None);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(mut perms) = fs::metadata(&wrapper_path).map(|m| m.permissions()) {
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(&wrapper_path, perms);
+        }
+    }
+
+    // Step 2: hooks.json
+    let hooks_outcome = merge_codex_hooks(&codex_dir, &wrapper_path)
+        .unwrap_or_else(|e| CodexHooksOutcome::Skipped(format!("I/O: {e}")));
+    if matches!(hooks_outcome, CodexHooksOutcome::Skipped(_)) {
+        let snippet_path = hooks_dir.join("codex-hooks.snippet.json");
+        let _ = atomic_write(&snippet_path, &render_codex_hooks_snippet(&wrapper_path));
+    }
+
+    // Step 3: config.toml
+    let config_outcome = match update_codex_config(&codex_dir) {
+        Ok(outcome) => outcome,
+        Err(e) => CodexConfigOutcome::Skipped(format!("I/O: {e}")),
+    };
+
+    (
+        Some(wrapper_path),
+        Some(hooks_outcome),
+        Some(config_outcome),
+    )
+}
+
+/// Auto-setup Codex hooks from shim when `CODEX_CI` is detected
+/// but the wrapper script doesn't exist yet.
+///
+/// Non-fatal: all errors are logged to stderr and swallowed.
+/// Returns `true` if setup was performed.
+pub fn auto_setup_codex_if_needed(base_dir: &Path) -> bool {
+    // Fast path: no CODEX_CI env → skip (0 cost)
+    if std::env::var_os("CODEX_CI").is_none() {
+        return false;
+    }
+
+    let wrapper_path = base_dir.join("hooks/codex-pretooluse.sh");
+    if wrapper_path.exists() {
+        return false; // Already configured
+    }
+
+    // Codex detected but hooks not set up — auto-configure
+    let source_exe = match std::env::current_exe() {
+        Ok(exe) => resolve_stable_exe_path(&exe),
+        Err(_) => return false,
+    };
+
+    let codex_dir = codex_home_dir();
+    if !is_real_directory(&codex_dir) {
+        return false;
+    }
+
+    eprintln!("omamori: Codex CLI detected — auto-configuring hooks");
+
+    let hooks_dir = base_dir.join("hooks");
+    if fs::create_dir_all(&hooks_dir).is_err() {
+        eprintln!("omamori: warning — could not create hooks directory");
+        return false;
+    }
+
+    let (wrapper, hooks_out, config_out) = setup_codex_hooks(base_dir, &source_exe);
+
+    if let Some(ref path) = wrapper {
+        eprintln!("omamori: [done] {} (created)", path.display());
+    }
+    match hooks_out {
+        Some(CodexHooksOutcome::Created | CodexHooksOutcome::Merged) => {
+            eprintln!("omamori: [done] ~/.codex/hooks.json (merged)");
+        }
+        Some(CodexHooksOutcome::Skipped(ref reason)) => {
+            eprintln!("omamori: [warn] ~/.codex/hooks.json — {reason}");
+        }
+        _ => {}
+    }
+    match config_out {
+        Some(CodexConfigOutcome::Added) => {
+            eprintln!("omamori: [done] ~/.codex/config.toml (codex_hooks = true)");
+        }
+        Some(CodexConfigOutcome::ExplicitlyDisabled) => {
+            eprintln!(
+                "omamori: [warn] ~/.codex/config.toml: codex_hooks = false (set by user, not changed)"
+            );
+            eprintln!("omamori:        hooks will NOT activate until you set codex_hooks = true");
+        }
+        Some(CodexConfigOutcome::Skipped(ref reason)) => {
+            eprintln!("omamori: [warn] ~/.codex/config.toml — {reason}");
+        }
+        _ => {}
+    }
+
+    wrapper.is_some()
+}
+
+/// Render a Codex hooks.json snippet file (fallback for manual merge).
+pub(crate) fn render_codex_hooks_snippet(wrapper_path: &Path) -> String {
+    let doc = serde_json::json!({
+        "_comment": format!(
+            "Generated by omamori v{}. Merge PreToolUse entry into ~/.codex/hooks.json",
+            env!("CARGO_PKG_VERSION")
+        ),
+        "hooks": { "PreToolUse": [codex_hooks_entry(wrapper_path)] }
+    });
+    serde_json::to_string_pretty(&doc).unwrap() + "\n"
 }
 
 #[cfg(test)]
@@ -825,6 +1255,269 @@ mod tests {
             patterns.iter().any(|(p, _)| p.contains("omamori override")),
             "meta-patterns should block 'omamori override'"
         );
+    }
+
+    // --- Codex CLI hook tests (#66) ---
+
+    #[test]
+    fn codex_pretooluse_script_contains_fail_close_logic() {
+        let script = render_codex_pretooluse_script(Path::new("/usr/local/bin/omamori"));
+        assert!(script.contains("exit 2"), "must map non-zero to exit 2");
+        assert!(script.contains("hook-check --provider codex"));
+        assert!(script.contains("set -u"));
+        assert!(script.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn codex_hooks_entry_has_status_message() {
+        let entry = codex_hooks_entry(Path::new("/path/to/wrapper.sh"));
+        let msg = entry
+            .pointer("/hooks/0/statusMessage")
+            .and_then(|v| v.as_str());
+        assert_eq!(msg, Some(CODEX_STATUS_MESSAGE));
+    }
+
+    #[test]
+    fn merge_codex_hooks_creates_new_file() {
+        let dir = std::env::temp_dir().join(format!("omamori-codex-new-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let wrapper = dir.join("wrapper.sh");
+        fs::write(&wrapper, "#!/bin/sh").unwrap();
+
+        let result = merge_codex_hooks(&dir, &wrapper).unwrap();
+        assert!(matches!(result, CodexHooksOutcome::Created));
+
+        let content = fs::read_to_string(dir.join("hooks.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            doc.pointer("/hooks/PreToolUse/0/hooks/0/statusMessage")
+                .is_some()
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_codex_hooks_preserves_existing_entries() {
+        let dir = std::env::temp_dir().join(format!("omamori-codex-merge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Pre-existing hooks.json with UserPromptSubmit
+        let existing = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/tmp/test.sh"}]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/other/tool"}]}]
+            }
+        });
+        fs::write(
+            dir.join("hooks.json"),
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        let wrapper = dir.join("wrapper.sh");
+        fs::write(&wrapper, "#!/bin/sh").unwrap();
+
+        let result = merge_codex_hooks(&dir, &wrapper).unwrap();
+        assert!(matches!(result, CodexHooksOutcome::Merged));
+
+        let content = fs::read_to_string(dir.join("hooks.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // UserPromptSubmit preserved
+        assert!(doc.pointer("/hooks/UserPromptSubmit/0").is_some());
+        // Original PreToolUse entry preserved
+        let arr = doc
+            .pointer("/hooks/PreToolUse")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 2, "should have original + omamori entry");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_codex_hooks_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("omamori-codex-idem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let wrapper = dir.join("wrapper.sh");
+        fs::write(&wrapper, "#!/bin/sh").unwrap();
+
+        // First merge
+        let r1 = merge_codex_hooks(&dir, &wrapper).unwrap();
+        assert!(matches!(r1, CodexHooksOutcome::Created));
+
+        // Second merge — should detect existing entry
+        let r2 = merge_codex_hooks(&dir, &wrapper).unwrap();
+        assert!(matches!(r2, CodexHooksOutcome::AlreadyPresent));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_codex_hooks_skips_invalid_json() {
+        let dir = std::env::temp_dir().join(format!("omamori-codex-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("hooks.json"), "{ not valid json }}}").unwrap();
+
+        let wrapper = dir.join("wrapper.sh");
+        fs::write(&wrapper, "#!/bin/sh").unwrap();
+
+        let result = merge_codex_hooks(&dir, &wrapper).unwrap();
+        assert!(matches!(result, CodexHooksOutcome::Skipped(_)));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_codex_hooks_entry_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("omamori-codex-rm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Set HOME so codex_home_dir() points to our test dir
+        // We test remove_codex_hooks_entry indirectly through merge + manual cleanup
+        let wrapper = dir.join("wrapper.sh");
+        fs::write(&wrapper, "#!/bin/sh").unwrap();
+
+        merge_codex_hooks(&dir, &wrapper).unwrap();
+
+        // Verify entry exists
+        let content = fs::read_to_string(dir.join("hooks.json")).unwrap();
+        assert!(content.contains(CODEX_STATUS_MESSAGE));
+
+        // Manual removal (since remove_codex_hooks_entry uses codex_home_dir())
+        let raw = fs::read_to_string(dir.join("hooks.json")).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if let Some(arr) = doc
+            .pointer_mut("/hooks/PreToolUse")
+            .and_then(|v| v.as_array_mut())
+        {
+            arr.retain(|e| {
+                e.pointer("/hooks/0/statusMessage").and_then(|v| v.as_str())
+                    != Some(CODEX_STATUS_MESSAGE)
+            });
+        }
+        fs::write(
+            dir.join("hooks.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        let cleaned = fs::read_to_string(dir.join("hooks.json")).unwrap();
+        assert!(!cleaned.contains(CODEX_STATUS_MESSAGE));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn is_real_directory_rejects_symlinks() {
+        let dir = std::env::temp_dir().join(format!("omamori-symdir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let real = dir.join("real");
+        let link = dir.join("link");
+        fs::create_dir_all(&real).unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(is_real_directory(&real));
+        #[cfg(unix)]
+        assert!(!is_real_directory(&link));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_codex_config_skips_non_table_features() {
+        let dir = std::env::temp_dir().join(format!("omamori-toml-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("config.toml"), "features = \"oops\"\n").unwrap();
+
+        let result = update_codex_config(&dir).unwrap();
+        assert!(
+            matches!(result, CodexConfigOutcome::Skipped(ref s) if s.contains("not a table")),
+            "should skip when features is not a table, got: {result:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_codex_config_adds_feature_flag() {
+        let dir = std::env::temp_dir().join(format!("omamori-toml-add-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("config.toml"), "model = \"gpt-5.3-codex\"\n").unwrap();
+
+        let result = update_codex_config(&dir).unwrap();
+        assert!(matches!(result, CodexConfigOutcome::Added));
+
+        let content = fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(content.contains("codex_hooks = true"));
+        // Backup created
+        assert!(dir.join("config.toml.bak").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_codex_config_idempotent() {
+        let dir = std::env::temp_dir().join(format!("omamori-toml-idem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("config.toml"), "[features]\ncodex_hooks = true\n").unwrap();
+
+        let result = update_codex_config(&dir).unwrap();
+        assert!(matches!(result, CodexConfigOutcome::AlreadyEnabled));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn update_codex_config_respects_explicit_false() {
+        let dir = std::env::temp_dir().join(format!("omamori-toml-false-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("config.toml"), "[features]\ncodex_hooks = false\n").unwrap();
+
+        let result = update_codex_config(&dir).unwrap();
+        assert!(matches!(result, CodexConfigOutcome::ExplicitlyDisabled));
+
+        // File not modified
+        let content = fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(content.contains("codex_hooks = false"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn meta_patterns_cover_codex_protection() {
+        let patterns = blocked_command_patterns();
+        for keyword in &[
+            ".codex/hooks.json",
+            ".codex/config.toml",
+            "config.toml.bak",
+            "codex_hooks",
+        ] {
+            assert!(
+                patterns.iter().any(|(p, _)| p.contains(keyword)),
+                "should block: {keyword}"
+            );
+        }
     }
 
     #[test]
