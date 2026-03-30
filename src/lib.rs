@@ -326,6 +326,45 @@ fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
     if let Some(cursor_snippet) = &result.cursor_hook_snippet {
         println!("  [done] Cursor hook snippet: {}", cursor_snippet.display());
     }
+    if let Some(wrapper) = &result.codex_wrapper {
+        println!("  [done] Codex CLI wrapper: {}", wrapper.display());
+    }
+    match &result.codex_hooks_outcome {
+        Some(installer::CodexHooksOutcome::Created) => {
+            println!("  [done] Codex CLI hooks.json: created ~/.codex/hooks.json");
+        }
+        Some(installer::CodexHooksOutcome::Merged) => {
+            println!("  [done] Codex CLI hooks.json: merged into ~/.codex/hooks.json");
+        }
+        Some(installer::CodexHooksOutcome::AlreadyPresent) => {
+            println!("  [skip] Codex CLI hooks.json: already configured");
+        }
+        Some(installer::CodexHooksOutcome::Skipped(reason)) => {
+            println!("  [warn] Codex CLI hooks.json: {reason}");
+            println!("         Manual merge needed: cat ~/.omamori/hooks/codex-hooks.snippet.json");
+        }
+        None => {}
+    }
+    match &result.codex_config_outcome {
+        Some(installer::CodexConfigOutcome::Added) => {
+            println!("  [done] Codex CLI config.toml: set [features] codex_hooks = true");
+            println!("         (backup: ~/.codex/config.toml.bak)");
+        }
+        Some(installer::CodexConfigOutcome::AlreadyEnabled) => {
+            println!("  [skip] Codex CLI config.toml: codex_hooks already enabled");
+        }
+        Some(installer::CodexConfigOutcome::ExplicitlyDisabled) => {
+            println!(
+                "  [warn] Codex CLI config.toml: codex_hooks = false (set by user, not changed)"
+            );
+            println!("         omamori hooks will NOT activate until you set codex_hooks = true");
+            println!("         in ~/.codex/config.toml");
+        }
+        Some(installer::CodexConfigOutcome::Skipped(reason)) => {
+            println!("  [warn] Codex CLI config.toml: {reason}");
+        }
+        None => {}
+    }
 
     // Config
     println!("\nConfig:");
@@ -446,8 +485,11 @@ fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError> {
     // Step 2: Hook version + content hash check, regenerate if needed
     let hooks_regenerated = ensure_hooks_current();
 
-    // Step 3: If hooks were regenerated, update baseline to prevent false positives
-    if hooks_regenerated {
+    // Step 2b: Auto-setup Codex hooks if CODEX_CI detected but not configured
+    let codex_setup = installer::auto_setup_codex_if_needed(&base_dir);
+
+    // Step 3: If hooks were regenerated or Codex was set up, update baseline
+    if hooks_regenerated || codex_setup {
         update_baseline_silent(&base_dir);
     }
 
@@ -760,7 +802,7 @@ fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
         "[ok]", "Layer 2 (hooks)"
     );
     println!(
-        "  {:<6} {:<36} Claude Code + Cursor",
+        "  {:<6} {:<36} Claude Code + Codex CLI + Cursor",
         "[info]", "Layer 2 coverage"
     );
     println!();

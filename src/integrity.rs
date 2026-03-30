@@ -132,6 +132,7 @@ pub fn generate_baseline(base_dir: &Path) -> Result<IntegrityBaseline, AppError>
         "claude-pretooluse.sh",
         "claude-settings.snippet.json",
         "cursor-hooks.snippet.json",
+        "codex-pretooluse.sh",
     ];
     for name in &hook_files {
         let path = hooks_dir.join(name);

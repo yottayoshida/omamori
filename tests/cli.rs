@@ -1080,3 +1080,112 @@ fn blocked_patterns_include_integrity_json() {
         "blocked_command_patterns should include .integrity.json"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Codex CLI hook-check compatibility tests (#66)
+// ---------------------------------------------------------------------------
+
+/// Build a Codex CLI PreToolUse JSON input (includes extra fields vs Claude Code).
+fn codex_pretooluse_json(command: &str) -> String {
+    serde_json::json!({
+        "session_id": "019d3c44-test",
+        "turn_id": "019d3c45-test",
+        "transcript_path": "/tmp/test-session.jsonl",
+        "cwd": "/tmp",
+        "hook_event_name": "PreToolUse",
+        "model": "gpt-5.4",
+        "permission_mode": "default",
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "tool_use_id": "call_test_001"
+    })
+    .to_string()
+}
+
+/// V-001 (Codex): safe command → ALLOW (exit 0)
+#[test]
+fn codex_hook_check_allow() {
+    let (stdout, _, exit_code) = run_hook_check(&codex_pretooluse_json("ls /tmp"));
+    assert_eq!(exit_code, 0, "safe command should exit 0");
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// V-001 (Codex): dangerous command → BLOCK (exit 2)
+#[test]
+fn codex_hook_check_block_rm_rf() {
+    let (stdout, stderr, exit_code) = run_hook_check(&codex_pretooluse_json("rm -rf /"));
+    assert_eq!(exit_code, 2, "rm -rf should exit 2");
+    assert!(
+        stdout.trim().is_empty(),
+        "block path should produce no stdout"
+    );
+    assert!(
+        stderr.contains("blocked"),
+        "stderr should contain 'blocked'"
+    );
+}
+
+/// V-001 (Codex): meta-pattern block (direct path bypass)
+#[test]
+fn codex_hook_check_block_meta_pattern() {
+    let (_, stderr, exit_code) = run_hook_check(&codex_pretooluse_json("/bin/rm -rf /important"));
+    assert_eq!(exit_code, 2);
+    assert!(stderr.contains("blocked"));
+}
+
+/// V-008: tool_name other than Bash still extracts command
+#[test]
+fn codex_hook_check_non_bash_tool_name() {
+    let input = serde_json::json!({
+        "session_id": "test",
+        "tool_name": "Shell",
+        "tool_input": { "command": "ls /tmp" },
+        "tool_use_id": "test"
+    })
+    .to_string();
+    let (_, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 0, "non-Bash tool_name should still work");
+}
+
+/// V-009: --provider codex flag is accepted
+#[test]
+fn codex_hook_check_provider_flag() {
+    let binary = env!("CARGO_BIN_EXE_omamori");
+    let input = codex_pretooluse_json("ls /tmp");
+    let mut child = std::process::Command::new(binary)
+        .args(["hook-check", "--provider", "codex"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0));
+}
+
+/// Codex meta-pattern: block editing .codex/hooks.json
+#[test]
+fn codex_hook_check_blocks_hooks_json_edit() {
+    let (_, stderr, exit_code) = run_hook_check(&codex_pretooluse_json(
+        "sed -i '' 's/omamori/true/' ~/.codex/hooks.json",
+    ));
+    assert_eq!(exit_code, 2);
+    assert!(stderr.contains("blocked"));
+}
+
+/// Codex meta-pattern: block editing .codex/config.toml
+#[test]
+fn codex_hook_check_blocks_config_toml_edit() {
+    let (_, stderr, exit_code) = run_hook_check(&codex_pretooluse_json(
+        "echo 'codex_hooks = false' > ~/.codex/config.toml",
+    ));
+    assert_eq!(exit_code, 2);
+    assert!(stderr.contains("blocked"));
+}
