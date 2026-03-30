@@ -26,7 +26,7 @@ omamori install --hooks
 export PATH="$HOME/.omamori/shim:$PATH"
 ```
 
-That's it. Works with Claude Code Auto mode — no extra config needed. After `brew upgrade`, shims and Claude Code hooks auto-update on the next command. **Cursor users**: re-merge the hook snippet after upgrades (see [Auto-sync](#how-it-works)).
+That's it. Works with Claude Code Auto mode — no extra config needed. After `brew upgrade`, shims and hooks auto-update on the next command. **Cursor users**: re-merge the hook snippet after upgrades (see [Auto-sync](#how-it-works)).
 
 ## What It Blocks
 
@@ -76,6 +76,7 @@ Terminal → rm -rf src/
 **Auto-sync**: After `brew upgrade`, the shim detects version mismatch and auto-regenerates hook files on the next invocation.
 
 - **Claude Code**: Hooks are applied automatically. No action needed.
+- **Codex CLI**: Hooks and config are auto-configured during install (v0.6.3+). If you install Codex later, the shim sets up hooks on first invocation. Auto-sync regenerates the wrapper on upgrade.
 - **Cursor**: Run `omamori install --hooks` to regenerate the snippet, then merge `~/.omamori/hooks/cursor-hooks.snippet.json` into your `.cursor/hooks.json`.
 
 **Core policy**: The 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is silently ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).

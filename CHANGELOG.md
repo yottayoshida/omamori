@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.3] - 2026-03-30
+
+### Added
+
+- **Codex CLI hook support** (#66): Full Tier 1 support for OpenAI Codex CLI (v0.117.0+) PreToolUse hooks.
+  - **hooks.json auto-merge**: `omamori install --hooks` auto-detects `~/.codex/` and merges omamori's PreToolUse entry into `~/.codex/hooks.json`. Existing entries (UserPromptSubmit, etc.) are preserved.
+  - **config.toml auto-write**: Sets `[features] codex_hooks = true` using `toml_edit` (preserves comments and formatting). Explicit `false` is respected (user intent).
+  - **fail-close wrapper**: Codex CLI treats exit 1 as ALLOW (fail-open), unlike Claude Code which blocks on any non-zero exit. The wrapper script converts all non-zero exits to exit 2 for fail-close safety.
+  - **shim auto-setup**: When `CODEX_CI` env is detected but the Codex wrapper doesn't exist, omamori auto-configures hooks on the first shim invocation. Users who install Codex after omamori get automatic protection.
+  - **self-defense**: `blocked_command_patterns` now protects `.codex/hooks.json`, `.codex/config.toml`, `config.toml.bak`, and the `codex_hooks` feature flag from AI agent tampering.
+  - **symlink checks**: Refuses to read/write hooks.json and config.toml if they are symlinks (consistent with existing O_NOFOLLOW pattern).
+  - `omamori status` Layer 2 coverage now shows "Claude Code + Codex CLI + Cursor".
+  - Codex wrapper included in integrity baseline.
+  - `toml_edit` v0.22 dependency added.
+  - 20 new tests (273 total).
+
 ## [0.6.2] - 2026-03-25
 
 ### Added
