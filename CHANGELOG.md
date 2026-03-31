@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.5] - 2026-03-31
+
+### Added
+
+- **20 new tests** (312 → 331): Complete coverage for all P0/P1 security-critical paths from issue #69.
+  - `unwrap` fail-close limits (4): `TooManyTokens` (>1000) and `TooManySegments` (>20) boundary tests — previously 0 tests for these fail-close guards.
+  - `IntegrityReport::exit_code` (4): direct tests for Fail=1, Warn=2, Ok=0, and Fail-takes-precedence-over-Warn.
+  - `check_path_order` (4): all 4 branches — shim before/after /usr/bin, shim missing, /usr/bin missing.
+  - `evaluate_git_context` git clean (2): `-fd`/`-fdx` untracked file detection (present → keep action, absent → LogOnly).
+  - `evaluate_git_context` GIT_WORK_TREE spoofing (1): env var sanitization defense (complements existing GIT_DIR test).
+  - `run_shim` integration smoke (1): end-to-end shim path via HOME-based DI + symlink invocation.
+  - `AuditLogger` (3): `from_config` default path, `from_outcome` all-fields verification, JSONL special character integrity.
+
 ## [0.6.4] - 2026-03-31
 
 ### Fixed
