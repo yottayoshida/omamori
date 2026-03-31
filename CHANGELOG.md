@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.4] - 2026-03-31
+
+### Fixed
+
+- **`move_to_dir` canonicalize fail-close** (#69): Two-stage path resolution for blocked prefix check. Previously, `canonicalize()` failure silently skipped the check, allowing symlink-based bypass to system paths. Now uses dest-first canonicalize with parent fallback; any failure is rejected (fail-close).
+
+### Changed
+
+- **`ensure_hooks_current_at` testability**: Extracted `ensure_hooks_current_at(base_dir)` from `ensure_hooks_current()` for dependency injection in tests. No behavior change.
+- README: Added sandbox complementarity section explaining omamori (semantic layer) vs. filesystem sandbox (OS boundary) and their defense-in-depth relationship.
+
+### Added
+
+- **39 new tests** (273 → 312): Comprehensive coverage for 8 previously untested gaps identified via QA Report-Only mapping, plus 1 adversarial scenario.
+  - `evaluate_git_context` (7): real git repos, GIT_DIR spoof defense (T4), timeout fail-close.
+  - `ensure_hooks_current_at` (5): version mismatch, T2 hash tampering, read-only dir failure.
+  - `should_block_for_sudo` (1): non-root negative path.
+  - `SystemOps::move_to_dir` (10+1 ignored): real FS operations — symlink rejection, blocked prefix, basename dedup, canonicalize fail-close, EXDEV.
+  - `write_default_config` (4): permissions 600/700, symlink rejection, atomic write, no-force guard.
+  - `load_config` (2): insecure/secure permission handling.
+  - `AuditLogger` (4): from_config enable/disable, JSONL append integrity, I/O error path.
+  - `write_baseline` (3): symlink rejection, atomic update, O_NOFOLLOW.
+  - `auto_setup_codex_if_needed` (2): env-absent skip, wrapper-exists skip.
+  - Adversarial: hooks symlink attack → hash mismatch detection and regeneration (ADV-01).
+- `serial_test` v3 dev-dependency for CWD-sensitive git context tests.
+
 ## [0.6.3] - 2026-03-30
 
 ### Added
