@@ -1091,4 +1091,137 @@ action = "block"
             code_names.difference(&toml_names).collect::<Vec<_>>(),
         );
     }
+
+    // --- G-05: write_default_config ---
+
+    #[test]
+    fn write_default_config_creates_with_correct_permissions() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfg-g05-1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let path = dir.join("config.toml");
+        let result = write_default_config(&path, false);
+        assert!(result.is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::metadata(&path).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o600, "file should be mode 600");
+            let dir_meta = fs::metadata(&dir).unwrap();
+            assert_eq!(dir_meta.mode() & 0o777, 0o700, "dir should be mode 700");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_default_config_rejects_symlink_target() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfg-g05-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            let real_file = dir.join("real.toml");
+            fs::write(&real_file, "real").unwrap();
+            let link_path = dir.join("config.toml");
+            std::os::unix::fs::symlink(&real_file, &link_path).unwrap();
+
+            let result = write_default_config(&link_path, false);
+            assert!(result.is_err());
+            let err = format!("{}", result.unwrap_err());
+            assert!(err.contains("symlink"));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_default_config_force_atomic_write() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfg-g05-3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let path = dir.join("config.toml");
+        // First create
+        write_default_config(&path, false).unwrap();
+        let content1 = fs::read_to_string(&path).unwrap();
+
+        // Force overwrite
+        let result = write_default_config(&path, true);
+        assert!(result.is_ok());
+        let content2 = fs::read_to_string(&path).unwrap();
+        assert_eq!(content1, content2, "content should be the same template");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_default_config_no_force_errors_on_existing() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfg-g05-4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let path = dir.join("config.toml");
+        write_default_config(&path, false).unwrap();
+
+        // Second create without force should fail
+        let result = write_default_config(&path, false);
+        assert!(result.is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- G-06: load_config permissions ---
+
+    #[test]
+    fn load_config_rejects_insecure_permissions() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfg-g06-1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("config.toml");
+        fs::write(&path, "# test config\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Set insecure permissions (world-readable)
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+            let result = load_config(Some(&path)).unwrap();
+            // Should warn about permissions and use default config
+            assert!(
+                result.warnings.iter().any(|w| w.contains("permissions")),
+                "should warn about insecure permissions"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_config_accepts_secure_permissions() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfg-g06-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("config.toml");
+        // Write a minimal valid config
+        fs::write(&path, "# valid config\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+            let result = load_config(Some(&path)).unwrap();
+            // No permission warnings
+            assert!(
+                !result.warnings.iter().any(|w| w.contains("permissions")),
+                "should not warn about secure permissions"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

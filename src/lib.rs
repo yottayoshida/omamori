@@ -506,7 +506,16 @@ fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError> {
 /// 2. Version match but content hash mismatch → regenerate (T2 attack: AI keeps
 ///    version comment but rewrites hook body, e.g. `exit 2` → `exit 0`)
 fn ensure_hooks_current() -> bool {
-    let base_dir = default_base_dir();
+    ensure_hooks_current_at(&default_base_dir())
+}
+
+/// Testable version of `ensure_hooks_current` that accepts a base directory.
+///
+/// Two-level check:
+/// 1. Version mismatch → regenerate (existing behavior, e.g. after upgrade)
+/// 2. Version match but content hash mismatch → regenerate (T2 attack: AI keeps
+///    version comment but rewrites hook body, e.g. `exit 2` → `exit 0`)
+fn ensure_hooks_current_at(base_dir: &Path) -> bool {
     let hook_path = base_dir.join("hooks/claude-pretooluse.sh");
 
     let content = match std::fs::read_to_string(&hook_path) {
@@ -523,7 +532,7 @@ fn ensure_hooks_current() -> bool {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        match installer::regenerate_hooks(&base_dir) {
+        match installer::regenerate_hooks(base_dir) {
             Ok(()) => {
                 eprintln!(
                     "omamori: hooks updated ({} → {})",
@@ -548,7 +557,7 @@ fn ensure_hooks_current() -> bool {
     let actual_hash = installer::hook_content_hash(&content);
 
     if expected_hash != actual_hash {
-        match installer::regenerate_hooks(&base_dir) {
+        match installer::regenerate_hooks(base_dir) {
             Ok(()) => {
                 eprintln!("omamori: hooks content mismatch detected — regenerated");
                 return true;
@@ -2006,6 +2015,174 @@ mod tests {
         let config = Config::default();
         let rule = match_rule(&config.rules, &invocation).expect("rule should match");
         assert_eq!(rule.action, ActionKind::Trash);
+    }
+
+    // --- G-02: ensure_hooks_current_at ---
+
+    fn setup_hooks_dir(base_dir: &Path) -> PathBuf {
+        let hooks_dir = base_dir.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        hooks_dir
+    }
+
+    #[test]
+    fn hooks_current_old_version_triggers_regen() {
+        let dir = std::env::temp_dir().join(format!("omamori-hooks-g02-1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        // Write hook with old version
+        let old_hook = "#!/bin/sh\n# omamori hook v0.0.1\nset -eu\nexit 0\n";
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), old_hook).unwrap();
+
+        let result = ensure_hooks_current_at(&dir);
+        assert!(result, "should regenerate hooks for old version");
+
+        // Verify the regenerated hook has the current version
+        let content = std::fs::read_to_string(hooks_dir.join("claude-pretooluse.sh")).unwrap();
+        assert_eq!(
+            installer::parse_hook_version(&content),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_hash_mismatch_triggers_regen() {
+        let dir = std::env::temp_dir().join(format!("omamori-hooks-g02-2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        // Write hook with correct version but tampered body (T2 attack)
+        let tampered = format!(
+            "#!/bin/sh\n# omamori hook v{}\nset -eu\nexit 0\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), tampered).unwrap();
+
+        let result = ensure_hooks_current_at(&dir);
+        assert!(result, "should regenerate hooks for hash mismatch (T2)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_correct_returns_false() {
+        let dir = std::env::temp_dir().join(format!("omamori-hooks-g02-3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        // Write the exact expected hook content
+        let expected = installer::render_hook_script();
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), expected).unwrap();
+
+        let result = ensure_hooks_current_at(&dir);
+        assert!(!result, "should return false when hooks are current");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_missing_returns_false() {
+        let dir = std::env::temp_dir().join(format!("omamori-hooks-g02-4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No hooks file at all
+        let result = ensure_hooks_current_at(&dir);
+        assert!(!result, "should return false when no hooks file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_readonly_dir_regen_fails_returns_false() {
+        let dir = std::env::temp_dir().join(format!("omamori-hooks-g02-5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        // Write hook with old version
+        let old_hook = "#!/bin/sh\n# omamori hook v0.0.1\nset -eu\nexit 0\n";
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), old_hook).unwrap();
+
+        // Make hooks dir read-only so regeneration fails
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hooks_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        let result = ensure_hooks_current_at(&dir);
+        assert!(!result, "should return false when regen fails");
+
+        // Restore permissions for cleanup
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hooks_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- G-03: should_block_for_sudo ---
+
+    #[test]
+    fn sudo_block_returns_false_when_not_root() {
+        // Normal test process is not root
+        let result = should_block_for_sudo();
+        assert!(!result, "non-root user should not be blocked");
+    }
+
+    // Note: Testing the true path (euid=0 + SUDO_USER set) requires actual
+    // root privileges. We test the negative path and trust the implementation.
+    // The function is 2 lines of platform-specific code with no branching.
+
+    // --- ADV-01: hooks symlink attack ---
+
+    #[test]
+    fn hooks_symlink_attack_triggers_regen() {
+        // ADV-01: If the hooks file is a symlink (attacker replaced it),
+        // ensure_hooks_current_at reads through it and detects the hash mismatch.
+        let dir = std::env::temp_dir().join(format!("omamori-adv01-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        #[cfg(unix)]
+        {
+            // Create a malicious script elsewhere
+            let malicious = dir.join("malicious.sh");
+            std::fs::write(
+                &malicious,
+                format!(
+                    "#!/bin/sh\n# omamori hook v{}\nexit 0\n",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            )
+            .unwrap();
+
+            // Replace hook with symlink to malicious script
+            let hook_path = hooks_dir.join("claude-pretooluse.sh");
+            std::os::unix::fs::symlink(&malicious, &hook_path).unwrap();
+
+            // ensure_hooks_current_at should detect hash mismatch and regenerate
+            let result = ensure_hooks_current_at(&dir);
+            assert!(
+                result,
+                "symlink hook should trigger regeneration due to hash mismatch"
+            );
+
+            // After regen, the hook should have the correct hash
+            let content = std::fs::read_to_string(&hook_path).unwrap();
+            let expected = installer::render_hook_script();
+            assert_eq!(
+                installer::hook_content_hash(&content),
+                installer::hook_content_hash(&expected),
+                "regenerated hook should match expected content"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

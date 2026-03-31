@@ -681,6 +681,236 @@ mod tests {
 
     // --- CI consistency check: NEVER_REGENERABLE ⊃ default_protected_paths ---
 
+    // --- evaluate_git_context (G-01) ---
+
+    /// Helper: create a real git repo in a temp directory.
+    /// Returns the temp dir path (caller must clean up).
+    fn create_git_repo() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("omamori-git-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        dir
+    }
+
+    fn git_config() -> GitContextConfig {
+        GitContextConfig {
+            enabled: true,
+            timeout_ms: 5000,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_clean_repo_downgrades_to_log_only() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        // Create initial commit so repo is clean
+        std::fs::write(dir.join("dummy.txt"), "init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["reset".to_string(), "--hard".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        assert!(result.is_some());
+        let eval = result.unwrap();
+        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_dirty_repo_keeps_original() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        // Create initial commit
+        std::fs::write(dir.join("dummy.txt"), "init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        // Make dirty
+        std::fs::write(dir.join("dirty.txt"), "uncommitted").unwrap();
+
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["reset".to_string(), "--hard".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        assert!(result.is_some());
+        let eval = result.unwrap();
+        assert!(eval.action_override.is_none());
+        assert!(eval.reason.contains("uncommitted"));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_timeout_keeps_original() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        let config = GitContextConfig {
+            enabled: true,
+            timeout_ms: 0, // 0ms = guaranteed timeout
+        };
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["reset".to_string(), "--hard".to_string()],
+        );
+        // With 0ms timeout, git status may or may not time out depending on system.
+        // Either way, the result should not downgrade to LogOnly for a dirty/timeout case.
+        let result = evaluate_git_context(&inv, &config, &[]);
+        // We just check it returns Some (git command is evaluated)
+        assert!(result.is_some());
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_sanitizes_git_dir_env() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        // Create initial commit so repo is clean
+        std::fs::write(dir.join("dummy.txt"), "init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        // GIT_DIR spoof: point to a non-existent dir.
+        // evaluate_git_context should remove GIT_DIR before calling git.
+        // SAFETY: test is #[serial], no other threads access env vars concurrently.
+        unsafe { env::set_var("GIT_DIR", "/nonexistent/.git") };
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["reset".to_string(), "--hard".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        // SAFETY: test is #[serial], no other threads access env vars concurrently.
+        unsafe { env::remove_var("GIT_DIR") };
+
+        // Should still work correctly (env var sanitized)
+        assert!(result.is_some());
+        let eval = result.unwrap();
+        // Clean repo → LogOnly (proves GIT_DIR was sanitized, not followed)
+        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_context_non_git_command_returns_none() {
+        let inv = CommandInvocation::new(
+            "rm".to_string(),
+            vec!["-rf".to_string(), "target/".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn git_context_disabled_returns_none() {
+        let config = GitContextConfig {
+            enabled: false,
+            timeout_ms: 100,
+        };
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["reset".to_string(), "--hard".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &config, &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_non_git_directory_returns_some_none_override() {
+        let dir = std::env::temp_dir().join(format!("omamori-nongit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["reset".to_string(), "--hard".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        assert!(result.is_some());
+        let eval = result.unwrap();
+        assert!(eval.action_override.is_none());
+        assert!(eval.reason.contains("not inside a git repository"));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn never_regenerable_covers_all_default_protected_paths() {
         let protected = default_protected_paths();

@@ -21,3 +21,6 @@ toml = "0.8"
 toml_edit = "0.22"
 trash = "5.2"
 shell-words = "1.1"
+
+[dev-dependencies]
+serial_test = "3"

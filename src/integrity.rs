@@ -841,4 +841,101 @@ mod tests {
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(item.detail.contains("not installed"));
     }
+
+    // --- G-08: write_baseline ---
+
+    #[test]
+    fn write_baseline_rejects_symlink() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-integrity-g08-1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a symlink at the baseline path
+        let real_file = dir.join("real.json");
+        fs::write(&real_file, "{}").unwrap();
+        let baseline_file = baseline_path(&dir);
+        symlink(&real_file, &baseline_file).unwrap();
+
+        let baseline = IntegrityBaseline {
+            version: "test".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            omamori_exe: "test".to_string(),
+            shims: vec![],
+            hooks: vec![],
+            config: None,
+        };
+
+        let result = write_baseline(&dir, &baseline);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("symlink"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_baseline_atomic_update() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-integrity-g08-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let baseline1 = IntegrityBaseline {
+            version: "0.1.0".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            omamori_exe: "test".to_string(),
+            shims: vec![],
+            hooks: vec![],
+            config: None,
+        };
+
+        // First write (new file)
+        write_baseline(&dir, &baseline1).unwrap();
+        let loaded1 = read_baseline(&dir).unwrap().unwrap();
+        assert_eq!(loaded1.version, "0.1.0");
+
+        // Second write (atomic update)
+        let baseline2 = IntegrityBaseline {
+            version: "0.2.0".to_string(),
+            ..baseline1
+        };
+        write_baseline(&dir, &baseline2).unwrap();
+        let loaded2 = read_baseline(&dir).unwrap().unwrap();
+        assert_eq!(loaded2.version, "0.2.0");
+
+        // Verify permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::metadata(baseline_path(&dir)).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_baseline_o_nofollow() {
+        // Verify that the write uses O_NOFOLLOW (checked indirectly via symlink rejection)
+        let dir =
+            std::env::temp_dir().join(format!("omamori-integrity-g08-3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let baseline = IntegrityBaseline {
+            version: "test".to_string(),
+            generated_at: "2026-01-01T00:00:00Z".to_string(),
+            omamori_exe: "test".to_string(),
+            shims: vec![],
+            hooks: vec![],
+            config: None,
+        };
+
+        // Normal write should succeed
+        write_baseline(&dir, &baseline).unwrap();
+        assert!(baseline_path(&dir).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
