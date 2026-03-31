@@ -938,4 +938,140 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // =========================================================================
+    // G-09: IntegrityReport::exit_code direct tests
+    // =========================================================================
+
+    fn make_item(status: CheckStatus) -> CheckItem {
+        CheckItem {
+            category: "test",
+            name: "test_item".to_string(),
+            status,
+            detail: String::new(),
+        }
+    }
+
+    // =========================================================================
+    // G-10: check_path_order direct tests
+    // =========================================================================
+
+    #[test]
+    #[serial_test::serial]
+    fn path_order_shim_before_usr_bin_is_ok() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-integrity-g10-1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("shim")).unwrap();
+
+        let shim_str = dir.join("shim").display().to_string();
+        let saved = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{shim_str}:/usr/bin:/usr/local/bin")) };
+
+        let item = check_path_order(&dir);
+        assert_eq!(item.status, CheckStatus::Ok);
+        assert!(item.detail.contains("before /usr/bin"));
+
+        unsafe { std::env::set_var("PATH", &saved) };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn path_order_shim_after_usr_bin_is_warn() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-integrity-g10-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("shim")).unwrap();
+
+        let shim_str = dir.join("shim").display().to_string();
+        let saved = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("/usr/bin:{shim_str}:/usr/local/bin")) };
+
+        let item = check_path_order(&dir);
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(item.detail.contains("AFTER /usr/bin"));
+
+        unsafe { std::env::set_var("PATH", &saved) };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn path_order_shim_not_in_path_is_warn() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-integrity-g10-3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("shim")).unwrap();
+
+        let saved = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", "/usr/bin:/usr/local/bin") };
+
+        let item = check_path_order(&dir);
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(item.detail.contains("not found in PATH"));
+
+        unsafe { std::env::set_var("PATH", &saved) };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn path_order_usr_bin_not_in_path_is_ok() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-integrity-g10-4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("shim")).unwrap();
+
+        let shim_str = dir.join("shim").display().to_string();
+        let saved = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", format!("{shim_str}:/usr/local/bin")) };
+
+        let item = check_path_order(&dir);
+        assert_eq!(item.status, CheckStatus::Ok);
+        assert!(item.detail.contains("/usr/bin not found"));
+
+        unsafe { std::env::set_var("PATH", &saved) };
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // =========================================================================
+    // G-09: IntegrityReport::exit_code direct tests
+    // =========================================================================
+
+    #[test]
+    fn exit_code_fail_returns_1() {
+        let report = IntegrityReport {
+            items: vec![make_item(CheckStatus::Fail)],
+        };
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn exit_code_warn_returns_2() {
+        let report = IntegrityReport {
+            items: vec![make_item(CheckStatus::Warn)],
+        };
+        assert_eq!(report.exit_code(), 2);
+    }
+
+    #[test]
+    fn exit_code_ok_returns_0() {
+        let report = IntegrityReport {
+            items: vec![make_item(CheckStatus::Ok)],
+        };
+        assert_eq!(report.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_fail_takes_precedence_over_warn() {
+        let report = IntegrityReport {
+            items: vec![
+                make_item(CheckStatus::Warn),
+                make_item(CheckStatus::Fail),
+                make_item(CheckStatus::Ok),
+            ],
+        };
+        assert_eq!(report.exit_code(), 1);
+    }
 }

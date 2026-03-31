@@ -1189,3 +1189,60 @@ fn codex_hook_check_blocks_config_toml_edit() {
     assert_eq!(exit_code, 2);
     assert!(stderr.contains("blocked"));
 }
+
+// =========================================================================
+// run_shim smoke integration test
+// =========================================================================
+
+/// Verify the shim invocation path works end-to-end:
+/// symlink named "rm" → omamori binary → run_shim → canary + rule evaluation.
+/// Uses HOME env override to isolate base_dir.
+#[cfg(unix)]
+#[test]
+fn shim_invocation_runs_canary_and_rule_evaluation() {
+    use std::os::unix::fs::symlink;
+
+    let poc_dir = unique_dir("shim-smoke");
+    let fake_home = poc_dir.join("fakehome");
+    let shim_dir = fake_home.join(".omamori").join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+
+    // Create target directory to be rm -rf'd via shim
+    let target = poc_dir.join("victim");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("file.txt"), "data").unwrap();
+
+    // Symlink: shim/rm -> omamori binary
+    let shim_rm = shim_dir.join("rm");
+    symlink(binary(), &shim_rm).unwrap();
+
+    // Run: rm -rf <target> via shim with fake HOME
+    let output = Command::new(&shim_rm)
+        .args(["-rf", target.to_str().unwrap()])
+        .env("HOME", &fake_home)
+        .env_remove("CLAUDECODE")
+        .env_remove("CODEX_CI")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("GEMINI_CLI")
+        .env_remove("CLINE_ACTIVE")
+        .env_remove("AI_GUARD")
+        .output()
+        .expect("failed to run shim");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Verify shim path was entered and rule evaluation occurred.
+    // The shim should produce health/diagnostic messages on stderr.
+    // At minimum, the baseline creation or Trash message should appear.
+    let shim_entered = stderr.contains("omamori")
+        || stderr.contains("Trash")
+        || stderr.contains("integrity")
+        || stderr.contains("health");
+
+    assert!(
+        shim_entered,
+        "Expected shim stderr to contain omamori diagnostic output, got: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&poc_dir);
+}

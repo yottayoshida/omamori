@@ -865,6 +865,51 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn git_context_sanitizes_git_work_tree_env() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        // Create initial commit so repo is clean
+        std::fs::write(dir.join("dummy.txt"), "init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        // GIT_WORK_TREE spoof: point to a non-existent dir.
+        // evaluate_git_context should remove GIT_WORK_TREE before calling git.
+        // SAFETY: test is #[serial], no other threads access env vars concurrently.
+        unsafe { env::set_var("GIT_WORK_TREE", "/nonexistent/fake") };
+        let inv = CommandInvocation::new(
+            "git".to_string(),
+            vec!["reset".to_string(), "--hard".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        // SAFETY: test is #[serial], no other threads access env vars concurrently.
+        unsafe { env::remove_var("GIT_WORK_TREE") };
+
+        // Should still work correctly (env var sanitized)
+        assert!(result.is_some());
+        let eval = result.unwrap();
+        // Clean repo → LogOnly (proves GIT_WORK_TREE was sanitized, not followed)
+        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn git_context_non_git_command_returns_none() {
         let inv = CommandInvocation::new(
             "rm".to_string(),
@@ -906,6 +951,83 @@ mod tests {
         let eval = result.unwrap();
         assert!(eval.action_override.is_none());
         assert!(eval.reason.contains("not inside a git repository"));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- evaluate_git_context: git clean path (G-01 cont.) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_clean_no_untracked_downgrades_to_log_only() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        // Create initial commit so repo is clean with no untracked files
+        std::fs::write(dir.join("committed.txt"), "init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        let inv = super::CommandInvocation::new(
+            "git".to_string(),
+            vec!["clean".to_string(), "-fdx".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        assert!(result.is_some());
+        let eval = result.unwrap();
+        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+        assert!(eval.reason.contains("no untracked"));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_clean_with_untracked_keeps_original() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        // Create initial commit, then add an untracked file
+        std::fs::write(dir.join("committed.txt"), "init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::fs::write(dir.join("untracked.txt"), "not tracked").unwrap();
+
+        let inv = super::CommandInvocation::new(
+            "git".to_string(),
+            vec!["clean".to_string(), "-fd".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        assert!(result.is_some());
+        let eval = result.unwrap();
+        assert!(eval.action_override.is_none());
+        assert!(eval.reason.contains("untracked files present"));
 
         env::set_current_dir(&saved).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

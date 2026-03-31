@@ -865,6 +865,54 @@ mod tests {
         assert_block(&huge, BlockReason::InputTooLarge);
     }
 
+    #[test]
+    fn too_many_tokens_blocks() {
+        // MAX_TOKENS = 1000; 1001 tokens should trigger Block
+        let input = (0..1001)
+            .map(|i| format!("arg{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_block(&input, BlockReason::TooManyTokens);
+    }
+
+    #[test]
+    fn tokens_at_limit_still_works() {
+        // Exactly 1000 tokens should parse successfully
+        let input = (0..1000)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let result = parse_command_string(&input);
+        assert!(
+            matches!(result, ParseResult::Commands(_)),
+            "1000 tokens should parse, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn too_many_segments_blocks() {
+        // MAX_SEGMENTS = 20; 21 segments (20 && operators) should trigger Block
+        let input = (0..21)
+            .map(|i| format!("cmd{i}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        assert_block(&input, BlockReason::TooManySegments);
+    }
+
+    #[test]
+    fn segments_at_limit_still_works() {
+        // Exactly 20 segments should parse successfully
+        let input = (0..20)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        let result = parse_command_string(&input);
+        assert!(
+            matches!(result, ParseResult::Commands(_)),
+            "20 segments should parse, got: {result:?}"
+        );
+    }
+
     // =========================================================================
     // 9. Quote normalization (shell-words handles these)
     // =========================================================================
