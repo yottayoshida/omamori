@@ -233,4 +233,99 @@ mod tests {
         assert!(json.contains("\"target_count\":2"));
         assert!(json.contains("\"target_hash\":\"sha256:"));
     }
+
+    // --- G-07 cont.: additional coverage ---
+
+    #[test]
+    #[serial_test::serial]
+    fn audit_logger_from_config_default_path() {
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+        };
+        let logger = AuditLogger::from_config(&config).expect("should create logger");
+        // default_audit_path() uses HOME env
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let expected = home
+            .join(".local")
+            .join("share")
+            .join("omamori")
+            .join("audit.jsonl");
+        assert_eq!(logger.path, expected);
+    }
+
+    #[test]
+    fn audit_event_from_outcome_all_fields() {
+        let invocation = CommandInvocation::new(
+            "git".to_string(),
+            vec!["push".to_string(), "origin".to_string()],
+        );
+        let rule = RuleConfig::new(
+            "git-push",
+            "git",
+            ActionKind::LogOnly,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let event = AuditEvent::from_outcome(
+            &invocation,
+            Some(&rule),
+            &["claude-code".to_string()],
+            &ActionOutcome::LoggedOnly {
+                exit_code: 0,
+                message: "ok".to_string(),
+            },
+        );
+        assert_eq!(event.command, "git");
+        assert_eq!(event.rule_id, Some("git-push".to_string()));
+        assert_eq!(event.provider, "claude-code");
+        assert_eq!(event.detection_layer, Some("layer1".to_string()));
+        assert!(event.unwrap_chain.is_none());
+        assert!(event.raw_input_hash.is_none());
+        assert_eq!(event.target_count, 2);
+        assert!(!event.target_hash.is_empty());
+    }
+
+    #[test]
+    fn audit_logger_jsonl_special_chars() {
+        let dir = std::env::temp_dir().join(format!("omamori-audit-g07-sc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("test.jsonl");
+
+        let logger = AuditLogger {
+            path: log_path.clone(),
+        };
+
+        // Event with special characters in fields
+        let invocation = CommandInvocation::new(
+            "echo".to_string(),
+            vec!["hello\nworld".to_string(), "it's \"quoted\"".to_string()],
+        );
+        let event = AuditEvent::from_outcome(
+            &invocation,
+            None,
+            &["test\u{1F680}".to_string()], // rocket emoji
+            &ActionOutcome::PassedThrough { exit_code: 0 },
+        );
+        logger.append(&event).unwrap();
+
+        // Append a second event to verify multi-line JSONL
+        logger.append(&event).unwrap();
+
+        // Read back and verify each line is valid JSON
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 JSONL lines");
+        for line in &lines {
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).expect("each line must be valid JSON");
+            assert!(parsed.get("command").is_some());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
