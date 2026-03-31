@@ -121,6 +121,89 @@ mod tests {
     use super::*;
     use crate::rules::{ActionKind, RuleConfig};
 
+    // --- G-07: AuditLogger ---
+
+    #[test]
+    fn audit_logger_from_config_disabled() {
+        let config = AuditConfig {
+            enabled: false,
+            path: None,
+        };
+        assert!(AuditLogger::from_config(&config).is_none());
+    }
+
+    #[test]
+    fn audit_logger_from_config_enabled() {
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("/tmp/test-audit.jsonl")),
+        };
+        assert!(AuditLogger::from_config(&config).is_some());
+    }
+
+    #[test]
+    fn audit_logger_append_writes_jsonl() {
+        let dir = std::env::temp_dir().join(format!("omamori-audit-g07-1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let path = dir.join("audit.jsonl");
+        let logger = AuditLogger { path: path.clone() };
+
+        let event = AuditEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            provider: "test".to_string(),
+            command: "rm".to_string(),
+            rule_id: Some("test-rule".to_string()),
+            action: "trash".to_string(),
+            result: "trashed".to_string(),
+            target_count: 1,
+            target_hash: "sha256:abc".to_string(),
+            detection_layer: Some("layer1".to_string()),
+            unwrap_chain: None,
+            raw_input_hash: None,
+        };
+
+        logger.append(&event).unwrap();
+        logger.append(&event).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "should have 2 JSONL lines");
+
+        // Each line should be valid JSON
+        for line in &lines {
+            let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(parsed["command"], "rm");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_logger_append_io_error() {
+        // Write to a path that can't be created
+        let logger = AuditLogger {
+            path: PathBuf::from("/nonexistent/dir/audit.jsonl"),
+        };
+
+        let event = AuditEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            provider: "test".to_string(),
+            command: "rm".to_string(),
+            rule_id: None,
+            action: "trash".to_string(),
+            result: "trashed".to_string(),
+            target_count: 0,
+            target_hash: "sha256:empty".to_string(),
+            detection_layer: None,
+            unwrap_chain: None,
+            raw_input_hash: None,
+        };
+
+        let result = logger.append(&event);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn audit_event_hides_argument_values() {
         let invocation = CommandInvocation::new(

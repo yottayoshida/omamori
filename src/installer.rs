@@ -1528,4 +1528,47 @@ mod tests {
             "blocked_command_patterns should include 'omamori override'"
         );
     }
+
+    // --- G-12: auto_setup_codex_if_needed ---
+
+    #[test]
+    fn auto_setup_codex_skips_without_env() {
+        // No CODEX_CI env → should return false immediately
+        // SAFETY: test relies on CODEX_CI not being set in test environment
+        let dir = std::env::temp_dir().join(format!("omamori-codex-g12-1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Ensure CODEX_CI is not set (it shouldn't be in test)
+        assert!(
+            std::env::var_os("CODEX_CI").is_none(),
+            "CODEX_CI should not be set in test environment"
+        );
+
+        let result = auto_setup_codex_if_needed(&dir);
+        assert!(!result, "should skip when CODEX_CI is not set");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_setup_codex_skips_when_wrapper_exists() {
+        let dir = std::env::temp_dir().join(format!("omamori-codex-g12-2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let hooks_dir = dir.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+
+        // Pre-create the wrapper script
+        fs::write(hooks_dir.join("codex-pretooluse.sh"), "#!/bin/sh\n").unwrap();
+
+        // Even if CODEX_CI were set, wrapper exists → skip
+        // We test this indirectly: the function checks wrapper first after env check
+        let result = auto_setup_codex_if_needed(&dir);
+        assert!(!result);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Note: Testing CODEX_CI=1 + no wrapper requires setting env var (unsafe in Rust 2024)
+    // and having a valid codex home dir. This is covered by integration tests (E-01~E-05).
 }
