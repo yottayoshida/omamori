@@ -83,6 +83,8 @@ Terminal → rm -rf src/
 
 **Integrity monitoring** (`omamori status`): Verifies all defense layers are intact — shims, hooks, config, core policy, PATH order. Detects tampering including subtle hook edits where the version comment is preserved but the body is rewritten.
 
+**Sandbox complementarity**: omamori operates at the semantic layer — it understands *what* a command does (Layer 1: shim, Layer 2: hooks). A filesystem sandbox (e.g., sandbox-exec, container isolation) operates at the OS boundary — it restricts *where* processes can read and write. These are complementary: omamori catches `rm -rf src/` before it runs; a sandbox prevents damage if something slips through. For defense in depth, use both. omamori plans to add optional sandbox integration in a future release ([#61](https://github.com/yottayoshida/omamori/issues/61)).
+
 ## Supported Tools
 
 | Tier | Tools | Coverage |
