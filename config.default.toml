@@ -115,7 +115,7 @@ message = "omamori blocked rsync with destructive flags"
 #
 # [context.git]
 # enabled = true
-# timeout_ms = 3000
+# timeout_ms = 100
 
 [audit]
 enabled = false
