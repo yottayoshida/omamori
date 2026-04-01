@@ -1265,11 +1265,40 @@ fn is_core_rule(name: &str) -> bool {
     config::core_rule_names().contains(&name)
 }
 
+// ---------------------------------------------------------------------------
+// Config mutation helper — shared read → parse → mutate → validate → write
+// ---------------------------------------------------------------------------
+
+/// Read config.toml, parse as DocumentMut, apply mutation, validate, and write back.
+/// The `toml::from_str` validation is an independent failsafe layer — do NOT remove.
+fn mutate_config<F>(config_path: &Path, mutate: F) -> Result<(), AppError>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<(), AppError>,
+{
+    let content = std::fs::read_to_string(config_path)?;
+    let mut doc: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|e| AppError::Config(format!("failed to parse config as TOML: {e}")))?;
+
+    mutate(&mut doc)?;
+
+    let new_content = doc.to_string();
+    // Failsafe: validate with independent parser (toml_edit and toml are different impls).
+    // DO NOT REMOVE — this catches toml_edit bugs that would corrupt config.toml.
+    if toml::from_str::<toml::Value>(&new_content).is_err() {
+        return Err(AppError::Config(
+            "config mutation would create invalid TOML; aborting".to_string(),
+        ));
+    }
+    std::fs::write(config_path, &new_content)?;
+    update_baseline_silent(&default_base_dir());
+    Ok(())
+}
+
 fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     guard_ai_config_modification("config disable")?;
     validate_rule_name(rule_name)?;
 
-    // Core rules cannot be disabled via `config disable`
     if is_core_rule(rule_name) {
         return Err(AppError::Config(format!(
             "`{rule_name}` is a core safety rule and cannot be disabled.\n\n  \
@@ -1279,94 +1308,54 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     }
 
     let config_path = resolve_config_path_checked()?;
-
-    // Auto-create config if it doesn't exist
     if !config_path.exists() {
         config::write_default_config(&config_path, false)?;
     }
 
-    // Check current state via the config loader to detect all forms of disable
     let load_result = load_config(None)?;
-    let rule = load_result
+    if let Some(r) = load_result
         .config
         .rules
         .iter()
-        .find(|r| r.name == rule_name);
-    if let Some(r) = rule
+        .find(|r| r.name == rule_name)
         && !r.enabled
     {
         eprintln!("Rule `{rule_name}` is already disabled.");
         return Ok(2);
     }
 
-    // Read current content
-    let content = std::fs::read_to_string(&config_path)?;
+    mutate_config(&config_path, |doc| {
+        let rules = doc
+            .get_mut("rules")
+            .and_then(|item| item.as_array_of_tables_mut());
 
-    // P1 fix: check if an existing [[rules]] entry for this rule exists in the file.
-    // If so, we need to add `enabled = false` to that entry rather than appending a new block.
-    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
-
-    // Check if an uncommented entry for this rule exists
-    let has_uncommented_entry = content.lines().any(|l| {
-        let trimmed = l.trim();
-        !trimmed.starts_with('#') && trimmed == format!("name = \"{rule_name}\"")
-    });
-
-    let new_content = if has_uncommented_entry {
-        // Existing entry — replace or add enabled = false in the block
-        // Find the block and ensure enabled = false is present
-        let mut result = String::new();
-        let mut in_target_block = false;
-        let mut added_enabled = false;
-        for line in content.lines() {
-            if line.trim() == "[[rules]]" {
-                if in_target_block && !added_enabled {
-                    result.push_str("enabled = false\n");
-                    added_enabled = true;
-                }
-                in_target_block = false;
-                result.push_str(line);
-                result.push('\n');
-                continue;
-            }
-            if line.trim() == format!("name = \"{rule_name}\"") {
-                in_target_block = true;
-            }
-            if in_target_block && line.trim().starts_with("enabled") {
-                result.push_str("enabled = false\n");
-                added_enabled = true;
-                continue;
-            }
-            result.push_str(line);
-            result.push('\n');
+        if let Some(entry) = rules.and_then(|tables| {
+            tables
+                .iter_mut()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(rule_name))
+        }) {
+            entry["enabled"] = toml_edit::value(false);
+            return Ok(());
         }
-        if in_target_block && !added_enabled {
-            result.push_str("enabled = false\n");
-        }
-        result
-    } else {
-        // No existing entry — append a new disable block
-        let mut new = content;
-        if !new.ends_with('\n') {
-            new.push('\n');
-        }
-        new.push('\n');
-        new.push_str(&disable_block);
-        new
-    };
 
-    // Validate the new TOML is parseable
-    if toml::from_str::<toml::Value>(&new_content).is_err() {
-        return Err(AppError::Config(
-            "modifying config would create invalid TOML; aborting".to_string(),
-        ));
-    }
+        // No existing entry — append a new [[rules]] block
+        let mut new_table = toml_edit::Table::new();
+        new_table["name"] = toml_edit::value(rule_name);
+        new_table["enabled"] = toml_edit::value(false);
+        if let Some(array) = doc
+            .get_mut("rules")
+            .and_then(|item| item.as_array_of_tables_mut())
+        {
+            array.push(new_table);
+        } else {
+            let mut array = toml_edit::ArrayOfTables::new();
+            array.push(new_table);
+            doc.insert("rules", toml_edit::Item::ArrayOfTables(array));
+        }
+        Ok(())
+    })?;
 
-    std::fs::write(&config_path, &new_content)?;
     eprintln!("Disabled: {rule_name}");
-    update_baseline_silent(&default_base_dir());
-
-    // Show updated config list
     run_config_list()
 }
 
@@ -1381,62 +1370,46 @@ fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
         return Ok(2);
     }
 
-    // Check current state
     let load_result = load_config(None)?;
-    let rule = load_result
+    if let Some(r) = load_result
         .config
         .rules
         .iter()
-        .find(|r| r.name == rule_name);
-    if let Some(r) = rule
+        .find(|r| r.name == rule_name)
         && r.enabled
     {
         eprintln!("Rule `{rule_name}` is already enabled.");
         return Ok(2);
     }
 
-    let content = std::fs::read_to_string(&config_path)?;
+    mutate_config(&config_path, |doc| {
+        if let Some(tables) = doc
+            .get_mut("rules")
+            .and_then(|item| item.as_array_of_tables_mut())
+        {
+            // Find the target entry index
+            let idx = tables
+                .iter()
+                .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(rule_name));
 
-    // Remove standalone disable blocks
-    let disable_block = format!("[[rules]]\nname = \"{rule_name}\"\nenabled = false\n");
-    let mut new_content = content.replace(&disable_block, "");
-
-    // Also handle entries where enabled = false is within a larger block
-    // by removing the `enabled = false` line
-    let enabled_false_line = "enabled = false";
-    let mut lines: Vec<&str> = new_content.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        if lines[i].trim() == enabled_false_line {
-            // Check if we're in the target rule's block by looking backwards for the name
-            let mut in_target = false;
-            for j in (0..i).rev() {
-                let trimmed = lines[j].trim();
-                if trimmed == format!("name = \"{rule_name}\"") {
-                    in_target = true;
-                    break;
+            if let Some(i) = idx {
+                // If the entry only has "name" and "enabled", remove the entire entry
+                // (standalone disable block → restore to built-in default)
+                let key_count = tables.iter().nth(i).map_or(0, |t| t.iter().count());
+                if key_count <= 2 {
+                    tables.remove(i);
+                } else {
+                    // Entry has other fields — just remove "enabled"
+                    if let Some(entry) = tables.iter_mut().nth(i) {
+                        entry.remove("enabled");
+                    }
                 }
-                if trimmed == "[[rules]]" {
-                    break;
-                }
-            }
-            if in_target {
-                lines.remove(i);
-                continue;
             }
         }
-        i += 1;
-    }
-    new_content = lines.join("\n");
+        Ok(())
+    })?;
 
-    // Clean up trailing whitespace
-    let new_content = new_content.trim_end().to_string() + "\n";
-
-    std::fs::write(&config_path, &new_content)?;
     eprintln!("Enabled: {rule_name} (restored to built-in default)");
-    update_baseline_silent(&default_base_dir());
-
-    // Show updated config list
     run_config_list()
 }
 
@@ -1476,47 +1449,32 @@ fn run_override_disable(rule_name: &str) -> Result<i32, AppError> {
     }
 
     let config_path = resolve_config_path_checked()?;
-
-    // Auto-create config if it doesn't exist
     if !config_path.exists() {
         config::write_default_config(&config_path, false)?;
     }
 
+    // Check if already overridden by reading the raw TOML
     let content = std::fs::read_to_string(&config_path)?;
-
-    // Check if [overrides] section exists
-    let new_content = if content.contains("[overrides]") {
-        // Check if already has this rule
-        if content.contains(&format!("{rule_name} = false"))
-            || content.contains(&format!("{rule_name}=false"))
-        {
-            eprintln!("Rule `{rule_name}` is already overridden (disabled).");
-            return Ok(2);
-        }
-        // Add entry after [overrides] line
-        content.replace("[overrides]", &format!("[overrides]\n{rule_name} = false"))
-    } else {
-        // Append [overrides] section
-        let mut new = content;
-        if !new.ends_with('\n') {
-            new.push('\n');
-        }
-        new.push_str(&format!("\n[overrides]\n{rule_name} = false\n"));
-        new
-    };
-
-    // Validate TOML
-    if toml::from_str::<toml::Value>(&new_content).is_err() {
-        return Err(AppError::Config(
-            "modifying config would create invalid TOML; aborting".to_string(),
-        ));
+    if content
+        .parse::<toml_edit::DocumentMut>()
+        .ok()
+        .and_then(|doc| doc.get("overrides")?.get(rule_name)?.as_bool())
+        == Some(false)
+    {
+        eprintln!("Rule `{rule_name}` is already overridden (disabled).");
+        return Ok(2);
     }
 
-    std::fs::write(&config_path, &new_content)?;
+    mutate_config(&config_path, |doc| {
+        if !doc.contains_key("overrides") {
+            doc["overrides"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["overrides"][rule_name] = toml_edit::value(false);
+        Ok(())
+    })?;
+
     eprintln!("Override: disabled core rule `{rule_name}`");
     eprintln!("To restore: omamori override enable {rule_name}");
-    update_baseline_silent(&default_base_dir());
-
     run_config_list()
 }
 
@@ -1537,50 +1495,18 @@ fn run_override_enable(rule_name: &str) -> Result<i32, AppError> {
         return Ok(2);
     }
 
-    let content = std::fs::read_to_string(&config_path)?;
+    mutate_config(&config_path, |doc| {
+        if let Some(overrides) = doc.get_mut("overrides").and_then(|t| t.as_table_mut()) {
+            overrides.remove(rule_name);
+            // Remove empty [overrides] section
+            if overrides.is_empty() {
+                doc.remove("overrides");
+            }
+        }
+        Ok(())
+    })?;
 
-    // Remove the override entry
-    let patterns = [
-        format!("{rule_name} = false\n"),
-        format!("{rule_name}=false\n"),
-        format!("{rule_name} = false"),
-        format!("{rule_name}=false"),
-    ];
-
-    let mut new_content = content.clone();
-    for pat in &patterns {
-        new_content = new_content.replace(pat, "");
-    }
-
-    // Clean up empty [overrides] section
-    let new_content = new_content
-        .replace("[overrides]\n\n", "[overrides]\n")
-        .trim_end()
-        .to_string()
-        + "\n";
-
-    // Check if [overrides] section is now empty and remove it
-    let new_content = if new_content.contains("[overrides]\n")
-        && !new_content
-            .split("[overrides]\n")
-            .nth(1)
-            .unwrap_or("")
-            .lines()
-            .any(|l| {
-                let t = l.trim();
-                !t.is_empty() && !t.starts_with('#') && !t.starts_with('[')
-            }) {
-        new_content.replace("[overrides]\n", "")
-    } else {
-        new_content
-    };
-
-    let new_content = new_content.trim_end().to_string() + "\n";
-
-    std::fs::write(&config_path, &new_content)?;
     eprintln!("Restored: core rule `{rule_name}` is active again.");
-    update_baseline_silent(&default_base_dir());
-
     run_config_list()
 }
 
