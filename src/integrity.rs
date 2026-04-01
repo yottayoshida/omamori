@@ -260,7 +260,7 @@ pub fn canary(base_dir: &Path, program: &str) -> Option<String> {
 fn cursor_snippet_exe_path(content: &str) -> Option<PathBuf> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
     let cmd = v["hooks"]["beforeShellExecution"][0]["command"].as_str()?;
-    let path = cmd.strip_prefix('"')?.split('"').next()?;
+    let path = cmd.strip_suffix(" cursor-hook")?.trim_matches('"');
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
@@ -764,6 +764,14 @@ mod tests {
             installer::render_cursor_hooks_snippet(Path::new("/opt/homebrew/bin/omamori"));
         let exe = cursor_snippet_exe_path(&snippet).unwrap();
         assert_eq!(exe, PathBuf::from("/opt/homebrew/bin/omamori"));
+    }
+
+    #[test]
+    fn cursor_snippet_exe_path_handles_spaces_in_path() {
+        let snippet =
+            installer::render_cursor_hooks_snippet(Path::new("/Users/my user/bin/omamori"));
+        let exe = cursor_snippet_exe_path(&snippet).unwrap();
+        assert_eq!(exe, PathBuf::from("/Users/my user/bin/omamori"));
     }
 
     #[test]

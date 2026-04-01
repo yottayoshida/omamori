@@ -330,6 +330,10 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
                 let _ = merge_codex_hooks(&codex_dir, &codex_wrapper);
             }
         }
+    } else {
+        eprintln!(
+            "omamori warning: failed to resolve current exe; cursor/codex hooks not regenerated"
+        );
     }
 
     Ok(())
@@ -1532,27 +1536,32 @@ mod tests {
     // --- G-12: auto_setup_codex_if_needed ---
 
     #[test]
+    #[serial_test::serial]
     fn auto_setup_codex_skips_without_env() {
-        // No CODEX_CI env → should return false immediately
-        // SAFETY: test relies on CODEX_CI not being set in test environment
+        // SAFETY: serial_test ensures no concurrent access to env vars
+        let saved = std::env::var_os("CODEX_CI");
+        unsafe { std::env::remove_var("CODEX_CI") };
+
         let dir = std::env::temp_dir().join(format!("omamori-codex-g12-1-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-
-        // Ensure CODEX_CI is not set (it shouldn't be in test)
-        assert!(
-            std::env::var_os("CODEX_CI").is_none(),
-            "CODEX_CI should not be set in test environment"
-        );
 
         let result = auto_setup_codex_if_needed(&dir);
         assert!(!result, "should skip when CODEX_CI is not set");
 
         let _ = fs::remove_dir_all(&dir);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CODEX_CI", v) };
+        }
     }
 
     #[test]
+    #[serial_test::serial]
     fn auto_setup_codex_skips_when_wrapper_exists() {
+        // SAFETY: serial_test ensures no concurrent access to env vars
+        let saved = std::env::var_os("CODEX_CI");
+        unsafe { std::env::remove_var("CODEX_CI") };
+
         let dir = std::env::temp_dir().join(format!("omamori-codex-g12-2-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let hooks_dir = dir.join("hooks");
@@ -1561,12 +1570,13 @@ mod tests {
         // Pre-create the wrapper script
         fs::write(hooks_dir.join("codex-pretooluse.sh"), "#!/bin/sh\n").unwrap();
 
-        // Even if CODEX_CI were set, wrapper exists → skip
-        // We test this indirectly: the function checks wrapper first after env check
         let result = auto_setup_codex_if_needed(&dir);
         assert!(!result);
 
         let _ = fs::remove_dir_all(&dir);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CODEX_CI", v) };
+        }
     }
 
     // Note: Testing CODEX_CI=1 + no wrapper requires setting env var (unsafe in Rust 2024)

@@ -7,7 +7,9 @@
 
 > Safety guard for AI CLI tools. Blocks dangerous commands — and resists being disabled.
 
-When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori intercepts destructive operations and replaces them with safe alternatives. It also defends itself against AI agents attempting to disable or bypass its protection ([#22](https://github.com/yottayoshida/omamori/issues/22)).
+When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori intercepts destructive operations and replaces them with safe alternatives.
+
+Unlike other guards, omamori defends itself — AI agents cannot disable or bypass its protection ([#22](https://github.com/yottayoshida/omamori/issues/22)).
 
 **macOS only. Terminal commands are never affected** — omamori only activates when it detects an AI tool's environment variable.
 
@@ -26,7 +28,9 @@ omamori install --hooks
 export PATH="$HOME/.omamori/shim:$PATH"
 ```
 
-That's it. Works with Claude Code Auto mode — no extra config needed. After `brew upgrade`, shims and hooks auto-update on the next command. **Cursor users**: re-merge the hook snippet after upgrades (see [Auto-sync](#how-it-works)).
+That's it. Works with Claude Code Auto mode — no extra config needed.
+
+> **Cursor users**: After upgrades, re-merge the hook snippet. See [Auto-sync](#how-it-works).
 
 ## What It Blocks
 
@@ -35,7 +39,7 @@ That's it. Works with Claude Code Auto mode — no extra config needed. After `b
 | `rm` | `-r`, `-rf`, `-fr`, `--recursive` | **trash** — move to macOS Trash |
 | `git` | `reset --hard` | **stash-then-exec** — `git stash` first |
 | `git` | `push --force`, `push -f` | **block** |
-| `git` | `clean -fd`, `clean -fdx` | **block** |
+| `git` | `clean -f`, `clean --force` | **block** |
 | `chmod` | `777` | **block** |
 | `find` | `-delete`, `--delete` | **block** |
 | `rsync` | `--delete` + 7 variants | **block** |
@@ -67,9 +71,14 @@ Terminal → rm -rf src/
 
 **Layer 1 — PATH shim**: Symlinks for `rm`, `git`, `chmod`, `find`, `rsync` point to omamori. Rules apply only when an AI environment variable is detected.
 
-**Layer 2 — Hooks**: Recursively unwraps shell wrappers (`sudo env bash -c "..."` → extracts inner command) and evaluates against the same rules as Layer 1. Also blocks pipe-to-shell (`curl | bash`) and dynamic generation (`bash -c "$(cmd)"`). Available for Claude Code and Cursor.
+**Layer 2 — Hooks**: Evaluates commands against the same rules as Layer 1, with three additional capabilities:
+- Recursively unwraps shell wrappers (`sudo env bash -c "..."` → extracts inner command)
+- Blocks pipe-to-shell patterns (`curl | bash`)
+- Blocks dynamic command generation (`bash -c "$(cmd)"`)
 
-**Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting and direct config file editing. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
+Available for Claude Code, Cursor, and Codex CLI.
+
+**Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting and config modification via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
 **Auto mode compatible** (v0.6.2+): Works seamlessly with Claude Code's [Auto mode](https://claude.com/blog/auto-mode) — safe commands proceed without prompts, dangerous commands are still hard-blocked.
 
@@ -84,6 +93,8 @@ Terminal → rm -rf src/
 **Integrity monitoring** (`omamori status`): Verifies all defense layers are intact — shims, hooks, config, core policy, PATH order. Detects tampering including subtle hook edits where the version comment is preserved but the body is rewritten.
 
 **Sandbox complementarity**: omamori operates at the semantic layer — it understands *what* a command does (Layer 1: shim, Layer 2: hooks). A filesystem sandbox (e.g., sandbox-exec, container isolation) operates at the OS boundary — it restricts *where* processes can read and write. These are complementary: omamori catches `rm -rf src/` before it runs; a sandbox prevents damage if something slips through. For defense in depth, use both. omamori plans to add optional sandbox integration in a future release ([#61](https://github.com/yottayoshida/omamori/issues/61)).
+
+For what omamori **cannot** catch, see [Structural Limitations](#structural-limitations).
 
 ## Supported Tools
 
