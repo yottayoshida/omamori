@@ -239,7 +239,8 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 - `config disable`, `config enable`, `uninstall`, and `init --force` are blocked when AI detector env vars are present
 - Uses the same detector logic as the PATH shim (`evaluate_detectors()`)
 - Hooks also block these commands as string patterns (Claude Code + Cursor)
-- Claude Code PreToolUse hooks block direct `config.toml` file editing via Edit/Write tools
+- Hooks block shell commands that modify `config.toml` (sed, echo, etc.)
+- **Not yet implemented**: file_path-aware blocking for Edit/Write tools (planned for v0.7+)
 
 ### Known limitations
 
@@ -247,7 +248,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 |--------------|-----------|-------|
 | `omamori config disable` | Yes — env var guard | All tools with known env vars |
 | `omamori uninstall` | Yes — env var guard | All tools with known env vars |
-| Direct config.toml editing (Edit/Write) | Claude Code only | PreToolUse hook blocks file_path match |
+| Direct config.toml editing (Edit/Write) | **No** | file_path-aware hook not yet implemented (v0.7+) |
 | Direct config.toml editing (Bash: sed, echo >>) | Claude Code + Cursor | Hooks block Bash patterns containing config.toml |
 | Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
 | env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |

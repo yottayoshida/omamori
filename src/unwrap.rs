@@ -137,7 +137,7 @@ fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
         return parse_at_depth(&inner, depth + 1);
     }
 
-    let program = tokens[0].clone();
+    let program = basename(&tokens[0]).to_string();
     let args = tokens[1..].to_vec();
     ParseResult::Commands(vec![CommandInvocation::new(program, args)])
 }
