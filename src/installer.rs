@@ -232,22 +232,29 @@ fn atomic_write(target: &Path, content: &str) -> Result<(), std::io::Error> {
 }
 
 /// Create a named temp file in the given directory.
-/// Uses O_NOFOLLOW on Unix to prevent symlink-following attacks on the predictable
-/// temp path (symmetric with integrity.rs write_new_file). See: #56, T7.
+/// Uses O_EXCL (create_new) for exclusive creation + O_NOFOLLOW on Unix to prevent
+/// symlink-following attacks. AtomicU64 counter ensures uniqueness within a process.
+/// See: #56, #82, T7.
 fn tempfile_in(dir: &Path) -> Result<AtomicTempFile, std::io::Error> {
-    let path = dir.join(format!(".omamori-tmp-{}", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(".omamori-tmp-{}-{}", std::process::id(), seq));
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)?
     };
     #[cfg(not(unix))]
-    let file = fs::File::create(&path)?;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
     Ok(AtomicTempFile { file, path })
 }
 
@@ -1093,6 +1100,46 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "hello world");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tempfile_in_generates_unique_paths() {
+        let dir = std::env::temp_dir().join(format!("omamori-tmpuniq-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let tmp1 = tempfile_in(&dir).unwrap();
+        let tmp2 = tempfile_in(&dir).unwrap();
+        assert_ne!(
+            tmp1.path, tmp2.path,
+            "sequential tempfile_in must produce different paths"
+        );
+
+        // Cleanup
+        let _ = fs::remove_file(&tmp1.path);
+        let _ = fs::remove_file(&tmp2.path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tempfile_in_uses_exclusive_creation() {
+        let dir = std::env::temp_dir().join(format!("omamori-tmpexcl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a file that would collide if tempfile_in used deterministic naming
+        let tmp = tempfile_in(&dir).unwrap();
+        let path = tmp.path.clone();
+        drop(tmp); // close file handle, but don't delete
+
+        // The file still exists — a second call with the SAME name would fail on create_new
+        // But since we use a counter, the next call gets a different name and succeeds
+        let tmp2 = tempfile_in(&dir).unwrap();
+        assert_ne!(path, tmp2.path);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&tmp2.path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // --- Hook content hash tests (T2 attack detection) ---
