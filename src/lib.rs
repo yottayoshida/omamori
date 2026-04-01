@@ -601,9 +601,51 @@ fn run_command(
         CommandInvocation::new(program.clone(), args.iter().map(clone_lossy).collect());
     let env_pairs = env::vars().collect::<Vec<_>>();
     let detection = evaluate_detectors(&load_result.config.detectors, &env_pairs);
-    let matched_rule = match_rule(&load_result.config.rules, &invocation);
 
-    let resolved_program = resolve_real_command(&program)?;
+    // Sudo check: always evaluated, regardless of AI detection.
+    // Root-privilege destructive operations must be blocked even in non-AI environments.
+    if should_block_for_sudo() {
+        let outcome = ActionOutcome::Blocked {
+            message:
+                "omamori blocked this command because it was invoked via sudo/elevated privileges"
+                    .to_string(),
+        };
+        eprintln!("{}", outcome.message());
+        for warning in &detection.warnings {
+            eprintln!("omamori warning: {warning}");
+        }
+        if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
+            let event =
+                AuditEvent::from_outcome(&invocation, None, &detection.matched_detectors, &outcome);
+            let _ = logger.append(&event);
+        }
+        return Ok(outcome.exit_code());
+    }
+
+    // Non-protected fast path: no AI environment detected = human terminal.
+    // This is NOT a security boundary — omamori only guards AI-initiated commands.
+    // match_rule, context evaluation, and ActionExecutor are not constructed.
+    if !detection.protected {
+        let resolved = resolve_real_command(&program)?;
+        let status = std::process::Command::new(&resolved)
+            .args(&invocation.args)
+            .status()?;
+        let exit_code = actions::exit_code_from_status(status);
+        let outcome = ActionOutcome::PassedThrough { exit_code };
+        for warning in &detection.warnings {
+            eprintln!("omamori warning: {warning}");
+        }
+        if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
+            let event =
+                AuditEvent::from_outcome(&invocation, None, &detection.matched_detectors, &outcome);
+            let _ = logger.append(&event);
+        }
+        return Ok(exit_code);
+    }
+
+    // --- Protected path: AI environment detected. Full evaluation. ---
+
+    let matched_rule = match_rule(&load_result.config.rules, &invocation);
     let detector_env_keys: Vec<String> = load_result
         .config
         .detectors
@@ -611,75 +653,67 @@ fn run_command(
         .map(|d| d.env_key.clone())
         .filter(|k| !k.is_empty() && !k.contains('='))
         .collect();
-    let mut executor =
-        ActionExecutor::new(SystemOps::new(resolved_program, detector_env_keys.clone()));
-    let audit_logger = AuditLogger::from_config(&load_result.config.audit);
 
     // Context-aware evaluation: compute effective rule (may differ from matched_rule)
     let context_override: Option<RuleConfig> = if let (Some(rule), Some(ctx_config)) =
         (matched_rule, &load_result.config.context)
     {
-        if detection.protected {
-            // Tier 1: path-based evaluation
-            let ctx = context::evaluate_context(&invocation, rule, ctx_config);
-            let tier1_override = if let Some(override_action) = ctx.action_override {
-                eprintln!(
-                    "omamori: {} {} → {} ({}, original: {})",
-                    invocation.program,
-                    invocation.target_args().join(" "),
-                    override_action.as_str(),
-                    ctx.reason,
-                    rule.action.as_str(),
-                );
-                let mut overridden = rule.clone();
-                overridden.message = Some(override_action.context_message(&ctx.reason));
-                overridden.action = override_action;
-                Some(overridden)
-            } else {
-                if !ctx.reason.contains("no target paths")
-                    && !ctx.reason.contains("no context pattern")
-                {
-                    eprintln!("omamori warning: {}", ctx.reason);
-                }
-                None
-            };
+        // Tier 1: path-based evaluation
+        let ctx = context::evaluate_context(&invocation, rule, ctx_config);
+        let tier1_override = if let Some(override_action) = ctx.action_override {
+            eprintln!(
+                "omamori: {} {} → {} ({}, original: {})",
+                invocation.program,
+                invocation.target_args().join(" "),
+                override_action.as_str(),
+                ctx.reason,
+                rule.action.as_str(),
+            );
+            let mut overridden = rule.clone();
+            overridden.message = Some(override_action.context_message(&ctx.reason));
+            overridden.action = override_action;
+            Some(overridden)
+        } else {
+            if !ctx.reason.contains("no target paths") && !ctx.reason.contains("no context pattern")
+            {
+                eprintln!("omamori warning: {}", ctx.reason);
+            }
+            None
+        };
 
-            // Tier 2: git-aware evaluation (skip if Tier 1 already escalated to Block)
-            let is_escalated = tier1_override
-                .as_ref()
-                .is_some_and(|r| matches!(r.action, rules::ActionKind::Block));
+        // Tier 2: git-aware evaluation (skip if Tier 1 already escalated to Block)
+        let is_escalated = tier1_override
+            .as_ref()
+            .is_some_and(|r| matches!(r.action, rules::ActionKind::Block));
 
-            if !is_escalated {
-                if let Some(git_ctx) =
-                    context::evaluate_git_context(&invocation, &ctx_config.git, &detector_env_keys)
-                {
-                    if let Some(git_action) = git_ctx.action_override {
-                        eprintln!(
-                            "omamori: {} {} → {} ({}, original: {})",
-                            invocation.program,
-                            invocation.args.join(" "),
-                            git_action.as_str(),
-                            git_ctx.reason,
-                            rule.action.as_str(),
-                        );
-                        let mut overridden = rule.clone();
-                        overridden.message = Some(git_action.context_message(&git_ctx.reason));
-                        overridden.action = git_action;
-                        Some(overridden)
-                    } else {
-                        if !git_ctx.reason.contains("skipping") {
-                            eprintln!("omamori: {}", git_ctx.reason);
-                        }
-                        tier1_override
-                    }
+        if !is_escalated {
+            if let Some(git_ctx) =
+                context::evaluate_git_context(&invocation, &ctx_config.git, &detector_env_keys)
+            {
+                if let Some(git_action) = git_ctx.action_override {
+                    eprintln!(
+                        "omamori: {} {} → {} ({}, original: {})",
+                        invocation.program,
+                        invocation.args.join(" "),
+                        git_action.as_str(),
+                        git_ctx.reason,
+                        rule.action.as_str(),
+                    );
+                    let mut overridden = rule.clone();
+                    overridden.message = Some(git_action.context_message(&git_ctx.reason));
+                    overridden.action = git_action;
+                    Some(overridden)
                 } else {
+                    if !git_ctx.reason.contains("skipping") {
+                        eprintln!("omamori: {}", git_ctx.reason);
+                    }
                     tier1_override
                 }
             } else {
                 tier1_override
             }
         } else {
-            None
+            tier1_override
         }
     } else {
         None
@@ -691,17 +725,11 @@ fn run_command(
         _ => None,
     };
 
-    let outcome = if should_block_for_sudo() {
-        let blocked = ActionOutcome::Blocked {
-            message:
-                "omamori blocked this command because it was invoked via sudo/elevated privileges"
-                    .to_string(),
-        };
-        eprintln!("{}", blocked.message());
-        blocked
-    } else if !detection.protected {
-        executor.exec_passthrough(&invocation)?
-    } else if let Some(rule) = effective_rule {
+    let resolved_program = resolve_real_command(&program)?;
+    let mut executor =
+        ActionExecutor::new(SystemOps::new(resolved_program, detector_env_keys.clone()));
+
+    let outcome = if let Some(rule) = effective_rule {
         let outcome = executor.execute(&invocation, rule)?;
         match &outcome {
             ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. } => {
@@ -721,7 +749,7 @@ fn run_command(
         eprintln!("omamori warning: {warning}");
     }
 
-    if let Some(logger) = audit_logger {
+    if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
         let event = AuditEvent::from_outcome(
             &invocation,
             effective_rule,

@@ -149,6 +149,9 @@ pub fn match_rule<'a>(
 /// are at least 2 chars after the leading `-`.
 pub(crate) fn expand_short_flags(args: &[String]) -> Vec<String> {
     let mut expanded = Vec::with_capacity(args.len());
+    // Track which single-letter flags have been emitted to avoid O(n²) contains() checks.
+    // Index: 0-25 = a-z, 26-51 = A-Z.
+    let mut seen = [false; 52];
     for arg in args {
         expanded.push(arg.clone());
         let bytes = arg.as_bytes();
@@ -158,9 +161,14 @@ pub(crate) fn expand_short_flags(args: &[String]) -> Vec<String> {
             && bytes[1..].iter().all(|b| b.is_ascii_alphabetic())
         {
             for &ch in &bytes[1..] {
-                let single = format!("-{}", ch as char);
-                if !expanded.contains(&single) {
-                    expanded.push(single);
+                let idx = match ch {
+                    b'a'..=b'z' => (ch - b'a') as usize,
+                    b'A'..=b'Z' => (ch - b'A') as usize + 26,
+                    _ => continue,
+                };
+                if !seen[idx] {
+                    seen[idx] = true;
+                    expanded.push(format!("-{}", ch as char));
                 }
             }
         }

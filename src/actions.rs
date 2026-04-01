@@ -5,7 +5,7 @@ use std::process::{Command, ExitStatus};
 use crate::config::BLOCKED_DESTINATION_PREFIXES;
 use crate::rules::{ActionKind, CommandInvocation, RuleConfig};
 
-fn exit_code_from_status(status: ExitStatus) -> i32 {
+pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }
