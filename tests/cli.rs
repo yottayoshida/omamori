@@ -457,13 +457,51 @@ fn cursor_hook_stdout_is_json_only() {
 }
 
 #[test]
-fn cursor_hook_handles_malformed_stdin() {
+fn cursor_hook_denies_malformed_stdin() {
     let (stdout, _, success) = run_cursor_hook("not json at all");
     assert!(success);
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON even on bad input");
+    assert_eq!(parsed["continue"], false);
+    assert_eq!(parsed["permission"], "deny");
+}
+
+#[test]
+fn cursor_hook_denies_null_command() {
+    let (stdout, _, success) = run_cursor_hook(r#"{"command":null,"cwd":"/tmp"}"#);
+    assert!(success);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["continue"], false);
+    assert_eq!(parsed["permission"], "deny");
+}
+
+#[test]
+fn cursor_hook_denies_missing_command_key() {
+    let (stdout, _, success) = run_cursor_hook(r#"{"foo":"bar","cwd":"/tmp"}"#);
+    assert!(success);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["continue"], false);
+    assert_eq!(parsed["permission"], "deny");
+}
+
+#[test]
+fn cursor_hook_allows_empty_command() {
+    let (stdout, _, success) = run_cursor_hook(r#"{"command":"","cwd":"/tmp"}"#);
+    assert!(success);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(parsed["continue"], true);
     assert_eq!(parsed["permission"], "allow");
+}
+
+#[test]
+fn cursor_hook_stderr_does_not_leak_command() {
+    let (_, stderr, success) =
+        run_cursor_hook(r#"{"command":"echo secret-token-12345","cwd":"/tmp"}"#);
+    assert!(success);
+    assert!(
+        !stderr.contains("secret-token-12345"),
+        "stderr must not contain the full command string"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,4 +1283,88 @@ fn shim_invocation_runs_canary_and_rule_evaluation() {
     );
 
     let _ = fs::remove_dir_all(&poc_dir);
+}
+
+// ---------------------------------------------------------------------------
+// #76: basename normalization — path traversal must not bypass rules
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hook_check_blocks_path_traversal_rm() {
+    // /bin/../bin/rm should normalize to rm and match rm-recursive-to-trash
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("/bin/../bin/rm -rf /tmp/test"));
+    assert_eq!(exit_code, 2, "path traversal must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_dot_segment_rm() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("/usr/./bin/rm -rf /tmp/test"));
+    assert_eq!(exit_code, 2, "dot segment must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_relative_path_rm() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("./rm -rf /tmp/test"));
+    assert_eq!(exit_code, 2, "relative path must be blocked");
+}
+
+// ---------------------------------------------------------------------------
+// #78: git clean rule expansion — split flags must also match
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hook_check_blocks_git_clean_split_flags() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("git clean -f -d"));
+    assert_eq!(exit_code, 2, "git clean -f -d must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_git_clean_df() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("git clean -df"));
+    assert_eq!(exit_code, 2, "git clean -df must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_git_clean_three_flags() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("git clean -d -f -x"));
+    assert_eq!(exit_code, 2, "git clean -d -f -x must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_git_clean_long_force() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("git clean --force -d"));
+    assert_eq!(exit_code, 2, "git clean --force must be blocked");
+}
+
+#[test]
+fn hook_check_allows_git_clean_dry_run() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("git clean -n"));
+    assert_eq!(exit_code, 0, "git clean -n (dry-run) must be allowed");
+}
+
+// ---------------------------------------------------------------------------
+// #78: cursor-hook git clean regression
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_hook_blocks_git_clean_split_flags() {
+    let (stdout, _, success) = run_cursor_hook(r#"{"command":"git clean -f -d","cwd":"/tmp"}"#);
+    assert!(success);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["continue"], false);
+    assert_eq!(parsed["permission"], "deny");
+}
+
+// ---------------------------------------------------------------------------
+// #76: cursor-hook path traversal regression
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cursor_hook_blocks_path_traversal_rm() {
+    let (stdout, _, success) =
+        run_cursor_hook(r#"{"command":"/bin/../bin/rm -rf /tmp/test","cwd":"/tmp"}"#);
+    assert!(success);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(parsed["continue"], false);
+    assert_eq!(parsed["permission"], "deny");
 }

@@ -853,14 +853,18 @@ fn run_cursor_hook() -> Result<i32, AppError> {
     std::io::stdin().read_to_string(&mut input)?;
 
     let command = match serde_json::from_str::<serde_json::Value>(&input) {
-        Ok(v) => v
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string(),
+        Ok(v) => match v.get("command") {
+            Some(c) if c.is_string() => c.as_str().unwrap().to_string(),
+            Some(_) | None => {
+                // command key missing or not a string → malformed protocol → deny
+                eprintln!("omamori cursor-hook: missing or invalid 'command' field");
+                print_cursor_response(false, "deny", Some("omamori: malformed hook input"), None);
+                return Ok(0);
+            }
+        },
         Err(_) => {
             eprintln!("omamori cursor-hook: failed to parse stdin JSON");
-            print_cursor_response(true, "allow", None, None);
+            print_cursor_response(false, "deny", Some("omamori: malformed hook input"), None);
             return Ok(0);
         }
     };
@@ -869,8 +873,6 @@ fn run_cursor_hook() -> Result<i32, AppError> {
         print_cursor_response(true, "allow", None, None);
         return Ok(0);
     }
-
-    eprintln!("omamori cursor-hook: command={command}");
 
     match check_command_for_hook(&command) {
         HookCheckResult::Allow => {
@@ -1154,7 +1156,7 @@ fn print_cursor_response(
     println!(
         "{}",
         serde_json::to_string(&response)
-            .unwrap_or_else(|_| { r#"{"continue":true,"permission":"allow"}"#.to_string() })
+            .unwrap_or_else(|_| { r#"{"continue":false,"permission":"deny"}"#.to_string() })
     );
 }
 
