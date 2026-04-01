@@ -469,7 +469,7 @@ pub fn default_rules() -> Vec<RuleConfig> {
             "git",
             ActionKind::Block,
             vec!["clean".to_string()],
-            vec!["-fd".to_string(), "-fdx".to_string()],
+            vec!["-f".to_string(), "--force".to_string()],
             Some("omamori blocked git clean because it would remove untracked files".to_string()),
         )
         .with_builtin(true),

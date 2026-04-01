@@ -72,7 +72,7 @@ name = "git-clean-force-block"
 command = "git"
 action = "block"
 match_all = ["clean"]
-match_any = ["-fd", "-fdx"]
+match_any = ["-f", "--force"]
 message = "omamori blocked git clean because it would remove untracked files"
 
 [[rules]]
@@ -114,7 +114,8 @@ message = "omamori blocked rsync with destructive flags"
 # regenerable_paths = ["target/", "dist/", "node_modules/", "build/", "__pycache__/", ".cache/"]
 #
 # [context.git]
-# uncommitted_escalation = "block"
+# enabled = true
+# timeout_ms = 3000
 
 [audit]
 enabled = false

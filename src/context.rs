@@ -394,8 +394,10 @@ pub fn evaluate_git_context(
         };
     }
 
-    // git clean -fd/-fdx: check for untracked files
-    if args.contains(&"clean") && (args.contains(&"-fd") || args.contains(&"-fdx")) {
+    // git clean with force flag: check for untracked files
+    let expanded_args = crate::rules::expand_short_flags(&invocation.args);
+    let has_force = expanded_args.iter().any(|a| a == "-f" || a == "--force");
+    if args.contains(&"clean") && has_force {
         return match git_status_porcelain(detector_env_keys, config.timeout_ms) {
             Ok(output) => {
                 let has_untracked = output.lines().any(|line| line.starts_with("??"));
@@ -1028,6 +1030,55 @@ mod tests {
         let eval = result.unwrap();
         assert!(eval.action_override.is_none());
         assert!(eval.reason.contains("untracked files present"));
+
+        env::set_current_dir(&saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #78: git clean with split flags must also trigger context evaluation ---
+
+    #[test]
+    #[serial_test::serial]
+    fn git_context_clean_split_flags_triggers_evaluation() {
+        let dir = create_git_repo();
+        let saved = env::current_dir().unwrap();
+        env::set_current_dir(&dir).unwrap();
+
+        std::fs::write(dir.join("committed.txt"), "init").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+
+        // git clean -f -d (split flags) should still trigger evaluation
+        let inv = super::CommandInvocation::new(
+            "git".to_string(),
+            vec!["clean".to_string(), "-f".to_string(), "-d".to_string()],
+        );
+        let result = evaluate_git_context(&inv, &git_config(), &[]);
+        assert!(
+            result.is_some(),
+            "split -f -d must trigger context evaluation"
+        );
+        let eval = result.unwrap();
+        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+
+        // git clean --force -d should also trigger
+        let inv2 = super::CommandInvocation::new(
+            "git".to_string(),
+            vec!["clean".to_string(), "--force".to_string(), "-d".to_string()],
+        );
+        let result2 = evaluate_git_context(&inv2, &git_config(), &[]);
+        assert!(result2.is_some(), "--force must trigger context evaluation");
 
         env::set_current_dir(&saved).unwrap();
         let _ = std::fs::remove_dir_all(&dir);

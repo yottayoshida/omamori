@@ -147,7 +147,7 @@ pub fn match_rule<'a>(
 /// `["-rfv", "-r", "-f", "-v"]`, preserving the original.
 /// Only expands when the flag chars are all ASCII alphabetic and there
 /// are at least 2 chars after the leading `-`.
-fn expand_short_flags(args: &[String]) -> Vec<String> {
+pub(crate) fn expand_short_flags(args: &[String]) -> Vec<String> {
     let mut expanded = Vec::with_capacity(args.len());
     for arg in args {
         expanded.push(arg.clone());
