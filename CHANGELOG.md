@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.6] - 2026-04-01
+
+### Fixed
+
+- **Cursor hook fail-close** (#75): Malformed JSON, missing/null `command` field now returns `deny` instead of `allow`. Closes a fail-open vulnerability (DREAD 8.6) where invalid input could bypass all protection.
+- **Basename normalization** (#76): Commands with path traversal (`/bin/../bin/rm`, `./rm`) are now normalized via `basename()` before rule matching, preventing bypass of protection rules (DREAD 8.0).
+- **git clean rule expansion** (#78): `match_any` changed from `["-fd", "-fdx"]` to `["-f", "--force"]`. Split flags (`git clean -f -d`) and long form (`git clean --force`) are now blocked. `context.rs` also uses `expand_short_flags` for consistent evaluation. **Breaking**: `git clean -f` (without `-d`) is now also blocked.
+- **cursor_snippet_exe_path** (#59): Improved path extraction using `strip_suffix(" cursor-hook")` for robustness with space-containing paths.
+- **regenerate_hooks else branch** (#60): Added warning log when `current_exe()` fails, making hook regeneration failures visible.
+
+### Changed
+
+- **stderr command logging removed** (#79): `cursor-hook` no longer logs the full command string to stderr, preventing potential secret leakage (DREAD 6.8).
+- **print_cursor_response fallback** (#75): Serialization fallback JSON changed from `allow` to `deny` (fail-close).
+- **expand_short_flags visibility** (#78): Changed from `fn` to `pub(crate) fn` for use in `context.rs`.
+- **Test hermetic isolation** (#83): `auto_setup_codex` tests now use `#[serial]` with env var save/restore to prevent cross-test contamination.
+
+### Docs
+
+- **README.md** (#77): Corrected "direct config file editing" to "config modification via shell commands" — Edit/Write tool blocking is not yet implemented.
+- **SECURITY.md** (#77): Corrected known limitations table — Edit/Write `file_path` blocking marked as "Not yet implemented (v0.7+)" instead of falsely claiming Claude Code coverage.
+- **config.default.toml** (#77): `[context.git]` example updated from `uncommitted_escalation` to `enabled` + `timeout_ms` to match actual schema.
+
 ## [0.6.5] - 2026-03-31
 
 ### Added
