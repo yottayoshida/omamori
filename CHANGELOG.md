@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.6.7] - 2026-04-01
+
+### Changed
+
+- **run_command() lazy init** (#80): Non-protected (non-AI) path now exits early with direct `Command::new()` passthrough. `match_rule`, context evaluation, and `ActionExecutor` are no longer constructed for human terminal commands. Source: Codex quality review S2-1.
+- **Config mutation toml_edit** (#81): `config disable/enable` and `override disable/enable` rewritten from string surgery to `toml_edit::DocumentMut` structured editing. Common I/O pattern extracted into `mutate_config()` helper. Preserves comments and formatting. `toml::from_str` failsafe validation retained. Source: Codex quality review S2-2.
+- **expand_short_flags O(n)** (#85): Duplicate check changed from `Vec::contains()` O(n²) to `[bool; 52]` lookup table for ASCII letters. Source: Codex quality review S3-1.
+
+### Fixed
+
+- **atomic_write uniqueness** (#82): Temp file names now include an `AtomicU64` sequence counter (`PID-seq` format). `create(true)+truncate(true)` replaced with `create_new(true)` (O_EXCL) for exclusive creation. `O_NOFOLLOW` maintained. Source: Codex quality review S2-3.
+- **config.default.toml timeout_ms**: Corrected example value from `3000` to `100` to match code default (`default_timeout_ms()`). Introduced in v0.6.6.
+
 ## [0.6.6] - 2026-04-01
 
 ### Fixed
