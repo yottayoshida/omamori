@@ -390,4 +390,18 @@ If the secret file is deleted or unreadable:
 
 ### Legacy Compatibility
 
-Entries written before v0.7.0 lack chain fields. When `append()` encounters a legacy last entry (no `chain_version`), it starts a new chain from genesis (`seq=0`). `omamori audit verify` (v0.7.1) will skip legacy entries with a warning.
+Entries written before v0.7.0 lack chain fields. When `append()` encounters a legacy last entry (no `chain_version`), it starts a new chain from genesis (`seq=0`). `omamori audit verify` skips legacy entries with a warning. A log containing only legacy entries returns exit code 2 (no chain entries to verify).
+
+### Verify Information Disclosure Policy (v0.7.1+)
+
+`omamori audit verify` is designed to be useful to the user while limiting information useful to an attacker:
+
+| Information | Disclosed | Rationale |
+|-------------|-----------|-----------|
+| Entry count | Yes | Non-sensitive; needed for user to assess log completeness |
+| Broken entry position (seq #) | Yes | Needed for investigation; without HMAC secret, position alone cannot repair chain |
+| Expected hash value | **No** | Would allow targeted forgery if secret is also compromised |
+| HMAC secret file path | **No** | Reduces attack surface; path is derivable from code but not explicitly provided |
+| Chain structure (prev_hash linkage) | Via `--json` only | Machine consumers need full provenance for forensics/SIEM. HMAC protection means chain fields cannot be forged without secret |
+
+**Recommendation**: Run `omamori audit verify` directly in a terminal, not through an AI agent. AI agents can read stdout and may misrepresent results to the user.

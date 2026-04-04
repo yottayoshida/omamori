@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.7.1] - 2026-04-05
+
+### Added
+
+- **`omamori audit verify`** (#29): Verify hash chain integrity of the audit log. Stream processing with `flock_shared` for concurrent safety. Exit codes: 0=intact, 1=broken, 2=error/missing. Legacy entries skipped with warning; legacy-only logs return exit 2 (no chain entries to verify). 3-line recovery guidance on chain break.
+- **`omamori audit show`** (#29): View audit log entries with filters. Defaults to `--last 20` (matches `git log` convention). Supports `--all`, `--rule <name>`, `--provider <name>` (substring match), `--json` (full JSONL including chain fields for forensics). Human-readable table: 6 columns (no SEQ, no hashes).
+- **`omamori status` Layer 3**: Detection section now shows audit status (entry count + verify prompt). Does not run full verification — avoids false "chain intact" on unverified data.
+- **`omamori audit` help**: Running `omamori audit` with no subcommand shows audit-specific usage.
+
 ## [0.7.0] - 2026-04-04
 
 ### Added

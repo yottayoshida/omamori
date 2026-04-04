@@ -186,6 +186,12 @@ omamori test [--config PATH]             # Verify policy rules
 omamori status [--refresh]               # Health check all defense layers
 omamori exec [--config PATH] -- CMD      # Run command through policy engine
 
+omamori audit verify                     # Verify hash chain integrity (exit 0/1/2)
+omamori audit show [--last N] [--json]   # View recent audit entries (default: last 20)
+omamori audit show --all                 # View all entries
+omamori audit show --rule <name>         # Filter by rule (substring match)
+omamori audit show --provider <name>     # Filter by provider
+
 omamori config list                      # Show rules with status
 omamori config disable <rule>            # Disable a rule
 omamori config enable <rule>             # Re-enable a rule
