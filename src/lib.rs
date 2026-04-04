@@ -13,7 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use actions::{ActionExecutor, ActionOutcome, SystemOps};
-use audit::{AuditEvent, AuditLogger};
+use audit::AuditLogger;
 use config::{ConfigLoadResult, load_config};
 use detector::evaluate_detectors;
 use installer::{InstallOptions, default_base_dir, install, uninstall};
@@ -616,7 +616,7 @@ fn run_command(
         }
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
             let event =
-                AuditEvent::from_outcome(&invocation, None, &detection.matched_detectors, &outcome);
+                logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
             let _ = logger.append(&event);
         }
         return Ok(outcome.exit_code());
@@ -637,7 +637,7 @@ fn run_command(
         }
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
             let event =
-                AuditEvent::from_outcome(&invocation, None, &detection.matched_detectors, &outcome);
+                logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
             let _ = logger.append(&event);
         }
         return Ok(exit_code);
@@ -750,7 +750,7 @@ fn run_command(
     }
 
     if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
-        let event = AuditEvent::from_outcome(
+        let event = logger.create_event(
             &invocation,
             effective_rule,
             &detection.matched_detectors,
