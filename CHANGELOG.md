@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.7.0] - 2026-04-04
+
+### Added
+
+- **Tamper-evident audit log** (#29): Every command decision is recorded in `~/.local/share/omamori/audit.jsonl` with HMAC-SHA256 integrity and hash-chain continuity. File paths are never stored in plaintext.
+  - **HMAC-SHA256 target_hash**: Per-install secret (32 bytes, `/dev/urandom`) replaces plain SHA-256. Resists dictionary attacks on low-entropy paths.
+  - **Hash chain**: Each entry includes `seq`, `prev_hash`, and `entry_hash`. Modifying or deleting any entry breaks the chain for all subsequent entries.
+  - **Concurrent safety**: `flock(2)` advisory lock prevents chain corruption from parallel shim invocations.
+  - **Torn line recovery**: Partial writes from crashes are detected and skipped; new entries always start on a clean line.
+  - **Self-defense**: `audit.jsonl` and `audit-secret` paths added to `blocked_command_patterns`.
+
+### Changed
+
+- **Audit enabled by default**: `AuditConfig.enabled` now defaults to `true`. Existing users with no `[audit]` section in config.toml will see `audit.jsonl` created automatically. Set `enabled = false` to opt out.
+- **`AuditEvent::from_outcome()` removed**: Replaced by `AuditLogger::create_event()`. HMAC secret is encapsulated inside the logger and never exposed via public API.
+
+### Closed
+
+- **#74 Interpreter detection**: NO-GO. [Investigated](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools. Full-block approach was disproportionate to the risk.
+
 ## [0.6.7] - 2026-04-01
 
 ### Changed
