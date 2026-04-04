@@ -617,7 +617,7 @@ fn run_command(
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
             let event =
                 logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
-            let _ = logger.append(&event);
+            let _ = logger.append(event);
         }
         return Ok(outcome.exit_code());
     }
@@ -638,7 +638,7 @@ fn run_command(
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
             let event =
                 logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
-            let _ = logger.append(&event);
+            let _ = logger.append(event);
         }
         return Ok(exit_code);
     }
@@ -756,7 +756,7 @@ fn run_command(
             &detection.matched_detectors,
             &outcome,
         );
-        let _ = logger.append(&event);
+        let _ = logger.append(event);
     }
 
     Ok(outcome.exit_code())
