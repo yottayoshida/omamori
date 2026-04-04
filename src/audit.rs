@@ -1,5 +1,5 @@
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, Mac};
@@ -334,7 +334,22 @@ fn flock_exclusive(file: &fs::File) -> Result<(), std::io::Error> {
 
 #[cfg(not(unix))]
 fn flock_exclusive(_file: &fs::File) -> Result<(), std::io::Error> {
-    Ok(()) // No-op on non-Unix (omamori is Unix-only, but keeps compilation clean)
+    Ok(())
+}
+
+#[cfg(unix)]
+fn flock_shared(file: &fs::File) -> Result<(), std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn flock_shared(_file: &fs::File) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -437,6 +452,236 @@ fn default_audit_path() -> PathBuf {
         .join("share")
         .join("omamori")
         .join("audit.jsonl")
+}
+
+// ---------------------------------------------------------------------------
+// CLI: verify, show, summary
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum AuditError {
+    SecretUnavailable,
+    FileNotFound,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for AuditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SecretUnavailable => write!(f, "HMAC secret unavailable"),
+            Self::FileNotFound => write!(f, "audit log not found"),
+            Self::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for AuditError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+pub struct VerifyResult {
+    pub chain_entries: u64,
+    pub legacy_entries: u64,
+    pub torn_lines: u64,
+    pub broken_at: Option<u64>,
+}
+
+pub struct ShowOptions {
+    pub last: Option<usize>,
+    pub rule: Option<String>,
+    pub provider: Option<String>,
+    pub json: bool,
+}
+
+pub struct AuditSummary {
+    pub enabled: bool,
+    pub entry_count: u64,
+    pub secret_available: bool,
+}
+
+pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
+    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let secret = read_secret(&secret_path_for(&path)).map_err(|_| AuditError::SecretUnavailable)?;
+
+    let file = fs::File::open(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => AuditError::FileNotFound,
+        _ => AuditError::Io(e),
+    })?;
+    flock_shared(&file)?;
+
+    let reader = std::io::BufReader::new(&file);
+    let genesis = genesis_hash(Some(&secret));
+
+    let mut result = VerifyResult {
+        chain_entries: 0,
+        legacy_entries: 0,
+        torn_lines: 0,
+        broken_at: None,
+    };
+    let mut expected_prev = genesis;
+    let mut expected_seq: u64 = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let event: AuditEvent = match serde_json::from_str(trimmed) {
+            Ok(e) => e,
+            Err(_) => {
+                result.torn_lines += 1;
+                continue;
+            }
+        };
+
+        if event.chain_version.is_none() {
+            result.legacy_entries += 1;
+            continue;
+        }
+
+        let seq = event.seq.unwrap_or(0);
+        let prev_hash = event.prev_hash.as_deref().unwrap_or("");
+        let recorded_hash = event.entry_hash.as_deref().unwrap_or("");
+
+        if result.chain_entries > 0 && seq != expected_seq {
+            result.broken_at = Some(seq);
+            break;
+        }
+        if prev_hash != expected_prev {
+            result.broken_at = Some(seq);
+            break;
+        }
+
+        let recomputed = compute_entry_hash(Some(&secret), &event);
+        if recomputed != recorded_hash {
+            result.broken_at = Some(seq);
+            break;
+        }
+
+        expected_prev = recorded_hash.to_string();
+        expected_seq = seq + 1;
+        result.chain_entries += 1;
+    }
+
+    Ok(result)
+}
+
+pub fn show_entries(
+    config: &AuditConfig,
+    opts: &ShowOptions,
+    out: &mut impl Write,
+) -> Result<(), AuditError> {
+    use std::collections::VecDeque;
+
+    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let file = fs::File::open(&path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => AuditError::FileNotFound,
+        _ => AuditError::Io(e),
+    })?;
+
+    let reader = std::io::BufReader::new(&file);
+    let capacity = opts.last.unwrap_or(usize::MAX);
+    let mut entries: VecDeque<AuditEvent> = VecDeque::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let event: AuditEvent = match serde_json::from_str(trimmed) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if let Some(ref filter) = opts.rule {
+            match &event.rule_id {
+                Some(rule) if rule.contains(filter.as_str()) => {}
+                _ => continue,
+            }
+        }
+        if opts
+            .provider
+            .as_ref()
+            .is_some_and(|f| !event.provider.contains(f.as_str()))
+        {
+            continue;
+        }
+
+        entries.push_back(event);
+        if entries.len() > capacity {
+            entries.pop_front();
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    if opts.json {
+        for event in &entries {
+            serde_json::to_writer(&mut *out, event).map_err(std::io::Error::from)?;
+            writeln!(out)?;
+        }
+    } else {
+        writeln!(
+            out,
+            "{:<20} {:<12} {:<8} {:<15} {:<8} RULE",
+            "TIMESTAMP", "PROVIDER", "COMMAND", "ACTION", "RESULT"
+        )?;
+        for event in &entries {
+            let rule = event.rule_id.as_deref().unwrap_or("\u{2014}");
+            let ts = display_timestamp(&event.timestamp);
+            writeln!(
+                out,
+                "{:<20} {:<12} {:<8} {:<15} {:<8} {rule}",
+                ts, event.provider, event.command, event.action, event.result
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
+    if !config.enabled {
+        return AuditSummary {
+            enabled: false,
+            entry_count: 0,
+            secret_available: false,
+        };
+    }
+
+    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let secret_available = read_secret(&secret_path_for(&path)).is_ok();
+
+    let entry_count = fs::File::open(&path)
+        .ok()
+        .map(|f| {
+            std::io::BufReader::new(f)
+                .lines()
+                .filter(|l| l.as_ref().is_ok_and(|s| !s.trim().is_empty()))
+                .count() as u64
+        })
+        .unwrap_or(0);
+
+    AuditSummary {
+        enabled: true,
+        entry_count,
+        secret_available,
+    }
+}
+
+fn display_timestamp(ts: &str) -> String {
+    // "2026-04-04T03:31:02.54814Z" → "2026-04-04T03:31:02Z"
+    match ts.find('.') {
+        Some(dot) => format!("{}Z", &ts[..dot]),
+        None => ts.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -707,7 +952,7 @@ mod tests {
 
     // --- Verify chain integrity (helper for tests) ---
 
-    fn verify_chain(events: &[serde_json::Value], secret: Option<&[u8; 32]>) -> bool {
+    fn check_chain_manual(events: &[serde_json::Value], secret: Option<&[u8; 32]>) -> bool {
         let genesis = genesis_hash(secret);
         let mut expected_prev = genesis;
 
@@ -743,7 +988,7 @@ mod tests {
         logger.append(make_event("echo")).unwrap();
 
         let events = read_events(&logger.path);
-        assert!(verify_chain(&events, Some(&TEST_SECRET)));
+        assert!(check_chain_manual(&events, Some(&TEST_SECRET)));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -764,7 +1009,7 @@ mod tests {
 
         let events = read_events(&logger.path);
         assert!(
-            !verify_chain(&events, Some(&TEST_SECRET)),
+            !check_chain_manual(&events, Some(&TEST_SECRET)),
             "tamper should be detected"
         );
 
@@ -996,5 +1241,304 @@ mod tests {
             secret: Some([0u8; 32]),
         };
         assert!(logger.append(make_event("rm")).is_err());
+    }
+
+    // --- verify_chain ---
+
+    fn verify_config(dir: &Path) -> AuditConfig {
+        AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+        }
+    }
+
+    #[test]
+    fn verify_clean_chain() {
+        let dir = test_dir("verify-clean");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+        logger.append(make_event("cat")).unwrap();
+        logger.append(make_event("echo")).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.chain_entries, 3);
+        assert_eq!(result.legacy_entries, 0);
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_tampered_chain() {
+        let dir = test_dir("verify-tamper");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+        logger.append(make_event("rm")).unwrap();
+        logger.append(make_event("cat")).unwrap();
+
+        let path = dir.join("audit.jsonl");
+        let content = fs::read_to_string(&path).unwrap();
+        let tampered = content.replacen("\"passthrough\"", "\"blocked\"", 1);
+        fs::write(&path, tampered).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_legacy_then_chain() {
+        let dir = test_dir("verify-legacy");
+        let logger = test_logger(&dir);
+
+        let path = dir.join("audit.jsonl");
+        let legacy = r#"{"timestamp":"2026-01-01T00:00:00Z","provider":"test","command":"old","rule_id":null,"action":"passthrough","result":"passthrough","target_count":0,"target_hash":"sha256:old"}"#;
+        fs::write(&path, format!("{legacy}\n{legacy}\n")).unwrap();
+
+        logger.append(make_event("new1")).unwrap();
+        logger.append(make_event("new2")).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.chain_entries, 2);
+        assert_eq!(result.legacy_entries, 2);
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_legacy_only() {
+        let dir = test_dir("verify-legacy-only");
+        test_logger(&dir); // create secret
+
+        let path = dir.join("audit.jsonl");
+        let legacy = r#"{"timestamp":"2026-01-01T00:00:00Z","provider":"test","command":"old","rule_id":null,"action":"passthrough","result":"passthrough","target_count":0,"target_hash":"sha256:old"}"#;
+        fs::write(&path, format!("{legacy}\n")).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.chain_entries, 0);
+        assert_eq!(result.legacy_entries, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_empty_file() {
+        let dir = test_dir("verify-empty");
+        test_logger(&dir); // create secret
+        fs::write(dir.join("audit.jsonl"), "").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.chain_entries, 0);
+        assert_eq!(result.legacy_entries, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_torn_line() {
+        let dir = test_dir("verify-torn");
+        let logger = test_logger(&dir);
+        logger.append(make_event("first")).unwrap();
+
+        let path = dir.join("audit.jsonl");
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        write!(f, "{{\"broken\":tru").unwrap();
+
+        logger.append(make_event("second")).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.chain_entries, 2);
+        assert!(result.torn_lines > 0);
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_no_secret() {
+        let dir = test_dir("verify-no-secret");
+        fs::write(dir.join("audit.jsonl"), "").unwrap();
+        // No secret file created
+        let result = verify_chain(&verify_config(&dir));
+        assert!(matches!(result, Err(AuditError::SecretUnavailable)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_no_file() {
+        let dir = test_dir("verify-no-file");
+        test_logger(&dir); // create secret but no audit.jsonl
+
+        let result = verify_chain(&verify_config(&dir));
+        assert!(matches!(result, Err(AuditError::FileNotFound)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- show_entries ---
+
+    #[test]
+    fn show_last_n() {
+        let dir = test_dir("show-last");
+        let logger = test_logger(&dir);
+        for i in 0..10 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+
+        let opts = ShowOptions {
+            last: Some(3),
+            rule: None,
+            provider: None,
+            json: false,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        // 1 header + 3 data lines
+        assert_eq!(
+            lines.len(),
+            4,
+            "expected header + 3 entries, got:\n{output}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_filter_rule() {
+        let dir = test_dir("show-filter-rule");
+        let logger = test_logger(&dir);
+
+        // Append events with different rules by manipulating directly
+        let mut e1 = make_event("rm");
+        e1.rule_id = Some("rm-recursive".to_string());
+        logger.append(e1).unwrap();
+
+        let mut e2 = make_event("git");
+        e2.rule_id = Some("git-push-force".to_string());
+        logger.append(e2).unwrap();
+
+        let mut e3 = make_event("rm");
+        e3.rule_id = Some("rm-recursive".to_string());
+        logger.append(e3).unwrap();
+
+        let opts = ShowOptions {
+            last: None,
+            rule: Some("rm".to_string()),
+            provider: None,
+            json: false,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let data_lines = output.lines().skip(1).count(); // skip header
+        assert_eq!(data_lines, 2, "expected 2 rm entries");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_json_includes_chain_fields() {
+        let dir = test_dir("show-json");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+
+        let opts = ShowOptions {
+            last: None,
+            rule: None,
+            provider: None,
+            json: true,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert!(
+            parsed.get("entry_hash").is_some(),
+            "json should include entry_hash"
+        );
+        assert!(
+            parsed.get("chain_version").is_some(),
+            "json should include chain_version"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_table_hides_hashes() {
+        let dir = test_dir("show-hides");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+
+        let opts = ShowOptions {
+            last: None,
+            rule: None,
+            provider: None,
+            json: false,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("hmac-sha256:"),
+            "table should not show hashes"
+        );
+        assert!(
+            !output.contains("entry_hash"),
+            "table should not show entry_hash"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_empty_file() {
+        let dir = test_dir("show-empty");
+        test_logger(&dir);
+        fs::write(dir.join("audit.jsonl"), "").unwrap();
+
+        let opts = ShowOptions {
+            last: None,
+            rule: None,
+            provider: None,
+            json: false,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        assert!(buf.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- audit_summary ---
+
+    #[test]
+    fn summary_with_entries() {
+        let dir = test_dir("summary");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+        logger.append(make_event("rm")).unwrap();
+
+        let summary = audit_summary(&verify_config(&dir));
+        assert!(summary.enabled);
+        assert_eq!(summary.entry_count, 2);
+        assert!(summary.secret_available);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summary_disabled() {
+        let config = AuditConfig {
+            enabled: false,
+            path: None,
+        };
+        let summary = audit_summary(&config);
+        assert!(!summary.enabled);
+    }
+
+    // --- display_timestamp ---
+
+    #[test]
+    fn timestamp_truncation() {
+        assert_eq!(
+            display_timestamp("2026-04-04T03:31:02.54814Z"),
+            "2026-04-04T03:31:02Z"
+        );
+        assert_eq!(
+            display_timestamp("2026-04-04T03:31:02Z"),
+            "2026-04-04T03:31:02Z"
+        );
     }
 }
