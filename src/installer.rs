@@ -482,6 +482,9 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
             "codex_hooks",
             "blocked attempt to modify Codex hooks feature flag",
         ),
+        // Audit log protection (#29)
+        ("audit.jsonl", "blocked attempt to modify audit log"),
+        ("audit-secret", "blocked attempt to access audit secret"),
     ]
 }
 
