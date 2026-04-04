@@ -78,7 +78,12 @@ Terminal → rm -rf src/
 
 Available for Claude Code, Cursor, and Codex CLI.
 
-**Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting and config modification via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
+**Layer 3 — Audit** (v0.7.0+): Records every command decision in a tamper-evident log — if an AI agent modifies any entry, the chain breaks and tampering is detected.
+- HMAC-SHA256 signed and hash-chained JSONL (`~/.local/share/omamori/audit.jsonl`)
+- Per-install secret; file paths HMAC-hashed (never stored in plaintext)
+- Enabled by default; no configuration needed
+
+**Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting, config modification, and audit log/secret access via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
 **Auto mode compatible** (v0.6.2+): Works seamlessly with Claude Code's [Auto mode](https://claude.com/blog/auto-mode) — safe commands proceed without prompts, dangerous commands are still hard-blocked.
 
@@ -200,7 +205,7 @@ These are inherent to the PATH shim approach and documented honestly:
 
 - **Full-path execution** (`/bin/rm`) bypasses the shim — mitigated by Layer 2 hooks
 - **`sudo`** changes PATH — omamori blocks when it detects elevated execution
-- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected (bash/sh/zsh/dash/ksh only)
+- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected. [Investigated and deferred](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools
 - **Obfuscated commands** (base64, variable indirection) — cannot be detected by static analysis
 - **AI self-bypass** — `config disable`/`uninstall` are blocked; direct file editing blocked by hooks (Claude Code only)
 

@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.6.0)
+## What It Protects (v0.7.0)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -101,7 +101,7 @@ Core immutability uses structural enforcement (binary ignores config overrides f
 - Full-path execution such as `/bin/rm` or `/usr/bin/git` can bypass the PATH shim. Mitigated by Layer 2 hooks (Claude Code + Cursor).
 - `find -exec /bin/rm {} \;` bypasses both the find shim and the rm shim because rm is invoked via absolute path. Partially mitigated by Layer 2 hooks.
 - `sudo` may change PATH before the shim runs.
-- Interpreter commands (`python -c "shutil.rmtree(...)"`) are not currently detected by the unwrap stack (which handles bash/sh/zsh/dash/ksh only). Future versions may add interpreter-aware parsing.
+- Interpreter commands (`python -c "shutil.rmtree(...)"`) are not detected by the unwrap stack (which handles bash/sh/zsh/dash/ksh only). [Investigated and deferred](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools (Claude Code, Cursor, Codex CLI).
 - **Dynamic command generation** (`bash -c "$(cmd)"`, backtick substitution) inside shell launchers is **blocked** (fail-close) because the inner content cannot be statically analyzed.
 - **Obfuscated commands** (base64 encoding, heredoc, variable indirection, string concatenation outside shell launchers) **cannot be detected**. This is a fundamental limitation of static analysis.
 - **Bypass-by-substitution**: AI agents may attempt alternative commands (e.g., `rmdir`, `unlink`, `python os.rmdir()`) when their primary method is blocked. The unwrap stack partially mitigates this for shell launcher wrapping, but cannot prevent all substitution patterns. Protocol-level enforcement (#14 MCP) is the structural answer.
@@ -227,7 +227,7 @@ These attack vectors **cannot** be detected by omamori's design. They are docume
 | `env -i rm -rf` | Clears all env vars including detectors; undetectable by hooks |
 | Obfuscated commands (base64, hex, variable expansion) | Static analysis cannot decode runtime-constructed commands |
 | `export -n CLAUDECODE` | Removes export attribute without unsetting; not caught by `unset` patterns |
-| `python -c "shutil.rmtree(...)"` | Python/Node interpreters not in shell list; future interpreter-aware parsing planned |
+| `python -c "shutil.rmtree(...)"` | Python/Node interpreters not in shell list; [investigated, zero incidents in target tools](https://github.com/yottayoshida/omamori/issues/74) |
 | `bash -c "$VAR"` where VAR is set earlier | Variable expansion requires runtime evaluation |
 
 ## AI Config Bypass Guard (v0.3.2+)
@@ -315,18 +315,79 @@ This means users cannot accidentally remove default protection by creating a con
 
 The `stash-then-exec` action runs `git stash` as a subprocess. To prevent this internal call from triggering omamori's own protection (via PATH shim), the subprocess environment strips the default detector variables (`CLAUDECODE`, `AI_GUARD`).
 
-## Logging
+## Audit Log (v0.7.0+)
 
-Audit logs avoid storing raw file paths or argument values.
+Tamper-evident audit logging. Every command decision is recorded with HMAC integrity and hash-chain continuity.
 
-Current schema includes:
-- `timestamp`
-- `provider`
-- `command`
-- `rule_id`
-- `action`
-- `result`
-- `target_count`
-- `target_hash`
+### Schema
 
-`target_hash` is derived from target paths using SHA-256 so operators can correlate repeated events without storing the original paths. The `destination` path for `move-to` actions is not recorded in audit logs; it can be derived from the `rule_id` via config lookup.
+Each JSONL entry contains:
+
+| Field | Description |
+|-------|-------------|
+| `chain_version` | Chain format version (currently `1`) |
+| `seq` | Monotonic sequence number |
+| `prev_hash` | HMAC of the previous entry (genesis for first entry) |
+| `key_id` | HMAC key identifier (for future key rotation) |
+| `timestamp` | RFC 3339 UTC timestamp |
+| `provider` | AI tool that triggered the command |
+| `command` | Command name (e.g., `rm`, `git`) |
+| `rule_id` | Matched rule name, if any |
+| `action` | Rule action (trash, block, passthrough, etc.) |
+| `result` | Execution result |
+| `target_count` | Number of target arguments |
+| `target_hash` | HMAC-SHA256 of target paths (privacy-preserving) |
+| `entry_hash` | HMAC-SHA256 of the entire entry (chain integrity) |
+
+### HMAC Integrity
+
+- **Per-install secret**: 32 bytes from `/dev/urandom`, stored at `~/.local/share/omamori/audit-secret` (chmod 0600)
+- **target_hash**: `HMAC-SHA256(secret, targets)` — file paths are never stored in plaintext
+- **entry_hash**: `HMAC-SHA256(secret, canonical_json(entry))` — computed over a fixed-field-order `HashableEvent` struct to ensure deterministic hashing regardless of serde serialization options
+- **Genesis**: First entry's `prev_hash` = `HMAC-SHA256(secret, "omamori-genesis-v1")`
+
+### Hash Chain
+
+Each entry's `prev_hash` contains the previous entry's `entry_hash`. This creates a tamper-evident chain: modifying or deleting any entry breaks the chain for all subsequent entries.
+
+```
+Entry 0: prev_hash = genesis_hash,  entry_hash = H0
+Entry 1: prev_hash = H0,            entry_hash = H1
+Entry 2: prev_hash = H1,            entry_hash = H2
+         ↑ deleting Entry 1 breaks H2 verification
+```
+
+### Concurrent Safety
+
+`append()` uses `flock(2)` (exclusive advisory lock) to prevent chain corruption when multiple omamori shim processes run simultaneously. The file is opened with `read+write+create` (not `O_APPEND`) to allow tail-reading for chain state under lock.
+
+### Torn Line Recovery
+
+If a previous write was interrupted (partial JSON line), `append()` detects the unterminated line and inserts a newline before writing the new entry. `read_last_valid_line()` scans backward, skipping invalid JSON fragments, to find the last intact chain entry.
+
+### Defense Boundary
+
+**What the audit log can and cannot protect against:**
+
+| Attack | Defense | Effectiveness |
+|--------|---------|---------------|
+| AI modifies log via omamori hook layer | `blocked_command_patterns` | Detected and blocked |
+| AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
+| AI deletes/truncates log entries | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` |
+| AI accesses secret via omamori hook layer | `blocked_command_patterns` | Detected and blocked |
+| AI directly operates on files (bypassing omamori) | None (same OS user) | **Not protected** |
+| AI reads secret and forges valid chain | None (same OS user) | **Not protected** |
+
+**Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `blocked_command_patterns` operates at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing ([#61](https://github.com/yottayoshida/omamori/issues/61)).
+
+### Secret Loss
+
+If the secret file is deleted or unreadable:
+- `load_or_create_secret()` attempts to generate a new secret
+- If generation also fails, entries are written with `NO_HMAC_SECRET` marker
+- `omamori audit verify` (v0.7.1) will flag these entries
+- A `strict` mode (v0.7.2) will allow users to block commands when the secret is unavailable
+
+### Legacy Compatibility
+
+Entries written before v0.7.0 lack chain fields. When `append()` encounters a legacy last entry (no `chain_version`), it starts a new chain from genesis (`seq=0`). `omamori audit verify` (v0.7.1) will skip legacy entries with a warning.
