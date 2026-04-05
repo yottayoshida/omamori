@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.7.0)
+## What It Protects (v0.7.2)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -386,7 +386,42 @@ If the secret file is deleted or unreadable:
 - `load_or_create_secret()` attempts to generate a new secret
 - If generation also fails, entries are written with `NO_HMAC_SECRET` marker
 - `omamori audit verify` (v0.7.1) will flag these entries
-- A `strict` mode (v0.7.2) will allow users to block commands when the secret is unavailable
+- A `strict` mode (v0.7.3) will allow users to block commands when the secret is unavailable
+
+### Audit Retention (v0.7.2+)
+
+Optional automatic pruning of old audit entries. Preserves the tamper-evident property through a cryptographic prune_point.
+
+**Configuration** (`~/.config/omamori/config.toml`):
+```toml
+[audit]
+retention_days = 90  # 0 = unlimited (default)
+```
+
+**Security properties**:
+
+| Property | Mechanism |
+|----------|-----------|
+| Prune_point authenticity | `entry_hash` = HMAC-SHA256 over all fields (secret required to forge) |
+| Prune_point anchoring | `prev_hash` = HMAC(secret, "omamori-prune-v1") — distinct from chain genesis |
+| First-retained binding | `target_hash` = HMAC(secret, "prune-bind:{count}:{first_retained_entry_hash}") |
+| Minimum retention | 7 days enforced (values < 7 clamped with warning) |
+| Minimum entry count | 1000 entries always retained regardless of age |
+| Config protection | `omamori/config.toml` added to `blocked_command_patterns` |
+| Trigger frequency | Every 1000 appends (seq % 1000); zero overhead otherwise |
+
+**Threat model**:
+
+| Attack | Defense |
+|--------|---------|
+| Forge prune_point to hide evidence | entry_hash HMAC verification fails without secret |
+| Delete entries after legitimate prune | target_hash binding mismatch detected by verify |
+| Set retention_days=1 to fast-erase | Clamped to min 7; config.toml blocked from AI editing |
+| Truncate file (remove prune_point + entries) | prev_hash ≠ genesis → chain broken |
+
+**Verification**: `omamori audit verify` detects pruned chains and reports: `N entries verified, chain intact. (M entries pruned; prune_point anchored)`.
+
+**Design decision**: In-place rewrite (not tmpfile→rename). Rationale: rename changes the inode, which breaks flock for any other process holding the old inode. Prune is best-effort under flock; crash during rewrite produces torn lines handled by existing recovery.
 
 ### Legacy Compatibility
 
