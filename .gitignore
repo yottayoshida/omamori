@@ -17,3 +17,7 @@ tests/poc.sh
 # OS
 .DS_Store
 omamori-test-sandbox/
+
+# Claude Code local plans & investigation notes
+.claude/plans/
+investigation/

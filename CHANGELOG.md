@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.7.2] - 2026-04-05
+
+### Added
+
+- **Audit retention + auto prune** (#29): Optional `retention_days` config prunes old audit entries while preserving tamper-evident chain integrity.
+  - `retention_days` in `[audit]` section (default 0 = unlimited). Minimum 7 days enforced; values below are clamped with warning.
+  - Auto-prune triggers every 1000 appends (`seq % 1000`) under flock. Zero overhead when not triggered.
+  - **prune_point**: HMAC-protected chain entry inserted at the head of the pruned log. `prev_hash` = prune genesis (distinct from chain genesis), `target_hash` = HMAC binding to the first retained entry.
+  - **verify_chain**: Recognizes prune_point, validates prune genesis anchor, verifies target_hash binding (detects post-prune deletion). Reports pruned count.
+  - **show**: prune_point displayed as separator (`--- pruned N entries before YYYY-MM-DD ---`).
+  - **status**: Shows retention info (`retention: Nd`) when configured.
+  - Minimum retain 1000 entries regardless of age.
+  - `omamori/config.toml` added to `blocked_command_patterns` to prevent AI agents from editing retention settings.
+
 ## [0.7.1] - 2026-04-05
 
 ### Added

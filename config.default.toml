@@ -119,3 +119,4 @@ message = "omamori blocked rsync with destructive flags"
 
 [audit]
 enabled = false
+# retention_days = 90  # 0 = unlimited (default). Minimum 7 days.

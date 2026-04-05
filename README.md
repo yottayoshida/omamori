@@ -81,7 +81,8 @@ Available for Claude Code, Cursor, and Codex CLI.
 **Layer 3 — Audit** (v0.7.0+): Records every command decision in a tamper-evident log — if an AI agent modifies any entry, the chain breaks and tampering is detected.
 - HMAC-SHA256 signed and hash-chained JSONL (`~/.local/share/omamori/audit.jsonl`)
 - Per-install secret; file paths HMAC-hashed (never stored in plaintext)
-- Enabled by default; no configuration needed
+- Auto-retention (v0.7.2+): set `retention_days` in config to automatically prune old entries — chain integrity is preserved across pruning
+- Logging enabled by default; retention is opt-in via config
 
 **Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting, config modification, and audit log/secret access via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
@@ -172,6 +173,12 @@ match_any = ["-r", "-rf", "-fr", "--recursive"]
 name = "rm-recursive-to-trash"
 action = "move-to"
 destination = "/tmp/omamori-quarantine/"
+```
+
+**Enable audit retention** (prunes entries older than N days):
+```toml
+[audit]
+retention_days = 90  # 0 = keep all (default). Minimum 7 days.
 ```
 
 **Notes**: Config requires `chmod 600`. Destinations must be absolute paths on the same volume. System directories and symlinks are rejected.
