@@ -175,10 +175,12 @@ impl AuditLogger {
         file.flush()?;
 
         // Auto-prune under the same flock (no extra I/O when not triggered)
-        if self.retention_days > 0 && seq > 0 && seq % PRUNE_CHECK_INTERVAL == 0 {
-            if let Err(e) = try_prune(&mut file, self.secret.as_ref(), self.retention_days) {
-                eprintln!("omamori warning: audit prune failed: {e}");
-            }
+        if self.retention_days > 0
+            && seq > 0
+            && seq % PRUNE_CHECK_INTERVAL == 0
+            && let Err(e) = try_prune(&mut file, self.secret.as_ref(), self.retention_days)
+        {
+            eprintln!("omamori warning: audit prune failed: {e}");
         }
 
         // flock released on file drop
@@ -777,18 +779,17 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         }
 
         // --- prune-bind verification (after prune gap) ---
-        if last_was_prune {
-            if let (Some(saved_target), Some(saved_count)) =
+        if last_was_prune
+            && let (Some(saved_target), Some(saved_count)) =
                 (&prune_target_hash, prune_target_count)
-            {
-                let expected_bind = hmac_bytes(
-                    Some(&secret),
-                    format!("prune-bind:{saved_count}:{recorded_hash}").as_bytes(),
-                );
-                if *saved_target != expected_bind {
-                    result.broken_at = Some(seq);
-                    break;
-                }
+        {
+            let expected_bind = hmac_bytes(
+                Some(&secret),
+                format!("prune-bind:{saved_count}:{recorded_hash}").as_bytes(),
+            );
+            if *saved_target != expected_bind {
+                result.broken_at = Some(seq);
+                break;
             }
         }
 

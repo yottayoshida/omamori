@@ -949,10 +949,10 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     "omamori audit verify: {} entries verified, chain intact.",
                     result.chain_entries
                 );
-                if result.pruned {
-                    if let Some(count) = result.pruned_count {
-                        msg.push_str(&format!(" ({count} entries pruned; prune_point anchored)"));
-                    }
+                if result.pruned
+                    && let Some(count) = result.pruned_count
+                {
+                    msg.push_str(&format!(" ({count} entries pruned; prune_point anchored)"));
                 }
                 if result.legacy_entries > 0 {
                     msg.push_str(&format!(" ({} legacy skipped)", result.legacy_entries));
