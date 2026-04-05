@@ -485,6 +485,11 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
         // Audit log protection (#29)
         ("audit.jsonl", "blocked attempt to modify audit log"),
         ("audit-secret", "blocked attempt to access audit secret"),
+        // Config protection for retention settings (#29)
+        (
+            "omamori/config.toml",
+            "blocked attempt to edit omamori config",
+        ),
     ]
 }
 

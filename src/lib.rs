@@ -865,8 +865,13 @@ fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
                 "[warn]", "Layer 3 (audit)"
             );
         } else {
+            let retention = if summary.retention_days > 0 {
+                format!(", retention: {}d", summary.retention_days)
+            } else {
+                String::new()
+            };
             println!(
-                "  {:<6} {:<36} {} entries (run 'omamori audit verify' to check chain)",
+                "  {:<6} {:<36} {} entries{retention} (run 'omamori audit verify' to check chain)",
                 "[ok]", "Layer 3 (audit)", summary.entry_count
             );
         }
@@ -944,6 +949,11 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     "omamori audit verify: {} entries verified, chain intact.",
                     result.chain_entries
                 );
+                if result.pruned
+                    && let Some(count) = result.pruned_count
+                {
+                    msg.push_str(&format!(" ({count} entries pruned; prune_point anchored)"));
+                }
                 if result.legacy_entries > 0 {
                     msg.push_str(&format!(" ({} legacy skipped)", result.legacy_entries));
                 }
