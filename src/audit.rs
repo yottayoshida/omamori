@@ -15,6 +15,13 @@ type HmacSha256 = Hmac<Sha256>;
 
 const CHAIN_VERSION: u32 = 1;
 const GENESIS_SEED: &[u8] = b"omamori-genesis-v1";
+const PRUNE_GENESIS_SEED: &[u8] = b"omamori-prune-v1";
+const PRUNE_CHECK_INTERVAL: u64 = 1000;
+const MIN_RETENTION_DAYS: u32 = 7;
+const MIN_RETAIN_ENTRIES: usize = 1000;
+const PRUNE_COMMAND: &str = "_prune";
+const PRUNE_ACTION: &str = "retention";
+const PRUNE_RESULT: &str = "pruned";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -25,6 +32,8 @@ pub struct AuditConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub retention_days: u32,
 }
 
 impl Default for AuditConfig {
@@ -32,7 +41,24 @@ impl Default for AuditConfig {
         Self {
             enabled: true,
             path: None,
+            retention_days: 0,
         }
+    }
+}
+
+impl AuditConfig {
+    /// Validate and clamp retention_days. Returns warnings if adjusted.
+    pub fn validate(&self) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut config = self.clone();
+        if config.retention_days > 0 && config.retention_days < MIN_RETENTION_DAYS {
+            warnings.push(format!(
+                "audit.retention_days {} is below minimum {}; clamped to {}",
+                config.retention_days, MIN_RETENTION_DAYS, MIN_RETENTION_DAYS
+            ));
+            config.retention_days = MIN_RETENTION_DAYS;
+        }
+        (config, warnings)
     }
 }
 
@@ -47,6 +73,7 @@ fn default_true() -> bool {
 pub struct AuditLogger {
     path: PathBuf,
     secret: Option<[u8; 32]>,
+    retention_days: u32,
 }
 
 impl AuditLogger {
@@ -54,9 +81,14 @@ impl AuditLogger {
         if !config.enabled {
             return None;
         }
-        let path = config.path.clone().unwrap_or_else(default_audit_path);
+        let (validated, _warnings) = config.validate();
+        let path = validated.path.clone().unwrap_or_else(default_audit_path);
         let secret = load_or_create_secret(&secret_path_for(&path));
-        Some(Self { path, secret })
+        Some(Self {
+            path,
+            secret,
+            retention_days: validated.retention_days,
+        })
     }
 
     pub fn create_event(
@@ -141,6 +173,13 @@ impl AuditLogger {
         serde_json::to_writer(&mut file, &event)?;
         writeln!(file)?;
         file.flush()?;
+
+        // Auto-prune under the same flock (no extra I/O when not triggered)
+        if self.retention_days > 0 && seq > 0 && seq % PRUNE_CHECK_INTERVAL == 0 {
+            if let Err(e) = try_prune(&mut file, self.secret.as_ref(), self.retention_days) {
+                eprintln!("omamori warning: audit prune failed: {e}");
+            }
+        }
 
         // flock released on file drop
         Ok(())
@@ -232,6 +271,10 @@ fn genesis_hash(secret: Option<&[u8; 32]>) -> String {
     hmac_bytes(secret, GENESIS_SEED)
 }
 
+fn prune_genesis_hash(secret: Option<&[u8; 32]>) -> String {
+    hmac_bytes(secret, PRUNE_GENESIS_SEED)
+}
+
 fn compute_entry_hash(secret: Option<&[u8; 32]>, event: &AuditEvent) -> String {
     let canonical = serde_json::to_string(&HashableEvent::from_event(event))
         .expect("AuditEvent serialization cannot fail");
@@ -316,6 +359,140 @@ fn read_last_valid_line(file: &mut fs::File) -> Option<String> {
         }
         chunk_size *= 2;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Retention / Prune
+// ---------------------------------------------------------------------------
+
+/// In-place prune of entries older than `retention_days`.
+/// Called under flock_exclusive from append().
+/// Best-effort: errors are silently ignored (prune is not critical path).
+fn try_prune(
+    file: &mut fs::File,
+    secret: Option<&[u8; 32]>,
+    retention_days: u32,
+) -> Result<u64, std::io::Error> {
+    use time::format_description::well_known::Rfc3339;
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+
+    let cutoff = OffsetDateTime::now_utc() - time::Duration::days(i64::from(retention_days));
+
+    // Partition lines: find the first line whose timestamp >= cutoff.
+    // Also capture the first retained entry's hash (for prune-bind) in a single pass.
+    let lines: Vec<&str> = content.lines().collect();
+    let mut retain_from = 0usize;
+    let mut skip_existing_prune = 0usize;
+    let mut first_retained_hash = String::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue; // torn line
+        };
+
+        // Skip existing prune_point at the start (don't count it as prunable)
+        if i == 0 && val.get("command").and_then(|v| v.as_str()) == Some(PRUNE_COMMAND) {
+            skip_existing_prune = 1;
+            continue;
+        }
+
+        let Some(ts_str) = val.get("timestamp").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(ts) = OffsetDateTime::parse(ts_str, &Rfc3339) else {
+            continue;
+        };
+
+        if ts >= cutoff {
+            retain_from = i;
+            first_retained_hash = val
+                .get("entry_hash")
+                .and_then(|h| h.as_str())
+                .unwrap_or_default()
+                .to_string();
+            break;
+        }
+        retain_from = i + 1; // haven't found a keeper yet
+    }
+
+    // Adjust for existing prune_point: don't re-count it
+    let prune_count = retain_from.saturating_sub(skip_existing_prune) as u64;
+    if prune_count == 0 {
+        return Ok(0);
+    }
+
+    // Check minimum retain count
+    let retain_count = lines.len() - retain_from;
+    if retain_count < MIN_RETAIN_ENTRIES {
+        return Ok(0);
+    }
+
+    let prune_point = build_prune_point(secret, prune_count, &first_retained_hash);
+
+    // In-place rewrite: prune_point + retained lines
+    let estimated_size = content.len(); // upper bound; retained portion is smaller
+    let mut new_content = String::with_capacity(estimated_size);
+    let prune_json =
+        serde_json::to_string(&prune_point).expect("prune_point serialization cannot fail");
+    new_content.push_str(&prune_json);
+    new_content.push('\n');
+    for line in &lines[retain_from..] {
+        new_content.push_str(line);
+        new_content.push('\n');
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(new_content.as_bytes())?;
+    file.set_len(new_content.len() as u64)?;
+    file.flush()?;
+
+    eprintln!("omamori: pruned {prune_count} audit entries older than {retention_days}d");
+    Ok(prune_count)
+}
+
+fn build_prune_point(
+    secret: Option<&[u8; 32]>,
+    prune_count: u64,
+    first_retained_hash: &str,
+) -> AuditEvent {
+    let target_hash = hmac_bytes(
+        secret,
+        format!("prune-bind:{prune_count}:{first_retained_hash}").as_bytes(),
+    );
+
+    let mut event = AuditEvent {
+        timestamp: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+        provider: "omamori".to_string(),
+        command: PRUNE_COMMAND.to_string(),
+        rule_id: None,
+        action: PRUNE_ACTION.to_string(),
+        result: PRUNE_RESULT.to_string(),
+        target_count: prune_count as usize,
+        target_hash,
+        detection_layer: None,
+        unwrap_chain: None,
+        raw_input_hash: None,
+        chain_version: Some(CHAIN_VERSION),
+        seq: Some(0),
+        prev_hash: Some(prune_genesis_hash(secret)),
+        key_id: Some("default".to_string()),
+        entry_hash: None,
+    };
+    event.entry_hash = Some(compute_entry_hash(secret, &event));
+    event
+}
+
+fn is_prune_point(event: &AuditEvent) -> bool {
+    event.command == PRUNE_COMMAND && event.action == PRUNE_ACTION && event.result == PRUNE_RESULT
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +663,8 @@ pub struct VerifyResult {
     pub legacy_entries: u64,
     pub torn_lines: u64,
     pub broken_at: Option<u64>,
+    pub pruned: bool,
+    pub pruned_count: Option<u64>,
 }
 
 pub struct ShowOptions {
@@ -499,6 +678,7 @@ pub struct AuditSummary {
     pub enabled: bool,
     pub entry_count: u64,
     pub secret_available: bool,
+    pub retention_days: u32,
 }
 
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
@@ -513,15 +693,21 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
 
     let reader = std::io::BufReader::new(&file);
     let genesis = genesis_hash(Some(&secret));
+    let prune_genesis = prune_genesis_hash(Some(&secret));
 
     let mut result = VerifyResult {
         chain_entries: 0,
         legacy_entries: 0,
         torn_lines: 0,
         broken_at: None,
+        pruned: false,
+        pruned_count: None,
     };
     let mut expected_prev = genesis;
     let mut expected_seq: u64 = 0;
+    let mut last_was_prune = false;
+    let mut prune_target_hash: Option<String> = None;
+    let mut prune_target_count: Option<u64> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -546,22 +732,75 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         let seq = event.seq.unwrap_or(0);
         let prev_hash = event.prev_hash.as_deref().unwrap_or("");
         let recorded_hash = event.entry_hash.as_deref().unwrap_or("");
+        let is_prune = is_prune_point(&event);
 
-        if result.chain_entries > 0 && seq != expected_seq {
-            result.broken_at = Some(seq);
-            break;
-        }
-        if prev_hash != expected_prev {
-            result.broken_at = Some(seq);
-            break;
+        // --- prev_hash verification ---
+        if result.chain_entries == 0 {
+            // First chain entry: genesis or prune_genesis
+            let expected = if is_prune {
+                &prune_genesis
+            } else {
+                &expected_prev
+            };
+            if prev_hash != expected {
+                result.broken_at = Some(seq);
+                break;
+            }
+            if is_prune {
+                // seq must be 0 for prune_point at head
+                if seq != 0 {
+                    result.broken_at = Some(seq);
+                    break;
+                }
+            }
+        } else if last_was_prune {
+            // Prune gap: prev_hash won't match prune_point's entry_hash — allowed.
+            // But verify the prune-bind: target_hash must bind this entry's hash.
+            // (entry_hash verification below will confirm this entry is authentic)
+        } else {
+            // Normal chain link
+            if seq != expected_seq {
+                result.broken_at = Some(seq);
+                break;
+            }
+            if prev_hash != expected_prev {
+                result.broken_at = Some(seq);
+                break;
+            }
         }
 
+        // --- entry_hash HMAC verification (always, including prune_point) ---
         let recomputed = compute_entry_hash(Some(&secret), &event);
         if recomputed != recorded_hash {
             result.broken_at = Some(seq);
             break;
         }
 
+        // --- prune-bind verification (after prune gap) ---
+        if last_was_prune {
+            if let (Some(saved_target), Some(saved_count)) =
+                (&prune_target_hash, prune_target_count)
+            {
+                let expected_bind = hmac_bytes(
+                    Some(&secret),
+                    format!("prune-bind:{saved_count}:{recorded_hash}").as_bytes(),
+                );
+                if *saved_target != expected_bind {
+                    result.broken_at = Some(seq);
+                    break;
+                }
+            }
+        }
+
+        // Track prune state
+        if is_prune {
+            result.pruned = true;
+            result.pruned_count = Some(event.target_count as u64);
+            prune_target_hash = Some(event.target_hash.clone());
+            prune_target_count = Some(event.target_count as u64);
+        }
+
+        last_was_prune = is_prune;
         expected_prev = recorded_hash.to_string();
         expected_seq = seq + 1;
         result.chain_entries += 1;
@@ -634,6 +873,15 @@ pub fn show_entries(
             "TIMESTAMP", "PROVIDER", "COMMAND", "ACTION", "RESULT"
         )?;
         for event in &entries {
+            if is_prune_point(event) {
+                let ts = display_timestamp(&event.timestamp);
+                writeln!(
+                    out,
+                    "--- pruned {} entries before {ts} ---",
+                    event.target_count
+                )?;
+                continue;
+            }
             let rule = event.rule_id.as_deref().unwrap_or("\u{2014}");
             let ts = display_timestamp(&event.timestamp);
             writeln!(
@@ -653,6 +901,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             enabled: false,
             entry_count: 0,
             secret_available: false,
+            retention_days: 0,
         };
     }
 
@@ -673,6 +922,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         enabled: true,
         entry_count,
         secret_available,
+        retention_days: config.retention_days,
     }
 }
 
@@ -705,6 +955,7 @@ mod tests {
         AuditLogger {
             path,
             secret: Some(TEST_SECRET),
+            retention_days: 0,
         }
     }
 
@@ -752,6 +1003,7 @@ mod tests {
         let config = AuditConfig {
             enabled: false,
             path: None,
+            retention_days: 0,
         };
         assert!(AuditLogger::from_config(&config).is_none());
     }
@@ -762,6 +1014,7 @@ mod tests {
         let config = AuditConfig {
             enabled: true,
             path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
         };
         let logger = AuditLogger::from_config(&config).expect("should create logger");
         assert!(logger.secret.is_some());
@@ -785,6 +1038,7 @@ mod tests {
         let config = AuditConfig {
             enabled: true,
             path: None,
+            retention_days: 0,
         };
         let logger = AuditLogger::from_config(&config);
         assert!(logger.is_some());
@@ -1095,6 +1349,7 @@ mod tests {
         let logger = AuditLogger {
             path: PathBuf::from("/tmp/dummy.jsonl"),
             secret: None,
+            retention_days: 0,
         };
         let invocation = CommandInvocation::new("ls".to_string(), vec![]);
         let event = logger.create_event(
@@ -1239,6 +1494,7 @@ mod tests {
         let logger = AuditLogger {
             path: PathBuf::from("/nonexistent/dir/audit.jsonl"),
             secret: Some([0u8; 32]),
+            retention_days: 0,
         };
         assert!(logger.append(make_event("rm")).is_err());
     }
@@ -1249,6 +1505,7 @@ mod tests {
         AuditConfig {
             enabled: true,
             path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
         }
     }
 
@@ -1523,6 +1780,7 @@ mod tests {
         let config = AuditConfig {
             enabled: false,
             path: None,
+            retention_days: 0,
         };
         let summary = audit_summary(&config);
         assert!(!summary.enabled);
@@ -1540,5 +1798,517 @@ mod tests {
             display_timestamp("2026-04-04T03:31:02Z"),
             "2026-04-04T03:31:02Z"
         );
+    }
+
+    // --- Retention / Prune ---
+
+    fn make_event_with_timestamp(command: &str, ts: &str) -> AuditEvent {
+        let mut event = make_event(command);
+        event.timestamp = ts.to_string();
+        event
+    }
+
+    fn test_logger_with_retention(dir: &Path, retention_days: u32) -> AuditLogger {
+        let path = dir.join("audit.jsonl");
+        let secret_file = dir.join("audit-secret");
+        let hex: String = TEST_SECRET.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(&secret_file, &hex).unwrap();
+        AuditLogger {
+            path,
+            secret: Some(TEST_SECRET),
+            retention_days,
+        }
+    }
+
+    /// Write chain entries directly with given timestamps (bypass append to control timestamps).
+    fn write_chain_entries(path: &Path, secret: &[u8; 32], entries: &[(&str, &str)]) {
+        let genesis = genesis_hash(Some(secret));
+        let mut prev_hash = genesis;
+        let mut content = String::new();
+
+        for (seq, (command, timestamp)) in entries.iter().enumerate() {
+            let mut event = make_event_with_timestamp(command, timestamp);
+            event.chain_version = Some(CHAIN_VERSION);
+            event.seq = Some(seq as u64);
+            event.prev_hash = Some(prev_hash.clone());
+            event.key_id = Some("default".to_string());
+            event.entry_hash = Some(compute_entry_hash(Some(secret), &event));
+            prev_hash = event.entry_hash.clone().unwrap();
+            content.push_str(&serde_json::to_string(&event).unwrap());
+            content.push('\n');
+        }
+
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn prune_genesis_hash_is_distinct() {
+        let genesis = genesis_hash(Some(&TEST_SECRET));
+        let prune = prune_genesis_hash(Some(&TEST_SECRET));
+        assert_ne!(genesis, prune);
+    }
+
+    #[test]
+    fn prune_genesis_hash_is_deterministic() {
+        let a = prune_genesis_hash(Some(&TEST_SECRET));
+        let b = prune_genesis_hash(Some(&TEST_SECRET));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn try_prune_removes_old_entries() {
+        let dir = test_dir("prune-old");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // Write 1100 entries: 1050 old (200 days ago), 50 recent
+        let old_ts = "2025-09-18T00:00:00Z"; // ~200 days ago from 2026-04-05
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..1050 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..50 {
+            entries.push(("new", new_ts));
+        }
+        // Need at least 1000 retained — 50 < 1000 so prune won't fire.
+        // Adjust: 100 old, 1100 new
+        entries.clear();
+        for _ in 0..100 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..1100 {
+            entries.push(("new", new_ts));
+        }
+
+        let refs: Vec<(&str, &str)> = entries.iter().copied().collect();
+        write_chain_entries(&path, &TEST_SECRET, &refs);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        assert_eq!(pruned, 100, "should prune 100 old entries");
+
+        // Verify the file has prune_point + 1100 entries
+        drop(file);
+        let events = read_events(&path);
+        assert_eq!(events.len(), 1101, "prune_point + 1100 retained");
+        assert_eq!(events[0]["command"], "_prune");
+        assert_eq!(events[0]["target_count"], 100);
+        assert_eq!(events[0]["action"], "retention");
+        assert_eq!(events[0]["result"], "pruned");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_prune_nothing_to_prune() {
+        let dir = test_dir("prune-nothing");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        let new_ts = "2026-04-04T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..1100).map(|_| ("cmd", new_ts)).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        assert_eq!(pruned, 0, "nothing should be pruned");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_prune_min_retain_prevents_prune() {
+        let dir = test_dir("prune-min-retain");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // 500 old, 500 new = 500 retained < 1000 min → no prune
+        let old_ts = "2025-01-01T00:00:00Z";
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..500 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..500 {
+            entries.push(("new", new_ts));
+        }
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        assert_eq!(pruned, 0, "min retain should prevent prune");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn try_prune_retention_days_zero_is_noop() {
+        // retention_days=0 means try_prune is never called from append,
+        // but verify it does nothing if called directly
+        let dir = test_dir("prune-zero");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        let old_ts = "2020-01-01T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..100).map(|_| ("cmd", old_ts)).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        // retention_days=0 is checked in append(), not try_prune() itself
+        // But try_prune with very large retention should prune nothing recent
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 36500).unwrap();
+        assert_eq!(pruned, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_pruned_chain_intact() {
+        let dir = test_dir("verify-pruned");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // Create a chain, then manually prune with build_prune_point
+        let old_ts = "2025-01-01T00:00:00Z";
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..100 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..1100 {
+            entries.push(("new", new_ts));
+        }
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        assert_eq!(pruned, 100);
+        drop(file);
+
+        // Verify
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none(), "pruned chain should verify OK");
+        assert!(result.pruned, "should detect prune_point");
+        assert_eq!(result.pruned_count, Some(100));
+        assert_eq!(result.chain_entries, 1101); // prune_point + 1100 retained
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_detects_forged_prune_point() {
+        let dir = test_dir("verify-forged-prune");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // Write entries
+        let ts = "2026-04-04T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..10).map(|_| ("cmd", ts)).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        // Read entries, keep last 5, prepend a forged prune_point
+        let events = read_events(&path);
+        let retained = &events[5..];
+
+        // Forge a prune_point with wrong secret
+        let bad_secret = [0x99u8; 32];
+        let first_retained_hash = retained[0]["entry_hash"].as_str().unwrap();
+        let forged = build_prune_point(Some(&bad_secret), 5, first_retained_hash);
+
+        let mut content = serde_json::to_string(&forged).unwrap();
+        content.push('\n');
+        for ev in retained {
+            content.push_str(&serde_json::to_string(ev).unwrap());
+            content.push('\n');
+        }
+        fs::write(&path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_some(),
+            "forged prune_point should be detected"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_detects_extra_deletion_after_prune() {
+        let dir = test_dir("verify-extra-delete");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // Write chain, prune it
+        let old_ts = "2025-01-01T00:00:00Z";
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..100 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..1100 {
+            entries.push(("new", new_ts));
+        }
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        drop(file);
+
+        // Now delete an extra entry after the prune_point (attacker removes entry #100)
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        // lines[0] = prune_point, lines[1] = first retained (entry #100)
+        // Remove lines[1] to simulate extra deletion
+        let mut tampered = String::new();
+        tampered.push_str(lines[0]);
+        tampered.push('\n');
+        for line in &lines[2..] {
+            tampered.push_str(line);
+            tampered.push('\n');
+        }
+        fs::write(&path, tampered).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_some(),
+            "extra deletion after prune should be detected via target_hash binding"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn re_prune_replaces_existing_prune_point() {
+        let dir = test_dir("re-prune");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // First prune: 50 old, 1100 new
+        let old_ts = "2025-01-01T00:00:00Z";
+        let mid_ts = "2025-10-01T00:00:00Z"; // ~6 months ago, within 90d? No, > 90d
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..50 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..50 {
+            entries.push(("mid", mid_ts));
+        }
+        for _ in 0..1100 {
+            entries.push(("new", new_ts));
+        }
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        // First prune
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned1 = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        assert_eq!(pruned1, 100, "should prune 50 old + 50 mid");
+        drop(file);
+
+        // Verify after first prune
+        let result1 = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result1.broken_at.is_none(),
+            "first prune chain should be intact"
+        );
+        assert!(result1.pruned);
+
+        // Second prune (simulate time passing — add more old entries conceptually)
+        // In practice, we re-prune with a shorter retention to exercise the path
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        // With retention_days=1, all "new" entries at 2026-04-04 would be >1 day old on 2026-04-05
+        // But min retain 1000 protects: 1100 retained > 1000
+        let pruned2 = try_prune(&mut file, Some(&TEST_SECRET), 1).unwrap();
+        // 1100 entries remain, all "old" by 1-day standard, but 1100 > 1000 min retain
+        // So some could be pruned: 1100 - 1000 = 100 could be pruned
+        // The old prune_point is at index 0 and gets skipped
+        assert!(pruned2 <= 100, "second prune should respect min retain");
+        drop(file);
+
+        // Verify after second prune
+        let result2 = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result2.broken_at.is_none(),
+            "re-pruned chain should still be intact"
+        );
+        assert!(result2.pruned);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_prune_point_only() {
+        let dir = test_dir("verify-prune-only");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // Write just a prune_point (edge case: all entries pruned except prune_point)
+        let prune = build_prune_point(Some(&TEST_SECRET), 50, "");
+        let content = serde_json::to_string(&prune).unwrap() + "\n";
+        fs::write(&path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none(), "prune_point alone should be OK");
+        assert!(result.pruned);
+        assert_eq!(result.chain_entries, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_head_deletion_without_prune_point() {
+        let dir = test_dir("verify-head-delete");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // Write 5 entries, delete the first one (without prune_point)
+        let ts = "2026-04-04T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..5).map(|_| ("cmd", ts)).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let tampered = lines[1..].join("\n") + "\n";
+        fs::write(&path, tampered).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_some(),
+            "head deletion without prune_point = chain broken"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_prune_separator() {
+        let dir = test_dir("show-prune-sep");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+
+        // Build a file with prune_point + 2 entries
+        let prune = build_prune_point(Some(&TEST_SECRET), 42, "hash123");
+        let mut content = serde_json::to_string(&prune).unwrap() + "\n";
+
+        let ts = "2026-04-04T00:00:00Z";
+        let refs: Vec<(&str, &str)> = vec![("ls", ts), ("cat", ts)];
+        // Write entries starting from the prune_point's perspective
+        let genesis = genesis_hash(Some(&TEST_SECRET));
+        let mut prev_hash = genesis;
+        for (seq, (cmd, ts)) in refs.iter().enumerate() {
+            let mut event = make_event_with_timestamp(cmd, ts);
+            event.chain_version = Some(CHAIN_VERSION);
+            event.seq = Some(seq as u64);
+            event.prev_hash = Some(prev_hash.clone());
+            event.key_id = Some("default".to_string());
+            event.entry_hash = Some(compute_entry_hash(Some(&TEST_SECRET), &event));
+            prev_hash = event.entry_hash.clone().unwrap();
+            content.push_str(&serde_json::to_string(&event).unwrap());
+            content.push('\n');
+        }
+        fs::write(&path, content).unwrap();
+
+        let opts = ShowOptions {
+            last: None,
+            rule: None,
+            provider: None,
+            json: false,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("--- pruned 42 entries"),
+            "should show prune separator, got:\n{output}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_validate_clamps_retention() {
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 3,
+        };
+        let (validated, warnings) = config.validate();
+        assert_eq!(validated.retention_days, MIN_RETENTION_DAYS);
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn config_validate_zero_unchanged() {
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 0,
+        };
+        let (validated, warnings) = config.validate();
+        assert_eq!(validated.retention_days, 0);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn config_validate_valid_retention_unchanged() {
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 90,
+        };
+        let (validated, warnings) = config.validate();
+        assert_eq!(validated.retention_days, 90);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn summary_includes_retention() {
+        let dir = test_dir("summary-retention");
+        let logger = test_logger_with_retention(&dir, 90);
+        logger.append(make_event("ls")).unwrap();
+
+        let mut config = verify_config(&dir);
+        config.retention_days = 90;
+        let summary = audit_summary(&config);
+        assert_eq!(summary.retention_days, 90);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

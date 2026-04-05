@@ -148,10 +148,13 @@ fn build_merged_config(user: UserConfig, warnings: &mut Vec<String>) -> Config {
         warnings.extend(ctx_warnings);
     }
 
+    let (validated_audit, audit_warnings) = user.audit.validate();
+    warnings.extend(audit_warnings);
+
     Config {
         detectors,
         rules,
-        audit: user.audit,
+        audit: validated_audit,
         context: user.context,
     }
 }
