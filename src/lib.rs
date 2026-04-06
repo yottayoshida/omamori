@@ -875,15 +875,17 @@ fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
         let summary = audit::audit_summary(&audit_config);
         if !summary.enabled {
             println!("  {:<6} {:<36} disabled", "[info]", "Layer 3 (audit)");
-        } else if summary.entry_count == 0 {
-            println!(
-                "  {:<6} {:<36} enabled (log created on first event)",
-                "[ok]", "Layer 3 (audit)"
-            );
+        } else if let Some(ref err) = summary.path_error {
+            println!("  {:<6} {:<36} {err}", "[warn]", "Layer 3 (audit)");
         } else if !summary.secret_available {
             println!(
                 "  {:<6} {:<36} HMAC secret missing",
                 "[warn]", "Layer 3 (audit)"
+            );
+        } else if summary.entry_count == 0 {
+            println!(
+                "  {:<6} {:<36} enabled (log created on first event)",
+                "[ok]", "Layer 3 (audit)"
             );
         } else {
             let retention = if summary.retention_days > 0 {
