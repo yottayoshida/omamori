@@ -34,6 +34,8 @@ pub struct AuditConfig {
     pub path: Option<PathBuf>,
     #[serde(default)]
     pub retention_days: u32,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 impl Default for AuditConfig {
@@ -42,6 +44,7 @@ impl Default for AuditConfig {
             enabled: true,
             path: None,
             retention_days: 0,
+            strict: false,
         }
     }
 }
@@ -77,6 +80,10 @@ pub struct AuditLogger {
 }
 
 impl AuditLogger {
+    pub fn secret_available(&self) -> bool {
+        self.secret.is_some()
+    }
+
     pub fn from_config(config: &AuditConfig) -> Option<Self> {
         if !config.enabled {
             return None;
@@ -137,11 +144,7 @@ impl AuditLogger {
 
         // read+write+create without truncate: we read the tail for chain state, then append.
         #[allow(clippy::suspicious_open_options)]
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&self.path)?;
+        let mut file = open_audit_rw(&self.path)?;
 
         flock_exclusive(&file)?;
 
@@ -576,8 +579,53 @@ fn load_or_create_secret(path: &Path) -> Option<[u8; 32]> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Symlink-safe open helpers (O_NOFOLLOW)
+// ---------------------------------------------------------------------------
+
+/// Open a file for reading, refusing symlinks on Unix.
+fn open_read_nofollow(path: &Path) -> Result<fs::File, std::io::Error> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path).map_err(|e| eloop_message(e, path))
+}
+
+/// Open audit.jsonl for read+write+create, refusing symlinks on Unix.
+fn open_audit_rw(path: &Path) -> Result<fs::File, std::io::Error> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path).map_err(|e| eloop_message(e, path))
+}
+
+/// Convert ELOOP into a user-friendly error message.
+fn eloop_message(e: std::io::Error, path: &Path) -> std::io::Error {
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        return std::io::Error::new(
+            e.kind(),
+            format!(
+                "audit path is a symlink (possible attack): {}",
+                path.display()
+            ),
+        );
+    }
+    e
+}
+
 fn read_secret(path: &Path) -> Result<[u8; 32], std::io::Error> {
-    let hex = fs::read_to_string(path)?;
+    let file = open_read_nofollow(path)?;
+    let mut hex = String::new();
+    std::io::BufReader::new(file).read_to_string(&mut hex)?;
     decode_hex_secret(hex.trim())
 }
 
@@ -596,9 +644,9 @@ fn create_secret(path: &Path) -> Result<[u8; 32], std::io::Error> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = opts.open(path)?;
+    let mut file = opts.open(path).map_err(|e| eloop_message(e, path))?;
     file.write_all(hex.as_bytes())?;
 
     Ok(secret)
@@ -687,7 +735,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let path = config.path.clone().unwrap_or_else(default_audit_path);
     let secret = read_secret(&secret_path_for(&path)).map_err(|_| AuditError::SecretUnavailable)?;
 
-    let file = fs::File::open(&path).map_err(|e| match e.kind() {
+    let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => AuditError::FileNotFound,
         _ => AuditError::Io(e),
     })?;
@@ -818,7 +866,7 @@ pub fn show_entries(
     use std::collections::VecDeque;
 
     let path = config.path.clone().unwrap_or_else(default_audit_path);
-    let file = fs::File::open(&path).map_err(|e| match e.kind() {
+    let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => AuditError::FileNotFound,
         _ => AuditError::Io(e),
     })?;
@@ -909,7 +957,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
     let path = config.path.clone().unwrap_or_else(default_audit_path);
     let secret_available = read_secret(&secret_path_for(&path)).is_ok();
 
-    let entry_count = fs::File::open(&path)
+    let entry_count = open_read_nofollow(&path)
         .ok()
         .map(|f| {
             std::io::BufReader::new(f)
@@ -1005,6 +1053,7 @@ mod tests {
             enabled: false,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         assert!(AuditLogger::from_config(&config).is_none());
     }
@@ -1016,6 +1065,7 @@ mod tests {
             enabled: true,
             path: Some(dir.join("audit.jsonl")),
             retention_days: 0,
+            strict: false,
         };
         let logger = AuditLogger::from_config(&config).expect("should create logger");
         assert!(logger.secret.is_some());
@@ -1040,6 +1090,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         let logger = AuditLogger::from_config(&config);
         assert!(logger.is_some());
@@ -1507,6 +1558,7 @@ mod tests {
             enabled: true,
             path: Some(dir.join("audit.jsonl")),
             retention_days: 0,
+            strict: false,
         }
     }
 
@@ -1782,6 +1834,7 @@ mod tests {
             enabled: false,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         let summary = audit_summary(&config);
         assert!(!summary.enabled);
@@ -2270,6 +2323,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 3,
+            strict: false,
         };
         let (validated, warnings) = config.validate();
         assert_eq!(validated.retention_days, MIN_RETENTION_DAYS);
@@ -2282,6 +2336,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         let (validated, warnings) = config.validate();
         assert_eq!(validated.retention_days, 0);
@@ -2294,6 +2349,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 90,
+            strict: false,
         };
         let (validated, warnings) = config.validate();
         assert_eq!(validated.retention_days, 90);
@@ -2311,5 +2367,218 @@ mod tests {
         let summary = audit_summary(&config);
         assert_eq!(summary.retention_days, 90);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- O_NOFOLLOW: symlink rejection ---
+
+    #[cfg(unix)]
+    #[test]
+    fn append_rejects_symlink_audit_log() {
+        let dir = test_dir("symlink-audit-log");
+        let real_path = dir.join("real-audit.jsonl");
+        fs::write(&real_path, "").unwrap();
+        let symlink_path = dir.join("audit.jsonl");
+        std::os::unix::fs::symlink(&real_path, &symlink_path).unwrap();
+
+        let secret_file = dir.join("audit-secret");
+        let hex: String = TEST_SECRET.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(&secret_file, &hex).unwrap();
+
+        let logger = AuditLogger {
+            path: symlink_path,
+            secret: Some(TEST_SECRET),
+            retention_days: 0,
+        };
+        let err = logger.append(make_event("ls")).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink error, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_secret_rejects_symlink() {
+        let dir = test_dir("symlink-secret-read");
+        let real_secret = dir.join("real-secret");
+        let hex: String = TEST_SECRET.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(&real_secret, &hex).unwrap();
+        let symlink_secret = dir.join("audit-secret");
+        std::os::unix::fs::symlink(&real_secret, &symlink_secret).unwrap();
+
+        let err = read_secret(&symlink_secret).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink error, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_secret_rejects_existing_symlink() {
+        let dir = test_dir("symlink-secret-create");
+        let real_secret = dir.join("real-secret");
+        fs::write(&real_secret, "placeholder").unwrap();
+        let symlink_secret = dir.join("audit-secret");
+        std::os::unix::fs::symlink(&real_secret, &symlink_secret).unwrap();
+
+        // create_secret uses create_new=true, so it fails on any existing path;
+        // with O_NOFOLLOW it also rejects symlinks specifically.
+        let err = create_secret(&symlink_secret).unwrap_err();
+        // Either ELOOP (symlink) or AlreadyExists — both are acceptable rejections.
+        assert!(
+            err.to_string().contains("symlink") || err.kind() == std::io::ErrorKind::AlreadyExists,
+            "expected symlink or AlreadyExists error, got: {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_chain_rejects_symlink() {
+        let dir = test_dir("symlink-verify");
+        // Create a real audit log with one entry
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+
+        // Replace audit.jsonl with a symlink
+        let real_path = dir.join("real-audit.jsonl");
+        fs::rename(&logger.path, &real_path).unwrap();
+        std::os::unix::fs::symlink(&real_path, &logger.path).unwrap();
+
+        let config = verify_config(&dir);
+        match verify_chain(&config) {
+            Err(AuditError::Io(e)) => assert!(
+                e.to_string().contains("symlink"),
+                "expected symlink error, got: {e}"
+            ),
+            Err(other) => panic!("expected Io error, got: {other}"),
+            Ok(_) => panic!("expected error for symlink path"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn show_entries_rejects_symlink() {
+        let dir = test_dir("symlink-show");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+
+        let real_path = dir.join("real-audit.jsonl");
+        fs::rename(&logger.path, &real_path).unwrap();
+        std::os::unix::fs::symlink(&real_path, &logger.path).unwrap();
+
+        let config = verify_config(&dir);
+        let opts = ShowOptions {
+            last: None,
+            rule: None,
+            provider: None,
+            json: false,
+        };
+        let mut buf = Vec::new();
+        let err = show_entries(&config, &opts, &mut buf).unwrap_err();
+        match err {
+            AuditError::Io(e) => assert!(
+                e.to_string().contains("symlink"),
+                "expected symlink error, got: {e}"
+            ),
+            other => panic!("expected Io error, got: {other}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_summary_handles_symlink_gracefully() {
+        let dir = test_dir("symlink-summary");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+
+        let real_path = dir.join("real-audit.jsonl");
+        fs::rename(&logger.path, &real_path).unwrap();
+        std::os::unix::fs::symlink(&real_path, &logger.path).unwrap();
+
+        let config = verify_config(&dir);
+        // audit_summary uses .ok() so symlink rejection = 0 entries (graceful)
+        let summary = audit_summary(&config);
+        assert_eq!(summary.entry_count, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- O_NOFOLLOW: normal (non-symlink) paths still work ---
+
+    #[test]
+    fn normal_path_append_works_with_nofollow() {
+        let dir = test_dir("nofollow-normal");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+        logger.append(make_event("cat")).unwrap();
+
+        let events = read_events(&logger.path);
+        assert_eq!(events.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normal_path_verify_works_with_nofollow() {
+        let dir = test_dir("nofollow-verify");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+
+        let config = verify_config(&dir);
+        let result = verify_chain(&config).unwrap();
+        assert_eq!(result.chain_entries, 1);
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- strict mode: secret_available ---
+
+    #[test]
+    fn secret_available_true_when_secret_present() {
+        let dir = test_dir("strict-avail-true");
+        let logger = test_logger(&dir);
+        assert!(logger.secret_available());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_available_false_when_secret_absent() {
+        let dir = test_dir("strict-avail-false");
+        let logger = AuditLogger {
+            path: dir.join("audit.jsonl"),
+            secret: None,
+            retention_days: 0,
+        };
+        assert!(!logger.secret_available());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_config_parses_from_default() {
+        let config = AuditConfig::default();
+        assert!(!config.strict, "strict should default to false");
+    }
+
+    #[test]
+    fn strict_config_deserializes_true() {
+        let toml_str = r#"
+            enabled = true
+            strict = true
+        "#;
+        let config: AuditConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.strict);
+    }
+
+    #[test]
+    fn strict_config_deserializes_absent_as_false() {
+        let toml_str = r#"
+            enabled = true
+        "#;
+        let config: AuditConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.strict);
     }
 }

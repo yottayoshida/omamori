@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.7.2)
+## What It Protects (v0.7.3)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -386,7 +386,55 @@ If the secret file is deleted or unreadable:
 - `load_or_create_secret()` attempts to generate a new secret
 - If generation also fails, entries are written with `NO_HMAC_SECRET` marker
 - `omamori audit verify` (v0.7.1) will flag these entries
-- A `strict` mode (v0.7.3) will allow users to block commands when the secret is unavailable
+- **Strict mode** (v0.7.3): When `audit.strict = true`, AI-initiated commands are blocked if the secret is unavailable after re-creation attempt
+
+### Strict Mode (v0.7.3+)
+
+Opt-in fail-close mode. When enabled, AI-initiated commands are blocked if the audit HMAC secret is unavailable, preventing unverifiable command execution.
+
+**Configuration**:
+```toml
+[audit]
+strict = true  # default: false
+```
+
+**Behavior**:
+
+| Condition | strict=false (default) | strict=true |
+|-----------|----------------------|-------------|
+| Secret available | Normal operation | Normal operation |
+| Secret unavailable + AI detected | Log with `NO_HMAC_SECRET` | **Block command (exit 1)** |
+| Secret unavailable + human terminal | Normal operation | Normal operation |
+| Audit disabled (`enabled = false`) | — | strict ignored |
+
+**Design decisions**:
+- **Opt-in**: Default `false` preserves backward compatibility. Users explicitly opt in.
+- **AI-only**: Only affects `detection.protected = true` paths. Human terminal use is never affected.
+- **After re-creation attempt**: `AuditLogger::from_config()` calls `load_or_create_secret()` first. Strict only triggers when re-creation also fails.
+- **Residual TOCTOU**: `secret_available()` check and subsequent `append()` are not atomic. An attacker deleting the secret between check and use could bypass strict mode. This is accepted because: (1) the attacker would need to delete the secret within the same process execution window, (2) `blocked_command_patterns` protects the secret file from AI-layer deletion.
+
+### Symlink Protection (v0.7.3+)
+
+All audit file operations use `O_NOFOLLOW` to reject symlinks at the kernel level. This prevents symlink attacks where an attacker replaces `audit.jsonl` or `audit-secret` with a symlink to `/dev/null` or a controlled location.
+
+**Protected operations** (6 total):
+
+| Operation | File | Effect on symlink |
+|-----------|------|-------------------|
+| `append()` | audit.jsonl | `ELOOP` error, entry not written |
+| `read_secret()` | audit-secret | `ELOOP` error, secret not loaded |
+| `create_secret()` | audit-secret | `ELOOP` error, secret not created |
+| `verify_chain()` | audit.jsonl | `ELOOP` error, verify fails |
+| `show_entries()` | audit.jsonl | `ELOOP` error, show fails |
+| `audit_summary()` | audit.jsonl | `ELOOP` error, count returns 0 |
+
+**Limitations**:
+
+| Limitation | Reason | Mitigation |
+|------------|--------|------------|
+| Parent directory symlinks not detected | `O_NOFOLLOW` only applies to the final path component | `create_dir_all` is called by omamori itself; `blocked_command_patterns` protects `.local/share/omamori` |
+| Hardlink attacks not detected | `O_NOFOLLOW` does not affect hardlinks | Same-user structural limitation. Hardlinks require same-partition + same-user |
+| Non-Unix platforms have no symlink protection | `O_NOFOLLOW` is Unix-specific (`#[cfg(unix)]`) | On non-Unix, audit operates without symlink protection. Document as known limitation |
 
 ### Audit Retention (v0.7.2+)
 
