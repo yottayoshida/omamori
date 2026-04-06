@@ -181,10 +181,10 @@ destination = "/tmp/omamori-quarantine/"
 retention_days = 90  # 0 = keep all (default). Minimum 7 days.
 ```
 
-**Enable strict mode** (block AI commands when HMAC secret is unavailable):
+**Enable strict mode** (block shim-intercepted commands when HMAC secret is unavailable):
 ```toml
 [audit]
-strict = true  # default: false. Only affects AI-detected commands.
+strict = true  # default: false. Hook-only commands (ls, cat, etc.) are not affected.
 ```
 
 **Notes**: Config requires `chmod 600`. Destinations must be absolute paths on the same volume. System directories and symlinks are rejected.
