@@ -646,6 +646,27 @@ fn run_command(
 
     // --- Protected path: AI environment detected. Full evaluation. ---
 
+    // Strict mode: block if audit HMAC secret is unavailable (opt-in).
+    // This prevents AI commands from running without tamper-evident logging.
+    if load_result.config.audit.strict && load_result.config.audit.enabled {
+        match AuditLogger::from_config(&load_result.config.audit) {
+            Some(logger) if !logger.secret_available() => {
+                eprintln!("omamori: audit strict mode — HMAC secret unavailable, blocking command");
+                eprintln!(
+                    "omamori: to fix, re-create the secret or set audit.strict = false in config.toml"
+                );
+                return Ok(1);
+            }
+            None => {
+                eprintln!(
+                    "omamori: audit strict mode — audit logger unavailable, blocking command"
+                );
+                return Ok(1);
+            }
+            _ => {} // secret available, proceed normally
+        }
+    }
+
     let matched_rule = match_rule(&load_result.config.rules, &invocation);
     let detector_env_keys: Vec<String> = load_result
         .config

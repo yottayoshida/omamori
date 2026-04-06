@@ -490,6 +490,11 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
             "omamori/config.toml",
             "blocked attempt to edit omamori config",
         ),
+        // Data directory protection (#29)
+        (
+            ".local/share/omamori",
+            "blocked attempt to modify omamori data directory",
+        ),
     ]
 }
 

@@ -34,6 +34,8 @@ pub struct AuditConfig {
     pub path: Option<PathBuf>,
     #[serde(default)]
     pub retention_days: u32,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 impl Default for AuditConfig {
@@ -42,6 +44,7 @@ impl Default for AuditConfig {
             enabled: true,
             path: None,
             retention_days: 0,
+            strict: false,
         }
     }
 }
@@ -77,6 +80,10 @@ pub struct AuditLogger {
 }
 
 impl AuditLogger {
+    pub fn secret_available(&self) -> bool {
+        self.secret.is_some()
+    }
+
     pub fn from_config(config: &AuditConfig) -> Option<Self> {
         if !config.enabled {
             return None;
@@ -1046,6 +1053,7 @@ mod tests {
             enabled: false,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         assert!(AuditLogger::from_config(&config).is_none());
     }
@@ -1057,6 +1065,7 @@ mod tests {
             enabled: true,
             path: Some(dir.join("audit.jsonl")),
             retention_days: 0,
+            strict: false,
         };
         let logger = AuditLogger::from_config(&config).expect("should create logger");
         assert!(logger.secret.is_some());
@@ -1081,6 +1090,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         let logger = AuditLogger::from_config(&config);
         assert!(logger.is_some());
@@ -1548,6 +1558,7 @@ mod tests {
             enabled: true,
             path: Some(dir.join("audit.jsonl")),
             retention_days: 0,
+            strict: false,
         }
     }
 
@@ -1823,6 +1834,7 @@ mod tests {
             enabled: false,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         let summary = audit_summary(&config);
         assert!(!summary.enabled);
@@ -2311,6 +2323,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 3,
+            strict: false,
         };
         let (validated, warnings) = config.validate();
         assert_eq!(validated.retention_days, MIN_RETENTION_DAYS);
@@ -2323,6 +2336,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 0,
+            strict: false,
         };
         let (validated, warnings) = config.validate();
         assert_eq!(validated.retention_days, 0);
@@ -2335,6 +2349,7 @@ mod tests {
             enabled: true,
             path: None,
             retention_days: 90,
+            strict: false,
         };
         let (validated, warnings) = config.validate();
         assert_eq!(validated.retention_days, 90);
@@ -2518,5 +2533,52 @@ mod tests {
         assert_eq!(result.chain_entries, 1);
         assert!(result.broken_at.is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- strict mode: secret_available ---
+
+    #[test]
+    fn secret_available_true_when_secret_present() {
+        let dir = test_dir("strict-avail-true");
+        let logger = test_logger(&dir);
+        assert!(logger.secret_available());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_available_false_when_secret_absent() {
+        let dir = test_dir("strict-avail-false");
+        let logger = AuditLogger {
+            path: dir.join("audit.jsonl"),
+            secret: None,
+            retention_days: 0,
+        };
+        assert!(!logger.secret_available());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_config_parses_from_default() {
+        let config = AuditConfig::default();
+        assert!(!config.strict, "strict should default to false");
+    }
+
+    #[test]
+    fn strict_config_deserializes_true() {
+        let toml_str = r#"
+            enabled = true
+            strict = true
+        "#;
+        let config: AuditConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.strict);
+    }
+
+    #[test]
+    fn strict_config_deserializes_absent_as_false() {
+        let toml_str = r#"
+            enabled = true
+        "#;
+        let config: AuditConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.strict);
     }
 }
