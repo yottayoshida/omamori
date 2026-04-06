@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.7.3)
+## What It Protects (v0.7.4)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -126,6 +126,8 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 1. **Phase 1 — Meta-patterns** (string-level): Catches tamper attempts (env var unset, config editing, `/bin/rm` direct paths, `.integrity.json` editing). These are intentionally broad — `unset CLAUDECODE` appearing anywhere in a command is blocked, including inside `echo`.
 
 2. **Phase 2 — Unwrap Stack** (token-level): Tokenizes the command, strips shell wrappers, extracts inner commands from shell launchers, and evaluates each extracted command against the same rules as Layer 1.
+
+**Broad match by design**: Meta-patterns use `command.contains(pattern)` substring matching. This means `ls ~/.local/share/omamori` is blocked alongside `rm -rf ~/.local/share/omamori`. Read-only commands on protected paths are intentionally blocked to prevent reconnaissance that could aid targeted attacks. Affected patterns include `audit.jsonl`, `audit-secret`, `.integrity.json`, `.local/share/omamori`, `omamori/config.toml`, and `.codex/hooks.json`.
 
 | Capability | Detection |
 |-----------|-----------|
@@ -386,11 +388,11 @@ If the secret file is deleted or unreadable:
 - `load_or_create_secret()` attempts to generate a new secret
 - If generation also fails, entries are written with `NO_HMAC_SECRET` marker
 - `omamori audit verify` (v0.7.1) will flag these entries
-- **Strict mode** (v0.7.3): When `audit.strict = true`, AI-initiated commands are blocked if the secret is unavailable after re-creation attempt
+- **Strict mode** (v0.7.3): When `audit.strict = true`, AI commands intercepted by the PATH shim are blocked if the secret is unavailable after re-creation attempt. Hook-only commands (not matching any shim rule) are not affected
 
 ### Strict Mode (v0.7.3+)
 
-Opt-in fail-close mode. When enabled, AI-initiated commands are blocked if the audit HMAC secret is unavailable, preventing unverifiable command execution.
+Opt-in fail-close mode. When enabled, AI commands intercepted by the PATH shim are blocked if the audit HMAC secret is unavailable, preventing unverifiable command execution. Commands that only pass through Layer 2 hooks (not matching any shim rule) are not affected — the hook path does not hold an `AuditLogger` instance.
 
 **Configuration**:
 ```toml
@@ -403,7 +405,7 @@ strict = true  # default: false
 | Condition | strict=false (default) | strict=true |
 |-----------|----------------------|-------------|
 | Secret available | Normal operation | Normal operation |
-| Secret unavailable + AI detected | Log with `NO_HMAC_SECRET` | **Block command (exit 1)** |
+| Secret unavailable + AI detected (shim path) | Log with `NO_HMAC_SECRET` | **Block command (exit 1)** |
 | Secret unavailable + human terminal | Normal operation | Normal operation |
 | Audit disabled (`enabled = false`) | — | strict ignored |
 

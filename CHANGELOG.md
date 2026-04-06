@@ -4,13 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.7.4] - 2026-04-06
+
+### Fixed
+
+- **`omamori status` false [ok] on symlink attack** (#98): `audit_summary()` now detects non-NotFound errors (ELOOP, permission denied) via `path_error` field instead of silently returning `entry_count = 0`. Status displays `[warn]` with the error message. Reordered status display to check `path_error` and `secret_available` before `entry_count == 0`.
+- **`omamori audit verify` loses symlink cause on secret** (#99): `verify_chain()` now propagates symlink-specific error messages instead of mapping all `read_secret()` failures to generic "HMAC secret unavailable".
+- **strict mode docs overstated scope** (#97): SECURITY.md and CHANGELOG clarified that strict mode only affects commands intercepted by the PATH shim, not hook-only commands.
+- **`blocked_command_patterns` broad match undocumented** (#100): SECURITY.md now documents that meta-patterns use intentional substring matching, blocking read-only commands on protected paths to prevent reconnaissance.
+
 ## [0.7.3] - 2026-04-06
 
 ### Added
 
 - **O_NOFOLLOW symlink defense** (#29): All 6 audit file operations (`append`, `read_secret`, `create_secret`, `verify_chain`, `show_entries`, `audit_summary`) now use `O_NOFOLLOW` to reject symlinks at the kernel level. Prevents symlink attacks where `audit.jsonl` or `audit-secret` is replaced with a symlink to `/dev/null` or attacker-controlled path. ELOOP errors are converted to user-friendly "symlink detected" messages. Unix-only (`#[cfg(unix)]`); non-Unix platforms operate without symlink protection.
 
-- **Audit strict mode** (#29): Opt-in fail-close mode (`audit.strict = true`, default `false`). When enabled, AI-initiated commands are blocked if the HMAC secret is unavailable after re-creation attempt. Human terminal use is never affected. Prevents unverifiable command execution when the audit chain cannot provide tamper evidence.
+- **Audit strict mode** (#29): Opt-in fail-close mode (`audit.strict = true`, default `false`). When enabled, AI commands intercepted by the PATH shim are blocked if the HMAC secret is unavailable after re-creation attempt. Human terminal use and hook-only commands are not affected.
 
 - **Data directory protection** (#29): `.local/share/omamori` added to `blocked_command_patterns`. Prevents AI agents from deleting the entire data directory (which would simultaneously remove both `audit.jsonl` and `audit-secret`).
 

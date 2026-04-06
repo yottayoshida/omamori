@@ -729,11 +729,19 @@ pub struct AuditSummary {
     pub entry_count: u64,
     pub secret_available: bool,
     pub retention_days: u32,
+    pub path_error: Option<String>,
 }
 
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let path = config.path.clone().unwrap_or_else(default_audit_path);
-    let secret = read_secret(&secret_path_for(&path)).map_err(|_| AuditError::SecretUnavailable)?;
+    let secret = read_secret(&secret_path_for(&path)).map_err(|e| {
+        // eloop_message() converts ELOOP to a descriptive string error,
+        // so raw_os_error() is None. Check the message instead.
+        if e.to_string().contains("symlink") {
+            return AuditError::Io(e);
+        }
+        AuditError::SecretUnavailable
+    })?;
 
     let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => AuditError::FileNotFound,
@@ -951,27 +959,31 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             entry_count: 0,
             secret_available: false,
             retention_days: 0,
+            path_error: None,
         };
     }
 
     let path = config.path.clone().unwrap_or_else(default_audit_path);
     let secret_available = read_secret(&secret_path_for(&path)).is_ok();
 
-    let entry_count = open_read_nofollow(&path)
-        .ok()
-        .map(|f| {
-            std::io::BufReader::new(f)
+    let (entry_count, path_error) = match open_read_nofollow(&path) {
+        Ok(f) => {
+            let count = std::io::BufReader::new(f)
                 .lines()
                 .filter(|l| l.as_ref().is_ok_and(|s| !s.trim().is_empty()))
-                .count() as u64
-        })
-        .unwrap_or(0);
+                .count() as u64;
+            (count, None)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
+        Err(e) => (0, Some(e.to_string())),
+    };
 
     AuditSummary {
         enabled: true,
         entry_count,
         secret_available,
         retention_days: config.retention_days,
+        path_error,
     }
 }
 
@@ -2492,7 +2504,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn audit_summary_handles_symlink_gracefully() {
+    fn audit_summary_symlink_sets_path_error() {
         let dir = test_dir("symlink-summary");
         let logger = test_logger(&dir);
         logger.append(make_event("ls")).unwrap();
@@ -2502,9 +2514,27 @@ mod tests {
         std::os::unix::fs::symlink(&real_path, &logger.path).unwrap();
 
         let config = verify_config(&dir);
-        // audit_summary uses .ok() so symlink rejection = 0 entries (graceful)
         let summary = audit_summary(&config);
         assert_eq!(summary.entry_count, 0);
+        assert!(
+            summary
+                .path_error
+                .as_ref()
+                .is_some_and(|e| e.contains("symlink")),
+            "expected path_error with 'symlink', got: {:?}",
+            summary.path_error
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_summary_no_file_no_path_error() {
+        let dir = test_dir("summary-nofile");
+        let config = verify_config(&dir);
+        // File doesn't exist yet — this is normal, not an error
+        let summary = audit_summary(&config);
+        assert_eq!(summary.entry_count, 0);
+        assert!(summary.path_error.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2580,5 +2610,32 @@ mod tests {
         "#;
         let config: AuditConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.strict);
+    }
+
+    // --- verify_chain: secret symlink ELOOP propagation ---
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_chain_secret_symlink_returns_io_error() {
+        let dir = test_dir("verify-secret-symlink");
+        let logger = test_logger(&dir);
+        logger.append(make_event("ls")).unwrap();
+
+        // Replace audit-secret with a symlink
+        let real_secret = dir.join("real-secret");
+        let secret_path = dir.join("audit-secret");
+        fs::rename(&secret_path, &real_secret).unwrap();
+        std::os::unix::fs::symlink(&real_secret, &secret_path).unwrap();
+
+        let config = verify_config(&dir);
+        match verify_chain(&config) {
+            Err(AuditError::Io(e)) => assert!(
+                e.to_string().contains("symlink"),
+                "expected symlink error, got: {e}"
+            ),
+            Err(other) => panic!("expected Io error, got: {other}"),
+            Ok(_) => panic!("expected error for symlink secret"),
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
