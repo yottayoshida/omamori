@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.7.3] - 2026-04-06
+
+### Added
+
+- **O_NOFOLLOW symlink defense** (#29): All 6 audit file operations (`append`, `read_secret`, `create_secret`, `verify_chain`, `show_entries`, `audit_summary`) now use `O_NOFOLLOW` to reject symlinks at the kernel level. Prevents symlink attacks where `audit.jsonl` or `audit-secret` is replaced with a symlink to `/dev/null` or attacker-controlled path. ELOOP errors are converted to user-friendly "symlink detected" messages. Unix-only (`#[cfg(unix)]`); non-Unix platforms operate without symlink protection.
+
+- **Audit strict mode** (#29): Opt-in fail-close mode (`audit.strict = true`, default `false`). When enabled, AI-initiated commands are blocked if the HMAC secret is unavailable after re-creation attempt. Human terminal use is never affected. Prevents unverifiable command execution when the audit chain cannot provide tamper evidence.
+
+- **Data directory protection** (#29): `.local/share/omamori` added to `blocked_command_patterns`. Prevents AI agents from deleting the entire data directory (which would simultaneously remove both `audit.jsonl` and `audit-secret`).
+
+### Closed
+
+- **#29**: Tamper-evident audit log — complete. All sub-features delivered across v0.7.0–v0.7.3: HMAC chain (v0.7.0), CLI verify/show/status (v0.7.1), retention/prune (v0.7.2), strict mode/O_NOFOLLOW hardening (v0.7.3).
+
 ## [0.7.2] - 2026-04-05
 
 ### Added
