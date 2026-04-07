@@ -1503,7 +1503,21 @@ where
             "config mutation would create invalid TOML; aborting".to_string(),
         ));
     }
-    std::fs::write(config_path, &new_content)?;
+    // Hardened write: atomic (temp → fsync → rename) with O_NOFOLLOW (#102)
+    config::reject_symlink_public(config_path, "config path")?;
+    let temp_path = config_path.with_extension("toml.tmp");
+    if temp_path.symlink_metadata().is_ok() {
+        config::reject_symlink_public(&temp_path, "config temp")?;
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    integrity::write_new_file(&temp_path, &new_content)?;
+    std::fs::File::open(&temp_path)?.sync_all()?;
+    std::fs::rename(&temp_path, config_path)?;
+    if let Some(dir) = config_path.parent()
+        && let Ok(f) = std::fs::File::open(dir)
+    {
+        let _ = f.sync_all();
+    }
     update_baseline_silent(&default_base_dir());
     Ok(())
 }
