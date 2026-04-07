@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.7.5] - 2026-04-07
+
+### Fixed
+
+- **Cursor/Codex hook shell-safe paths** (#104): `render_cursor_hooks_snippet` and `render_codex_pretooluse_script` now use `shell_words::quote` for executable path escaping, consistent with `codex_hooks_entry`. Also updated `cursor_snippet_exe_path` to use `shell_words::split` for robust path extraction.
+- **Config destination symlink check was dead code** (#105): `validate_destination` checked for symlinks after `canonicalize()`, which resolves all symlinks — making the check always false. Moved the check before `canonicalize`. Runtime guard in `move_to_dir` is unchanged.
+- **Config mutation not using hardened write** (#102): `mutate_config()` now uses atomic write (temp → fsync → rename) with `O_NOFOLLOW`, consistent with `write_baseline()` and `write_default_config()`.
+- **Shim target not verified against baseline** (#101): `full_check()` now compares each shim's resolved symlink target against the baseline record using `canonicalize` on both sides (handles Homebrew Cellar ↔ stable paths). Mismatch reports `[WARN]` with repair guidance.
+- **Config hash not compared to baseline** (#103): `full_check()` now compares the current config hash against the baseline. Detects out-of-band modification with `[WARN]`. Legitimate `omamori config` commands update the baseline automatically, avoiding false positives.
+
 ## [0.7.4] - 2026-04-06
 
 ### Fixed
