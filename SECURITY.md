@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.7.4)
+## What It Protects (v0.7.5)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
