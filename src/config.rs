@@ -370,6 +370,16 @@ fn validate_destination(dest: &str, rule_name: &str, warnings: &mut Vec<String>)
         return false;
     }
 
+    // Check symlink on original path before canonicalize resolves it (#105)
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        warnings.push(format!(
+            "rule `{rule_name}`: destination `{dest}` is a symlink; rule disabled for security"
+        ));
+        return false;
+    }
+
     // Resolve canonical path (catches .. traversal)
     if let Ok(canonical) = path.canonicalize() {
         let canonical_str = canonical.to_string_lossy();
@@ -381,16 +391,6 @@ fn validate_destination(dest: &str, rule_name: &str, warnings: &mut Vec<String>)
                 ));
                 return false;
             }
-        }
-
-        // Check symlink
-        if let Ok(meta) = fs::symlink_metadata(&canonical)
-            && meta.file_type().is_symlink()
-        {
-            warnings.push(format!(
-                "rule `{rule_name}`: destination `{dest}` is a symlink; rule disabled for security"
-            ));
-            return false;
         }
     }
     // If canonicalize fails (path doesn't exist yet), we'll catch it at runtime
@@ -996,6 +996,39 @@ mod tests {
         validate_rules(&mut rules, &mut warnings);
         assert!(warnings.iter().any(|w| w.contains("not an absolute path")));
         assert!(!rules[0].enabled); // rule gets disabled
+    }
+
+    #[test]
+    fn validate_symlink_destination_disables_rule() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("omamori-symdest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link = dir.join("link");
+        symlink(&real_dir, &link).unwrap();
+
+        let mut rules = vec![
+            RuleConfig::new(
+                "sym",
+                "rm",
+                ActionKind::MoveTo,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .with_destination(link.display().to_string()),
+        ];
+        let mut warnings = Vec::new();
+        validate_rules(&mut rules, &mut warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("is a symlink")),
+            "expected symlink warning, got: {warnings:?}"
+        );
+        assert!(!rules[0].enabled);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
