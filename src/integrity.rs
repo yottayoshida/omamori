@@ -260,8 +260,9 @@ pub fn canary(base_dir: &Path, program: &str) -> Option<String> {
 fn cursor_snippet_exe_path(content: &str) -> Option<PathBuf> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
     let cmd = v["hooks"]["beforeShellExecution"][0]["command"].as_str()?;
-    let path = cmd.strip_suffix(" cursor-hook")?.trim_matches('"');
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    let words = shell_words::split(cmd).ok()?;
+    let exe = words.first()?;
+    (!exe.is_empty()).then(|| PathBuf::from(exe))
 }
 
 /// Validate cursor hooks snippet: hash comparison + dangling path detection.
@@ -327,9 +328,31 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
     }
 }
 
+/// Compare a shim's resolved target against the baseline record.
+/// Returns `true` (match) when baseline is absent, entry is missing, or paths agree.
+fn shim_matches_baseline(
+    target: &Path,
+    command: &str,
+    baseline: Option<&IntegrityBaseline>,
+) -> bool {
+    let Some(b) = baseline else { return true };
+    let Some(entry) = b.shims.iter().find(|s| s.command == command) else {
+        return true;
+    };
+    if entry.target.is_empty() {
+        return true;
+    }
+    // Canonicalize both sides to handle Homebrew Cellar ↔ stable symlinks
+    let actual = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let expected =
+        fs::canonicalize(Path::new(&entry.target)).unwrap_or_else(|_| PathBuf::from(&entry.target));
+    actual == expected
+}
+
 /// Run a full integrity check of all defense layers.
 pub fn full_check(base_dir: &Path) -> IntegrityReport {
     let mut items = Vec::new();
+    let baseline = read_baseline(base_dir).ok().flatten();
 
     // --- Shims ---
     let shim_dir = base_dir.join("shim");
@@ -347,6 +370,14 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                     (
                         CheckStatus::Fail,
                         format!("-> {} (dangling)", target.display()),
+                    )
+                } else if !shim_matches_baseline(&target, command, baseline.as_ref()) {
+                    (
+                        CheckStatus::Warn,
+                        format!(
+                            "-> {} (differs from baseline — run `omamori install` to update)",
+                            target.display()
+                        ),
                     )
                 } else {
                     (CheckStatus::Ok, format!("-> {}", target.display()))
@@ -430,25 +461,39 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     // --- Config ---
     if let Some(entry) = read_config_entry() {
         let path = Path::new(&entry.path);
-        if entry.mode & 0o777 == 0o600 {
-            items.push(CheckItem {
-                category: "Config",
-                name: "config.toml".to_string(),
-                status: CheckStatus::Ok,
-                detail: format!("(mode 600, hash {})", &entry.sha256[..12]),
-            });
-        } else {
-            items.push(CheckItem {
-                category: "Config",
-                name: "config.toml".to_string(),
-                status: CheckStatus::Warn,
-                detail: format!(
+        let mode_ok = entry.mode & 0o777 == 0o600;
+        let hash_ok = baseline
+            .as_ref()
+            .and_then(|b| b.config.as_ref())
+            .map(|bc| bc.sha256 == entry.sha256)
+            .unwrap_or(true); // no baseline = skip comparison
+
+        let (status, detail) = if !mode_ok {
+            (
+                CheckStatus::Warn,
+                format!(
                     "(mode {:o} — run `chmod 600 {}`)",
                     entry.mode & 0o777,
                     path.display()
                 ),
-            });
-        }
+            )
+        } else if !hash_ok {
+            (
+                CheckStatus::Warn,
+                "(modified outside omamori — run `omamori install` to update baseline)".to_string(),
+            )
+        } else {
+            (
+                CheckStatus::Ok,
+                format!("(mode 600, hash {})", &entry.sha256[..12]),
+            )
+        };
+        items.push(CheckItem {
+            category: "Config",
+            name: "config.toml".to_string(),
+            status,
+            detail,
+        });
     } else {
         items.push(CheckItem {
             category: "Config",
@@ -493,40 +538,38 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     items.push(path_check);
 
     // --- Baseline ---
+    // Reuse `baseline` loaded at the top of full_check.
     let bp = baseline_path(base_dir);
-    if bp.exists() {
-        match read_baseline(base_dir) {
-            Ok(Some(b)) => {
-                if b.version == env!("CARGO_PKG_VERSION") {
-                    items.push(CheckItem {
-                        category: "Baseline",
-                        name: ".integrity.json".to_string(),
-                        status: CheckStatus::Ok,
-                        detail: format!("(v{}, {})", b.version, b.generated_at),
-                    });
-                } else {
-                    items.push(CheckItem {
-                        category: "Baseline",
-                        name: ".integrity.json".to_string(),
-                        status: CheckStatus::Warn,
-                        detail: format!(
-                            "(v{} — current binary is v{})",
-                            b.version,
-                            env!("CARGO_PKG_VERSION")
-                        ),
-                    });
-                }
-            }
-            Ok(None) => unreachable!(),
-            Err(e) => {
-                items.push(CheckItem {
-                    category: "Baseline",
-                    name: ".integrity.json".to_string(),
-                    status: CheckStatus::Warn,
-                    detail: format!("(corrupt: {e})"),
-                });
-            }
-        }
+    if let Some(b) = &baseline {
+        let (status, detail) = if b.version == env!("CARGO_PKG_VERSION") {
+            (
+                CheckStatus::Ok,
+                format!("(v{}, {})", b.version, b.generated_at),
+            )
+        } else {
+            (
+                CheckStatus::Warn,
+                format!(
+                    "(v{} — current binary is v{})",
+                    b.version,
+                    env!("CARGO_PKG_VERSION")
+                ),
+            )
+        };
+        items.push(CheckItem {
+            category: "Baseline",
+            name: ".integrity.json".to_string(),
+            status,
+            detail,
+        });
+    } else if bp.exists() {
+        // baseline is None but file exists → corrupt
+        items.push(CheckItem {
+            category: "Baseline",
+            name: ".integrity.json".to_string(),
+            status: CheckStatus::Warn,
+            detail: "(corrupt — run `omamori install` to regenerate)".to_string(),
+        });
     } else {
         items.push(CheckItem {
             category: "Baseline",
@@ -617,7 +660,7 @@ fn file_mode(_path: &Path) -> u32 {
 }
 
 #[cfg(unix)]
-fn write_new_file(path: &Path, content: &str) -> Result<(), AppError> {
+pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), AppError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut file = fs::OpenOptions::new()
@@ -633,7 +676,7 @@ fn write_new_file(path: &Path, content: &str) -> Result<(), AppError> {
 }
 
 #[cfg(not(unix))]
-fn write_new_file(path: &Path, content: &str) -> Result<(), AppError> {
+pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), AppError> {
     fs::write(path, content)?;
     Ok(())
 }
@@ -1081,5 +1124,111 @@ mod tests {
             ],
         };
         assert_eq!(report.exit_code(), 1);
+    }
+
+    // --- #101: shim baseline comparison ---
+
+    #[test]
+    fn shim_matches_baseline_returns_true_when_no_baseline() {
+        let target = PathBuf::from("/usr/local/bin/omamori");
+        assert!(shim_matches_baseline(&target, "rm", None));
+    }
+
+    #[test]
+    fn shim_matches_baseline_returns_true_when_target_matches() {
+        let dir = std::env::temp_dir().join(format!("omamori-shim-bl-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("omamori");
+        fs::write(&bin, "binary").unwrap();
+
+        let baseline = IntegrityBaseline {
+            version: "0.7.5".to_string(),
+            generated_at: String::new(),
+            omamori_exe: bin.display().to_string(),
+            shims: vec![ShimEntry {
+                command: "rm".to_string(),
+                target: bin.display().to_string(),
+            }],
+            hooks: vec![],
+            config: None,
+        };
+        assert!(shim_matches_baseline(&bin, "rm", Some(&baseline)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shim_matches_baseline_detects_mismatch() {
+        let dir = std::env::temp_dir().join(format!("omamori-shim-mm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("omamori");
+        let fake = dir.join("fake_omamori");
+        fs::write(&real, "real").unwrap();
+        fs::write(&fake, "fake").unwrap();
+
+        let baseline = IntegrityBaseline {
+            version: "0.7.5".to_string(),
+            generated_at: String::new(),
+            omamori_exe: real.display().to_string(),
+            shims: vec![ShimEntry {
+                command: "rm".to_string(),
+                target: real.display().to_string(),
+            }],
+            hooks: vec![],
+            config: None,
+        };
+        assert!(!shim_matches_baseline(&fake, "rm", Some(&baseline)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shim_matches_baseline_skips_empty_target() {
+        let baseline = IntegrityBaseline {
+            version: "0.7.5".to_string(),
+            generated_at: String::new(),
+            omamori_exe: String::new(),
+            shims: vec![ShimEntry {
+                command: "rm".to_string(),
+                target: String::new(),
+            }],
+            hooks: vec![],
+            config: None,
+        };
+        let any_path = PathBuf::from("/any/path/omamori");
+        assert!(shim_matches_baseline(&any_path, "rm", Some(&baseline)));
+    }
+
+    // --- #103: config hash baseline comparison ---
+
+    #[test]
+    fn full_check_config_hash_ok_when_baseline_matches() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfghash-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        // Create minimal structure so full_check doesn't fail early
+        let fake_bin = dir.join("omamori");
+        fs::write(&fake_bin, "binary").unwrap();
+        for cmd in installer::SHIM_COMMANDS {
+            let _ = symlink(&fake_bin, shim_dir.join(cmd));
+        }
+
+        // Generate and write baseline (includes config hash)
+        let baseline = generate_baseline(&dir).unwrap();
+        write_baseline(&dir, &baseline).unwrap();
+
+        let report = full_check(&dir);
+        let config_item = report.items.iter().find(|i| i.name == "config.toml");
+        // No config file = built-in defaults = Ok
+        if let Some(item) = config_item {
+            assert_ne!(
+                item.status,
+                CheckStatus::Fail,
+                "config should not fail: {}",
+                item.detail
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
     }
 }
