@@ -575,6 +575,29 @@ fn ensure_hooks_current_at(base_dir: &Path) -> bool {
     false
 }
 
+/// Attempt to append an audit event. On failure:
+/// - Always emits a WARNING to stderr
+/// - In strict mode, returns `Some(1)` to signal the caller should exit
+/// - In non-strict mode, returns `None` (command execution is not affected)
+fn try_audit_append(
+    logger: &audit::AuditLogger,
+    event: audit::AuditEvent,
+    strict: bool,
+) -> Option<i32> {
+    if let Err(e) = logger.append(event) {
+        eprintln!("omamori warning: audit log write failed: {e}");
+        eprintln!("  Command execution was not affected — this is a logging issue only.");
+        eprintln!(
+            "  To fix: check permissions on ~/.local/share/omamori/ or run omamori install --hooks"
+        );
+        if strict {
+            eprintln!("omamori error: audit strict mode — blocking because audit log is required");
+            return Some(1);
+        }
+    }
+    None
+}
+
 /// Silently update integrity baseline. Used after hook regen or config changes.
 /// Failures are non-fatal (warn to stderr).
 fn update_baseline_silent(base_dir: &Path) {
@@ -618,7 +641,9 @@ fn run_command(
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
             let event =
                 logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
-            let _ = logger.append(event);
+            if let Some(code) = try_audit_append(&logger, event, load_result.config.audit.strict) {
+                return Ok(code);
+            }
         }
         return Ok(outcome.exit_code());
     }
@@ -639,7 +664,9 @@ fn run_command(
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
             let event =
                 logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
-            let _ = logger.append(event);
+            if let Some(code) = try_audit_append(&logger, event, load_result.config.audit.strict) {
+                return Ok(code);
+            }
         }
         return Ok(exit_code);
     }
@@ -778,7 +805,9 @@ fn run_command(
             &detection.matched_detectors,
             &outcome,
         );
-        let _ = logger.append(event);
+        if let Some(code) = try_audit_append(&logger, event, load_result.config.audit.strict) {
+            return Ok(code);
+        }
     }
 
     Ok(outcome.exit_code())
