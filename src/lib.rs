@@ -965,6 +965,7 @@ fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(2).and_then(|item| item.to_str()) {
         Some("verify") => run_audit_verify(args),
         Some("show") => run_audit_show(args),
+        Some("key") => run_audit_key(args),
         Some(other) => Err(AppError::Usage(format!(
             "unknown audit subcommand: {other}\n\n{}",
             audit_usage()
@@ -1103,6 +1104,45 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
     }
 }
 
+fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
+    match args.get(3).and_then(|item| item.to_str()) {
+        Some("rotate") => {
+            // Block in AI context — AI should not rotate keys
+            guard_ai_config_modification("audit key rotate")?;
+
+            let load_result = load_config(None)?;
+            eprintln!("omamori: rotating audit HMAC key...");
+            eprintln!("  Old entries will still verify against the retired key backup.");
+
+            match audit::rotate_key(&load_result.config.audit) {
+                Ok(result) => {
+                    eprintln!("omamori: key rotation complete.");
+                    eprintln!("  New key ID: {}", result.new_key_id);
+                    eprintln!("  Retired key: {}", result.retired_path.display());
+                    eprintln!("  Run `omamori audit verify` to confirm chain integrity.");
+                    Ok(0)
+                }
+                Err(audit::AuditError::SecretUnavailable) => {
+                    eprintln!("omamori: no audit secret found — nothing to rotate");
+                    Ok(1)
+                }
+                Err(e) => {
+                    eprintln!("omamori: key rotation failed: {e}");
+                    Ok(1)
+                }
+            }
+        }
+        Some(other) => Err(AppError::Usage(format!(
+            "unknown audit key subcommand: {other}\n\n{}",
+            audit_usage()
+        ))),
+        None => Err(AppError::Usage(format!(
+            "audit key requires a subcommand\n\n{}",
+            audit_usage()
+        ))),
+    }
+}
+
 fn audit_usage() -> &'static str {
     "omamori audit — audit log commands
 
@@ -1110,7 +1150,8 @@ fn audit_usage() -> &'static str {
   omamori audit show [--last N] [--json]         View recent audit entries (default: last 20)
   omamori audit show --all                       View all entries
   omamori audit show --rule <name>               Filter by rule (substring match)
-  omamori audit show --provider <name>           Filter by provider"
+  omamori audit show --provider <name>           Filter by provider
+  omamori audit key rotate                       Rotate HMAC signing key"
 }
 
 /// Cursor `beforeShellExecution` hook handler.

@@ -77,6 +77,7 @@ pub struct AuditLogger {
     path: PathBuf,
     secret: Option<[u8; 32]>,
     retention_days: u32,
+    key_id: String,
 }
 
 impl AuditLogger {
@@ -91,10 +92,12 @@ impl AuditLogger {
         let (validated, _warnings) = config.validate();
         let path = validated.path.clone().unwrap_or_else(default_audit_path);
         let secret = load_or_create_secret(&secret_path_for(&path));
+        let key_id = current_key_id(&secret_path_for(&path));
         Some(Self {
             path,
             secret,
             retention_days: validated.retention_days,
+            key_id,
         })
     }
 
@@ -156,7 +159,7 @@ impl AuditLogger {
         event.chain_version = Some(CHAIN_VERSION);
         event.seq = Some(seq);
         event.prev_hash = Some(last_hash);
-        event.key_id = Some("default".to_string());
+        event.key_id = Some(self.key_id.clone());
         event.entry_hash = Some(compute_entry_hash(self.secret.as_ref(), &event));
 
         // Ensure new entry starts on its own line (torn lines may lack trailing newline)
@@ -559,6 +562,114 @@ fn secret_path_for(audit_path: &Path) -> PathBuf {
     audit_path.with_file_name("audit-secret")
 }
 
+/// Determine the current key_id based on retired key files.
+/// "default" if no rotation has occurred; "key-N" where N = retired_count + 1.
+fn current_key_id(secret_path: &Path) -> String {
+    let count = retired_key_count(secret_path);
+    if count == 0 {
+        "default".to_string()
+    } else {
+        format!("key-{}", count + 1)
+    }
+}
+
+/// Count how many retired key files exist (audit-secret.N.retired).
+fn retired_key_count(secret_path: &Path) -> usize {
+    let Some(parent) = secret_path.parent() else {
+        return 0;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return 0;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("audit-secret.")
+                && e.file_name().to_string_lossy().ends_with(".retired")
+        })
+        .count()
+}
+
+/// Load all keys (active + retired) into a key_id → secret mapping.
+/// Used by verify_chain for multi-key verification.
+fn load_keyring(secret_path: &Path) -> std::collections::HashMap<String, [u8; 32]> {
+    let mut keyring = std::collections::HashMap::new();
+
+    // Active key → current key_id
+    if let Ok(secret) = read_secret(secret_path) {
+        keyring.insert(current_key_id(secret_path), secret);
+        // Also register as "default" if no rotation has occurred
+        if retired_key_count(secret_path) == 0 {
+            keyring.insert("default".to_string(), secret);
+        }
+    }
+
+    // Retired keys → key-1, key-2, ...
+    if let Some(parent) = secret_path.parent() {
+        for n in 1.. {
+            let retired_path = parent.join(format!("audit-secret.{n}.retired"));
+            match read_secret(&retired_path) {
+                Ok(secret) => {
+                    // First retired key was originally "default"
+                    if n == 1 {
+                        keyring.insert("default".to_string(), secret);
+                    }
+                    keyring.insert(format!("key-{n}"), secret);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    keyring
+}
+
+/// Result of a key rotation operation.
+pub struct RotationResult {
+    pub new_key_id: String,
+    pub retired_path: PathBuf,
+}
+
+/// Rotate the audit HMAC key.
+///
+/// 1. Rename current secret to audit-secret.N.retired
+/// 2. Generate a new secret at audit-secret
+/// 3. New entries will use the new key_id
+/// 4. verify_chain uses keyring to verify old entries with old key
+pub fn rotate_key(config: &AuditConfig) -> Result<RotationResult, AuditError> {
+    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let secret_path = secret_path_for(&path);
+
+    // Verify current secret exists
+    read_secret(&secret_path).map_err(|_| AuditError::SecretUnavailable)?;
+
+    // Determine retired key number
+    let n = retired_key_count(&secret_path) + 1;
+    let retired_path = secret_path
+        .parent()
+        .unwrap()
+        .join(format!("audit-secret.{n}.retired"));
+
+    // Rename active → retired
+    fs::rename(&secret_path, &retired_path).map_err(AuditError::Io)?;
+
+    // Set restrictive permissions on retired key
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&retired_path, fs::Permissions::from_mode(0o600));
+    }
+
+    // Generate new secret
+    create_secret(&secret_path).map_err(AuditError::Io)?;
+
+    let new_key_id = format!("key-{}", n + 1);
+    Ok(RotationResult {
+        new_key_id,
+        retired_path,
+    })
+}
+
 fn load_or_create_secret(path: &Path) -> Option<[u8; 32]> {
     if let Ok(secret) = read_secret(path) {
         return Some(secret);
@@ -734,14 +845,19 @@ pub struct AuditSummary {
 
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let path = config.path.clone().unwrap_or_else(default_audit_path);
-    let secret = read_secret(&secret_path_for(&path)).map_err(|e| {
-        // eloop_message() converts ELOOP to a descriptive string error,
-        // so raw_os_error() is None. Check the message instead.
+    let secret_path = secret_path_for(&path);
+
+    // Primary secret for genesis hash computation (always the active key).
+    // Read before keyring to preserve ELOOP (symlink attack) error distinction.
+    let secret = read_secret(&secret_path).map_err(|e| {
         if e.to_string().contains("symlink") {
             return AuditError::Io(e);
         }
         AuditError::SecretUnavailable
     })?;
+
+    // Load keyring for multi-key verification (active + retired keys)
+    let keyring = load_keyring(&secret_path);
 
     let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => AuditError::FileNotFound,
@@ -827,20 +943,22 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             }
         }
 
-        // --- entry_hash HMAC verification (always, including prune_point) ---
-        let recomputed = compute_entry_hash(Some(&secret), &event);
+        // --- entry_hash HMAC verification (multi-key: lookup by key_id) ---
+        let entry_key_id = event.key_id.as_deref().unwrap_or("default");
+        let entry_secret = keyring.get(entry_key_id).unwrap_or(&secret);
+        let recomputed = compute_entry_hash(Some(entry_secret), &event);
         if recomputed != recorded_hash {
             result.broken_at = Some(seq);
             break;
         }
 
-        // --- prune-bind verification (after prune gap) ---
+        // --- prune-bind verification (after prune gap, use entry's key) ---
         if last_was_prune
             && let (Some(saved_target), Some(saved_count)) =
                 (&prune_target_hash, prune_target_count)
         {
             let expected_bind = hmac_bytes(
-                Some(&secret),
+                Some(entry_secret),
                 format!("prune-bind:{saved_count}:{recorded_hash}").as_bytes(),
             );
             if *saved_target != expected_bind {
@@ -1017,6 +1135,7 @@ mod tests {
             path,
             secret: Some(TEST_SECRET),
             retention_days: 0,
+            key_id: "default".to_string(),
         }
     }
 
@@ -1414,6 +1533,7 @@ mod tests {
             path: PathBuf::from("/tmp/dummy.jsonl"),
             secret: None,
             retention_days: 0,
+            key_id: "default".to_string(),
         };
         let invocation = CommandInvocation::new("ls".to_string(), vec![]);
         let event = logger.create_event(
@@ -1559,6 +1679,7 @@ mod tests {
             path: PathBuf::from("/nonexistent/dir/audit.jsonl"),
             secret: Some([0u8; 32]),
             retention_days: 0,
+            key_id: "default".to_string(),
         };
         assert!(logger.append(make_event("rm")).is_err());
     }
@@ -1883,6 +2004,7 @@ mod tests {
             path,
             secret: Some(TEST_SECRET),
             retention_days,
+            key_id: "default".to_string(),
         }
     }
 
@@ -2400,6 +2522,7 @@ mod tests {
             path: symlink_path,
             secret: Some(TEST_SECRET),
             retention_days: 0,
+            key_id: "default".to_string(),
         };
         let err = logger.append(make_event("ls")).unwrap_err();
         assert!(
@@ -2582,6 +2705,7 @@ mod tests {
             path: dir.join("audit.jsonl"),
             secret: None,
             retention_days: 0,
+            key_id: "default".to_string(),
         };
         assert!(!logger.secret_available());
         let _ = fs::remove_dir_all(&dir);
