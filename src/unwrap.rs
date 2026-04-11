@@ -252,9 +252,13 @@ fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
                 pos += 1;
                 while pos < len && tokens[pos].starts_with('-') {
                     if tokens[pos] == "-u" || tokens[pos] == "-g" {
-                        pos += 1; // skip the flag value too
+                        pos += 1; // skip the flag
+                        if pos < len {
+                            pos += 1; // skip the value
+                        }
+                    } else {
+                        pos += 1;
                     }
-                    pos += 1;
                 }
             }
             "env" => {
@@ -275,7 +279,10 @@ fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
             "nice" => {
                 pos += 1;
                 if pos < len && tokens[pos] == "-n" {
-                    pos += 2; // -n VALUE
+                    pos += 1; // skip -n
+                    if pos < len {
+                        pos += 1; // skip VALUE
+                    }
                 } else if pos < len && tokens[pos].starts_with("-n") {
                     pos += 1; // -n10 combined form
                 }
@@ -287,6 +294,8 @@ fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
         }
     }
 
+    // Bounds safety: pos can exceed len if input is all wrappers with no actual command
+    let pos = pos.min(len);
     tokens[pos..].to_vec()
 }
 
@@ -611,6 +620,26 @@ mod tests {
     #[test]
     fn nice_combined_form() {
         assert_commands("nice -n10 make", &[cmd("make", &[])]);
+    }
+
+    // Regression: fuzz found panic when input is all wrappers with no actual command
+    #[test]
+    fn wrappers_only_no_command() {
+        // Should return empty commands, not panic
+        let result = parse_command_string("sudo sudo sudo");
+        assert!(matches!(result, ParseResult::Commands(ref cmds) if cmds.is_empty()));
+    }
+
+    #[test]
+    fn nice_n_at_end_no_command() {
+        let result = parse_command_string("nice -n");
+        assert!(matches!(result, ParseResult::Commands(ref cmds) if cmds.is_empty()));
+    }
+
+    #[test]
+    fn sudo_u_at_end_no_command() {
+        let result = parse_command_string("sudo -u root");
+        assert!(matches!(result, ParseResult::Commands(ref cmds) if cmds.is_empty()));
     }
 
     #[test]
