@@ -451,6 +451,36 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
             "blocked attempt to unset a detector env var",
         ),
         ("AI_GUARD=", "blocked attempt to unset a detector env var"),
+        // export -n detection — unexport detector env vars (#110 S2)
+        (
+            "export -n CLAUDECODE",
+            "blocked attempt to unexport detector env var",
+        ),
+        (
+            "export -n CODEX_CI",
+            "blocked attempt to unexport detector env var",
+        ),
+        (
+            "export -n CURSOR_AGENT",
+            "blocked attempt to unexport detector env var",
+        ),
+        (
+            "export -n GEMINI_CLI",
+            "blocked attempt to unexport detector env var",
+        ),
+        (
+            "export -n CLINE_ACTIVE",
+            "blocked attempt to unexport detector env var",
+        ),
+        (
+            "export -n AI_GUARD",
+            "blocked attempt to unexport detector env var",
+        ),
+        // Claude Code hook registration protection (#110 T3)
+        (
+            ".claude/settings.json",
+            "blocked attempt to edit Claude Code settings (contains hook config)",
+        ),
         // Config modification protection (#22)
         ("config disable", "blocked attempt to modify omamori rules"),
         ("config enable", "blocked attempt to modify omamori rules"),

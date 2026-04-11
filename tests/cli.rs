@@ -1190,19 +1190,269 @@ fn hook_check_tool_name_only_allowed() {
     assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
 }
 
-/// #111: Edit tool with file_path → allowed (PR2 will add path guard).
+/// #110: Edit to non-protected path → allowed.
 #[test]
-fn hook_check_edit_file_op_allowed_pending_pr2() {
+fn hook_check_edit_non_protected_path_allowed() {
     let input = serde_json::json!({
         "tool_name": "Edit",
         "tool_input": { "file_path": "/tmp/test.txt", "old_string": "a", "new_string": "b" }
     })
     .to_string();
     let (stdout, _, exit_code) = run_hook_check(&input);
-    assert_eq!(exit_code, 0, "Edit file op must be allowed until PR2");
+    assert_eq!(exit_code, 0, "Edit to non-protected path must be allowed");
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("must return valid JSON");
     assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// #110 V-001: Edit to config.toml → blocked.
+#[test]
+fn hook_check_edit_config_toml_blocked() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{}/.config/omamori/config.toml", home),
+            "old_string": "enabled = true",
+            "new_string": "enabled = false"
+        }
+    })
+    .to_string();
+    let (stdout, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "Edit to config.toml must be blocked");
+    assert!(stdout.trim().is_empty());
+    assert!(stderr.contains("protected file"));
+    assert!(stderr.contains("omamori config"));
+}
+
+/// #110 V-002: Write to .integrity.json → blocked.
+#[test]
+fn hook_check_write_integrity_json_blocked() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": format!("{}/.omamori/.integrity.json", home),
+            "content": "{}"
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "Write to .integrity.json must be blocked");
+    assert!(stderr.contains("integrity baseline"));
+}
+
+/// #110: Write to audit.jsonl → blocked.
+#[test]
+fn hook_check_write_audit_jsonl_blocked() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": format!("{}/.local/share/omamori/audit.jsonl", home),
+            "content": ""
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "Write to audit.jsonl must be blocked");
+    assert!(stderr.contains("audit log"));
+}
+
+/// #110: Edit to audit-secret → blocked.
+#[test]
+fn hook_check_edit_audit_secret_blocked() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{}/.local/share/omamori/audit-secret", home),
+            "old_string": "old", "new_string": "new"
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "Edit to audit-secret must be blocked");
+    assert!(stderr.contains("HMAC secret"));
+}
+
+/// #110 T3: Edit to .claude/settings.json → blocked (hook registration protection).
+#[test]
+fn hook_check_edit_claude_settings_blocked() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{}/.claude/settings.json", home),
+            "old_string": "hooks", "new_string": ""
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "Edit to settings.json must be blocked");
+    assert!(stderr.contains("Claude Code settings"));
+}
+
+/// #110: Edit to .codex/hooks.json → blocked.
+#[test]
+fn hook_check_edit_codex_hooks_json_blocked() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{}/.codex/hooks.json", home),
+            "old_string": "omamori", "new_string": ""
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "Edit to .codex/hooks.json must be blocked");
+    assert!(stderr.contains("Codex hooks"));
+}
+
+/// #110: Edit to hook script → blocked.
+#[test]
+fn hook_check_edit_hook_script_blocked() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{}/.omamori/hooks/claude-pretooluse.sh", home),
+            "old_string": "exit 2", "new_string": "exit 0"
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "Edit to hook script must be blocked");
+    assert!(stderr.contains("hook script"));
+}
+
+/// #110 V-006: Path traversal with .. → blocked.
+#[test]
+fn hook_check_edit_path_traversal_blocked() {
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "/tmp/../../home/../tmp/../Users/nonexistent/.config/omamori/config.toml",
+            "old_string": "a", "new_string": "b"
+        }
+    })
+    .to_string();
+    let (_, _, exit_code) = run_hook_check(&input);
+    assert_eq!(
+        exit_code, 2,
+        "path traversal to config.toml must be blocked"
+    );
+}
+
+/// #110: Tilde path ~ → blocked.
+#[test]
+fn hook_check_edit_tilde_path_blocked() {
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "~/.config/omamori/config.toml",
+            "old_string": "a", "new_string": "b"
+        }
+    })
+    .to_string();
+    let (_, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "tilde path to config.toml must be blocked");
+}
+
+/// #110: Write to completely unrelated path → allowed.
+#[test]
+fn hook_check_write_unrelated_path_allowed() {
+    let input = serde_json::json!({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "/Users/someone/projects/myapp/src/main.rs",
+            "content": "fn main() {}"
+        }
+    })
+    .to_string();
+    let (stdout, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 0, "Write to unrelated path must be allowed");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// #110: Block message includes 3-layer structure and omamori config hint.
+#[test]
+fn hook_check_edit_block_message_has_3_layers() {
+    let home = std::env::var("HOME").unwrap();
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": format!("{}/.config/omamori/config.toml", home),
+            "old_string": "a", "new_string": "b"
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2);
+    // Layer 1: what happened
+    assert!(stderr.contains("blocked Edit to protected file"));
+    // Layer 2: current state
+    assert!(stderr.contains("AI agents cannot modify"));
+    // Layer 3: what to do
+    assert!(stderr.contains("omamori config"));
+}
+
+/// #110: Symlinked parent directory — canonicalize parent catches bypass.
+#[cfg(unix)]
+#[test]
+fn hook_check_edit_symlinked_parent_blocked() {
+    use std::os::unix::fs::symlink;
+
+    let poc_dir = unique_dir("symlink-guard");
+    std::fs::create_dir_all(&poc_dir).unwrap();
+
+    // Create a symlink: poc_dir/alias -> ~/.local/share/omamori
+    let home = std::env::var("HOME").unwrap();
+    let target = format!("{home}/.local/share/omamori");
+    let alias = poc_dir.join("alias");
+    // Only test if the target directory exists
+    if std::path::Path::new(&target).exists() {
+        symlink(&target, &alias).unwrap();
+
+        let fake_file = format!("{}/newfile.jsonl", alias.display());
+        let input = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": fake_file,
+                "content": "injected"
+            }
+        })
+        .to_string();
+        let (_, _, exit_code) = run_hook_check(&input);
+        assert_eq!(
+            exit_code, 2,
+            "symlinked parent to protected dir must be blocked"
+        );
+    }
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&poc_dir);
+}
+
+/// #110 S2: export -n meta-pattern blocks unexport of detector env vars.
+#[test]
+fn hook_check_blocks_export_n_claudecode() {
+    let (_, stderr, exit_code) =
+        run_hook_check(&pretooluse_bash_json("export -n CLAUDECODE && echo hi"));
+    assert_eq!(exit_code, 2);
+    assert!(stderr.contains("unexport"));
+}
+
+/// #110 T3: Bash command editing settings.json is blocked by meta-pattern.
+#[test]
+fn hook_check_blocks_bash_settings_json_edit() {
+    let (_, stderr, exit_code) = run_hook_check(&pretooluse_bash_json(
+        "sed -i '' 's/omamori//' ~/.claude/settings.json",
+    ));
+    assert_eq!(exit_code, 2);
+    assert!(stderr.contains("Claude Code settings"));
 }
 
 /// #111: VERBOSE mode includes raw input in stderr for malformed input.

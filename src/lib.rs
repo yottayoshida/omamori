@@ -1304,11 +1304,25 @@ fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
             ));
             Ok(0)
         }
-        HookInput::FileOp { .. } => {
-            // PR2 (#110) will add protected-path checking here.
-            // Until then, allow all file operations to avoid false positives.
-            print_hook_check_allow_response("omamori: file operation — not yet inspected");
-            Ok(0)
+        HookInput::FileOp { tool, path } => {
+            if let Some(reason) = is_protected_file_path(&path) {
+                eprintln!("omamori hook: blocked {tool} to protected file — {reason}");
+                eprintln!("  AI agents cannot modify omamori configuration or security files.");
+                eprintln!(
+                    "  To edit config: use `omamori config` CLI or edit the file directly in your terminal."
+                );
+                if verbose {
+                    eprintln!("  provider: {provider}");
+                    eprintln!("  tool: {tool}");
+                    eprintln!("  path: {path}");
+                }
+                Ok(2)
+            } else {
+                print_hook_check_allow_response(&format!(
+                    "omamori: {tool} to non-protected path — allowed"
+                ));
+                Ok(0)
+            }
         }
         HookInput::Command(command) => {
             if command.is_empty() {
@@ -1379,6 +1393,75 @@ fn truncate_for_log(s: &str, max_chars: usize) -> &str {
 }
 
 // ---------------------------------------------------------------------------
+// File path protection for Edit/Write/MultiEdit (#110)
+// ---------------------------------------------------------------------------
+
+/// Patterns that identify omamori's own files and external hook registrations.
+/// Substring match against the canonicalized (or lexically normalized) path.
+/// Intentionally broad: "audit-secret" matches "audit-secret.1.retired" too.
+const PROTECTED_FILE_PATTERNS: &[(&str, &str)] = &[
+    ("omamori/config.toml", "omamori config"),
+    (".integrity.json", "integrity baseline"),
+    ("audit-secret", "audit HMAC secret"),
+    ("audit.jsonl", "audit log"),
+    (".local/share/omamori", "omamori data directory"),
+    ("claude-pretooluse.sh", "omamori hook script"),
+    ("codex-pretooluse.sh", "omamori Codex hook script"),
+    (".codex/hooks.json", "Codex hooks config"),
+    (".codex/config.toml", "Codex config"),
+    // Claude Code hook registration — AI removing hooks = full bypass (#110 T3)
+    (
+        ".claude/settings.json",
+        "Claude Code settings (contains hook config)",
+    ),
+];
+
+/// Check whether a file path targets a protected omamori file.
+///
+/// Resolution strategy (defense-in-depth per Codex review):
+///   1. Try `canonicalize()` to resolve symlinks for existing paths
+///   2. For non-existent paths, canonicalize the parent directory
+///   3. Fall back to lexical normalization (`context::normalize_path`)
+///   4. If canonicalize fails AND lexical path matches → fail-close (block)
+fn is_protected_file_path(path: &str) -> Option<&'static str> {
+    let lexical = context::normalize_path(path);
+
+    // Try full canonicalize first (resolves symlinks for existing paths)
+    let candidates: Vec<std::path::PathBuf> = match std::fs::canonicalize(&lexical) {
+        Ok(canonical) => vec![canonical],
+        Err(_) => {
+            // Full path doesn't exist — try canonicalizing the parent directory.
+            // This catches symlinked parents: /tmp/alias/newfile where /tmp/alias → protected dir
+            let mut resolved_via_parent = Vec::new();
+            if let Some(parent) = lexical.parent() {
+                if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                    if let Some(filename) = lexical.file_name() {
+                        resolved_via_parent.push(canonical_parent.join(filename));
+                    }
+                }
+            }
+            resolved_via_parent
+        }
+    };
+
+    // Check all resolved candidates + the lexical path itself
+    let lexical_str = lexical.to_string_lossy();
+    for &(pattern, reason) in PROTECTED_FILE_PATTERNS {
+        // Lexical match always checked (fail-close: even if canonicalize failed)
+        if lexical_str.contains(pattern) {
+            return Some(reason);
+        }
+        // Canonical/parent-resolved matches
+        for candidate in &candidates {
+            if candidate.to_string_lossy().contains(pattern) {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // HookInput: typed representation of PreToolUse hook stdin
 // ---------------------------------------------------------------------------
 
@@ -1392,8 +1475,7 @@ enum HookInput {
     Command(String),
 
     /// `tool_input.file_path` present — file operation (Edit/Write/MultiEdit).
-    /// Protected-path checking is implemented in PR2 (#110); until then, allow.
-    #[expect(dead_code, reason = "fields used in PR2 (#110) file_path guard")]
+    /// Protected-path checking via `is_protected_file_path()`.
     FileOp { tool: String, path: String },
 
     /// Valid JSON with a `tool_name` but neither `command` nor `file_path`.
