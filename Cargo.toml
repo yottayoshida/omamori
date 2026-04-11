@@ -2,7 +2,7 @@
 name = "omamori"
 version = "0.7.5"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 description = "AI Agent's Omamori — protect your system from dangerous commands executed via AI CLI tools"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yottayoshida/omamori"
