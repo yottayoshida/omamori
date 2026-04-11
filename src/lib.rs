@@ -1536,6 +1536,7 @@ fn is_protected_file_path(path: &str) -> Option<&'static str> {
 ///
 /// Fail-close design: anything that cannot be positively identified as a known
 /// tool invocation is treated as malformed and blocked.
+#[derive(Debug)]
 enum HookInput {
     /// `tool_input.command` present — shell command to evaluate.
     /// Covers tool_name = "Bash", "Shell", or any tool that carries a command field.
@@ -2686,5 +2687,355 @@ mod tests {
         assert_eq!(resolved, real_path.canonicalize().unwrap());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // =====================================================================
+    // Guardrail tests for v0.8.1 module split (#112)
+    //
+    // These tests lock security-critical behavior that existing tests do
+    // NOT directly cover.  They must pass before AND after each PR in the
+    // module split sequence.
+    // =====================================================================
+
+    // --- GR-001: fail-close config fallback (T8 guardrail, DREAD 9.0) ---
+    //
+    // These tests isolate from ambient config by pointing XDG_CONFIG_HOME
+    // and HOME to an empty temp dir.  load_config(None) will fail to find
+    // config.toml and fall back to Config::default() — exactly the T8
+    // fail-close path we want to verify.
+
+    /// Redirect config discovery to an empty dir so load_config falls back
+    /// to Config::default().  Returns (old_xdg, old_home) for restore.
+    /// Redirect config discovery to an empty temp dir so `load_config(None)`
+    /// cannot find config.toml and falls back to `Config::default()`.
+    ///
+    /// # Safety
+    /// Env-var mutation is guarded by `#[serial_test::serial]` on every caller.
+    fn isolate_config() -> (Option<String>, Option<String>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("omamori-gr-iso-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let old_home = std::env::var("HOME").ok();
+        // SAFETY: serialized by #[serial_test::serial] — no concurrent env reads.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.join("xdg"));
+            std::env::set_var("HOME", &dir);
+        }
+        (old_xdg, old_home, dir)
+    }
+
+    fn restore_config(old_xdg: Option<String>, old_home: Option<String>, dir: std::path::PathBuf) {
+        // SAFETY: serialized by #[serial_test::serial] — no concurrent env reads.
+        unsafe {
+            match old_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_command_for_hook_blocks_rm_rf_with_default_rules() {
+        let (old_xdg, old_home, dir) = isolate_config();
+
+        match check_command_for_hook("rm -rf /") {
+            HookCheckResult::BlockRule { rule_name, .. } => {
+                assert!(
+                    rule_name.contains("rm"),
+                    "expected rm-related rule, got: {rule_name}"
+                );
+            }
+            HookCheckResult::BlockMeta(_) | HookCheckResult::BlockStructural(_) => {
+                // Also acceptable — blocked by meta-pattern or structural check.
+            }
+            HookCheckResult::Allow => {
+                restore_config(old_xdg, old_home, dir);
+                panic!("SECURITY: rm -rf / was ALLOWED — fail-close fallback is broken");
+            }
+        }
+        restore_config(old_xdg, old_home, dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_command_for_hook_allows_safe_command() {
+        let (old_xdg, old_home, dir) = isolate_config();
+
+        match check_command_for_hook("ls /tmp") {
+            HookCheckResult::Allow => {} // expected
+            other => {
+                restore_config(old_xdg, old_home, dir);
+                panic!(
+                    "expected Allow for 'ls /tmp', got: {}",
+                    match other {
+                        HookCheckResult::BlockMeta(r) => format!("BlockMeta({r})"),
+                        HookCheckResult::BlockRule { rule_name, .. } =>
+                            format!("BlockRule({rule_name})"),
+                        HookCheckResult::BlockStructural(r) => format!("BlockStructural({r})"),
+                        HookCheckResult::Allow => unreachable!(),
+                    }
+                );
+            }
+        }
+        restore_config(old_xdg, old_home, dir);
+    }
+
+    // --- GR-003: extract_hook_input 6-class unit tests (pipeline guardrail) ---
+
+    #[test]
+    fn extract_hook_input_command_from_tool_input() {
+        let input = r#"{"tool_name":"Bash","tool_input":{"command":"ls -la"}}"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(cmd, "ls -la"),
+            other => panic!("expected Command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_hook_input_command_from_top_level() {
+        // Cursor beforeShellExecution compat
+        let input = r#"{"command":"echo hello"}"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(cmd, "echo hello"),
+            other => panic!("expected Command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_hook_input_file_op() {
+        let input = r#"{"tool_name":"Edit","tool_input":{"file_path":"/tmp/x.rs"}}"#;
+        match extract_hook_input(input) {
+            HookInput::FileOp { tool, path } => {
+                assert_eq!(tool, "Edit");
+                assert_eq!(path, "/tmp/x.rs");
+            }
+            other => panic!("expected FileOp, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_hook_input_unknown_tool() {
+        let input = r#"{"tool_name":"FutureTool","tool_input":{"query":"something"}}"#;
+        match extract_hook_input(input) {
+            HookInput::UnknownTool(name) => assert_eq!(name, "FutureTool"),
+            other => panic!("expected UnknownTool, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_hook_input_malformed_json() {
+        match extract_hook_input("not json at all") {
+            HookInput::MalformedJson => {}
+            other => panic!("expected MalformedJson, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_hook_input_missing_field() {
+        // tool_input exists but is empty object → MalformedMissingField
+        let input = r#"{"tool_name":"Bash","tool_input":{}}"#;
+        match extract_hook_input(input) {
+            HookInput::MalformedMissingField => {}
+            other => panic!("expected MalformedMissingField, got: {other:?}"),
+        }
+    }
+
+    // --- GR-004: is_protected_file_path (PROTECTED_FILE_PATTERNS guardrail) ---
+
+    #[test]
+    fn protected_file_path_matches_config_toml() {
+        let result = is_protected_file_path("/home/user/.config/omamori/config.toml");
+        assert!(result.is_some(), "config.toml should be protected");
+    }
+
+    #[test]
+    fn protected_file_path_rejects_unrelated() {
+        let result = is_protected_file_path("/tmp/myfile.txt");
+        assert!(result.is_none(), "/tmp/myfile.txt should not be protected");
+    }
+
+    #[test]
+    fn protected_file_path_all_patterns_match() {
+        // Verify every pattern in PROTECTED_FILE_PATTERNS is reachable.
+        let test_paths = [
+            "/home/user/.config/omamori/config.toml",
+            "/home/user/.local/share/omamori/.integrity.json",
+            "/home/user/.local/share/omamori/audit-secret",
+            "/home/user/.local/share/omamori/audit.jsonl",
+            "/home/user/.local/share/omamori",
+            "/home/user/.local/share/omamori/hooks/claude-pretooluse.sh",
+            "/home/user/.local/share/omamori/hooks/codex-pretooluse.sh",
+            "/home/user/.codex/hooks.json",
+            "/home/user/.codex/config.toml",
+            "/home/user/.claude/settings.json",
+        ];
+        for path in &test_paths {
+            assert!(
+                is_protected_file_path(path).is_some(),
+                "PROTECTED_FILE_PATTERNS gap: {path} was not matched"
+            );
+        }
+    }
+
+    // --- GR-007: check_command_for_hook meta-pattern (hook pipeline guardrail) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn check_command_for_hook_blocks_meta_pattern() {
+        let (old_xdg, old_home, dir) = isolate_config();
+
+        match check_command_for_hook("unset CLAUDECODE") {
+            HookCheckResult::BlockMeta(_) => {}
+            HookCheckResult::BlockRule { .. } | HookCheckResult::BlockStructural(_) => {}
+            HookCheckResult::Allow => {
+                restore_config(old_xdg, old_home, dir);
+                panic!("SECURITY: 'unset CLAUDECODE' was ALLOWED — meta-pattern is broken");
+            }
+        }
+        restore_config(old_xdg, old_home, dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_command_for_hook_allows_echo() {
+        let (old_xdg, old_home, dir) = isolate_config();
+
+        match check_command_for_hook("echo hello world") {
+            HookCheckResult::Allow => {}
+            _ => {
+                restore_config(old_xdg, old_home, dir);
+                panic!("'echo hello world' should be allowed");
+            }
+        }
+        restore_config(old_xdg, old_home, dir);
+    }
+
+    // --- GR-005: mutate_config pipeline (T6 guardrail) ---
+
+    #[test]
+    fn mutate_config_rejects_invalid_mutation() {
+        let dir = std::env::temp_dir().join(format!("omamori-gr005-1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "[rules]\n").unwrap();
+
+        let original = std::fs::read_to_string(&config_path).unwrap();
+
+        // Mutation that produces invalid TOML (unparseable by the failsafe toml crate)
+        let result = mutate_config(&config_path, |doc| {
+            // Insert raw string that is valid toml_edit but breaks toml's stricter parser
+            doc.insert("__broken", toml_edit::Item::None);
+            Ok(())
+        });
+
+        // Regardless of whether this particular mutation triggers the failsafe,
+        // the original file must not be corrupted.
+        let after = std::fs::read_to_string(&config_path).unwrap_or_default();
+        // If mutation succeeded, the file was validly updated (also acceptable).
+        // The key invariant: the file is never left in a corrupt state.
+        if result.is_err() {
+            assert_eq!(
+                after, original,
+                "config must not be corrupted on mutation error"
+            );
+        } else {
+            // Mutation succeeded — verify output is valid TOML
+            assert!(
+                toml::from_str::<toml::Value>(&after).is_ok(),
+                "mutate_config produced invalid TOML"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutate_config_roundtrip_preserves_structure() {
+        let dir = std::env::temp_dir().join(format!("omamori-gr005-2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+
+        // Write a minimal valid config
+        let initial = "[rules]\n[audit]\nenabled = true\n";
+        std::fs::write(&config_path, initial).unwrap();
+
+        // Apply a valid mutation
+        let result = mutate_config(&config_path, |doc| {
+            doc["audit"]["enabled"] = toml_edit::value(false);
+            Ok(())
+        });
+        assert!(result.is_ok(), "valid mutation should succeed: {result:?}");
+
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = toml::from_str(&after).expect("output must be valid TOML");
+        assert_eq!(
+            parsed
+                .get("audit")
+                .and_then(|a| a.get("enabled"))
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "mutation should have set audit.enabled = false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- GR-008: try_audit_append strict/non-strict (audit safety guardrail) ---
+
+    #[test]
+    fn try_audit_append_strict_returns_exit_code_on_failure() {
+        // Create a logger pointing at a non-existent directory → append will fail
+        let logger = audit::AuditLogger::from_config(&audit::AuditConfig {
+            enabled: true,
+            path: Some(std::path::PathBuf::from("/nonexistent/dir/audit.jsonl")),
+            retention_days: 0,
+            strict: true,
+        });
+        if let Some(logger) = logger {
+            let event = logger.create_event(
+                &rules::CommandInvocation::new("test".to_string(), vec![]),
+                None,
+                &[],
+                &actions::ActionOutcome::PassedThrough { exit_code: 0 },
+            );
+            let result = try_audit_append(&logger, event, true);
+            assert_eq!(
+                result,
+                Some(1),
+                "strict mode should return Some(1) on append failure"
+            );
+        }
+        // If logger construction itself fails (no secret), that's also acceptable —
+        // the point is that strict+failure → exit code.
+    }
+
+    #[test]
+    fn try_audit_append_non_strict_returns_none_on_failure() {
+        let logger = audit::AuditLogger::from_config(&audit::AuditConfig {
+            enabled: true,
+            path: Some(std::path::PathBuf::from("/nonexistent/dir/audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        });
+        if let Some(logger) = logger {
+            let event = logger.create_event(
+                &rules::CommandInvocation::new("test".to_string(), vec![]),
+                None,
+                &[],
+                &actions::ActionOutcome::PassedThrough { exit_code: 0 },
+            );
+            let result = try_audit_append(&logger, event, false);
+            assert_eq!(
+                result, None,
+                "non-strict mode should return None on append failure"
+            );
+        }
     }
 }

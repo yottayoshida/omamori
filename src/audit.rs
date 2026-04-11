@@ -2762,4 +2762,50 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // --- GR-002: HashableEvent serialization order golden test (T9 guardrail) ---
+
+    #[test]
+    fn hashable_event_serialization_order_is_stable() {
+        // This test locks the field order of HashableEvent serialization.
+        // If someone reorders fields in the struct definition, serde will
+        // serialize in the new order — tests that compute hashes will still
+        // pass (consistently wrong), but *existing* audit.jsonl entries will
+        // fail verify_chain.  This golden test catches that.
+        let event = AuditEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            provider: "test-provider".to_string(),
+            command: "rm -rf /".to_string(),
+            rule_id: Some("test-rule".to_string()),
+            action: "block".to_string(),
+            result: "blocked".to_string(),
+            target_count: 1,
+            target_hash: "abc123".to_string(),
+            detection_layer: Some("layer1".to_string()),
+            unwrap_chain: None,
+            raw_input_hash: None,
+            chain_version: Some(1),
+            seq: Some(42),
+            prev_hash: Some("prev000".to_string()),
+            key_id: Some("default".to_string()),
+            entry_hash: None, // not part of HashableEvent
+        };
+        let json = serde_json::to_string(&HashableEvent::from_event(&event)).unwrap();
+
+        // Verify exact field order: chain_version must be first, raw_input_hash last.
+        // DO NOT update this string without understanding the chain compatibility impact.
+        let expected = concat!(
+            r#"{"chain_version":1,"seq":42,"prev_hash":"prev000","key_id":"default","#,
+            r#""timestamp":"2026-01-01T00:00:00Z","provider":"test-provider","#,
+            r#""command":"rm -rf /","rule_id":"test-rule","action":"block","#,
+            r#""result":"blocked","target_count":1,"target_hash":"abc123","#,
+            r#""detection_layer":"layer1","unwrap_chain":null,"raw_input_hash":null}"#,
+        );
+        assert_eq!(
+            json, expected,
+            "HashableEvent field order has changed! \
+            This WILL break verify_chain on all existing audit.jsonl files. \
+            If this is intentional (new chain_version), update this test and bump CHAIN_VERSION."
+        );
+    }
 }
