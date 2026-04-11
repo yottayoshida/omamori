@@ -1258,27 +1258,72 @@ fn format_unwrap_chain(original: &str, invocation: &CommandInvocation) -> Option
 // ---------------------------------------------------------------------------
 
 /// `omamori hook-check [--provider NAME]`
-/// Reads command string from stdin, checks against meta-patterns + unwrap stack + rules.
+/// Reads PreToolUse JSON from stdin, classifies via `HookInput`, then evaluates.
 /// Exit 0 = allow, exit 2 = block.
 fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     use std::io::Read;
 
     let provider = parse_provider_flag(args);
+    let verbose = std::env::var("OMAMORI_VERBOSE").is_ok();
 
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
-    // Claude Code sends JSON with tool_input.command; extract it
-    let command = extract_command_from_hook_input(&input);
-
-    if command.is_empty() {
-        print_hook_check_allow_response("omamori: empty command");
-        return Ok(0);
+    match extract_hook_input(&input) {
+        HookInput::MalformedJson => {
+            eprintln!("omamori hook: blocked — hook input is not valid JSON");
+            eprintln!("  The command was denied because omamori cannot verify its safety.");
+            eprintln!(
+                "  This may happen after an AI tool update. Try: upgrade omamori, or report at https://github.com/yottayoshida/omamori/issues"
+            );
+            if verbose {
+                eprintln!("  provider: {provider}");
+                eprintln!(
+                    "  raw input (first 200 chars): {}",
+                    truncate_for_log(&input, 200)
+                );
+            }
+            Ok(2)
+        }
+        HookInput::MalformedMissingField => {
+            eprintln!("omamori hook: blocked — required fields missing from hook input");
+            eprintln!("  The command was denied because omamori cannot verify its safety.");
+            eprintln!("  Expected: tool_input.command or tool_input.file_path");
+            if verbose {
+                eprintln!("  provider: {provider}");
+                eprintln!(
+                    "  raw input (first 200 chars): {}",
+                    truncate_for_log(&input, 200)
+                );
+            }
+            Ok(2)
+        }
+        HookInput::UnknownTool(tool_name) => {
+            print_hook_check_allow_response(&format!(
+                "omamori: unrecognized tool '{tool_name}' — allowed for forward compatibility"
+            ));
+            Ok(0)
+        }
+        HookInput::FileOp { .. } => {
+            // PR2 (#110) will add protected-path checking here.
+            // Until then, allow all file operations to avoid false positives.
+            print_hook_check_allow_response("omamori: file operation — not yet inspected");
+            Ok(0)
+        }
+        HookInput::Command(command) => {
+            if command.is_empty() {
+                print_hook_check_allow_response("omamori: empty command");
+                return Ok(0);
+            }
+            run_hook_check_command(&command, &provider, verbose)
+        }
     }
+}
 
-    let verbose = std::env::var("OMAMORI_VERBOSE").is_ok();
-
-    match check_command_for_hook(&command) {
+/// Evaluate a shell command through the two-phase hook check pipeline.
+/// Extracted from `run_hook_check` to keep the match arms concise.
+fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Result<i32, AppError> {
+    match check_command_for_hook(command) {
         HookCheckResult::Allow => {
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
@@ -1325,25 +1370,115 @@ fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     }
 }
 
-/// Extract the command string from Claude Code's PreToolUse hook JSON input.
-/// Falls back to treating the entire input as the command if JSON parsing fails.
-fn extract_command_from_hook_input(input: &str) -> String {
-    // Claude Code PreToolUse sends: { "tool_name": "Bash", "tool_input": { "command": "..." } }
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
-        if let Some(cmd) = v
-            .get("tool_input")
-            .and_then(|ti| ti.get("command"))
-            .and_then(|c| c.as_str())
-        {
-            return cmd.to_string();
-        }
-        // Cursor format: { "command": "..." }
-        if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-            return cmd.to_string();
-        }
+/// Truncate a string for log output, avoiding panic on multi-byte boundaries.
+fn truncate_for_log(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
     }
-    // Fallback: treat raw input as command
-    input.trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// HookInput: typed representation of PreToolUse hook stdin
+// ---------------------------------------------------------------------------
+
+/// Parsed hook input from AI tool platforms (Claude Code, Codex CLI, etc.).
+///
+/// Fail-close design: anything that cannot be positively identified as a known
+/// tool invocation is treated as malformed and blocked.
+enum HookInput {
+    /// `tool_input.command` present — shell command to evaluate.
+    /// Covers tool_name = "Bash", "Shell", or any tool that carries a command field.
+    Command(String),
+
+    /// `tool_input.file_path` present — file operation (Edit/Write/MultiEdit).
+    /// Protected-path checking is implemented in PR2 (#110); until then, allow.
+    #[expect(dead_code, reason = "fields used in PR2 (#110) file_path guard")]
+    FileOp { tool: String, path: String },
+
+    /// Valid JSON with a `tool_name` but neither `command` nor `file_path`.
+    /// Allow for forward compatibility with future platform tool types.
+    UnknownTool(String),
+
+    /// JSON parse failed entirely (invalid syntax, non-UTF8, etc.).
+    MalformedJson,
+
+    /// JSON parsed but required structure is missing (no `tool_input`, etc.).
+    MalformedMissingField,
+}
+
+/// Parse PreToolUse hook stdin into a typed `HookInput`.
+///
+/// Classification priority:
+///   1. JSON parse failure → `MalformedJson`
+///   2. `tool_input.command` (string) → `Command`
+///   3. top-level `command` (Cursor compat) → `Command`
+///   4. `tool_input.file_path` (string) → `FileOp`
+///   5. `tool_name` present → `UnknownTool`
+///   6. nothing recognizable → `MalformedMissingField`
+fn extract_hook_input(input: &str) -> HookInput {
+    let v = match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(v) => v,
+        Err(_) => return HookInput::MalformedJson,
+    };
+
+    let tool_input = v.get("tool_input");
+
+    // Priority 1: tool_input.command (Claude Code / Codex CLI format)
+    if let Some(cmd_val) = tool_input.and_then(|ti| ti.get("command")) {
+        // Key exists — value MUST be a string. null/number/array = malformed.
+        return match cmd_val.as_str() {
+            Some(cmd) => HookInput::Command(cmd.to_string()),
+            None => HookInput::MalformedMissingField,
+        };
+    }
+
+    // Priority 2: top-level command (Cursor beforeShellExecution compat)
+    if let Some(cmd_val) = v.get("command") {
+        return match cmd_val.as_str() {
+            Some(cmd) => HookInput::Command(cmd.to_string()),
+            None => HookInput::MalformedMissingField,
+        };
+    }
+
+    // Priority 3: tool_input.file_path (Edit/Write/MultiEdit)
+    if let Some(path_val) = tool_input.and_then(|ti| ti.get("file_path")) {
+        return match path_val.as_str() {
+            Some(path) => {
+                let tool = v
+                    .get("tool_name")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                HookInput::FileOp {
+                    tool,
+                    path: path.to_string(),
+                }
+            }
+            None => HookInput::MalformedMissingField,
+        };
+    }
+
+    // Priority 4: tool_input exists but has no command/file_path
+    if let Some(ti) = tool_input {
+        // Empty tool_input or non-object = malformed (e.g. {"tool_name":"Bash","tool_input":{}})
+        if ti.as_object().is_none_or(|obj| obj.is_empty()) {
+            return HookInput::MalformedMissingField;
+        }
+        // Non-empty tool_input with unrecognized fields = future tool type
+        if let Some(name) = v.get("tool_name").and_then(|t| t.as_str()) {
+            return HookInput::UnknownTool(name.to_string());
+        }
+        return HookInput::MalformedMissingField;
+    }
+
+    // Priority 5: no tool_input at all — tool_name alone = future tool type
+    if let Some(name) = v.get("tool_name").and_then(|t| t.as_str()) {
+        return HookInput::UnknownTool(name.to_string());
+    }
+
+    // Nothing recognizable
+    HookInput::MalformedMissingField
 }
 
 /// Parse --provider flag from args. Defaults to "unknown".
