@@ -46,6 +46,33 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo publish --dry-run
 
+  msrv:
+    name: MSRV check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.92"
+      - run: cargo +1.92 check
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Generate coverage
+        run: cargo tarpaulin --out xml --skip-clean
+      - name: Upload to Codecov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: codecov/codecov-action@v4
+        with:
+          files: cobertura.xml
+          fail_ci_if_error: false
+
   audit:
     name: Security audit
     runs-on: ubuntu-latest
