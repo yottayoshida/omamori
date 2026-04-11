@@ -1,0 +1,33 @@
+[package]
+name = "omamori-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.omamori]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_unwrap"
+path = "fuzz_targets/fuzz_unwrap.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_hook_input"
+path = "fuzz_targets/fuzz_hook_input.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_check_command"
+path = "fuzz_targets/fuzz_check_command.rs"
+doc = false

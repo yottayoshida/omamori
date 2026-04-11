@@ -2241,6 +2241,18 @@ pub struct PolicyTestResult {
     pub details: String,
 }
 
+/// Fuzz entry point: parse hook input without exposing internal types.
+/// Panics are the signal — if this doesn't panic, the input is handled safely.
+pub fn fuzz_extract_hook_input(input: &str) {
+    let _ = extract_hook_input(input);
+}
+
+/// Fuzz entry point: check a command string through the hook pipeline.
+/// Exercises meta-patterns + unwrap stack + rule matching.
+pub fn fuzz_check_command_for_hook(command: &str) {
+    let _ = check_command_for_hook(command);
+}
+
 pub fn run_policy_tests(load_result: &ConfigLoadResult) -> Vec<PolicyTestResult> {
     let config = &load_result.config;
     let claude_env = vec![("CLAUDECODE".to_string(), "1".to_string())];

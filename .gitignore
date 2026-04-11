@@ -18,6 +18,11 @@ tests/poc.sh
 .DS_Store
 omamori-test-sandbox/
 
+# Fuzz artifacts and corpus
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/
+
 # Claude Code local plans & investigation notes
 .claude/plans/
 investigation/
