@@ -1432,15 +1432,12 @@ fn is_protected_file_path(path: &str) -> Option<&'static str> {
         Err(_) => {
             // Full path doesn't exist — try canonicalizing the parent directory.
             // This catches symlinked parents: /tmp/alias/newfile where /tmp/alias → protected dir
-            let mut resolved_via_parent = Vec::new();
-            if let Some(parent) = lexical.parent() {
-                if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
-                    if let Some(filename) = lexical.file_name() {
-                        resolved_via_parent.push(canonical_parent.join(filename));
-                    }
-                }
-            }
-            resolved_via_parent
+            lexical
+                .parent()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .and_then(|cp| lexical.file_name().map(|f| cp.join(f)))
+                .into_iter()
+                .collect()
         }
     };
 
