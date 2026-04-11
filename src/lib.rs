@@ -1273,10 +1273,15 @@ fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
         HookInput::MalformedJson => {
             eprintln!("omamori hook: blocked — hook input is not valid JSON");
             eprintln!("  The command was denied because omamori cannot verify its safety.");
-            eprintln!("  This may happen after an AI tool update. Try: upgrade omamori, or report at https://github.com/yottayoshida/omamori/issues");
+            eprintln!(
+                "  This may happen after an AI tool update. Try: upgrade omamori, or report at https://github.com/yottayoshida/omamori/issues"
+            );
             if verbose {
                 eprintln!("  provider: {provider}");
-                eprintln!("  raw input (first 200 chars): {}", truncate_for_log(&input, 200));
+                eprintln!(
+                    "  raw input (first 200 chars): {}",
+                    truncate_for_log(&input, 200)
+                );
             }
             Ok(2)
         }
@@ -1286,7 +1291,10 @@ fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
             eprintln!("  Expected: tool_input.command or tool_input.file_path");
             if verbose {
                 eprintln!("  provider: {provider}");
-                eprintln!("  raw input (first 200 chars): {}", truncate_for_log(&input, 200));
+                eprintln!(
+                    "  raw input (first 200 chars): {}",
+                    truncate_for_log(&input, 200)
+                );
             }
             Ok(2)
         }
@@ -1385,10 +1393,8 @@ enum HookInput {
 
     /// `tool_input.file_path` present — file operation (Edit/Write/MultiEdit).
     /// Protected-path checking is implemented in PR2 (#110); until then, allow.
-    FileOp {
-        tool: String,
-        path: String,
-    },
+    #[expect(dead_code, reason = "fields used in PR2 (#110) file_path guard")]
+    FileOp { tool: String, path: String },
 
     /// Valid JSON with a `tool_name` but neither `command` nor `file_path`.
     /// Allow for forward compatibility with future platform tool types.
