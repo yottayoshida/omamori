@@ -626,6 +626,24 @@ fn init_force_blocked_in_ai_session() {
     assert!(stderr.contains("blocked"));
 }
 
+// --- GR-006: audit key rotate AI block (T3 guardrail) ---
+
+#[test]
+fn audit_key_rotate_blocked_in_ai_session() {
+    let output = Command::new(binary())
+        .args(["audit", "key", "rotate"])
+        .env("CURSOR_AGENT", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("blocked"),
+        "audit key rotate should be blocked in AI session, got: {stderr}"
+    );
+}
+
 #[test]
 fn config_disable_core_rule_rejected() {
     let dir = unique_dir("guard-core-reject");
