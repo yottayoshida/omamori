@@ -1074,24 +1074,160 @@ fn hook_check_verbose_does_not_pollute_stdout() {
     );
 }
 
-/// V-010: Malformed (non-JSON) input still returns ALLOW JSON
+/// #111: Malformed (non-JSON) input is BLOCKED (fail-close).
+/// Supersedes old V-010 which expected ALLOW — that was the fail-open vulnerability.
 #[test]
-fn hook_check_malformed_input_returns_allow_json() {
-    let (stdout, _, exit_code) = run_hook_check("this is not json at all");
-    assert_eq!(exit_code, 0);
+fn hook_check_malformed_input_blocks_with_exit_2() {
+    let (stdout, stderr, exit_code) = run_hook_check("this is not json at all");
+    assert_eq!(exit_code, 2, "malformed input must be blocked (fail-close)");
+    assert!(
+        stdout.trim().is_empty(),
+        "BLOCK stdout must be empty (exit 2)"
+    );
+    assert!(
+        stderr.contains("not valid JSON"),
+        "stderr must explain the parse failure"
+    );
+}
+
+/// #111: Completely empty stdin is BLOCKED (fail-close).
+/// Empty string is not valid JSON, so it triggers MalformedJson.
+#[test]
+fn hook_check_empty_stdin_blocks_with_exit_2() {
+    let (stdout, stderr, exit_code) = run_hook_check("");
+    assert_eq!(exit_code, 2, "empty stdin must be blocked (fail-close)");
+    assert!(
+        stdout.trim().is_empty(),
+        "BLOCK stdout must be empty (exit 2)"
+    );
+    assert!(
+        stderr.contains("not valid JSON"),
+        "stderr must explain the parse failure"
+    );
+}
+
+/// #111: JSON array (not an object) is BLOCKED — missing required fields.
+#[test]
+fn hook_check_json_array_blocks() {
+    let (_, _, exit_code) = run_hook_check("[1, 2, 3]");
+    assert_eq!(exit_code, 2, "JSON array must be blocked (no tool_input)");
+}
+
+/// #111: Valid JSON object but no tool_input and no command → MalformedMissingField.
+#[test]
+fn hook_check_json_no_tool_input_blocks() {
+    let input = serde_json::json!({"unrelated": "data"}).to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "JSON without tool_input must be blocked");
+    assert!(stderr.contains("required fields missing"));
+}
+
+/// #111: tool_input exists but command is null → MalformedMissingField.
+#[test]
+fn hook_check_null_command_blocks() {
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": null }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "null command must be blocked");
+    assert!(stderr.contains("required fields missing"));
+}
+
+/// #111: tool_input.command is a number (not string) → falls through to MalformedMissingField.
+#[test]
+fn hook_check_non_string_command_blocks() {
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": 42 }
+    })
+    .to_string();
+    let (_, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "non-string command must be blocked");
+}
+
+/// #111: Unknown tool_name with non-empty tool_input (no command/file_path) → allowed.
+/// Forward compatibility: future tools may have different field names.
+#[test]
+fn hook_check_unknown_tool_with_payload_allowed() {
+    let input = serde_json::json!({
+        "tool_name": "FutureTool2027",
+        "tool_input": { "query": "search term", "options": {} }
+    })
+    .to_string();
+    let (stdout, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 0, "unknown tool with payload must be allowed");
     let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("malformed input must still return valid JSON");
+        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
     assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
 }
 
-/// V-006 variant: Completely empty stdin returns ALLOW JSON
+/// #111: Known tool_name with empty tool_input → blocked (malformed).
+/// e.g. {"tool_name":"Bash","tool_input":{}} — Bash must have command field.
 #[test]
-fn hook_check_empty_stdin_returns_allow_json() {
-    let (stdout, _, exit_code) = run_hook_check("");
-    assert_eq!(exit_code, 0);
+fn hook_check_known_tool_empty_tool_input_blocks() {
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {}
+    })
+    .to_string();
+    let (_, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2, "empty tool_input must be blocked");
+}
+
+/// #111: tool_name only (no tool_input) → allowed (minimal future tool).
+#[test]
+fn hook_check_tool_name_only_allowed() {
+    let input = serde_json::json!({
+        "tool_name": "FutureTool2027"
+    })
+    .to_string();
+    let (stdout, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 0, "tool_name-only must be allowed");
     let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("empty stdin must return valid JSON");
+        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
     assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// #111: Edit tool with file_path → allowed (PR2 will add path guard).
+#[test]
+fn hook_check_edit_file_op_allowed_pending_pr2() {
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": { "file_path": "/tmp/test.txt", "old_string": "a", "new_string": "b" }
+    })
+    .to_string();
+    let (stdout, _, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 0, "Edit file op must be allowed until PR2");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// #111: VERBOSE mode includes raw input in stderr for malformed input.
+#[test]
+fn hook_check_malformed_verbose_shows_raw_input() {
+    let mut child = Command::new(binary())
+        .args(["hook-check", "--provider", "claude-code"])
+        .env("OMAMORI_VERBOSE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hook-check");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"broken json {{{")
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr.contains("raw input"), "verbose must show raw input");
 }
 
 // ---------------------------------------------------------------------------
