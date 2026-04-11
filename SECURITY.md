@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.7.5)
+## What It Protects (v0.8.0)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -242,7 +242,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 - Uses the same detector logic as the PATH shim (`evaluate_detectors()`)
 - Hooks also block these commands as string patterns (Claude Code + Cursor)
 - Hooks block shell commands that modify `config.toml` (sed, echo, etc.)
-- **Not yet implemented**: file_path-aware blocking for Edit/Write tools (planned for v0.7+)
+- **Edit/Write file_path guard** (v0.8.0 #110): AI Edit/Write/MultiEdit operations on protected files (config, hooks, audit, settings.json) are blocked via `PROTECTED_FILE_PATTERNS` with path normalization and symlink resolution
 
 ### Known limitations
 
@@ -250,7 +250,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 |--------------|-----------|-------|
 | `omamori config disable` | Yes — env var guard | All tools with known env vars |
 | `omamori uninstall` | Yes — env var guard | All tools with known env vars |
-| Direct config.toml editing (Edit/Write) | **No** | file_path-aware hook not yet implemented (v0.7+) |
+| Direct config.toml editing (Edit/Write) | **Yes** — file_path guard (v0.8.0) | Claude Code PreToolUse. Codex CLI: Bash only (structural limitation) |
 | Direct config.toml editing (Bash: sed, echo >>) | Claude Code + Cursor | Hooks block Bash patterns containing config.toml |
 | Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
 | env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |
@@ -377,10 +377,11 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 | AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
 | AI deletes/truncates log entries | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` |
 | AI accesses secret via omamori hook layer | `blocked_command_patterns` | Detected and blocked |
-| AI directly operates on files (bypassing omamori) | None (same OS user) | **Not protected** |
-| AI reads secret and forges valid chain | None (same OS user) | **Not protected** |
+| AI Edit/Write to protected files (config, audit, hooks, settings.json) | `is_protected_file_path` + `PROTECTED_FILE_PATTERNS` | **Blocked** (v0.8.0 #110) |
+| AI directly operates on files via OS (bypassing hook layer) | None (same OS user) | **Not protected** (structural limitation) |
+| AI reads secret and forges valid chain | None (same OS user) | **Not protected** (structural limitation) |
 
-**Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `blocked_command_patterns` operates at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing ([#61](https://github.com/yottayoshida/omamori/issues/61)).
+**Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `blocked_command_patterns` operates at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing — use your AI tool's sandbox (Codex CLI sandbox (on by default), Claude Code `/sandbox`, Cursor agent sandbox) or a dedicated tool like [nono](https://github.com/always-further/nono).
 
 ### Secret Loss
 

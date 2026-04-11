@@ -4,6 +4,48 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.8.0] - 2026-04-11
+
+**Summary**: Fail-close hook validation (**breaking** for non-standard integrations), Edit/Write file guard for protected files, audit key rotation, fuzz testing, MSRV 1.92.
+
+### Breaking
+
+- **Hook input validation is now strict** (#111): Malformed JSON input to hooks is blocked (exit 2) instead of falling back to string processing. If you see unexpected blocks after upgrading, verify your AI tool is sending valid hook input. Claude Code, Codex CLI, and Cursor are tested and unaffected.
+
+### Security
+
+- **Fail-close on malformed hook input** (#111): Hook layer now blocks (exit 2) when stdin is not valid JSON, missing required fields, or has wrong types. Previously fell back to raw string processing (fail-open). Typed `HookInput` enum replaces the old string-based extraction.
+
+- **Edit/Write file_path guard** (#110): AI Edit/Write/MultiEdit operations targeting omamori's protected files are now blocked. 10 protected patterns: config.toml, .integrity.json, audit-secret, audit.jsonl, hook scripts, `.claude/settings.json`, `.codex/hooks.json`, `.codex/config.toml`. Path normalization includes `canonicalize()` + parent directory symlink resolution. 3-layer error messages (what/state/action) with `omamori config` CLI alternative.
+
+- **New meta-patterns** (#110): `export -n` for 6 detector env vars (CLAUDECODE, CODEX_CI, CURSOR_AGENT, GEMINI_CLI, CLINE_ACTIVE, AI_GUARD). `.claude/settings.json` protection via both file_path guard and blocked_command_patterns.
+
+- **Fuzz testing** (#113): 3 cargo-fuzz targets (fuzz_unwrap, fuzz_hook_input, fuzz_check_command) with CI integration (nightly schedule + PR). Found and fixed a panic in `unwrap_transparent()` on wrapper-only input (e.g., `sudo sudo sudo`).
+
+### Fixed
+
+- **Silent audit log failures** (#114): 3 instances of `let _ = logger.append(event)` replaced with `try_audit_append()`. Write failures now emit WARNING to stderr. In strict mode (`audit.strict = true`), write failure blocks the command (exit 1).
+
+- **Parser panic on wrapper-only input** (#113): `unwrap_transparent()` panicked when input consisted entirely of wrappers with no actual command (e.g., `nice -n`, `sudo -u root`). Bounds check added.
+
+### Added
+
+- **Audit key rotation** (#116): `omamori audit key rotate` command. Renames active secret to `audit-secret.N.retired`, generates new secret. Multi-key verification in `verify_chain()` — old entries verify against retired key, new entries against active key. AI environment guard blocks rotation from AI context.
+
+- **MSRV declaration** (#115): `rust-version = "1.92"` in Cargo.toml. CI MSRV check job added.
+
+- **Coverage reporting** (#115): cargo-tarpaulin CI job with Codecov upload on main push.
+
+### Changed
+
+- Sandbox documentation updated: removed #61 references (NO-GO), updated to recommend platform-native sandboxes (Codex CLI, Claude Code `/sandbox`, Cursor) or [nono](https://github.com/always-further/nono).
+- SECURITY.md updated: Edit/Write file operations on protected files now listed as "Blocked" instead of "Not protected".
+
+### Stats
+
+- Tests: 427 → 453 (+26)
+- New CI jobs: MSRV check, Coverage, Fuzz (3 targets)
+
 ## [0.7.5] - 2026-04-07
 
 ### Fixed
