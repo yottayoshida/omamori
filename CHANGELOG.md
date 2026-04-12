@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.8.1] - 2026-04-12
+
+**Summary**: Internal module split for maintainability. No behavior changes, no config changes. Existing installations work as-is.
+
+### Changed
+
+- **Module split** (#112): Monolithic `lib.rs` (2,893 lines) and `audit.rs` (2,765 lines) split into focused submodules (`src/audit/`, `src/engine/`, `src/cli/`, `src/util.rs`). `lib.rs` reduced to 103-line dispatcher.
+
+### Internal
+
+- 19 guardrail tests added before the split to lock security-critical invariants (#132)
+- Tests: 453 → 473 (+20)
+
 ## [0.8.0] - 2026-04-11
 
 **Summary**: Fail-close hook validation (**breaking** for non-standard integrations), Edit/Write file guard for protected files, audit key rotation, fuzz testing, MSRV 1.92.
