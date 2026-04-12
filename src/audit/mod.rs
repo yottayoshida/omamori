@@ -255,8 +255,8 @@ mod tests {
     use std::path::Path;
 
     // Also import submodule internals needed by tests
-    use chain::{HashableEvent, genesis_hash, hmac_bytes, prune_genesis_hash};
-    use retention::{MIN_RETENTION_DAYS, build_prune_point, is_prune_point, try_prune};
+    use chain::{HashableEvent, genesis_hash, prune_genesis_hash};
+    use retention::{MIN_RETENTION_DAYS, build_prune_point, try_prune};
     use secret::{create_secret, decode_hex_secret, flock_exclusive, read_secret};
     use verify::{AuditError, display_timestamp};
 
