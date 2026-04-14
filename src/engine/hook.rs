@@ -198,6 +198,7 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
                 eprintln!("  provider: {provider}");
                 eprintln!("  layer: meta-pattern (string-level)");
             }
+            eprintln!("  hint: run `omamori explain -- {}` for details", command);
             Ok(2)
         }
         HookCheckResult::BlockRule {
@@ -215,9 +216,7 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
                 eprintln!("  rule: {rule_name}");
                 eprintln!("  layer: unwrap-stack (token-level)");
             }
-            eprintln!(
-                "  hint: if intentional, run the command directly in your terminal (not via AI agent)"
-            );
+            eprintln!("  hint: run `omamori explain -- {command}` for details");
             Ok(2)
         }
         HookCheckResult::BlockStructural(message) => {
@@ -226,9 +225,7 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
                 eprintln!("  provider: {provider}");
                 eprintln!("  layer: unwrap-stack (structural)");
             }
-            eprintln!(
-                "  hint: if intentional, run the command directly in your terminal (not via AI agent)"
-            );
+            eprintln!("  hint: run `omamori explain -- {command}` for details");
             Ok(2)
         }
     }
