@@ -26,9 +26,14 @@ omamori install --hooks
 
 # Add to your shell profile (~/.zshrc or ~/.bashrc)
 export PATH="$HOME/.omamori/shim:$PATH"
+
+# Verify everything is healthy
+omamori doctor
 ```
 
 That's it. Works with Claude Code Auto mode — no extra config needed.
+
+> Requires omamori >= 0.9.0 for `doctor` and `explain` commands.
 
 > **Cursor users**: After upgrades, re-merge the hook snippet. See [Auto-sync](#how-it-works).
 
@@ -78,20 +83,21 @@ Terminal → rm -rf src/
 
 Available for Claude Code, Cursor, and Codex CLI.
 
-**Layer 3 — Audit** (v0.7.0+): Records every command decision in a tamper-evident log — if an AI agent modifies any entry, the chain breaks and tampering is detected.
-- HMAC-SHA256 signed and hash-chained JSONL (`~/.local/share/omamori/audit.jsonl`)
+**Audit log**: Records every command decision in a tamper-evident log — if an AI agent modifies any entry, the chain breaks and tampering is detected.
+- Tamper-evident JSONL log at `~/.local/share/omamori/audit.jsonl`
+- HMAC-SHA256 signed and hash-chained — tampering breaks the chain and is detected
 - Per-install secret; file paths HMAC-hashed (never stored in plaintext)
-- Auto-retention (v0.7.2+): set `retention_days` in config to automatically prune old entries — chain integrity is preserved across pruning
+- Set `retention_days` in config to automatically prune old entries — chain integrity is preserved across pruning
 - Logging enabled by default; retention is opt-in via config
 
-**Self-defense** ([#22](https://github.com/yottayoshida/omamori/issues/22)): AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting, config modification, and audit log/secret access via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
+**Self-defense**: AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting, config modification, and audit log/secret access via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
-**Auto mode compatible** (v0.6.2+): Works seamlessly with Claude Code's [Auto mode](https://claude.com/blog/auto-mode) — safe commands proceed without prompts, dangerous commands are still hard-blocked.
+**Auto mode compatible**: Works seamlessly with Claude Code's [Auto mode](https://claude.com/blog/auto-mode) — safe commands proceed without prompts, dangerous commands are still hard-blocked.
 
 **Auto-sync**: After `brew upgrade`, the shim detects version mismatch and auto-regenerates hook files on the next invocation.
 
 - **Claude Code**: Hooks are applied automatically. No action needed.
-- **Codex CLI**: Hooks and config are auto-configured during install (v0.6.3+). If you install Codex later, the shim sets up hooks on first invocation. Auto-sync regenerates the wrapper on upgrade.
+- **Codex CLI**: Hooks and config are auto-configured during install. If you install Codex later, the shim sets up hooks on first invocation. Auto-sync regenerates the wrapper on upgrade.
 - **Cursor**: Run `omamori install --hooks` to regenerate the snippet, then merge `~/.omamori/hooks/cursor-hooks.snippet.json` into your `.cursor/hooks.json`.
 
 **Core policy**: The 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is silently ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
@@ -100,7 +106,7 @@ Available for Claude Code, Cursor, and Codex CLI.
 
 **Sandbox complementarity**: omamori operates at the semantic layer — it understands *what* a command does (Layer 1: shim, Layer 2: hooks). A filesystem sandbox operates at the OS boundary — it restricts *where* processes can read and write. These are complementary: omamori catches `rm -rf src/` before it runs; a sandbox prevents damage if something slips through. For defense in depth, combine omamori with your AI tool's sandbox (Codex CLI sandbox (on by default), Claude Code `/sandbox`, Cursor agent sandbox) or a dedicated tool like [nono](https://github.com/always-further/nono).
 
-**File protection** (v0.8.0+): AI Edit/Write operations on omamori's own files (config, hooks, audit log, integrity baseline, Claude Code settings.json) are blocked. See [SECURITY.md](SECURITY.md) for the full protected file list.
+**File protection**: AI Edit/Write operations on omamori's own files (config, hooks, audit log, integrity baseline, Claude Code settings.json) are blocked. See [SECURITY.md](SECURITY.md) for the full protected file list.
 
 For what omamori **cannot** catch, see [Structural Limitations](#structural-limitations).
 
@@ -197,6 +203,8 @@ strict = true  # default: false. Hook-only commands (ls, cat, etc.) are not affe
 
 ```
 omamori install [--hooks]                # Setup shims + hooks + config (re-run after brew upgrade for Cursor)
+omamori doctor [--fix] [--verbose] [--json]  # Diagnose and auto-repair installation
+omamori explain [--json] -- <cmd...>     # Show what would happen to a command and why
 omamori test [--config PATH]             # Verify policy rules
 omamori status [--refresh]               # Health check all defense layers
 omamori exec [--config PATH] -- CMD      # Run command through policy engine

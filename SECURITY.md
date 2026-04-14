@@ -4,7 +4,7 @@
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.
 
-## What It Protects (v0.8.0)
+## What It Protects (v0.9.0)
 
 - recursive `rm` variants matched by the default rules
 - `git reset --hard`
@@ -31,6 +31,17 @@
 - **Basename collision avoidance**: When `move-to` processes multiple targets, a dedup suffix (`_2`, `_3`, ...) prevents same-named files from overwriting each other.
 
 - **Cross-device move rejection**: `move-to` uses `rename(2)` which is atomic on the same filesystem. Cross-device moves (`EXDEV`) are rejected to avoid the TOCTOU window that copy+delete would introduce.
+
+## Design Invariants (v0.9.0+)
+
+| ID | Invariant | Enforcement |
+|----|-----------|-------------|
+| DI-7 | `doctor --fix` is blocked in AI environments | `guard_ai_config_modification("doctor --fix")` — prevents baseline normalization to hide tampering |
+| DI-8 | `explain` is blocked in AI environments | `guard_ai_config_modification("explain")` — prevents oracle attacks (probing which commands are blocked) |
+| DI-9 | `doctor --fix` and `explain` in `blocked_command_patterns` | Defense-in-depth: Layer 2 hooks also block these commands via string matching |
+| DI-10 | `doctor --fix` repair order: install → hooks → chmod → baseline (last) | Baseline must reflect the post-repair state, not the pre-repair state |
+
+`guard_ai_config_modification` call sites: 9 (as of v0.9.0).
 
 ## Integrity Monitoring (v0.5.0+)
 
