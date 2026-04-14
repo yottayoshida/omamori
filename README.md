@@ -84,7 +84,8 @@ Terminal → rm -rf src/
 Available for Claude Code, Cursor, and Codex CLI.
 
 **Audit log**: Records every command decision in a tamper-evident log — if an AI agent modifies any entry, the chain breaks and tampering is detected.
-- HMAC-SHA256 signed and hash-chained JSONL (`~/.local/share/omamori/audit.jsonl`)
+- Tamper-evident JSONL log at `~/.local/share/omamori/audit.jsonl`
+- HMAC-SHA256 signed and hash-chained — tampering breaks the chain and is detected
 - Per-install secret; file paths HMAC-hashed (never stored in plaintext)
 - Set `retention_days` in config to automatically prune old entries — chain integrity is preserved across pruning
 - Logging enabled by default; retention is opt-in via config
