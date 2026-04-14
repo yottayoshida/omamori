@@ -15,6 +15,7 @@ use std::ffi::OsString;
 
 use cli::audit_cmd::run_audit_command;
 use cli::config_cmd::{run_config_command, run_init_command, run_override_command};
+use cli::doctor::run_doctor_command;
 use cli::install::{run_install_command, run_uninstall_command};
 use cli::policy_test::run_policy_test_command;
 use cli::status::run_status_command;
@@ -72,6 +73,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("config") => run_config_command(args),
         Some("override") => run_override_command(args),
         Some("audit") => run_audit_command(args),
+        Some("doctor") => run_doctor_command(args),
         Some("status") => run_status_command(args),
         Some("cursor-hook") => run_cursor_hook(),
         Some("hook-check") => run_hook_check(args),
