@@ -493,6 +493,15 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
             "omamori override",
             "blocked attempt to override omamori core rules",
         ),
+        // DI-9: doctor --fix and explain are blocked in AI environments (defense-in-depth)
+        (
+            "omamori doctor --fix",
+            "blocked attempt to run doctor --fix via AI",
+        ),
+        (
+            "omamori explain",
+            "blocked attempt to run explain via AI (oracle attack prevention)",
+        ),
         // Integrity baseline protection
         (
             ".integrity.json",
