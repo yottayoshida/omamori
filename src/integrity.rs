@@ -59,6 +59,8 @@ pub struct CheckItem {
     pub name: String,
     pub status: CheckStatus,
     pub detail: String,
+    /// Suggested fix action. `None` for healthy items or when no auto-fix exists.
+    pub remediation: Option<Remediation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +78,22 @@ impl CheckStatus {
             Self::Fail => "FAIL",
         }
     }
+}
+
+/// Suggested remediation action for a failing or warning check item.
+/// Used by `omamori doctor --fix` to automatically repair issues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remediation {
+    /// Re-run `omamori install --hooks` to regenerate hook scripts.
+    RegenerateHooks,
+    /// Re-run `omamori install` to regenerate the integrity baseline.
+    RegenerateBaseline,
+    /// Re-run `omamori install` (full install: shims + hooks + baseline).
+    RunInstall,
+    /// Fix file permissions: `chmod 600 <path>`.
+    ChmodConfig(PathBuf),
+    /// Cannot be auto-fixed; display guidance to the user.
+    ManualOnly(String),
 }
 
 impl IntegrityReport {
@@ -278,6 +296,7 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
             name,
             status: CheckStatus::Warn,
             detail: "(not installed — run `omamori install --hooks`)".to_string(),
+            remediation: Some(Remediation::RunInstall),
         };
     }
 
@@ -289,6 +308,7 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
                 name,
                 status: CheckStatus::Fail,
                 detail: "(unreadable)".to_string(),
+                remediation: Some(Remediation::RegenerateHooks),
             };
         }
     };
@@ -303,20 +323,23 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
     // Dangling path detection: check if the exe in the snippet actually exists
     let dangling = cursor_snippet_exe_path(&actual).is_some_and(|p| !p.exists());
 
-    let (status, detail) = match (hash_ok, dangling) {
-        (Some(true), false) => (CheckStatus::Ok, "(hash match)"),
+    let (status, detail, remediation) = match (hash_ok, dangling) {
+        (Some(true), false) => (CheckStatus::Ok, "(hash match)", None),
         (Some(true), true) => (
             CheckStatus::Warn,
             "(path dangling — run `omamori install --hooks`)",
+            Some(Remediation::RunInstall),
         ),
         (Some(false), _) => (
             CheckStatus::Fail,
             "(hash MISMATCH — run `omamori install --hooks`)",
+            Some(Remediation::RegenerateHooks),
         ),
-        (None, false) => (CheckStatus::Warn, "(present, hash check skipped)"),
+        (None, false) => (CheckStatus::Warn, "(present, hash check skipped)", None),
         (None, true) => (
             CheckStatus::Warn,
             "(path dangling — run `omamori install --hooks`)",
+            Some(Remediation::RunInstall),
         ),
     };
 
@@ -325,6 +348,7 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
         name,
         status,
         detail: detail.to_string(),
+        remediation,
     }
 }
 
@@ -358,18 +382,20 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     let shim_dir = base_dir.join("shim");
     for command in installer::SHIM_COMMANDS {
         let link_path = shim_dir.join(command);
-        let (status, detail) = match fs::read_link(&link_path) {
+        let (status, detail, remediation) = match fs::read_link(&link_path) {
             Ok(target) => {
                 let target_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if target_name != "omamori" {
                     (
                         CheckStatus::Fail,
                         format!("-> {} (unexpected target)", target.display()),
+                        Some(Remediation::RunInstall),
                     )
                 } else if !target.exists() {
                     (
                         CheckStatus::Fail,
                         format!("-> {} (dangling)", target.display()),
+                        Some(Remediation::RunInstall),
                     )
                 } else if !shim_matches_baseline(&target, command, baseline.as_ref()) {
                     (
@@ -378,18 +404,24 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                             "-> {} (differs from baseline — run `omamori install` to update)",
                             target.display()
                         ),
+                        Some(Remediation::RunInstall),
                     )
                 } else {
-                    (CheckStatus::Ok, format!("-> {}", target.display()))
+                    (CheckStatus::Ok, format!("-> {}", target.display()), None)
                 }
             }
-            Err(_) => (CheckStatus::Fail, "missing".to_string()),
+            Err(_) => (
+                CheckStatus::Fail,
+                "missing".to_string(),
+                Some(Remediation::RunInstall),
+            ),
         };
         items.push(CheckItem {
             category: "Shims",
             name: (*command).to_string(),
             status,
             detail,
+            remediation,
         });
     }
 
@@ -408,6 +440,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                         name: "claude-pretooluse.sh".to_string(),
                         status: CheckStatus::Ok,
                         detail: "(hash match)".to_string(),
+                        remediation: None,
                     });
                 } else {
                     items.push(CheckItem {
@@ -415,6 +448,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                         name: "claude-pretooluse.sh".to_string(),
                         status: CheckStatus::Fail,
                         detail: "(hash MISMATCH — run `omamori install --hooks`)".to_string(),
+                        remediation: Some(Remediation::RegenerateHooks),
                     });
                 }
             }
@@ -424,6 +458,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                     name: "claude-pretooluse.sh".to_string(),
                     status: CheckStatus::Fail,
                     detail: "(unreadable)".to_string(),
+                    remediation: Some(Remediation::RegenerateHooks),
                 });
             }
         }
@@ -433,6 +468,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: "claude-pretooluse.sh".to_string(),
             status: CheckStatus::Warn,
             detail: "(not installed — run `omamori install --hooks`)".to_string(),
+            remediation: Some(Remediation::RunInstall),
         });
     }
 
@@ -444,6 +480,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: "claude-settings.snippet.json".to_string(),
             status: CheckStatus::Ok,
             detail: "(present)".to_string(),
+            remediation: None,
         }
     } else {
         CheckItem {
@@ -451,6 +488,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: "claude-settings.snippet.json".to_string(),
             status: CheckStatus::Warn,
             detail: "(not installed)".to_string(),
+            remediation: Some(Remediation::RunInstall),
         }
     });
 
@@ -468,7 +506,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             .map(|bc| bc.sha256 == entry.sha256)
             .unwrap_or(true); // no baseline = skip comparison
 
-        let (status, detail) = if !mode_ok {
+        let (status, detail, remediation) = if !mode_ok {
             (
                 CheckStatus::Warn,
                 format!(
@@ -476,16 +514,19 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                     entry.mode & 0o777,
                     path.display()
                 ),
+                Some(Remediation::ChmodConfig(path.to_path_buf())),
             )
         } else if !hash_ok {
             (
                 CheckStatus::Warn,
                 "(modified outside omamori — run `omamori install` to update baseline)".to_string(),
+                Some(Remediation::RegenerateBaseline),
             )
         } else {
             (
                 CheckStatus::Ok,
                 format!("(mode 600, hash {})", &entry.sha256[..12]),
+                None,
             )
         };
         items.push(CheckItem {
@@ -493,6 +534,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: "config.toml".to_string(),
             status,
             detail,
+            remediation,
         });
     } else {
         items.push(CheckItem {
@@ -500,6 +542,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: "config.toml".to_string(),
             status: CheckStatus::Ok,
             detail: "(using built-in defaults)".to_string(),
+            remediation: None,
         });
     }
 
@@ -514,15 +557,19 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             .collect();
         let overridden = core_rules.iter().filter(|r| !r.enabled).count();
         let active = core_rules.len() - overridden;
-        let (status, detail) = if overridden == 0 {
+        let (status, detail, remediation) = if overridden == 0 {
             (
                 CheckStatus::Ok,
                 format!("{} core rules active, 0 overridden", core_rules.len()),
+                None,
             )
         } else {
             (
                 CheckStatus::Warn,
                 format!("{active} active, {overridden} overridden"),
+                Some(Remediation::ManualOnly(
+                    "review core rule overrides in config.toml".to_string(),
+                )),
             )
         };
         items.push(CheckItem {
@@ -530,6 +577,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: "core rules".to_string(),
             status,
             detail,
+            remediation,
         });
     }
 
@@ -541,10 +589,11 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     // Reuse `baseline` loaded at the top of full_check.
     let bp = baseline_path(base_dir);
     if let Some(b) = &baseline {
-        let (status, detail) = if b.version == env!("CARGO_PKG_VERSION") {
+        let (status, detail, remediation) = if b.version == env!("CARGO_PKG_VERSION") {
             (
                 CheckStatus::Ok,
                 format!("(v{}, {})", b.version, b.generated_at),
+                None,
             )
         } else {
             (
@@ -554,6 +603,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                     b.version,
                     env!("CARGO_PKG_VERSION")
                 ),
+                Some(Remediation::RegenerateBaseline),
             )
         };
         items.push(CheckItem {
@@ -561,6 +611,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: ".integrity.json".to_string(),
             status,
             detail,
+            remediation,
         });
     } else if bp.exists() {
         // baseline is None but file exists → corrupt
@@ -569,6 +620,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: ".integrity.json".to_string(),
             status: CheckStatus::Warn,
             detail: "(corrupt — run `omamori install` to regenerate)".to_string(),
+            remediation: Some(Remediation::RegenerateBaseline),
         });
     } else {
         items.push(CheckItem {
@@ -576,6 +628,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             name: ".integrity.json".to_string(),
             status: CheckStatus::Warn,
             detail: "(not found — will be created)".to_string(),
+            remediation: Some(Remediation::RegenerateBaseline),
         });
     }
 
@@ -602,24 +655,34 @@ fn check_path_order(base_dir: &Path) -> CheckItem {
             name: "shim order".to_string(),
             status: CheckStatus::Ok,
             detail: format!("{} is before /usr/bin", shim_str),
+            remediation: None,
         },
         (Some(s), Some(u)) if s >= u => CheckItem {
             category: "PATH",
             name: "shim order".to_string(),
             status: CheckStatus::Warn,
             detail: format!("{} is AFTER /usr/bin — shims may be bypassed", shim_str),
+            remediation: Some(Remediation::ManualOnly(format!(
+                "move {} before /usr/bin in your shell profile (.zshrc / .bashrc)",
+                shim_str
+            ))),
         },
         (None, _) => CheckItem {
             category: "PATH",
             name: "shim order".to_string(),
             status: CheckStatus::Warn,
             detail: format!("{} not found in PATH", shim_str),
+            remediation: Some(Remediation::ManualOnly(format!(
+                "add {} to PATH in your shell profile (.zshrc / .bashrc)",
+                shim_str
+            ))),
         },
         _ => CheckItem {
             category: "PATH",
             name: "shim order".to_string(),
             status: CheckStatus::Ok,
             detail: format!("{} in PATH (/usr/bin not found to compare)", shim_str),
+            remediation: None,
         },
     }
 }
@@ -1000,6 +1063,7 @@ mod tests {
             name: "test_item".to_string(),
             status,
             detail: String::new(),
+            remediation: None,
         }
     }
 
