@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.9.1] - 2026-04-14
+
+### Fixed
+
+- Remove 3 stray files from crate package that were accidentally tracked in git: `.claude/plans/` (old plan), `PLAN.md`, `investigation/` (old PoC notes). No code changes.
+
 ## [0.9.0] - 2026-04-14
 
 **Summary**: "UX Revolution" — two new commands (`doctor`, `explain`) that transform the user experience from "something broke" to "fix it" and from "why was I blocked?" to "here's why."
