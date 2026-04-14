@@ -23,6 +23,7 @@ fuzz/artifacts/
 fuzz/corpus/
 fuzz/target/
 
-# Claude Code local plans & investigation notes
-.claude/plans/
+# Claude Code local config & notes
+.claude/
 investigation/
+PLAN.md
