@@ -9,6 +9,7 @@
 
 pub(crate) mod audit_cmd;
 pub(crate) mod config_cmd;
+pub(crate) mod doctor;
 pub(crate) mod install;
 pub(crate) mod policy_test;
 pub(crate) mod status;

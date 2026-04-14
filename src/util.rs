@@ -23,6 +23,7 @@ pub(crate) fn usage_text() -> &'static str {
   omamori config enable <rule>
   omamori audit verify                                    # Verify hash chain integrity
   omamori audit show [--last N] [--json] [--all]          # View audit log entries
+  omamori doctor [--fix] [--verbose] [--json]             # Diagnose and repair installation
   omamori status [--refresh]                              # Health check all defense layers
   omamori override disable <rule>                        # Override a core safety rule
   omamori override enable <rule>                         # Restore a core safety rule
