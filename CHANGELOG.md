@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.9.0] - 2026-04-14
+
+**Summary**: "UX Revolution" — two new commands (`doctor`, `explain`) that transform the user experience from "something broke" to "fix it" and from "why was I blocked?" to "here's why."
+
+### Added
+
+- **`omamori doctor`** (#117): Diagnose installation health. Shows only problems (or 3-line "all healthy" summary).
+  - `--fix`: Auto-repair shims, hooks, config permissions, and baseline. Repair order: install → hooks → chmod → baseline (DI-10).
+  - `--verbose`: Show all check items (works in both healthy and unhealthy states).
+  - `--json`: Structured JSON output for automation.
+  - AI guard (DI-7): `--fix` is blocked in AI environments to prevent baseline normalization attacks.
+
+- **`omamori explain -- <command>`** (#118): Simulate command evaluation through both defense layers without executing.
+  - Shows Layer 1 (PATH shim) rule match + context override and Layer 2 (hook) meta-pattern/unwrap evaluation.
+  - `--json`: Structured JSON output. `--config PATH`: Custom config for testing.
+  - AI guard (DI-8): Blocked in AI environments to prevent oracle attacks.
+  - Exit code: 0 = would be allowed, 2 = would be blocked (consistent with `hook-check`).
+
+- **Block message hint line**: All block messages (shim + hook) now include `hint: run \`omamori explain -- <cmd>\` for details`.
+
+- **`Remediation` enum**: Each integrity check item carries a suggested fix action (`RunInstall`, `RegenerateHooks`, `RegenerateBaseline`, `ChmodConfig`, `ManualOnly`). Foundation for `doctor --fix`.
+
+### Security
+
+- **DI-7 through DI-10**: Four new design invariants for `doctor --fix` and `explain`. See SECURITY.md.
+- **DI-9**: `blocked_command_patterns` updated with `omamori doctor --fix` and `omamori explain` (defense-in-depth via Layer 2 hooks).
+- `guard_ai_config_modification` call sites: 7 → 9.
+
+### Changed
+
+- **README overhaul** (#120): Removed 5 version annotations. Added `doctor` to Quick Start. Added `doctor` and `explain` to CLI Reference. User-value ordering per UX rules.
+
+### Internal
+
+- Tests: 473 → 491 (+18 new tests for doctor and explain)
+
 ## [0.8.1] - 2026-04-12
 
 **Summary**: Internal module split for maintainability. No behavior changes, no config changes. Existing installations work as-is.

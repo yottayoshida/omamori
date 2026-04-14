@@ -1,7 +1,7 @@
 //! AI environment guard for config-mutating operations.
 //!
 //! SECURITY (T3): `guard_ai_config_modification` must be called on every
-//! config-mutating code path (7 call sites as of v0.8.0).
+//! config-mutating code path (9 call sites as of v0.9.0).
 
 use crate::AppError;
 use crate::config;
