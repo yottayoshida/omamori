@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::AppError;
 use crate::engine::guard::guard_ai_config_modification;
@@ -105,14 +105,14 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     }
 
     // Unhealthy: show problems only
-    println!(
-        "omamori doctor: {} issue(s) found\n",
-        problems.len()
-    );
+    println!("omamori doctor: {} issue(s) found\n", problems.len());
 
     for item in &problems {
         let label = item.status.label();
-        println!("  {:<6} [{}] {} {}", label, item.category, item.name, item.detail);
+        println!(
+            "  {:<6} [{}] {} {}",
+            label, item.category, item.name, item.detail
+        );
         if let Some(ref rem) = item.remediation {
             println!("         {}", remediation_hint(rem));
         }
@@ -120,7 +120,9 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
 
     println!();
     let has_fixable = problems.iter().any(|i| {
-        i.remediation.as_ref().is_some_and(|r| !matches!(r, Remediation::ManualOnly(_)))
+        i.remediation
+            .as_ref()
+            .is_some_and(|r| !matches!(r, Remediation::ManualOnly(_)))
     });
     if has_fixable {
         println!("  run `omamori doctor --fix` to auto-repair");
@@ -146,7 +148,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
 
 /// Deduplicate and execute repairs in the correct order (DI-10).
 /// Order: RunInstall → RegenerateHooks → ChmodConfig → RegenerateBaseline (last).
-fn run_fix(items: &[CheckItem], base_dir: &PathBuf, verbose: bool) -> Result<i32, AppError> {
+fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, AppError> {
     let problems: Vec<_> = items
         .iter()
         .filter(|i| i.status != CheckStatus::Ok)
@@ -185,7 +187,10 @@ fn run_fix(items: &[CheckItem], base_dir: &PathBuf, verbose: bool) -> Result<i32
         needs_regen_baseline = false;
     }
 
-    println!("omamori doctor --fix: repairing {} issue(s)\n", problems.len());
+    println!(
+        "omamori doctor --fix: repairing {} issue(s)\n",
+        problems.len()
+    );
 
     let mut fixed = 0u32;
     let mut failed = 0u32;
@@ -254,10 +259,7 @@ fn run_fix(items: &[CheckItem], base_dir: &PathBuf, verbose: bool) -> Result<i32
     if !manual_items.is_empty() {
         println!();
         for (item, hint) in &manual_items {
-            println!(
-                "  [MANUAL] [{}] {} — {}",
-                item.category, item.name, hint
-            );
+            println!("  [MANUAL] [{}] {} — {}", item.category, item.name, hint);
         }
     }
 
@@ -296,7 +298,7 @@ fn run_fix(items: &[CheckItem], base_dir: &PathBuf, verbose: bool) -> Result<i32
 
 /// Execute repairs silently (for `--fix --json` mode).
 /// Runs the same repair logic as `run_fix` but without stdout output.
-fn run_fix_silent(items: &[CheckItem], base_dir: &PathBuf) -> Result<(), AppError> {
+fn run_fix_silent(items: &[CheckItem], base_dir: &Path) -> Result<(), AppError> {
     let problems: Vec<_> = items
         .iter()
         .filter(|i| i.status != CheckStatus::Ok)
@@ -348,11 +350,11 @@ fn run_fix_silent(items: &[CheckItem], base_dir: &PathBuf) -> Result<(), AppErro
 // Repair helpers
 // ---------------------------------------------------------------------------
 
-fn run_install_repair(base_dir: &PathBuf) -> Result<(), AppError> {
+fn run_install_repair(base_dir: &Path) -> Result<(), AppError> {
     let source_exe = std::env::current_exe()?;
     let source_exe = installer::resolve_stable_exe_path(&source_exe);
     let options = installer::InstallOptions {
-        base_dir: base_dir.clone(),
+        base_dir: base_dir.to_path_buf(),
         source_exe,
         generate_hooks: true,
     };
@@ -360,14 +362,14 @@ fn run_install_repair(base_dir: &PathBuf) -> Result<(), AppError> {
     Ok(())
 }
 
-fn regen_baseline(base_dir: &PathBuf) -> Result<(), AppError> {
+fn regen_baseline(base_dir: &Path) -> Result<(), AppError> {
     let baseline = integrity::generate_baseline(base_dir)?;
     integrity::write_baseline(base_dir, &baseline)?;
     Ok(())
 }
 
 #[cfg(unix)]
-fn chmod_600(path: &PathBuf) -> Result<(), AppError> {
+fn chmod_600(path: &Path) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(0o600);
@@ -376,7 +378,7 @@ fn chmod_600(path: &PathBuf) -> Result<(), AppError> {
 }
 
 #[cfg(not(unix))]
-fn chmod_600(_path: &PathBuf) -> Result<(), AppError> {
+fn chmod_600(_path: &Path) -> Result<(), AppError> {
     // No permission model on non-Unix
     Ok(())
 }
@@ -389,7 +391,9 @@ fn remediation_hint(rem: &Remediation) -> String {
     match rem {
         Remediation::RunInstall => "fix: run `omamori install`".to_string(),
         Remediation::RegenerateHooks => "fix: run `omamori install --hooks`".to_string(),
-        Remediation::RegenerateBaseline => "fix: run `omamori install` to update baseline".to_string(),
+        Remediation::RegenerateBaseline => {
+            "fix: run `omamori install` to update baseline".to_string()
+        }
         Remediation::ChmodConfig(path) => format!("fix: run `chmod 600 {}`", path.display()),
         Remediation::ManualOnly(hint) => format!("manual: {hint}"),
     }
@@ -425,7 +429,7 @@ fn print_all_items(items: &[CheckItem]) {
 // JSON output
 // ---------------------------------------------------------------------------
 
-fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &PathBuf) -> Result<i32, AppError> {
+fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i32, AppError> {
     let json_items: Vec<serde_json::Value> = items
         .iter()
         .map(|item| {
