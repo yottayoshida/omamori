@@ -32,18 +32,122 @@ pub(crate) enum HookCheckResult {
     BlockStructural(String),
 }
 
-/// Two-phase hook check:
-/// Phase 1: Meta-pattern string-level check (env var unset, config tamper, /bin/rm, etc.)
+/// Check if token at `idx` is in command position (start of a segment).
+/// Command position = index 0, immediately after an operator token,
+/// or after a run of KEY=VAL assignment prefixes (e.g., FOO=1 unset VAR).
+fn is_command_position(tokens: &[String], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    let mut j = idx;
+    while j > 0 {
+        let prev = &tokens[j - 1];
+        if matches!(prev.as_str(), "&&" | "||" | ";" | "|" | "&") {
+            return true;
+        }
+        if unwrap::is_env_assignment(prev) {
+            j -= 1;
+            continue;
+        }
+        return false;
+    }
+    true // walked all the way to start
+}
+
+/// Detect env var tampering at the token level.
+/// Only flags commands in command position to avoid false positives
+/// on quoted strings and arguments (e.g., printf 'unset CLAUDECODE').
+fn detect_env_var_tampering(tokens: &[String]) -> Option<&'static str> {
+    let vars = installer::PROTECTED_ENV_VARS;
+
+    // "unset VARNAME"
+    for (i, w) in tokens.windows(2).enumerate() {
+        if w[0] == "unset" && is_command_position(tokens, i) && vars.contains(&w[1].as_str()) {
+            return Some("blocked attempt to unset a detector env var");
+        }
+    }
+
+    for (i, w) in tokens.windows(2).enumerate() {
+        if !is_command_position(tokens, i) {
+            continue;
+        }
+        // "env -uVARNAME" (combined form)
+        if w[0] == "env" && w[1].starts_with("-u") {
+            let rest = &w[1][2..];
+            if !rest.is_empty() && vars.contains(&rest) {
+                return Some("blocked attempt to unset a detector env var");
+            }
+        }
+        // "export -nVARNAME" (combined form)
+        if w[0] == "export" && w[1].starts_with("-n") {
+            let rest = &w[1][2..];
+            if !rest.is_empty() && vars.contains(&rest) {
+                return Some("blocked attempt to unexport detector env var");
+            }
+        }
+    }
+
+    // "env -u VARNAME" / "export -n VARNAME" (separated form)
+    for (i, w) in tokens.windows(3).enumerate() {
+        if !is_command_position(tokens, i) {
+            continue;
+        }
+        if w[0] == "env" && w[1] == "-u" && vars.contains(&w[2].as_str()) {
+            return Some("blocked attempt to unset a detector env var");
+        }
+        if w[0] == "export" && w[1] == "-n" && vars.contains(&w[2].as_str()) {
+            return Some("blocked attempt to unexport detector env var");
+        }
+    }
+
+    // "VARNAME=" or "VARNAME=value" — only in command position
+    for (i, token) in tokens.iter().enumerate() {
+        if is_command_position(tokens, i) {
+            for var in vars {
+                if token
+                    .strip_prefix(var)
+                    .is_some_and(|rest| rest.starts_with('='))
+                {
+                    return Some("blocked attempt to unset a detector env var");
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Three-phase hook check:
+/// Phase 1A: String-level meta-patterns (path/config/uninstall)
+/// Phase 1B: Token-level env var tampering detection (whitespace-resilient)
 /// Phase 2: Token-level unwrap stack → rule matching
 ///
 /// SECURITY (T8): The `Config::default()` fallback on load_config failure is
 /// intentional fail-safe behavior. DO NOT replace with `?` operator.
 pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
-    // Phase 1: Meta-patterns (string-level, intentionally broad)
-    for (pattern, reason) in installer::blocked_command_patterns() {
+    // Phase 1A: String-level meta-patterns (path/config/uninstall)
+    for (pattern, reason) in installer::blocked_string_patterns() {
         if command.contains(pattern) {
             return HookCheckResult::BlockMeta(reason);
         }
+    }
+
+    // Phase 1B: Token-level env var tampering detection.
+    // normalize_compound_operators splits ;, &&, ||, |, &, \n into separate tokens,
+    // then shell_words::split normalizes whitespace + parses quotes.
+    // This ensures "echo ok;unset CLAUDECODE" is correctly tokenized as
+    // ["echo", "ok", ";", "unset", "CLAUDECODE"] — without normalize,
+    // shell_words would produce ["echo", "ok;unset", "CLAUDECODE"].
+    // is_command_position() ensures only segment-initial verbs are flagged.
+    //
+    // DEFENSE BOUNDARY on shell_words::split failure:
+    //   Phase 1A has already run. Phase 2 blocks malformed commands via
+    //   ParseResult::Block(ParseError) — fail-close (unwrap.rs:77).
+    let normalized = unwrap::normalize_compound_operators(command);
+    if let Ok(tokens) = shell_words::split(&normalized)
+        && let Some(reason) = detect_env_var_tampering(&tokens)
+    {
+        return HookCheckResult::BlockMeta(reason);
     }
 
     // Phase 2: Unwrap stack → rule matching
@@ -718,5 +822,221 @@ mod tests {
             }
         }
         restore_config(old_xdg, old_home, dir);
+    }
+
+    // =========================================================================
+    // Phase 1B: Token-level env var tampering tests (#145)
+    // =========================================================================
+
+    // --- Helper for concise block/allow assertions ---
+
+    /// Assert that a command is blocked specifically by Phase 1B (BlockMeta).
+    /// This ensures the test is exercising the token-level env var detection,
+    /// not accidentally passing via Phase 2 rule matching.
+    fn assert_blocks_meta(command: &str) {
+        let (old_xdg, old_home, dir) = isolate_config();
+        match check_command_for_hook(command) {
+            HookCheckResult::BlockMeta(_) => {}
+            HookCheckResult::Allow => {
+                restore_config(old_xdg, old_home, dir);
+                panic!("SECURITY: {command:?} was ALLOWED — should be BlockMeta");
+            }
+            other => {
+                let desc = match other {
+                    HookCheckResult::BlockRule { rule_name, .. } => {
+                        format!("BlockRule({rule_name})")
+                    }
+                    HookCheckResult::BlockStructural(r) => format!("BlockStructural({r})"),
+                    _ => unreachable!(),
+                };
+                restore_config(old_xdg, old_home, dir);
+                panic!("{command:?} blocked by {desc}, expected BlockMeta (Phase 1B)");
+            }
+        }
+        restore_config(old_xdg, old_home, dir);
+    }
+
+    fn assert_allows(command: &str) {
+        let (old_xdg, old_home, dir) = isolate_config();
+        match check_command_for_hook(command) {
+            HookCheckResult::Allow => {}
+            other => {
+                let desc = match other {
+                    HookCheckResult::BlockMeta(r) => format!("BlockMeta({r})"),
+                    HookCheckResult::BlockRule { rule_name, .. } => {
+                        format!("BlockRule({rule_name})")
+                    }
+                    HookCheckResult::BlockStructural(r) => format!("BlockStructural({r})"),
+                    HookCheckResult::Allow => unreachable!(),
+                };
+                restore_config(old_xdg, old_home, dir);
+                panic!("expected Allow for {command:?}, got: {desc}");
+            }
+        }
+        restore_config(old_xdg, old_home, dir);
+    }
+
+    // --- BLOCK: whitespace bypass (#145) — all use assert_blocks_meta ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_unset_double_space() {
+        assert_blocks_meta("unset  CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_unset_tab() {
+        assert_blocks_meta("unset\tCLAUDECODE");
+    }
+
+    // --- BLOCK: VARNAME= assignment (Codex 6-B: missing test) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_var_assignment_empty() {
+        assert_blocks_meta("CLAUDECODE=");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_var_assignment_value() {
+        assert_blocks_meta("CLAUDECODE=fake");
+    }
+
+    // --- BLOCK: separator-adjacent (Codex 6-A regression fix) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_semicolon_adjacent_unset() {
+        assert_blocks_meta("echo ok;unset CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_and_adjacent_export() {
+        assert_blocks_meta("cmd&&export -nCLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_newline_adjacent_env_u() {
+        assert_blocks_meta("echo ok\nenv -u CLAUDECODE bash");
+    }
+
+    // --- BLOCK: operator-after command position (Codex 6-B: missing boundary) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_after_semicolon() {
+        assert_blocks_meta("echo ok ; unset CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_after_pipe() {
+        assert_blocks_meta("cat /dev/null | unset CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_env_u_extra_spaces() {
+        assert_blocks_meta("env  -u  CLAUDECODE bash");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_env_u_tabs() {
+        assert_blocks_meta("env\t-u\tCLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_env_u_combined() {
+        assert_blocks_meta("env -uCLAUDECODE bash");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_export_n_extra_space() {
+        assert_blocks_meta("export  -n  CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_export_n_combined() {
+        assert_blocks_meta("export -nCLAUDECODE");
+    }
+
+    // --- BLOCK: assignment prefix (#145) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_assignment_prefix_unset() {
+        assert_blocks_meta("FOO=1 unset CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_assignment_prefix_env_u() {
+        assert_blocks_meta("BAR=x env -uCLAUDECODE bash");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_multi_assignment_export() {
+        assert_blocks_meta("X=1 Y=2 export -n CLAUDECODE");
+    }
+
+    // --- ALLOW: command position false positive prevention (#145) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_printf_unset_args() {
+        assert_allows("printf '%s %s' unset CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_echo_unset() {
+        assert_allows("echo unset CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_echo_env_u() {
+        assert_allows("echo env -u CLAUDECODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_printf_var_assignment() {
+        assert_allows("printf %s CLAUDECODE=test");
+    }
+
+    // --- ALLOW: quoted string false positive prevention (#145) ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_printf_unset_quoted() {
+        assert_allows("printf 'unset  CLAUDECODE'");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_echo_env_u_quoted() {
+        assert_allows("echo \"env  -u  CLAUDECODE\"");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_echo_newline_in_quotes() {
+        assert_allows("echo 'line1\nline2'");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_benign_env_assignment_in_string() {
+        assert_allows("echo 'CLAUDECODE=test'");
     }
 }
