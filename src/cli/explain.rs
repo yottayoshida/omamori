@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn layer2_blocked_command_pattern_explain() {
-        // "omamori explain" should be caught by blocked_command_patterns after DI-9
+        // "omamori explain" should be caught by blocked_string_patterns after DI-9
         // This test will pass after we add the pattern to installer.rs
         let result = evaluate_layer2("omamori explain -- rm -rf /");
         assert!(result.blocked);

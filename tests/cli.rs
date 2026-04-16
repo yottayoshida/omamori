@@ -1506,7 +1506,7 @@ fn hook_check_malformed_verbose_shows_raw_input() {
 fn hook_check_blocks_integrity_json() {
     // Verify meta-patterns block .integrity.json editing
     // (previously checked in hook script, now delegated to hook-check via meta-patterns)
-    let patterns = omamori::installer::blocked_command_patterns();
+    let patterns = omamori::installer::blocked_string_patterns();
     assert!(
         patterns.iter().any(|(p, _)| p.contains(".integrity.json")),
         "meta-patterns should block .integrity.json editing"
@@ -1515,11 +1515,11 @@ fn hook_check_blocks_integrity_json() {
 
 #[test]
 fn blocked_patterns_include_integrity_json() {
-    let patterns = omamori::installer::blocked_command_patterns();
+    let patterns = omamori::installer::blocked_string_patterns();
     let has_integrity = patterns.iter().any(|(p, _)| p.contains(".integrity.json"));
     assert!(
         has_integrity,
-        "blocked_command_patterns should include .integrity.json"
+        "blocked_string_patterns should include .integrity.json"
     );
 }
 
@@ -1771,4 +1771,79 @@ fn cursor_hook_blocks_path_traversal_rm() {
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(parsed["continue"], false);
     assert_eq!(parsed["permission"], "deny");
+}
+
+// ===========================================================================
+// #144: command separator bypass (newline + background operator)
+// ===========================================================================
+
+#[test]
+fn hook_check_blocks_newline_separated_rm() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("echo ok\nrm -rf /"));
+    assert_eq!(exit_code, 2, "newline-separated rm -rf must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_background_separated_rm() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("echo x & rm -rf /"));
+    assert_eq!(exit_code, 2, "background-separated rm -rf must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_background_no_space_rm() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("echo x&rm -rf /"));
+    assert_eq!(exit_code, 2, "no-space background rm -rf must be blocked");
+}
+
+#[test]
+fn hook_check_allows_redirect_ampersand() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("echo err &>/dev/null"));
+    assert_eq!(exit_code, 0, "&> redirect must be allowed (not split)");
+}
+
+#[test]
+fn hook_check_allows_fd_redirect() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("ls -la 2>&1"));
+    assert_eq!(exit_code, 0, "2>&1 redirect must be allowed (not split)");
+}
+
+// ===========================================================================
+// #145: meta-pattern whitespace bypass (Phase 1B)
+// ===========================================================================
+
+#[test]
+fn hook_check_blocks_unset_double_space() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("unset  CLAUDECODE"));
+    assert_eq!(exit_code, 2, "double-space unset must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_env_u_combined() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("env -uCLAUDECODE bash"));
+    assert_eq!(exit_code, 2, "combined env -uVAR must be blocked");
+}
+
+#[test]
+fn hook_check_allows_echo_unset_not_command_position() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("echo unset CLAUDECODE"));
+    assert_eq!(exit_code, 0, "echo unset (not command pos) must be allowed");
+}
+
+// ===========================================================================
+// #146 P1-2: rm split flags
+// ===========================================================================
+
+#[test]
+fn hook_check_blocks_rm_split_flags() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("rm -r -f /tmp/test"));
+    assert_eq!(exit_code, 2, "rm -r -f (split flags) must be blocked");
+}
+
+#[test]
+fn hook_check_blocks_rm_reversed_flags() {
+    let (_, _, exit_code) = run_hook_check(&pretooluse_bash_json("rm -f -r /tmp/test"));
+    assert_eq!(
+        exit_code, 2,
+        "rm -f -r (reversed split flags) must be blocked"
+    );
 }

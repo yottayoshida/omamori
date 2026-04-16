@@ -38,8 +38,10 @@
 |----|-----------|-------------|
 | DI-7 | `doctor --fix` is blocked in AI environments | `guard_ai_config_modification("doctor --fix")` — prevents baseline normalization to hide tampering |
 | DI-8 | `explain` is blocked in AI environments | `guard_ai_config_modification("explain")` — prevents oracle attacks (probing which commands are blocked) |
-| DI-9 | `doctor --fix` and `explain` in `blocked_command_patterns` | Defense-in-depth: Layer 2 hooks also block these commands via string matching |
+| DI-9 | `doctor --fix` and `explain` in `blocked_string_patterns` | Defense-in-depth: Layer 2 hooks also block these commands via string matching |
 | DI-10 | `doctor --fix` repair order: install → hooks → chmod → baseline (last) | Baseline must reflect the post-repair state, not the pre-repair state |
+| DI-11 | Command separators `\n`, `\r`, `&` are normalized before tokenization | `normalize_compound_operators` treats unquoted newlines as `;` and space-separates `&` (excluding `&>`, `>&`, `2>&1` redirects) |
+| DI-12 | Env var tampering detection is token-level, not string-level | Phase 1B `detect_env_var_tampering` uses `shell_words::split` after normalization, with `is_command_position()` to prevent false positives on quoted strings and arguments |
 
 `guard_ai_config_modification` call sites: 9 (as of v0.9.0).
 

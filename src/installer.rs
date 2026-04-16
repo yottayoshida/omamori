@@ -359,8 +359,22 @@ exit $?
     )
 }
 
-/// Blocked command patterns shared between Claude Code hooks and Cursor hooks.
-pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
+/// Protected AI environment detector variables.
+/// Used by Phase 1B token-level env var tampering detection.
+pub(crate) const PROTECTED_ENV_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CODEX_CI",
+    "CURSOR_AGENT",
+    "GEMINI_CLI",
+    "CLINE_ACTIVE",
+    "AI_GUARD",
+];
+
+/// String-level blocked patterns (Phase 1A).
+/// These are path-based, config, and uninstall patterns that don't require
+/// whitespace normalization. Env var patterns (unset, env -u, export -n, VAR=)
+/// are handled separately by token-level detection in hook.rs (Phase 1B).
+pub fn blocked_string_patterns() -> Vec<(&'static str, &'static str)> {
     vec![
         // Direct path execution bypassing PATH shim
         // Match various shell token boundaries: space, quote, tab
@@ -389,92 +403,6 @@ pub fn blocked_command_patterns() -> Vec<(&'static str, &'static str)> {
         (
             "/usr/bin/rm'",
             "blocked direct rm path that bypasses PATH shim",
-        ),
-        // Env var unsetting attempts
-        (
-            "unset CLAUDECODE",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "env -u CLAUDECODE",
-            "blocked attempt to unset a detector env var",
-        ),
-        ("CLAUDECODE=", "blocked attempt to unset a detector env var"),
-        (
-            "unset CODEX_CI",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "env -u CODEX_CI",
-            "blocked attempt to unset a detector env var",
-        ),
-        ("CODEX_CI=", "blocked attempt to unset a detector env var"),
-        (
-            "unset CURSOR_AGENT",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "env -u CURSOR_AGENT",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "CURSOR_AGENT=",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "unset GEMINI_CLI",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "env -u GEMINI_CLI",
-            "blocked attempt to unset a detector env var",
-        ),
-        ("GEMINI_CLI=", "blocked attempt to unset a detector env var"),
-        (
-            "unset CLINE_ACTIVE",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "env -u CLINE_ACTIVE",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "CLINE_ACTIVE=",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "unset AI_GUARD",
-            "blocked attempt to unset a detector env var",
-        ),
-        (
-            "env -u AI_GUARD",
-            "blocked attempt to unset a detector env var",
-        ),
-        ("AI_GUARD=", "blocked attempt to unset a detector env var"),
-        // export -n detection — unexport detector env vars (#110 S2)
-        (
-            "export -n CLAUDECODE",
-            "blocked attempt to unexport detector env var",
-        ),
-        (
-            "export -n CODEX_CI",
-            "blocked attempt to unexport detector env var",
-        ),
-        (
-            "export -n CURSOR_AGENT",
-            "blocked attempt to unexport detector env var",
-        ),
-        (
-            "export -n GEMINI_CLI",
-            "blocked attempt to unexport detector env var",
-        ),
-        (
-            "export -n CLINE_ACTIVE",
-            "blocked attempt to unexport detector env var",
-        ),
-        (
-            "export -n AI_GUARD",
-            "blocked attempt to unexport detector env var",
         ),
         // Claude Code hook registration protection (#110 T3)
         (
@@ -1026,25 +954,27 @@ mod tests {
         assert!(!snippet.contains(r#"" "path""#));
     }
 
-    // --- Meta-pattern tests (blocked_command_patterns, Phase 1) ---
+    // --- Meta-pattern tests (blocked_string_patterns, Phase 1) ---
 
     #[test]
     fn meta_patterns_cover_rm_path_boundaries() {
-        let patterns = blocked_command_patterns();
+        let patterns = blocked_string_patterns();
         for path in &["/bin/rm", "/usr/bin/rm"] {
             for boundary in &[" ", "\"", "\t", "'"] {
                 let needle = format!("{path}{boundary}");
                 assert!(
                     patterns.iter().any(|(p, _)| *p == needle),
-                    "blocked_command_patterns should cover: {path}{boundary:?}"
+                    "blocked_string_patterns should cover: {path}{boundary:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn meta_patterns_cover_all_detector_env_vars() {
-        let patterns = blocked_command_patterns();
+    fn protected_env_vars_constant_covers_all_detectors() {
+        // Verify PROTECTED_ENV_VARS covers all expected detector variables.
+        // Env var tampering detection is now handled by Phase 1B (token-level)
+        // in hook.rs, not by string-level patterns.
         for var in &[
             "CLAUDECODE",
             "CODEX_CI",
@@ -1054,27 +984,15 @@ mod tests {
             "AI_GUARD",
         ] {
             assert!(
-                patterns
-                    .iter()
-                    .any(|(p, _)| p.contains(&format!("unset {var}"))),
-                "should block unset {var}"
-            );
-            assert!(
-                patterns
-                    .iter()
-                    .any(|(p, _)| p.contains(&format!("env -u {var}"))),
-                "should block env -u {var}"
-            );
-            assert!(
-                patterns.iter().any(|(p, _)| p.contains(&format!("{var}="))),
-                "should block {var}= reassignment"
+                PROTECTED_ENV_VARS.contains(var),
+                "PROTECTED_ENV_VARS should include {var}"
             );
         }
     }
 
     #[test]
     fn meta_patterns_cover_config_modification() {
-        let patterns = blocked_command_patterns();
+        let patterns = blocked_string_patterns();
         for keyword in &[
             "config disable",
             "config enable",
@@ -1090,7 +1008,7 @@ mod tests {
 
     #[test]
     fn meta_patterns_do_not_false_positive_on_rmdir() {
-        let patterns = blocked_command_patterns();
+        let patterns = blocked_string_patterns();
         for (pattern, _) in &patterns {
             assert!(
                 !pattern.contains("/bin/rmdir"),
@@ -1107,7 +1025,7 @@ mod tests {
     // KNOWN_LIMIT: alias/function overrides bypass string matching
     // KNOWN_LIMIT: env -i clears all env vars (undetectable by hooks)
     // KNOWN_LIMIT: obfuscated commands (base64, hex, variable expansion) cannot be detected
-    // KNOWN_LIMIT: export -n VAR removes export attribute without unsetting
+    // export -n VAR is now detected by Phase 1B token-level detection (v0.9.2)
     // See SECURITY.md for the full Known Limitations table.
 
     // --- Hook version / regeneration tests (#26) ---
@@ -1376,7 +1294,7 @@ mod tests {
 
     #[test]
     fn meta_patterns_block_omamori_override() {
-        let patterns = blocked_command_patterns();
+        let patterns = blocked_string_patterns();
         assert!(
             patterns.iter().any(|(p, _)| p.contains("omamori override")),
             "meta-patterns should block 'omamori override'"
@@ -1632,7 +1550,7 @@ mod tests {
 
     #[test]
     fn meta_patterns_cover_codex_protection() {
-        let patterns = blocked_command_patterns();
+        let patterns = blocked_string_patterns();
         for keyword in &[
             ".codex/hooks.json",
             ".codex/config.toml",
@@ -1647,11 +1565,11 @@ mod tests {
     }
 
     #[test]
-    fn blocked_command_patterns_include_omamori_override() {
-        let patterns = blocked_command_patterns();
+    fn blocked_string_patterns_include_omamori_override() {
+        let patterns = blocked_string_patterns();
         assert!(
             patterns.iter().any(|(p, _)| *p == "omamori override"),
-            "blocked_command_patterns should include 'omamori override'"
+            "blocked_string_patterns should include 'omamori override'"
         );
     }
 

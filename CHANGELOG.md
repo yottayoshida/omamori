@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.9.2] - 2026-04-16
+
+**Summary**: Security patch — fix three confirmed hook bypass vulnerabilities discovered by Codex adversarial test review. All bypasses are Layer 2 (hook) only; Layer 1 (PATH shim) was not affected.
+
+### Security
+
+- **DI-11: Command separator normalization** (#144): `normalize_compound_operators` now treats unquoted `\n`, `\r`, `\r\n` as command separators (equivalent to `;`), and space-separates single `&` (background operator) while preserving `&>`, `>&`, and `2>&1` redirects. `split_on_operators` now treats `&` as a segment boundary. Previously, `echo ok\nrm -rf /` and `echo x & rm -rf /` bypassed Layer 2 detection.
+
+- **DI-12: Token-level env var tampering detection** (#145): Phase 1 meta-pattern check split into Phase 1A (string-level, path/config patterns) and Phase 1B (token-level, env var patterns). Phase 1B uses `shell_words::split` after `normalize_compound_operators` for whitespace normalization and quote awareness, with `is_command_position()` to prevent false positives on arguments and quoted strings. Detects `unset`, `env -u`, `export -n` (both separated and combined forms like `-uVAR`), and `VAR=` assignment. Previously, `unset  CLAUDECODE` (double space) and `unset\tCLAUDECODE` (tab) bypassed detection.
+
+### Changed
+
+- `blocked_command_patterns()` renamed to `blocked_string_patterns()` — env var patterns moved to token-level Phase 1B detection.
+- `PROTECTED_ENV_VARS` constant added to `installer.rs` for centralized env var list.
+- `is_env_assignment()` and `normalize_compound_operators()` promoted to `pub(crate)` for Phase 1B reuse.
+
+### Internal
+
+- Tests: 490 → 538 (+48 new tests for security fixes, adversarial coverage, and benign regression)
+- Adversarial test review process established: Codex reviews Claude-written tests before merge (Phase 6-B in `/develop`)
+
+### Found By
+
+Codex (GPT-5.3) adversarial test review + Claude (Opus 4.6) CLI reproduction + 2-round Codex plan review.
+
 ## [0.9.1] - 2026-04-14
 
 ### Fixed
