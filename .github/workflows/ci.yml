@@ -151,7 +151,7 @@ jobs:
         run: cargo tarpaulin --locked --out xml --skip-clean
       - name: Upload to Codecov
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
           files: cobertura.xml
           fail_ci_if_error: false
