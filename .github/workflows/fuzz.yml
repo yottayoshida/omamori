@@ -47,7 +47,11 @@ jobs:
           toolchain: nightly
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        # taiki-e/install-action does not currently ship cargo-fuzz binaries,
+        # so we fall back to `cargo install` with an explicit --locked --version
+        # pin. This keeps the supply-chain policy auditable (exact version,
+        # locked deps) without a silent registry fallback path.
+        run: cargo install --locked --version 0.13.1 cargo-fuzz
 
       - name: Run fuzz target (${{ matrix.target }})
         run: |

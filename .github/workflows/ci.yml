@@ -146,7 +146,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        # Pin cargo-tarpaulin via taiki-e/install-action. `fallback: none`
+        # disables the silent fallback-to-`cargo install`, so a registry
+        # hiccup cannot cause the job to silently build an unpinned binary.
+        uses: taiki-e/install-action@a2352fc6ce487f030a3aa709482d57823eadfb37 # v2.75.16
+        with:
+          tool: cargo-tarpaulin@0.35.2
+          fallback: none
       - name: Generate coverage
         run: cargo tarpaulin --locked --out xml --skip-clean
       - name: Upload to Codecov
