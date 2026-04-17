@@ -504,3 +504,34 @@ Entries written before v0.7.0 lack chain fields. When `append()` encounters a le
 | Chain structure (prev_hash linkage) | Via `--json` only | Machine consumers need full provenance for forensics/SIEM. HMAC protection means chain fields cannot be forged without secret |
 
 **Recommendation**: Run `omamori audit verify` directly in a terminal, not through an AI agent. AI agents can read stdout and may misrepresent results to the user.
+
+## AI-assisted Contribution Invariants (v0.9.3+)
+
+omamori is developed with AI coding assistants (Claude Code / Codex). That
+convenience creates an attack surface: an AI that subtly weakens supply-chain
+defenses inside an otherwise innocent refactoring PR can bypass the product's
+own philosophy.
+
+These five invariants are **load-bearing**. A PR that removes or neutralizes
+any of them SHOULD be rejected. If a future proposal argues for loosening one,
+treat it as a security change (separate RFC, human review, not an AI-batched
+cleanup).
+
+**Enforcement state (v0.9.3 series)**: the invariants are introduced across
+six PRs (PR1 policy -> PR6 release). Until the corresponding CI job listed
+below is live, reviewers MUST enforce the rule manually. The `Intended CI
+check` column describes the mechanism that becomes authoritative once v0.9.3
+ships; before that, the column is a specification, not an existing guarantee.
+
+| # | Invariant | Why it matters | Intended CI check (v0.9.3) |
+|---|-----------|----------------|-----------------------------|
+| 1 | `Cargo.lock` is tracked | `cargo install omamori --locked` must reproduce the exact dependency graph for consumers. An untracked lockfile makes release binaries non-reproducible and hides transitive-dep drift. | `invariants-check` job asserts `git ls-files Cargo.lock` is non-empty (added in PR2/PR3) |
+| 2 | Every `uses:` in `.github/workflows/*.yml` is pinned to a 40-char SHA | Moving tags (`@v4`, `@main`) let a compromised action execute with our repo secrets (incl. `CARGO_REGISTRY_TOKEN`). SHA pinning shrinks this to SHA-1 collision difficulty. | `action-pin-check` regex match on `@[0-9a-f]{40}` (added in PR3) |
+| 3 | `.gitignore` retains entries for `.claude/`, `investigation/`, `CLAUDE.local.md`, `target/`, `.env`, `.env.*` | These paths hold AI-agent context, private notes, and credentials. Removing an ignore rule risks accidental `git add` and subsequent crate/tarball inclusion. | `invariants-check` greps for required entries as fixed strings (added in PR3) |
+| 4 | `Cargo.toml` has an `include = [...]` allowlist | Deny-by-default is the structural defense against "a stray tracked file leaks to crates.io". `exclude=` alone is reactive — it only blocks what you already thought of. | `invariants-check` parses `include=` array (added in PR3, populated in PR5) |
+| 5 | CI jobs and release scripts always pass `--locked` to cargo | Without `--locked`, a fresh CI run can silently pick a newer transitive dep than the lockfile records, masking reproducibility bugs and dependency-confusion issues. | `pre-release-check.sh` runs `cargo ... --locked`; CI audit is manual review plus the `invariants-check` job (added in PR3) |
+
+An AI-generated PR that proposes loosening any of these (e.g. "move
+`Cargo.lock` to `.gitignore` for convenience", "pin at `@v4` instead of SHA",
+"drop `--locked` to speed up CI") is a supply-chain regression, not a
+quality-of-life change, and must be handled as such.

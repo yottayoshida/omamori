@@ -1,0 +1,26 @@
+# Normalize line endings across platforms.
+* text=auto eol=lf
+
+# Treat these as binary (no diff, no merge).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.svg binary
+*.pdf binary
+
+# Rust sources / scripts are always LF.
+*.rs  text eol=lf
+*.toml text eol=lf
+*.sh  text eol=lf
+
+# Exclude from GitHub archive tarballs (`git archive` / "Download ZIP").
+# Note: this does NOT affect `cargo package` — see Cargo.toml `include=` / `exclude=`.
+.claude/            export-ignore
+investigation/      export-ignore
+PLAN.md             export-ignore
+ACCEPTANCE_TEST.md  export-ignore
+demo.svg            export-ignore
+fuzz/               export-ignore
+omamori-test-sandbox/ export-ignore

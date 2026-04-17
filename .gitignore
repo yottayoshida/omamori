@@ -27,3 +27,4 @@ fuzz/target/
 .claude/
 investigation/
 PLAN.md
+CLAUDE.local.md
