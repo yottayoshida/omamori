@@ -12,6 +12,33 @@ categories = ["command-line-utilities", "development-tools"]
 authors = ["Iori Yoshida <yotta@users.noreply.github.com>"]
 readme = "README.md"
 
+# v0.9.3+ supply-chain policy (SECURITY.md invariants #4).
+#
+# `include` is a deny-by-default allowlist: only these paths ship in the
+# crate tarball uploaded to crates.io. Anything not listed — including
+# everything under `.claude/`, `investigation/`, `.github/`, `scripts/`,
+# `rust-toolchain.toml`, `CONTRIBUTING.md`, `demo.svg`, etc. — is
+# structurally excluded, regardless of whether it happens to be tracked
+# by git.
+#
+# Note on `exclude`: cargo ignores `exclude` whenever `include` is also
+# specified ("both package.include and package.exclude are specified;
+# the exclude list will be ignored"), so `include` is the single source
+# of truth here. `crate-contents-guard` in ci.yml is the defense-in-depth
+# layer that catches accidental widening of `include`.
+include = [
+    "src/**/*.rs",
+    "tests/**/*.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "config.default.toml",
+]
+
 [dependencies]
 libc = "0.2.183"
 serde = { version = "1.0", features = ["derive"] }

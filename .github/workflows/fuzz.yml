@@ -70,3 +70,7 @@ jobs:
         with:
           name: fuzz-crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}/
+          # Crash samples can reveal unpublished bugs; cap retention so a
+          # stale run does not advertise an open vulnerability indefinitely
+          # (security threat-model T9/M8 — accepted risk with 7-day cap).
+          retention-days: 7
