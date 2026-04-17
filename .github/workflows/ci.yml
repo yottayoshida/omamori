@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo test
+      - run: cargo test --locked
 
   clippy:
     name: Clippy
@@ -26,7 +26,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --locked -- -D warnings
 
   fmt:
     name: Format
@@ -44,7 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo publish --dry-run
+      - run: cargo publish --dry-run --locked
 
   msrv:
     name: MSRV check
@@ -54,7 +54,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "1.92"
-      - run: cargo +1.92 check
+      - run: cargo +1.92 check --locked
 
   coverage:
     name: Coverage
@@ -65,13 +65,24 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
       - name: Generate coverage
-        run: cargo tarpaulin --out xml --skip-clean
+        run: cargo tarpaulin --locked --out xml --skip-clean
       - name: Upload to Codecov
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: codecov/codecov-action@v4
         with:
           files: cobertura.xml
           fail_ci_if_error: false
+
+  lockfile-sanity:
+    name: Lockfile sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need origin/main as base for regression check
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Detect direct-dep downgrades
+        run: ./scripts/check-lockfile-regressions.sh origin/main
 
   audit:
     name: Security audit

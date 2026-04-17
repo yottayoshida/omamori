@@ -1,7 +1,8 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# NOTE (v0.9.3+): Cargo.lock is tracked for reproducible `cargo install --locked`.
+# See SECURITY.md "AI-assisted Contribution Invariants" #1 — do not re-add it here.
 
 # Environment
 .env
@@ -18,10 +19,12 @@ tests/poc.sh
 .DS_Store
 omamori-test-sandbox/
 
-# Fuzz artifacts and corpus
+# Fuzz artifacts and corpus. Fuzz is intentionally non-reproducible
+# (see rust-toolchain.toml), so we do NOT track fuzz/Cargo.lock.
 fuzz/artifacts/
 fuzz/corpus/
 fuzz/target/
+fuzz/Cargo.lock
 
 # Claude Code local config & notes
 .claude/
