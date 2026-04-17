@@ -4,6 +4,97 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.9.3] - 2026-04-17
+
+**Summary**: Repository structure & SCM hygiene hardening (#147). A
+six-PR supply-chain series that makes `cargo install omamori --locked`
+reproducible, pins every CI action to a 40-char SHA, installs a
+deny-by-default allowlist for tarball contents, and flips the
+SECURITY.md *AI-assisted Contribution Invariants* from "intended" to
+mechanically enforced.
+
+### Security (supply-chain)
+
+- **Invariant #1: reproducible installs** — `Cargo.lock` is now tracked.
+  All CI `cargo` invocations run with `--locked`. (PR #150)
+- **Invariant #2: pinned actions** — every `uses:` in
+  `.github/workflows/*` pinned to a 40-char SHA with a `# vX.Y.Z`
+  comment. `action-pin-check` is a **CI gate**: all third-party-action
+  jobs declare `needs: action-pin-check`, so no external action
+  executes until pinning has been validated. (PR #151)
+- **Invariant #3: enforced ignores** — `.gitignore` now audited via
+  `git check-ignore` probes (not grep), so a `!pattern` negation cannot
+  silently disable a required ignore rule. (PR #151)
+- **Invariant #4: deny-by-default tarball** — `Cargo.toml include =
+  [...]` allowlist drops the crates.io tarball from 58 files to 42,
+  excluding `.github/*`, `scripts/*`, `rust-toolchain.toml`,
+  `CONTRIBUTING.md`, `.editorconfig`, `.gitattributes`, `demo.svg`,
+  `ACCEPTANCE_TEST.md`, `.gitignore`. `crate-contents-guard` enforces
+  a **strict allowlist** (not denylist) at CI time; paths not on an
+  explicit allow list fail the build. (PR #156)
+- **Invariant #5: `--locked` everywhere** — enforced structurally via
+  the invariants-check CI job. (PR #151)
+- **Pinned cargo installs** — `cargo install cargo-tarpaulin` replaced
+  by `taiki-e/install-action@v2.75.16` + `tool: cargo-tarpaulin@0.35.2`
+  + `fallback: none`. `cargo-fuzz` pinned to `0.13.1` with `--locked`.
+  (PR #155)
+- **Fuzz artifact cap** — `retention-days: 7` on crash artifacts to
+  avoid indefinitely advertising unpublished vulnerabilities (threat
+  T9/M8). (PR #156)
+
+### Added
+
+- `.github/CODEOWNERS`, `.github/PULL_REQUEST_TEMPLATE.md`,
+  `.github/dependabot.yml` (weekly grouped minor/patch for cargo +
+  github-actions)
+- `.editorconfig`, `.gitattributes`
+- `CONTRIBUTING.md` — branch naming ladder, repository/automation map,
+  SHA pin policy, `feat/*` migration schedule (legacy `feature/*`
+  accepted until 2026-05-15)
+- `SECURITY.md` — new *AI-assisted Contribution Invariants (v0.9.3+)*
+  section. Five load-bearing invariants framed as mechanically-checked
+  rules; rejecting any of them is treated as a security change, not a
+  cleanup.
+- `rust-toolchain.toml` — stable pin for dev + non-fuzz CI jobs.
+  Fuzz (nightly) is intentionally not bound.
+- `scripts/pre-pr-check.sh`, `scripts/pre-release-check.sh`
+- `scripts/check-lockfile-regressions.sh` — detects direct-dep
+  version downgrades via `cargo metadata --locked` + `git worktree`
+  materialization of BASE (disambiguates same-named lockfile
+  entries via package IDs).
+- `scripts/check-action-pins.sh` — YAML-aware validator for SHA
+  pinning. Covers step-level `jobs[].steps[].uses` and job-level
+  reusable workflows; matches on parsed ref tokens so a comment
+  like `@v4 # @<40hex>` cannot false-pass.
+- `scripts/check-crate-contents.sh` — strict allowlist guard over
+  `cargo package --list` output + binary-file MIME detection.
+- `scripts/check-invariants.sh` — `python3 tomllib` structural check
+  on `package.include`, plus `git check-ignore` probes.
+- CI jobs: `action-pin-check` (gate), `invariants-check`,
+  `crate-contents-guard`, `lockfile-sanity`.
+
+### Changed
+
+- MSRV unchanged at 1.92.
+- Removed from crate tarball (16 files, all developer-only): `.github/*`,
+  `scripts/*`, `rust-toolchain.toml`, `CONTRIBUTING.md`,
+  `.editorconfig`, `.gitattributes`, `demo.svg`, `ACCEPTANCE_TEST.md`,
+  `.gitignore`.
+
+### Internal
+
+- 6 PRs: #149 governance → #150 Cargo.lock → #151 SHA pin + gate →
+  #155 cargo install pin → #156 artifact guard → this release.
+- 14 Codex adversarial-review findings resolved across the series.
+- New /develop process artifact: plan file
+  `.claude/plans/2026-04-17-v093-repo-hygiene.md` (local, untracked).
+
+### Found By
+
+Codex (GPT-5.3) adversarial-review per PR + /plan Phase 3/5 Codex
+rounds. Plan authored by Claude (Opus 4.7) with two-round Codex
+adversarial-review before /develop.
+
 ## [0.9.2] - 2026-04-16
 
 **Summary**: Security patch — fix three confirmed hook bypass vulnerabilities discovered by Codex adversarial test review. All bypasses are Layer 2 (hook) only; Layer 1 (PATH shim) was not affected.
