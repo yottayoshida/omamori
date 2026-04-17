@@ -1,0 +1,27 @@
+# omamori CODEOWNERS
+#
+# Every file has a default owner. Security-critical paths are explicitly listed
+# so PRs touching them trigger an ownership review even if the default wildcard
+# would have matched.
+
+* @yottayoshida
+
+# Security-critical source paths (v0.9.3+)
+# Policy & trust-boundary modules: command parsing, rule evaluation, detection,
+# execution context. A subtle refactor here can silently weaken the product.
+/src/audit/          @yottayoshida
+/src/engine/         @yottayoshida
+/src/engine/hook.rs  @yottayoshida
+/src/actions.rs      @yottayoshida
+/src/installer.rs    @yottayoshida
+/src/integrity.rs    @yottayoshida
+/src/config.rs       @yottayoshida
+/src/rules.rs        @yottayoshida
+/src/detector.rs     @yottayoshida
+/src/context.rs      @yottayoshida
+
+# Supply-chain / release surface
+/.github/workflows/  @yottayoshida
+/Cargo.toml          @yottayoshida
+/Cargo.lock          @yottayoshida
+/SECURITY.md         @yottayoshida
