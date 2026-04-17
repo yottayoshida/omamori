@@ -33,59 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Enforce SECURITY.md AI-assisted contribution invariants
-        run: |
-          set -euo pipefail
-          fail=0
-
-          # Invariant #1: Cargo.lock is tracked.
-          if [ -z "$(git ls-files Cargo.lock)" ]; then
-              echo "FAIL [invariant #1]: Cargo.lock is not tracked"
-              fail=1
-          fi
-
-          # Invariant #3: required paths are EFFECTIVELY ignored — probe with
-          # `git check-ignore` rather than grep so a later `!pattern` negation
-          # cannot silently disable an ignore rule.
-          probes=(
-              ".claude/probe.md"
-              "investigation/probe.md"
-              "CLAUDE.local.md"
-              "target/probe"
-              ".env"
-              ".env.local"
-          )
-          for probe in "${probes[@]}"; do
-              if ! git check-ignore -q "$probe"; then
-                  echo "FAIL [invariant #3]: $probe is NOT effectively ignored (check .gitignore + negation rules)"
-                  fail=1
-              fi
-          done
-
-          # Invariant #4: Cargo.toml has an include= allowlist (added in PR5).
-          # Until PR5 lands, this is WARN-only; it flips to FAIL once include=
-          # appears in Cargo.toml.
-          if grep -Eq '^include[[:space:]]*=' Cargo.toml; then
-              echo "#4 OK: Cargo.toml has include= allowlist"
-          else
-              echo "WARN [invariant #4]: Cargo.toml has no include= yet (expected before v0.9.3 release; enforced in PR5)"
-          fi
-
-          # Invariant #5: representative --locked usage in workflows.
-          if ! grep -q 'cargo test --locked' .github/workflows/ci.yml; then
-              echo "FAIL [invariant #5]: cargo test must use --locked"
-              fail=1
-          fi
-          if ! grep -q 'cargo publish --dry-run --locked' .github/workflows/ci.yml; then
-              echo "FAIL [invariant #5]: cargo publish --dry-run must use --locked"
-              fail=1
-          fi
-
-          if [ "$fail" -ne 0 ]; then
-              echo
-              echo "invariants-check: FAIL"
-              exit 1
-          fi
-          echo "invariants-check: OK"
+        run: ./scripts/check-invariants.sh
 
   test:
     name: Test
@@ -173,6 +121,16 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
       - name: Detect direct-dep downgrades
         run: ./scripts/check-lockfile-regressions.sh origin/main
+
+  crate-contents-guard:
+    name: Crate contents guard
+    runs-on: ubuntu-latest
+    needs: action-pin-check
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - name: Verify crate tarball contents
+        run: ./scripts/check-crate-contents.sh
 
   audit:
     name: Security audit

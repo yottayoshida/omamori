@@ -29,13 +29,11 @@ fi
 
 # 3. package listing: no forbidden files should ship to crates.io.
 #
-# NOTE (v0.9.3 transition): This is a denylist, which has structural false
-# negatives — it only blocks what we thought of. PR5 replaces this with an
-# allowlist strategy driven by `Cargo.toml` `include = [...]`, at which point
-# this regex becomes a belt-and-suspenders layer over deny-by-default.
-# Until then, this list expands to cover governance files that are currently
-# tracked but do not belong in the crate tarball.
-FORBIDDEN_REGEX='^(\.claude/|investigation/|\.github/|PLAN\.md$|ACCEPTANCE_TEST\.md$|demo\.svg$|CLAUDE\.local\.md$|omamori-test-sandbox/|fuzz/|\.editorconfig$|\.gitattributes$|CONTRIBUTING\.md$|scripts/)'
+# As of v0.9.3 PR5, the primary structural defense is `Cargo.toml`
+# `include = [...]` — an allowlist applied by cargo itself. This denylist
+# is a belt-and-suspenders layer that catches accidental widening of the
+# allowlist (e.g. someone adding `"**"` to include).
+FORBIDDEN_REGEX='^(\.claude/|investigation/|\.github/|PLAN\.md$|ACCEPTANCE_TEST\.md$|demo\.svg$|CLAUDE\.local\.md$|omamori-test-sandbox/|fuzz/|\.editorconfig$|\.gitattributes$|\.gitignore$|CONTRIBUTING\.md$|scripts/|rust-toolchain\.toml$)'
 if ! PKG_LIST="$(cargo package --list --locked 2>&1)"; then
     fail "cargo package --list failed:"
     echo "$PKG_LIST"
