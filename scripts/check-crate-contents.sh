@@ -45,11 +45,11 @@ ALLOWED_PATTERNS=(
     '^tests/[A-Za-z0-9_/-]+\.rs$'
 )
 
-list_out="$(cargo package --list --locked --allow-dirty 2>&1)"
-list_rc=$?
-if [ "$list_rc" -ne 0 ]; then
-    echo "ERROR: cargo package --list failed (rc=$list_rc):"
-    echo "$list_out"
+# Capture ONLY stdout — cargo writes progress (`Updating crates.io index`,
+# `Compiling ...`) to stderr, and mixing it in makes those lines look like
+# package paths to the allowlist check.
+if ! list_out="$(cargo package --list --locked --allow-dirty)"; then
+    echo "ERROR: cargo package --list failed"
     exit 1
 fi
 
