@@ -35,10 +35,21 @@ jobs:
       - name: Enforce SECURITY.md AI-assisted contribution invariants
         run: ./scripts/check-invariants.sh
 
+  # v0.9.4 (#121): test + clippy run on a Linux+macOS matrix so the hook
+  # integration suite in tests/hook_integration.rs exercises both /bin/sh
+  # targets (Ubuntu dash vs macOS bash-as-sh). Keep fail-fast: false so a
+  # failing leg preserves diagnostic output from the other leg, and leave
+  # continue-on-error at the default (false) so a failing leg blocks merge.
   test:
     name: Test
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     needs: action-pin-check
+    # Explicit: a failing leg must block merge. Do not change to true.
+    continue-on-error: false
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
@@ -46,8 +57,13 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     needs: action-pin-check
+    continue-on-error: false
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
