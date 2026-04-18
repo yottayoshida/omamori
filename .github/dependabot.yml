@@ -1,8 +1,17 @@
 version: 2
 
-# Weekly grouped updates. Minor + patch bumps are grouped into a single PR
-# per ecosystem to keep PR volume manageable; major bumps come as separate
-# PRs for individual review.
+# Cargo ecosystems: weekly grouped minor+patch updates (unchanged).
+# GitHub Actions ecosystem (v0.9.4, #159): narrowed to monthly patch-only.
+# Major and minor bumps are ignored to cut PR noise from Actions upstream
+# release cadence.
+#
+# Security updates are NOT affected by this narrowing — per GitHub docs:
+# "There is no interaction between the settings specified in the
+#  dependabot.yml file and Dependabot security alerts" and
+# "ignore only affects version updates, not security updates. Security
+#  updates will always be created regardless of the ignore setting."
+# Security PRs operate under a separate internal limit of ten which cannot
+# be changed, independent of open-pull-requests-limit here.
 #
 # The `github-actions` ecosystem also updates the SHA pins introduced in
 # v0.9.3 PR3 and rewrites the trailing `# vX.Y.Z` comment.
@@ -39,13 +48,17 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
       day: monday
       time: "09:00"
       timezone: Asia/Tokyo
-    open-pull-requests-limit: 5
-    groups:
-      actions-minor-patch:
+    open-pull-requests-limit: 2
+    ignore:
+      - dependency-name: "*"
         update-types:
-          - minor
-          - patch
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+    groups:
+      actions-patch-only:
+        patterns:
+          - "*"
