@@ -35,6 +35,13 @@ fn unique_dir(name: &str) -> PathBuf {
 
 /// Install omamori hooks into a fresh temp dir and return
 /// (base_dir, hook_path, shim_dir).
+///
+/// `HOME` is redirected to the temp `base` so that `install` does not merge
+/// into the developer's real `~/.codex/hooks.json` — a side effect that
+/// otherwise leaves broken references to deleted tempdirs after the test
+/// finishes. This follows the same pattern as existing installer tests (see
+/// `src/installer.rs` ~L1430 "Set HOME so codex_home_dir() points to our
+/// test dir").
 fn setup_hook_env(case: &str) -> (PathBuf, PathBuf, PathBuf) {
     let base = unique_dir(case);
     let output = Command::new(binary())
@@ -44,6 +51,7 @@ fn setup_hook_env(case: &str) -> (PathBuf, PathBuf, PathBuf) {
         .arg("--source")
         .arg(binary())
         .arg("--hooks")
+        .env("HOME", &base)
         .output()
         .expect("failed to run omamori install");
     assert!(
@@ -115,19 +123,23 @@ fn pretooluse_bash_json(command: &str) -> String {
 enum Decision {
     Allow,
     Block,
+    FailClose,
 }
 
 /// Map a hook-check exit code to the coarse decision enum.
 ///
-/// Contract (from `omamori hook-check`):
-///   exit 0 = allow (with hookSpecificOutput JSON on stdout)
-///   exit 2 = block
-///   other non-zero = fail-close (treated as Block here)
+/// Contract (from `omamori hook-check`, pinned by tests/cli.rs V-004/V-005):
+///   exit 0 = Allow (with hookSpecificOutput JSON on stdout)
+///   exit 2 = Block (intentional policy decision)
+///   other  = FailClose — command-not-found, JSON parse error, panic, etc.
+///            Safe by default (not Allow) but distinct from a real Block so
+///            that test assertions do not silently pass through execution
+///            failures dressed as policy decisions.
 fn decision_from_exit(exit: i32) -> Decision {
-    if exit == 0 {
-        Decision::Allow
-    } else {
-        Decision::Block
+    match exit {
+        0 => Decision::Allow,
+        2 => Decision::Block,
+        _ => Decision::FailClose,
     }
 }
 
@@ -143,11 +155,29 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "direct-path-bypass-block",
     ),
-    // 3. env tampering — disable AI env detection variable
+    // 3. env tampering (unset) — disable AI env detection variable
     (
         "unset CLAUDECODE && echo ok",
         Decision::Block,
-        "env-tampering-block",
+        "env-tampering-unset-block",
+    ),
+    // 3b. env tampering (env -u) — same intent, different syntax
+    (
+        "env -u CLAUDECODE bash",
+        Decision::Block,
+        "env-tampering-env-u-block",
+    ),
+    // 3c. env tampering (export -n) — unexport without unset
+    (
+        "export -n CLAUDECODE",
+        Decision::Block,
+        "env-tampering-export-n-block",
+    ),
+    // 3d. env tampering (VAR= prefix) — inline override of detector var
+    (
+        "CLAUDECODE=0 echo pwned",
+        Decision::Block,
+        "env-tampering-var-assign-block",
     ),
     // 4. compound command — semicolon separator hides dangerous tail
     (
@@ -199,34 +229,72 @@ fn corpus_includes_both_decisions() {
     assert!(has_block, "corpus must include at least one Block case");
 }
 
+/// Pin the Block exit code contract at exactly 2. The `cross_os_invariant`
+/// test maps anything non-zero to Block via `decision_from_exit`, which would
+/// silently accept a mutation from `exit 2` to `exit 1`. This test catches
+/// that mutation directly. Uses one Block-expected corpus entry as fixture.
+#[test]
+fn hook_script_block_exit_code_is_exactly_two() {
+    let (base, hook_path, shim_dir) = setup_hook_env("exit2");
+    let json = pretooluse_bash_json("/bin/rm -rf /tmp/x");
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        exit, 2,
+        "BLOCK must exit with exactly code 2 (hook-check contract, tests/cli.rs V-004/V-005)"
+    );
+}
+
+/// Pin the generated hook script's fail-safe primitives. If a refactor ever
+/// strips `set -eu` or changes `exit $?` to `exit 0`, this test fails before
+/// corpus-level behavior tests (which might silently pass because Allow
+/// cases still exit 0). Complements `check-invariants.sh` landing in PR2b.
+#[test]
+fn hook_script_wrapper_has_required_invariants() {
+    let (base, hook_path, _) = setup_hook_env("wrapper-invariant");
+    let content =
+        std::fs::read_to_string(&hook_path).expect("hook script must be readable after install");
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        content.contains("set -eu"),
+        "hook script must contain `set -eu` for fail-fast"
+    );
+    assert!(
+        content.contains("exit $?"),
+        "hook script must propagate hook-check exit code via `exit $?`"
+    );
+}
+
 /// Fail-close on malformed JSON stdin. The hook script feeds stdin as-is to
 /// `omamori hook-check`, which must not treat an invalid payload as Allow.
+/// Either Block (explicit policy deny) or FailClose (parse error / exec
+/// failure) is acceptable — the invariant is "never Allow".
 #[test]
 fn hook_script_malformed_json_is_not_allow() {
     let (base, hook_path, shim_dir) = setup_hook_env("malformed");
     let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, "{not valid json");
     let _ = std::fs::remove_dir_all(&base);
     let decision = decision_from_exit(exit);
-    assert_eq!(
+    assert_ne!(
         decision,
-        Decision::Block,
-        "malformed JSON must not produce Allow (fail-close)"
+        Decision::Allow,
+        "malformed JSON must not produce Allow (got {decision:?}, exit={exit})"
     );
 }
 
 /// Fail-close on empty stdin. Distinct from V-006 in tests/cli.rs, which
 /// pins an empty *command* (a well-formed JSON payload with `command: ""`)
 /// as Allow. An empty *stdin* here provides no payload at all, which the
-/// hook layer treats as malformed and must not accept as Allow.
+/// hook layer must not accept as Allow. Either Block or FailClose is OK.
 #[test]
 fn hook_script_empty_stdin_is_not_allow() {
     let (base, hook_path, shim_dir) = setup_hook_env("empty");
     let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, "");
     let _ = std::fs::remove_dir_all(&base);
     let decision = decision_from_exit(exit);
-    assert_eq!(
+    assert_ne!(
         decision,
-        Decision::Block,
-        "empty stdin must fail-close (no payload = malformed)"
+        Decision::Allow,
+        "empty stdin must not produce Allow (got {decision:?}, exit={exit})"
     );
 }
