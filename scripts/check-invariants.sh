@@ -74,6 +74,136 @@ if ! grep -q 'cargo publish --dry-run --locked' .github/workflows/ci.yml; then
 fi
 echo "#5 OK: representative --locked invocations present"
 
+# ---------- Invariant #6: hook integration test structural invariants (v0.9.4+, #121) ----------
+# Structural (not name-based): the hook integration suite must (a) exist,
+# (b) contain at least one test that spawns the hook script via /bin/sh,
+# (c) include both Decision::Allow and Decision::Block in its corpus,
+# (d) not use `#[ignore]`, (e) not gate on `#[cfg(target_os = ...)]`.
+# These shape checks complement the runtime Rust invariant
+# `corpus_includes_both_decisions` — if someone silently guts the corpus or
+# disables a test with `#[ignore]`, the gate here fails before the Rust
+# invariant even runs.
+hi=tests/hook_integration.rs
+hi_fail=0
+if [ ! -f "$hi" ]; then
+    echo "FAIL [invariant #6a]: $hi is missing"
+    hi_fail=1
+else
+    if ! grep -qF 'Command::new("/bin/sh")' "$hi"; then
+        echo "FAIL [invariant #6b]: $hi must spawn the hook script via /bin/sh"
+        hi_fail=1
+    fi
+    if ! grep -qF 'Decision::Allow' "$hi"; then
+        echo "FAIL [invariant #6c-allow]: $hi corpus must include Decision::Allow"
+        hi_fail=1
+    fi
+    if ! grep -qF 'Decision::Block' "$hi"; then
+        echo "FAIL [invariant #6c-block]: $hi corpus must include Decision::Block"
+        hi_fail=1
+    fi
+    if grep -Eq '^[[:space:]]*#\[ignore\]' "$hi"; then
+        echo "FAIL [invariant #6d]: $hi must have zero #[ignore] attributes"
+        hi_fail=1
+    fi
+    # Strip single-line comments before matching so explanatory text like
+    # "// never add #[cfg(target_os)] here" doesn't trip the check.
+    if sed 's|//.*$||' "$hi" | grep -qF '#[cfg(target_os'; then
+        echo "FAIL [invariant #6e]: $hi must not gate tests on target_os"
+        hi_fail=1
+    fi
+fi
+if [ "$hi_fail" -eq 0 ]; then
+    echo "#6 OK: hook integration suite has required structure"
+else
+    fail=1
+fi
+
+# ---------- Invariant #7: render_hook_script delegation contract (v0.9.4+, #121) ----------
+# The generated hook wrapper is the thin shell bridge between an AI tool and
+# `omamori hook-check`. If this shape drifts (e.g. `set -eu` dropped,
+# `cat | omamori hook-check` replaced, `exit $?` mutated), downstream tests
+# and the hook integration suite may still pass while the wrapper silently
+# stops enforcing policy. Pin the literal strings that make the contract.
+ih=src/installer.rs
+ih_fail=0
+if [ ! -f "$ih" ]; then
+    echo "FAIL [invariant #7a]: $ih is missing"
+    ih_fail=1
+else
+    # Extract the body of `render_hook_script` so that matching fixture strings
+    # elsewhere in the file (e.g. test fixtures with `set -eu`) cannot satisfy
+    # the contract checks. The function spans from its `pub fn` line to the
+    # next top-level closing `}` at column 1.
+    fn_body=$(awk '
+        /^pub fn render_hook_script/ { inside=1 }
+        inside { print }
+        inside && /^}/ { exit }
+    ' "$ih")
+    if [ -z "$fn_body" ]; then
+        echo "FAIL [invariant #7b]: render_hook_script function must exist in $ih"
+        ih_fail=1
+    else
+        if ! printf '%s\n' "$fn_body" | grep -qF 'cat | omamori hook-check'; then
+            echo "FAIL [invariant #7c]: render_hook_script must pipe stdin through omamori hook-check"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'set -eu'; then
+            echo "FAIL [invariant #7d]: render_hook_script body must use set -eu"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'exit $?'; then
+            echo "FAIL [invariant #7e]: render_hook_script body must propagate exit code via exit \$?"
+            ih_fail=1
+        fi
+    fi
+fi
+if [ "$ih_fail" -eq 0 ]; then
+    echo "#7 OK: render_hook_script contract intact"
+else
+    fail=1
+fi
+
+# ---------- Invariant #8: CODEOWNERS must explicitly list security-critical paths (v0.9.4+) ----------
+# `* @owner` would implicitly cover everything, but explicit entries guarantee
+# that future changes to the default line (e.g. adding a second owner or
+# removing the wildcard) cannot silently drop ownership on these paths.
+co=.github/CODEOWNERS
+co_fail=0
+if [ ! -f "$co" ]; then
+    echo "FAIL [invariant #8a]: $co is missing"
+    co_fail=1
+else
+    required_owners=(
+        "/tests/"
+        "/tests/hook_integration.rs"
+        "/fuzz/fuzz_targets/"
+        "/scripts/check-invariants.sh"
+        "/src/unwrap.rs"
+    )
+    # Use awk to enforce: non-comment line, path is the first token, and at
+    # least one @owner follows. A bare `grep -F "$path"` would let comments,
+    # substring matches, or ownerless paths pass.
+    for path in "${required_owners[@]}"; do
+        if ! awk -v p="$path" '
+            /^[[:space:]]*#/ { next }
+            $1 == p {
+                for (i = 2; i <= NF; i++) {
+                    if ($i ~ /^@/) { ok=1; exit }
+                }
+            }
+            END { exit !ok }
+        ' "$co"; then
+            echo "FAIL [invariant #8]: $co must include '$path' as a non-comment line with at least one @owner"
+            co_fail=1
+        fi
+    done
+fi
+if [ "$co_fail" -eq 0 ]; then
+    echo "#8 OK: CODEOWNERS includes required explicit paths"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"

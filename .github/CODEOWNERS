@@ -25,3 +25,20 @@
 /Cargo.toml          @yottayoshida
 /Cargo.lock          @yottayoshida
 /SECURITY.md         @yottayoshida
+
+# Security-critical test surface (v0.9.4+, #121 T10 mitigation)
+# A silently disabled or removed hook integration test becomes a blind spot
+# that AI agents can exploit. Explicit ownership here guarantees every PR
+# touching these paths surfaces for ownership review, complementing the
+# structural invariants enforced by scripts/check-invariants.sh.
+/tests/                        @yottayoshida
+/tests/hook_integration.rs     @yottayoshida
+/fuzz/fuzz_targets/            @yottayoshida
+
+# Invariant enforcer itself — if this file is weakened the whole gate collapses.
+/scripts/check-invariants.sh   @yottayoshida
+
+# Additional policy-adjacent sources (v0.9.4+)
+# src/unwrap.rs: command tokenization / PATH bypass detection — a regression
+# here silently widens the Allow surface without touching hook.rs or rules.rs.
+/src/unwrap.rs                 @yottayoshida
