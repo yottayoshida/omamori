@@ -58,11 +58,26 @@ fn setup_hook_env(case: &str) -> (PathBuf, PathBuf, PathBuf) {
     (base, hook_path, shim_dir)
 }
 
-/// Spawn the hook script via `/bin/sh` with shim_dir prepended to PATH,
-/// feed stdin, return (stdout, stderr, exit_code).
+/// Spawn the hook script via `/bin/sh` with two dirs prepended to PATH:
+///   1. `shim_dir` — the installed shim path (rm/git/chmod/find/rsync symlinks).
+///   2. `binary_dir` — the parent of the compiled test binary, so the wrapper's
+///      bare `omamori hook-check` call resolves to *this* build. Without this,
+///      a stale or missing `omamori` on the host PATH would silently change
+///      behavior (CI fresh runners have no global install, so the shell would
+///      otherwise fail with "command not found" and exit non-zero, making
+///      every Allow-case look like Block).
 fn run_hook_script(hook_path: &Path, shim_dir: &Path, input: &str) -> (String, String, i32) {
     let current_path = std::env::var("PATH").unwrap_or_default();
-    let injected_path = format!("{}:{}", shim_dir.display(), current_path);
+    let binary_dir = binary()
+        .parent()
+        .expect("omamori binary must have a parent dir")
+        .to_path_buf();
+    let injected_path = format!(
+        "{}:{}:{}",
+        shim_dir.display(),
+        binary_dir.display(),
+        current_path
+    );
 
     let mut child = Command::new("/bin/sh")
         .arg(hook_path)
