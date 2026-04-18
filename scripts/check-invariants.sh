@@ -105,7 +105,9 @@ else
         echo "FAIL [invariant #6d]: $hi must have zero #[ignore] attributes"
         hi_fail=1
     fi
-    if grep -qF '#[cfg(target_os' "$hi"; then
+    # Strip single-line comments before matching so explanatory text like
+    # "// never add #[cfg(target_os)] here" doesn't trip the check.
+    if sed 's|//.*$||' "$hi" | grep -qF '#[cfg(target_os'; then
         echo "FAIL [invariant #6e]: $hi must not gate tests on target_os"
         hi_fail=1
     fi
@@ -128,21 +130,31 @@ if [ ! -f "$ih" ]; then
     echo "FAIL [invariant #7a]: $ih is missing"
     ih_fail=1
 else
-    if ! grep -qF 'pub fn render_hook_script' "$ih"; then
+    # Extract the body of `render_hook_script` so that matching fixture strings
+    # elsewhere in the file (e.g. test fixtures with `set -eu`) cannot satisfy
+    # the contract checks. The function spans from its `pub fn` line to the
+    # next top-level closing `}` at column 1.
+    fn_body=$(awk '
+        /^pub fn render_hook_script/ { inside=1 }
+        inside { print }
+        inside && /^}/ { exit }
+    ' "$ih")
+    if [ -z "$fn_body" ]; then
         echo "FAIL [invariant #7b]: render_hook_script function must exist in $ih"
         ih_fail=1
-    fi
-    if ! grep -qF 'cat | omamori hook-check' "$ih"; then
-        echo "FAIL [invariant #7c]: render_hook_script must pipe stdin through omamori hook-check"
-        ih_fail=1
-    fi
-    if ! grep -qF 'set -eu' "$ih"; then
-        echo "FAIL [invariant #7d]: render_hook_script must use set -eu"
-        ih_fail=1
-    fi
-    if ! grep -qF 'exit $?' "$ih"; then
-        echo "FAIL [invariant #7e]: render_hook_script must propagate exit code via exit \$?"
-        ih_fail=1
+    else
+        if ! printf '%s\n' "$fn_body" | grep -qF 'cat | omamori hook-check'; then
+            echo "FAIL [invariant #7c]: render_hook_script must pipe stdin through omamori hook-check"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'set -eu'; then
+            echo "FAIL [invariant #7d]: render_hook_script body must use set -eu"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'exit $?'; then
+            echo "FAIL [invariant #7e]: render_hook_script body must propagate exit code via exit \$?"
+            ih_fail=1
+        fi
     fi
 fi
 if [ "$ih_fail" -eq 0 ]; then
@@ -168,9 +180,20 @@ else
         "/scripts/check-invariants.sh"
         "/src/unwrap.rs"
     )
+    # Use awk to enforce: non-comment line, path is the first token, and at
+    # least one @owner follows. A bare `grep -F "$path"` would let comments,
+    # substring matches, or ownerless paths pass.
     for path in "${required_owners[@]}"; do
-        if ! grep -qF "$path" "$co"; then
-            echo "FAIL [invariant #8]: $co must include explicit owner for $path"
+        if ! awk -v p="$path" '
+            /^[[:space:]]*#/ { next }
+            $1 == p {
+                for (i = 2; i <= NF; i++) {
+                    if ($i ~ /^@/) { ok=1; exit }
+                }
+            }
+            END { exit !ok }
+        ' "$co"; then
+            echo "FAIL [invariant #8]: $co must include '$path' as a non-comment line with at least one @owner"
             co_fail=1
         fi
     done
