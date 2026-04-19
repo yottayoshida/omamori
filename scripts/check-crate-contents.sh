@@ -100,10 +100,19 @@ fi
 
 # Binary-file detection. For each file in the package that is a regular
 # file on disk, assert its MIME type is text/* (or cargo-generated json).
+#
+# Files with known-text extensions listed in the allowlist above are trusted
+# without MIME re-check: `file --mime` heuristics are OS-specific and on some
+# Linux distributions label markdown-heavy documents (heavy on URLs and code
+# fences) as `application/javascript`. The structural defense (Cargo.toml
+# `include=` allowlist + ALLOWED_EXACT / ALLOWED_PATTERNS above) already
+# bounds what reaches this step; redundant MIME magic should not block a
+# release over a downstream `file(1)` quirk.
 for f in "${pkg_files[@]}"; do
     [ -z "$f" ] && continue
     case "$f" in
         Cargo.toml.orig|.cargo_vcs_info.json) continue ;;
+        *.md|*.toml|*.lock|LICENSE-*|config.default.toml) continue ;;
     esac
     [ -f "$f" ] || continue
     mime="$(file --brief --mime "$f" 2>/dev/null || true)"
