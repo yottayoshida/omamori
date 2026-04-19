@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.9.4] - 2026-04-19
+
+**Summary**: CI coverage + dependabot noise reduction. Adds a Linux + macOS CI matrix and a hook integration test suite so that Layer 2 regressions surface before merge on both OSes; extends `scripts/check-invariants.sh` with structural invariants that fire before `cargo test`; narrows the `github-actions` Dependabot ecosystem to monthly patch-only updates (security updates are independent per GitHub docs). Runtime behavior is unchanged — omamori remains macOS-only.
+
+### For users
+
+- No runtime behavior change. omamori still operates on macOS only; shim paths and trash integration remain macOS-specific.
+- `SECURITY.md` Known Limitations now documents the `curl URL | env bash` / `curl URL | sudo bash` pipe-wrapper gap as an implementation gap (not a design limit); runtime fix is tracked in [#146 P1-1](https://github.com/yottayoshida/omamori/issues/146) for v0.9.5+.
+- `README.md` has a new **Supported Platforms** section distinguishing Runtime (macOS only) from CI matrix (macOS + Ubuntu), so contributors and installers see accurate information at the same point in the file.
+
+### For contributors (CI)
+
+- CI `test` and `clippy` now run on a `matrix: [macos-latest, ubuntu-latest]` (PR #162). `fail-fast: false` + `continue-on-error: false` — both OS legs must pass to merge. `fmt`, `publish-dry-run`, and `msrv` stay macOS-only to contain CI wall-clock time.
+- New `tests/hook_integration.rs` (PR #162): table-driven 8-category corpus (allow baseline / direct-path bypass / `unset` / `env -u` / `export -n` / `VAR=` / compound separator / false-positive guard) plus dedicated tests for exit-code-2 pin, wrapper invariants (`set -eu` and `exit $?` must be present), and malformed/empty stdin fail-close. Spawns the installed hook script via `/bin/sh` with `PATH` injection so the full `installer → wrapper → hook-check` chain is exercised — the path contributor machines actually run.
+- `scripts/check-invariants.sh` extended with structural invariants #6/#7/#8 (PR #163): hook integration shape (corpus must include both `Decision::Allow` and `Decision::Block`, zero `#[ignore]`, no `#[cfg(target_os)]`), `render_hook_script` contract (function body must retain `cat | omamori hook-check`, `set -eu`, `exit $?` — body-scoped to avoid false-pass against historical test fixtures elsewhere in `installer.rs`), and CODEOWNERS explicit-path validation (awk-based: non-comment line, path as first token, at least one `@owner` on the same line).
+- `.github/CODEOWNERS` now lists `/tests/`, `/tests/hook_integration.rs`, `/fuzz/fuzz_targets/`, `/scripts/check-invariants.sh`, and `/src/unwrap.rs` as explicit security-critical paths (PR #163). The default `* @yottayoshida` line still covers them, but explicit entries survive future changes to the wildcard and surface the ownership intent to PR reviewers.
+
+### Maintenance
+
+- Dependabot `github-actions` ecosystem narrowed (PR #160): `schedule.interval` `weekly` → `monthly`, `open-pull-requests-limit` `5` → `2`, and `ignore: version-update:semver-major` + `semver-minor` on all deps. Cargo ecosystems (root + `/fuzz`) remain unchanged at weekly grouped minor + patch. Security updates are **unaffected** by the `ignore` rules per [GitHub docs](https://docs.github.com/en/code-security/dependabot/dependabot-security-updates/about-dependabot-security-updates): *"There is no interaction between the settings specified in the `dependabot.yml` file and Dependabot security alerts."* `SECURITY.md` now includes an annual audit procedure for this narrow config.
+- `SECURITY.md` AI-assisted Contribution Invariants section gains a new *Dependabot narrow configuration audit (v0.9.4+)* subsection documenting the annual verification procedure for the narrowed config's security-update reachability.
+
+### Known flakes (carried into v0.9.5)
+
+- `context::tests::multi_target_all_regenerable_downgrades` intermittently fails on the `Test (ubuntu-latest)` leg with the same signature (`left: None, right: Some(LogOnly)` at `src/context.rs:681`). Reproduced with zero Rust changes across PR #162 and PR #163 initial pushes — ordering-dependent between context tests. Re-run passes. Tracked as [#164](https://github.com/yottayoshida/omamori/issues/164) with `#[serial_test::serial]` as the low-effort fix candidate.
+
+### PRs
+
+- [#160](https://github.com/yottayoshida/omamori/pull/160) — dependabot narrow (`github-actions` monthly patch-only). Closes #159.
+- [#162](https://github.com/yottayoshida/omamori/pull/162) — hook integration tests + Linux CI matrix.
+- [#163](https://github.com/yottayoshida/omamori/pull/163) — structural invariants #6/#7/#8 + CODEOWNERS explicit paths.
+- [#165](https://github.com/yottayoshida/omamori/pull/165) — document `curl | env bash` / `curl | sudo bash` implementation gap in SECURITY.md.
+
 ## [0.9.3] - 2026-04-17
 
 **Summary**: Repository structure & SCM hygiene hardening (#147). A six-PR supply-chain series that makes `cargo install omamori --locked` reproducible, pins every CI action to a 40-char SHA, installs a deny-by-default allowlist for tarball contents, and flips the SECURITY.md *AI-assisted Contribution Invariants* from "intended" to mechanically enforced.

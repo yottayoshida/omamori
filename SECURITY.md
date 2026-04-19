@@ -536,3 +536,13 @@ An AI-generated PR that proposes loosening any of these (e.g. "move
 `Cargo.lock` to `.gitignore` for convenience", "pin at `@v4` instead of SHA",
 "drop `--locked` to speed up CI") is a supply-chain regression, not a
 quality-of-life change, and must be handled as such.
+
+### Dependabot narrow configuration audit (v0.9.4+)
+
+The `.github/dependabot.yml` `github-actions` ecosystem is narrowed to monthly patch-only updates (PR #160, v0.9.4). The narrowing relies on GitHub's documented guarantee that `ignore: version-update:*` does not suppress security updates — per [about-dependabot-security-updates](https://docs.github.com/en/code-security/dependabot/dependabot-security-updates/about-dependabot-security-updates): *"There is no interaction between the settings specified in the `dependabot.yml` file and Dependabot security alerts."* That guarantee is external state whose observed behavior should be verified annually:
+
+- Inspect the Dependabot alerts tab for the `github-actions` ecosystem over the last 12 months.
+- Confirm that at least one Dependabot security PR arrived during the window for any pinned action that received an advisory. If zero security PRs arrived despite known advisories existing on pinned actions, the narrow config may have over-filtered — revert or relax.
+- Re-read the GitHub docs page above to confirm the `ignore` / `update-types` semantics have not changed.
+
+This audit is operational (not enforced in CI) and is scheduled annually from the v0.9.4 release date.
