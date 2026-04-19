@@ -244,6 +244,7 @@ These attack vectors **cannot** be detected by omamori's design. They are docume
 | `export -n CLAUDECODE` | Removes export attribute without unsetting; not caught by `unset` patterns |
 | `python -c "shutil.rmtree(...)"` | Python/Node interpreters not in shell list; [investigated, zero incidents in target tools](https://github.com/yottayoshida/omamori/issues/74) |
 | `bash -c "$VAR"` where VAR is set earlier | Variable expansion requires runtime evaluation |
+| `curl URL \| env bash` / `curl URL \| sudo bash` | **Implementation gap, not a design limit.** Transparent-wrapper unwrapping (`env`, `sudo`) runs before pipe-to-shell detection, so the wrapped `bash` looks like a bare command and the pipe-to-shell signal is lost. Gap is documented in `src/unwrap.rs::tests::{curl_pipe_env_bash_not_yet_blocked,echo_pipe_sudo_bash_not_yet_blocked}`. Fix tracked as P1-1 in [#146](https://github.com/yottayoshida/omamori/issues/146); planned for v0.9.5+ by reordering pipe-to-shell detection to precede wrapper unwrapping |
 
 ## AI Config Bypass Guard (v0.3.2+)
 
