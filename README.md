@@ -11,7 +11,7 @@ When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori int
 
 Unlike other guards, omamori defends itself — AI agents cannot disable or bypass its protection ([#22](https://github.com/yottayoshida/omamori/issues/22)).
 
-**macOS only. Terminal commands are never affected** — omamori only activates when it detects an AI tool's environment variable.
+**macOS only** — Terminal commands are never affected; omamori only activates when it detects an AI tool's environment variable. See [Supported Platforms](#supported-platforms) for CI coverage on Linux.
 
 ![omamori demo](demo.svg)
 
@@ -36,6 +36,19 @@ That's it. Works with Claude Code Auto mode — no extra config needed.
 > Requires omamori >= 0.9.0 for `doctor` and `explain` commands.
 
 > **Cursor users**: After upgrades, re-merge the hook snippet. See [Auto-sync](#how-it-works).
+
+## Supported Platforms
+
+| Layer | macOS | Linux |
+|-------|-------|-------|
+| Runtime (shim + hooks) | Supported | Not supported |
+| CI matrix (contributors) | test + clippy + hook integration | test + clippy + hook integration (v0.9.4+) |
+
+**If you're installing omamori**: macOS only. This is a design decision — shim paths and trash integration are macOS-specific.
+
+**If you're contributing**: CI verifies your PR on both macOS and Ubuntu, so `#[cfg(unix)]` regressions are caught before merge.
+
+Windows is not currently supported (Runtime or CI).
 
 ## What It Blocks
 
