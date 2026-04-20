@@ -558,7 +558,16 @@ const SHELL_LONG_OPTS_WITH_VALUE: &[&str] = &["--rcfile", "--init-file"];
 const SHELL_SHORT_OPTS_WITH_VALUE: &[&str] = &["-O", "+O"];
 
 /// Bash long options that print metadata and exit without reading stdin.
-const SHELL_INFO_LONG_OPTS: &[&str] = &["--version", "--help"];
+/// `--dump-strings` / `--dump-po-strings` are the GNU long forms of `-D`
+/// (print translatable strings and exit). `--rpm-requires` prints rpm
+/// dependency spec and exits.
+const SHELL_INFO_LONG_OPTS: &[&str] = &[
+    "--version",
+    "--help",
+    "--dump-strings",
+    "--dump-po-strings",
+    "--rpm-requires",
+];
 
 /// Bash short options that print metadata and exit without reading stdin.
 const SHELL_INFO_SHORT_OPTS: &[&str] = &["-D"];
@@ -1598,6 +1607,34 @@ mod tests {
         assert_commands(
             "echo seed | env bash -D",
             &[cmd("echo", &["seed"]), cmd("bash", &["-D"])],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_bash_dump_strings_not_blocked() {
+        // V-146-Codex-DUMP: --dump-strings is GNU long form of -D, exits
+        // without reading stdin.
+        assert_commands(
+            "echo seed | env bash --dump-strings",
+            &[cmd("echo", &["seed"]), cmd("bash", &["--dump-strings"])],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_sudo_bash_dump_po_strings_not_blocked() {
+        // V-146-Codex-DUMP: --dump-po-strings same as above with PO output.
+        assert_commands(
+            "echo seed | sudo bash --dump-po-strings",
+            &[cmd("echo", &["seed"]), cmd("bash", &["--dump-po-strings"])],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_bash_rpm_requires_not_blocked() {
+        // V-146-Codex-RPM: --rpm-requires prints rpm spec and exits.
+        assert_commands(
+            "echo seed | env bash --rpm-requires",
+            &[cmd("echo", &["seed"]), cmd("bash", &["--rpm-requires"])],
         );
     }
 
