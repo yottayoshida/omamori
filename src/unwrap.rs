@@ -1795,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn command_dash_pV_rm_lookup_not_blocked() {
+    fn command_dash_p_capital_v_rm_lookup_not_blocked() {
         // V-146-Codex-CMDPV: -pV grouped form, non-piped.
         assert_commands("command -pV rm", &[cmd("command", &["-pV", "rm"])]);
     }
