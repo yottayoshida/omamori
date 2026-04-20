@@ -91,7 +91,7 @@ Terminal → rm -rf src/
 
 **Layer 2 — Hooks**: Evaluates commands against the same rules as Layer 1, with three additional capabilities:
 - Recursively unwraps shell wrappers (`sudo env bash -c "..."` → extracts inner command)
-- Blocks pipe-to-shell patterns (`curl | bash`)
+- Blocks pipe-to-shell patterns (`curl URL | bash`, `curl URL | sudo bash`, and other transparent-wrapper variants — see [SECURITY.md](SECURITY.md))
 - Blocks dynamic command generation (`bash -c "$(cmd)"`)
 
 Available for Claude Code, Cursor, and Codex CLI.
