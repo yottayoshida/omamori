@@ -363,6 +363,34 @@ fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
                 // command's own flags so the inner program is exposed
                 // for downstream classification (#146 P1-1, Codex
                 // Phase 6-A round 6).
+                //
+                // BUT: `-v` / `-V` are introspection flags ("look up
+                // foo's path / type", do NOT execute foo). Treat those
+                // forms as opaque so `command -v rm` is reported as
+                // `command -v rm` (no rule match) instead of being
+                // routed through the `rm` rule (Codex Phase 6-A
+                // round 7).
+                let mut probe = pos + 1;
+                let mut is_lookup = false;
+                while probe < len {
+                    let t = tokens[probe].as_str();
+                    if t == "--" {
+                        break;
+                    }
+                    if !t.starts_with('-') {
+                        break;
+                    }
+                    if t == "-v" || t == "-V" {
+                        is_lookup = true;
+                    }
+                    probe += 1;
+                }
+                if is_lookup {
+                    // Stop unwrapping: return original tokens so this
+                    // segment shows up as `command -v ...` to the rule
+                    // layer (which has no rule for `command`).
+                    return tokens.to_vec();
+                }
                 pos += 1;
                 while pos < len {
                     let t = tokens[pos].as_str();
@@ -1723,6 +1751,32 @@ mod tests {
                 cmd("bash", &["-o", "errexit", "script.sh"]),
             ],
         );
+    }
+
+    #[test]
+    fn command_dash_v_bash_lookup_not_blocked() {
+        // V-146-Codex-CMDV: `command -v bash` is the introspection form
+        // (look up bash's path / type), NOT execution. The fix in
+        // unwrap_transparent treats -v / -V as opaque so the segment
+        // surfaces as `command -v bash` to the rule layer (no match).
+        assert_commands("command -v bash", &[cmd("command", &["-v", "bash"])]);
+    }
+
+    #[test]
+    fn pipe_command_dash_v_bash_lookup_not_blocked() {
+        // V-146-Codex-CMDV-pipe: same lookup, but after a pipe. Still
+        // must NOT be classified as PipeToShell because the inner is
+        // never executed.
+        assert_commands(
+            "echo seed | command -v bash",
+            &[cmd("echo", &["seed"]), cmd("command", &["-v", "bash"])],
+        );
+    }
+
+    #[test]
+    fn command_dash_capital_v_rm_lookup_not_blocked() {
+        // -V is the verbose introspection flag. Same treatment.
+        assert_commands("command -V rm", &[cmd("command", &["-V", "rm"])]);
     }
 
     #[test]
