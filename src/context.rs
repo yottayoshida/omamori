@@ -431,6 +431,16 @@ pub fn evaluate_git_context(
 mod tests {
     use super::*;
 
+    // NOTE: Tests in this module that resolve relative paths via `fs::canonicalize`
+    // (directly or transitively through `evaluate_context` -> `resolve_path` ->
+    // `normalize_path`) depend on the process-wide CWD. They MUST be marked
+    // `#[serial_test::serial]` to avoid races with the `git_context_*` family,
+    // which mutates CWD via `env::set_current_dir`. Without serialization,
+    // `fs::canonicalize("target/")` may resolve against a `git_context_*`
+    // tempdir and flip the verdict (#164). The structural fix — threading an
+    // explicit base dir through `normalize_path` — is tracked as a v0.9.6
+    // follow-up; this quarantine is intentional patch scope.
+
     // --- normalize_path ---
 
     #[test]
@@ -651,6 +661,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // CWD-dependent via fs::canonicalize; see module note. Quarantine for #164.
     fn multi_target_protected_wins_over_regenerable() {
         // P1-1: rm -rf target/ src/ — src/ must be caught even though target/ matches first
         let config = test_config();
@@ -667,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // CWD-dependent via fs::canonicalize; see module note. Quarantine for #164.
     fn multi_target_all_regenerable_downgrades() {
         let config = test_config();
         let inv = CommandInvocation::new(
