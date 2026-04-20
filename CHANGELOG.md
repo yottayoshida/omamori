@@ -36,6 +36,7 @@ The format is based on Keep a Changelog.
 - [#168](https://github.com/yottayoshida/omamori/pull/168) — `test(context): quarantine multi_target_* with #[serial_test::serial]`. Closes #164.
 - [#169](https://github.com/yottayoshida/omamori/pull/169) — `docs(acceptance,security): refresh acceptance test prerequisites and Known Limitations`. Closes #167.
 - [#170](https://github.com/yottayoshida/omamori/pull/170) — `fix(unwrap): detect pipe-to-shell through transparent wrappers`. 8 rounds of Codex Phase 6-A adversarial review + 1 round of 6-B test adversarial review shaped the final surface (16 distinct fixes recorded in commit history). Refs #146 (P1-1 only).
+- [#173](https://github.com/yottayoshida/omamori/pull/173) — `docs(readme): clarify Layer 2 pipe-to-shell wrapper coverage`. README's "How It Works" → "Layer 2 — Hooks" bullet expanded to add `sudo bash` as a second example and link to `SECURITY.md` for the full wrapper list. UX-designer reviewed.
 
 ## [0.9.4] - 2026-04-19
 
