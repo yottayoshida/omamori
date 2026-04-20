@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.9.5] - 2026-04-20
+
+**Summary**: Security patch ([#146](https://github.com/yottayoshida/omamori/issues/146) P1-1) + Ubuntu CI quarantine ([#164](https://github.com/yottayoshida/omamori/issues/164)) + docs refresh ([#167](https://github.com/yottayoshida/omamori/issues/167)). Closes the documented `curl URL | env bash` / `curl URL | sudo bash` wrapper-evasion gap. Runtime behavior is otherwise unchanged — omamori remains macOS-only.
+
+### Security
+
+- **Pipe-to-shell with transparent wrappers now blocked** ([#170](https://github.com/yottayoshida/omamori/pull/170), #146 P1-1): `curl URL | env bash`, `curl URL | sudo bash`, and equivalent patterns with `nice`, `timeout`, `nohup`, `exec`, `command` wrappers are blocked at Layer 2. Coverage includes chained wrappers (`sudo env bash`), absolute-path variants (`/usr/bin/env`, `/bin/sudo`), stdin-mode flags (`-s`, bare `-`, `/dev/stdin`), option-value pairs (`-O extglob`, `-o errexit`, `--rcfile /tmp/rc`), grouped short options (`-la argv0`, `-pv`), and bash's `|&` (stdout+stderr pipe). The gap was previously documented in v0.9.4 `SECURITY.md` and in `src/unwrap.rs::tests::{curl_pipe_env_bash_not_yet_blocked,echo_pipe_sudo_bash_not_yet_blocked}`; those tests are now flipped to assert `BlockReason::PipeToShell`. Implementation reorders pipe-to-shell classification to run before `unwrap_transparent`, with explicit wrapper list synced to the transparent-unwrap list (same 7 wrappers). Info-only flags (`--version`, `--help`, `--dump-strings`, `--dump-po-strings`, `--rpm-requires`, `-D`) and positional script paths (`bash script.sh`, `env VAR=1 bash script.sh`) remain Allow. Block reason text is unchanged (`pipe to shell interpreter`) so AI agents reading the error message cannot iterate to the next wrapper kind — wrapper-kind surfacing is tracked as a v0.9.6 audit-only logging addition.
+
+### For users
+
+- No config or installation change required. macOS-only. If you were relying on the v0.9.4 known-gap behavior, `curl URL | env bash` now fails closed at Layer 2.
+
+### For contributors (CI)
+
+- **Ubuntu CI leg quarantined** ([#168](https://github.com/yottayoshida/omamori/pull/168), #164): `context::tests::multi_target_all_regenerable_downgrades` and its neighbor `multi_target_protected_wins_over_regenerable` are now annotated `#[serial_test::serial]`. Root cause is a process-wide CWD dependency in `normalize_path()` shared with the `git_context_*` family that mutates CWD via `env::set_current_dir`. This patch is a targeted quarantine, not a structural fix — threading an explicit base dir through `normalize_path` is tracked as a v0.9.6 follow-up. Ubuntu `Test` flakes across v0.9.4 PRs #162 and #163 (the latter with zero Rust changes) were driven by this interaction; re-run loops on Ubuntu should now indicate real regressions.
+
+### Docs
+
+- **`ACCEPTANCE_TEST.md` errata fixed** ([#169](https://github.com/yottayoshida/omamori/pull/169), #167): Prerequisites now require `export CLAUDECODE=1` before Layer 2 / Tamper / Doctor / Audit items, with a leading Warning box explaining that shim only activates with an AI env var detected. Without this, plain-terminal runs silently destroy test files instead of being blocked. A-2 audit log path corrected from `~/.omamori/audit/` to the actual `~/.local/share/omamori/audit.jsonl` (XDG Base Directory). D-3 / D-4 document the intentional `omamori explain` self-defense block under Claude Code (DI-8) and provide a copy-paste `omamori hook-check --provider claude-code` dry-run as the equivalent verdict source. Layer 2 section now includes H-5 / H-6 manual checks for `curl | env bash` and `curl | sudo bash` matching the #146 P1-1 scope. AI-generated test count updated from `490件` to `544件` (post-v0.9.4).
+- **`SECURITY.md` Known Limitations refreshed** ([#169](https://github.com/yottayoshida/omamori/pull/169)): `curl URL | env bash` / `sudo bash` rows updated to "Closed in v0.9.5" with explicit wrapper coverage list. `export -n CLAUDECODE` row corrected — it has been blocked since v0.9.2 Phase 1B token detection; the prior "undetectable" claim was stale. `env -S 'bash -e'` (split-string), `bash -c 'source /dev/stdin'` (stdin-consuming inner), and the `source`/`eval`/interpreter family are newly documented as pending for v0.9.6.
+
+### Known limitations (carried into v0.9.6)
+
+- **`normalize_path()` CWD dependency** (structural follow-up to #164): 14 other CWD-read tests in `context::tests` are not `#[serial_test::serial]`. If a future refactor introduces similar races, a structural fix threading an explicit base dir is required.
+- **`env -S 'bash -e'` split-string form**: env parses its quoted argument as its own command line; `shell-words` at the outer level does not split the inner content. Tracked as v0.9.6 follow-up to #146.
+- **`bash -c 'source /dev/stdin'` and `source`/`eval`/interpreter family**: these read command bodies from stdin at runtime and are outside `SHELL_NAMES`. Expanding the list has real false-positive risk (`cat data | python -c 'parse'`) and requires product-level discussion.
+
+### PRs
+
+- [#168](https://github.com/yottayoshida/omamori/pull/168) — `test(context): quarantine multi_target_* with #[serial_test::serial]`. Closes #164.
+- [#169](https://github.com/yottayoshida/omamori/pull/169) — `docs(acceptance,security): refresh acceptance test prerequisites and Known Limitations`. Closes #167.
+- [#170](https://github.com/yottayoshida/omamori/pull/170) — `fix(unwrap): detect pipe-to-shell through transparent wrappers`. 8 rounds of Codex Phase 6-A adversarial review + 1 round of 6-B test adversarial review shaped the final surface (16 distinct fixes recorded in commit history). Refs #146 (P1-1 only).
+
 ## [0.9.4] - 2026-04-19
 
 **Summary**: CI coverage + dependabot noise reduction. Adds a Linux + macOS CI matrix and a hook integration test suite so that Layer 2 regressions surface before merge on both OSes; extends `scripts/check-invariants.sh` with structural invariants that fire before `cargo test`; narrows the `github-actions` Dependabot ecosystem to monthly patch-only updates (security updates are independent per GitHub docs). Runtime behavior is unchanged — omamori remains macOS-only.
