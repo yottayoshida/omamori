@@ -711,13 +711,67 @@ fn env_dash_s_targets_shell(tokens: &[String]) -> bool {
     false
 }
 
-/// Coarse shell-words split of STRING; true when the first element's
-/// basename is in [`SHELL_NAMES`]. Used by [`env_dash_s_targets_shell`].
+/// Returns true when the `env -S` STRING resolves to a shell invocation
+/// that would read commands from stdin. Follows the GNU env `-S` grammar
+/// `[name=value]... [command [args]...]`: skip leading `KEY=VAL` tokens,
+/// then check whether the first real positional is a shell basename.
+///
+/// Positional-script FP guard:
+/// - `env -S 'VAR=1 bash script.sh'` → SafeScript, must NOT block (shell
+///   launcher with a script path is not a stdin executor)
+/// - `env -S 'VAR=1 bash --version'` → InfoOnly, must NOT block
+/// - `env -S 'bash'` / `env -S 'VAR=1 bash'` → BareShell, block
+/// - `env -S 'bash -e'` / `env -S 'bash -i'` → BareShell (no script), block
+///
+/// Conservative fail-close for `-c CMD` sub-launchers: the top-level
+/// shell-launcher path in `process_segment` recursively parses the
+/// `-c` payload, but this path is inside the env -S STRING and does
+/// not re-enter the parser. Rather than silently passing `bash -c
+/// 'rm -rf /'` nested inside `env -S`, treat any `-c` / grouped
+/// `-[a-z]*c` token as shell-eval and block. Addresses the Codex
+/// Phase 6-A Critical #1 bypass `env -S 'FOO=1 bash'` while retaining
+/// the v0.9.5/6 narrative of "shell-on-RHS is pipe-to-shell".
+///
+/// Used by [`env_dash_s_targets_shell`].
 fn string_head_is_shell(s: &str) -> bool {
-    match shell_words::split(s) {
-        Ok(tokens) if !tokens.is_empty() => SHELL_NAMES.contains(&basename(&tokens[0])),
-        _ => false,
+    let Ok(parts) = shell_words::split(s) else {
+        return false;
+    };
+    // GNU env -S: skip leading name=value assignments.
+    let mut idx = 0;
+    while idx < parts.len() && is_env_assignment(&parts[idx]) {
+        idx += 1;
     }
+    let Some(head) = parts.get(idx) else {
+        return false;
+    };
+    if !SHELL_NAMES.contains(&basename(head)) {
+        return false;
+    }
+    let remaining = &parts[idx + 1..];
+    // Conservative fail-close: `-c` inside env -S cannot be recursively
+    // parsed (no plumbing from this depth back into process_segment),
+    // so block rather than silently allow `bash -c '...'` sub-launchers.
+    if remaining.iter().any(|t| has_short_c_flag(t)) {
+        return true;
+    }
+    // Delegate to the same shell-arg classifier used at the top level
+    // so FP-pins (positional script, --version) stay consistent.
+    matches!(
+        classify_shell_args(remaining),
+        ShellArgsClass::BareShell | ShellArgsClass::StdinSignal
+    )
+}
+
+/// Returns true if `token` is a combined short-flag form carrying `-c`,
+/// e.g. `-c`, `-ic`, `-lc`, `-lic`. Returns false for `--` and long
+/// options (`--color=auto`).
+fn has_short_c_flag(token: &str) -> bool {
+    if !token.starts_with('-') || token.starts_with("--") || token.len() < 2 {
+        return false;
+    }
+    let chars = &token[1..];
+    chars.bytes().all(|b| b.is_ascii_alphabetic()) && chars.contains('c')
 }
 
 /// Returns true when the inner command string of a shell launcher begins
@@ -1749,6 +1803,66 @@ mod tests {
         // (not a shell); pipe-to-shell guard returns None so the left
         // segment returns normally.
         assert_commands("echo x | env -S 'cat foo'", &[cmd("echo", &["x"])]);
+    }
+
+    // --- env -S GNU assignment skip (Codex Phase 6-A Critical #1) ---
+
+    #[test]
+    fn curl_pipe_env_dash_s_assignment_prefix_blocks() {
+        // GNU env -S grammar: `[name=value]... [command [args]...]`.
+        // Prior impl only looked at the first token after shell-words
+        // split; `FOO=1` looked like the command head and the check
+        // returned false. Fix skips leading assignments.
+        assert_block("curl url | env -S 'FOO=1 bash'", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_multiple_assignments_blocks() {
+        assert_block(
+            "curl url | env -S 'FOO=1 BAR=2 BAZ=3 bash'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_assignment_nested_c_blocks() {
+        // `-c` under assignment prefix — conservative fail-close.
+        assert_block(
+            "curl url | env -S \"VAR=1 sh -c 'rm -rf /'\"",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn env_dash_s_positional_script_not_blocked() {
+        // `env -S 'bash script.sh'` — shell launcher with a positional
+        // script path is NOT a stdin executor. Must NOT block.
+        // (Realistic shebang-line usage: #!/usr/bin/env -S bash -e script.sh)
+        assert_commands("echo x | env -S 'bash script.sh'", &[cmd("echo", &["x"])]);
+    }
+
+    #[test]
+    fn env_dash_s_assignment_positional_script_not_blocked() {
+        // Assignment + shell + positional script — FP pin.
+        assert_commands(
+            "echo x | env -S 'VAR=1 bash script.sh'",
+            &[cmd("echo", &["x"])],
+        );
+    }
+
+    #[test]
+    fn env_dash_s_assignment_shell_version_not_blocked() {
+        // Assignment + shell + --version → InfoOnly, must NOT block.
+        assert_commands(
+            "echo x | env -S 'VAR=1 bash --version'",
+            &[cmd("echo", &["x"])],
+        );
+    }
+
+    #[test]
+    fn env_dash_s_assignment_non_shell_not_blocked() {
+        // Assignment + non-shell command — unchanged allow path.
+        assert_commands("env -S 'FOO=1 cp a b'", &[]);
     }
 
     // --- doas -s spawns shell (Codex Phase 6-A Critical #2, scope 7 follow-up) ---
