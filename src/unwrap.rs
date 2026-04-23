@@ -124,7 +124,9 @@ pub(crate) fn parse_at_depth(input: &str, depth: u8) -> ParseResult {
         // operator type is preserved by `split_on_operators` so this
         // discrimination is exact, not heuristic.
         if *op == SegmentOp::Pipe
-            && (is_bare_shell(segment) || segment_executes_shell_via_wrappers(segment).is_some())
+            && (is_bare_shell(segment)
+                || segment_executes_shell_via_wrappers(segment).is_some()
+                || segment_launcher_sources_stdin(segment))
         {
             return ParseResult::Block(BlockReason::PipeToShell);
         }
@@ -160,15 +162,12 @@ fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
         if contains_dynamic_generation(&inner) {
             return ParseResult::Block(BlockReason::DynamicGeneration);
         }
-        // Block `bash -c 'source /dev/stdin'` / `sh -c '. /dev/stdin'`:
-        // the launcher reads command text from stdin via the shell builtin
-        // `source` (or its POSIX alias `.`), which is functionally
-        // equivalent to pipe-to-shell. Detect statically at this site
-        // because `parse_at_depth` re-parses the inner string and loses
-        // the launcher context (scope 6, v0.9.6).
-        if inner_sources_stdin(&inner) {
-            return ParseResult::Block(BlockReason::PipeToShell);
-        }
+        // Note: `source /dev/stdin` inside the launcher is evaluated
+        // in pipe-context only (see `segment_launcher_sources_stdin`
+        // in the caller's pipe-to-shell OR chain). Non-piped launchers
+        // such as `bash -c 'source /dev/stdin' < setup.sh` read from a
+        // redirected file and are safe — scope 6 v0.9.6 (Codex Round 2
+        // Regression #1 fix).
         return parse_at_depth(&inner, depth + 1);
     }
 
@@ -700,11 +699,21 @@ fn env_dash_s_targets_shell(tokens: &[String]) -> bool {
             return false;
         }
         if t == "-S" {
-            return tokens.get(i + 1).is_some_and(|s| string_head_is_shell(s));
+            // GNU env: after splitting -S VALUE, any remaining command-line
+            // tokens are appended to the argv before exec. Forward them to
+            // the classifier so shebang-style `env -S 'bash -e' script.sh`
+            // is correctly recognized as a launcher + positional script
+            // (Codex Round 2 P2 #2 fix).
+            let Some(value) = tokens.get(i + 1) else {
+                return false;
+            };
+            let trailing = &tokens[i + 2..];
+            return string_head_is_shell_with_trailing(value, trailing);
         }
         if let Some(rest) = t.strip_prefix("-S") {
             let s = rest.strip_prefix('=').unwrap_or(rest);
-            return string_head_is_shell(s);
+            let trailing = &tokens[i + 1..];
+            return string_head_is_shell_with_trailing(s, trailing);
         }
         i += 1;
     }
@@ -732,11 +741,19 @@ fn env_dash_s_targets_shell(tokens: &[String]) -> bool {
 /// Phase 6-A Critical #1 bypass `env -S 'FOO=1 bash'` while retaining
 /// the v0.9.5/6 narrative of "shell-on-RHS is pipe-to-shell".
 ///
-/// Used by [`env_dash_s_targets_shell`].
-fn string_head_is_shell(s: &str) -> bool {
-    let Ok(parts) = shell_words::split(s) else {
+/// Used by [`env_dash_s_targets_shell`]. `trailing` carries the command-
+/// line tokens that follow `-S VALUE` in GNU env semantics; they are
+/// appended to the `shell_words::split` of VALUE before the head /
+/// classifier checks run. This is required for `env -S 'bash -e'
+/// script.sh` to be classified as a SafeScript launcher rather than a
+/// bare shell (Codex Round 2 P2 #2).
+fn string_head_is_shell_with_trailing(s: &str, trailing: &[String]) -> bool {
+    let Ok(mut parts) = shell_words::split(s) else {
         return false;
     };
+    // GNU env -S: appended command-line argv (trailing tokens after the
+    // -S VALUE pair) joins the split argv for exec.
+    parts.extend(trailing.iter().cloned());
     // GNU env -S: skip leading name=value assignments.
     let mut idx = 0;
     while idx < parts.len() && is_env_assignment(&parts[idx]) {
@@ -772,6 +789,25 @@ fn has_short_c_flag(token: &str) -> bool {
     }
     let chars = &token[1..];
     chars.bytes().all(|b| b.is_ascii_alphabetic()) && chars.contains('c')
+}
+
+/// Returns true when `tokens` form a shell launcher (possibly prefixed
+/// with transparent wrappers) whose `-c` payload sources `/dev/stdin`.
+/// Used in pipe-to-shell detection: when the piped stdin flows into
+/// such a launcher the shell eval's the payload, so the construct is
+/// equivalent to bare pipe-to-shell.
+///
+/// Intentionally only consulted in pipe context (`SegmentOp::Pipe`).
+/// Non-piped launchers such as `bash -c 'source /dev/stdin' < setup.sh`
+/// or `cmd && bash -c 'source /dev/stdin'` read from a redirected or
+/// inherited stdin and remain safe — forcing a block there would cause
+/// a false-positive regression (Codex Round 2 P2 #1).
+fn segment_launcher_sources_stdin(tokens: &[String]) -> bool {
+    let unwrapped = unwrap_transparent(tokens);
+    if let Some(inner) = extract_shell_inner(&unwrapped) {
+        return inner_sources_stdin(&inner);
+    }
+    false
 }
 
 /// Returns true when the inner command string of a shell launcher begins
@@ -1661,6 +1697,39 @@ mod tests {
         );
     }
 
+    // --- pipe-context gating for source /dev/stdin (Codex Round 2 P2 #1) ---
+
+    #[test]
+    fn bash_c_source_stdin_with_file_redirect_not_blocked() {
+        // Non-pipe context: `< setup.sh` redirects stdin from a file,
+        // so the source call reads from that file — safe. Must NOT block.
+        assert_commands(
+            "bash -c 'source /dev/stdin' < setup.sh",
+            &[cmd("source", &["/dev/stdin"])],
+        );
+    }
+
+    #[test]
+    fn bash_c_source_stdin_after_sequential_op_not_blocked() {
+        // `&&` is a sequential separator, not a pipe. stdin of the
+        // right side is inherited from the shell. Must NOT block.
+        assert_commands(
+            "echo ok && bash -c 'source /dev/stdin'",
+            &[cmd("echo", &["ok"]), cmd("source", &["/dev/stdin"])],
+        );
+    }
+
+    #[test]
+    fn bash_c_source_stdin_standalone_not_blocked() {
+        // Plain `bash -c 'source /dev/stdin'` with no pipe / redirect.
+        // stdin is the tty or whatever the invoking shell has. Must
+        // NOT block (was regressed to Block in the prior PR2 commit).
+        assert_commands(
+            "bash -c 'source /dev/stdin'",
+            &[cmd("source", &["/dev/stdin"])],
+        );
+    }
+
     // --- builtin/command dispatcher unwrap (Codex Phase 6-A Major #3) ---
 
     #[test]
@@ -1863,6 +1932,50 @@ mod tests {
     fn env_dash_s_assignment_non_shell_not_blocked() {
         // Assignment + non-shell command — unchanged allow path.
         assert_commands("env -S 'FOO=1 cp a b'", &[]);
+    }
+
+    // --- env -S trailing argv classification (Codex Round 2 P2 #2) ---
+
+    #[test]
+    fn curl_pipe_env_dash_s_with_trailing_script_not_blocked() {
+        // GNU env -S appends trailing command-line argv after the split.
+        // `bash -e` + `script.sh` → argv [bash, -e, script.sh] → SafeScript
+        // → must NOT be blocked as pipe-to-shell. Matches shebang-line
+        // `#!/usr/bin/env -S bash -e`. env wrapper unwrap then peels
+        // `-S VALUE` opaquely and the residual `script.sh` surfaces as
+        // the command for the rule layer.
+        assert_commands(
+            "echo x | env -S 'bash -e' script.sh",
+            &[cmd("echo", &["x"]), cmd("script.sh", &[])],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_concat_trailing_script_not_blocked() {
+        // Non-quoted `-S bash` + trailing `script.sh`. Same unwrap shape:
+        // env peels `-S bash` and `script.sh` is the residual command.
+        assert_commands(
+            "echo x | env -S bash script.sh",
+            &[cmd("echo", &["x"]), cmd("script.sh", &[])],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_assignment_trailing_script_not_blocked() {
+        // Assignment prefix + trailing script — still SafeScript,
+        // pipe-to-shell guard returns false, and env unwrap surfaces
+        // script.sh to the rule layer.
+        assert_commands(
+            "echo x | env -S 'VAR=1 bash' script.sh",
+            &[cmd("echo", &["x"]), cmd("script.sh", &[])],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_trailing_c_flag_blocks() {
+        // Trailing `-c` → conservative fail-close (no inner recursion
+        // path from env -S back into process_segment).
+        assert_block("curl url | env -S bash -c rm", BlockReason::PipeToShell);
     }
 
     // --- doas -s spawns shell (Codex Phase 6-A Critical #2, scope 7 follow-up) ---
