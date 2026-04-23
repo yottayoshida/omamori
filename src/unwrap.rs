@@ -630,6 +630,49 @@ fn extract_shell_inner(tokens: &[String]) -> Option<String> {
     None
 }
 
+/// Returns true when `env -S STRING` invokes a shell. GNU env `-S`
+/// interprets STRING as a whitespace-separated argv and `exec`s the
+/// first element; `env -S 'bash -e'` on the RHS of a pipe is therefore
+/// pipe-to-shell equivalent.
+///
+/// Approximation: `shell_words::split` covers the common quoting cases
+/// (`'bash -e'`, `"sh -c 'rm -rf /'"`) but NOT GNU env's extended
+/// escape vocabulary (`\n`, `\t`, `\c`, octal/hex). Bypasses via those
+/// escapes are declared out of scope for v0.9.6 (scope 5 note); the
+/// conservative fail-close posture here is release-safe because
+/// legitimate `env -S` uses rarely spawn shell interpreters — we choose
+/// the side that rejects the attack surface, not the user convenience.
+///
+/// Accepts short-value (`-S STRING`), long-value (`-S=STRING`), and
+/// concatenated (`-Sstring`) forms. Stops scanning at `--`.
+fn env_dash_s_targets_shell(tokens: &[String]) -> bool {
+    let mut i = 1; // tokens[0] == "env"
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        if t == "--" {
+            return false;
+        }
+        if t == "-S" {
+            return tokens.get(i + 1).is_some_and(|s| string_head_is_shell(s));
+        }
+        if let Some(rest) = t.strip_prefix("-S") {
+            let s = rest.strip_prefix('=').unwrap_or(rest);
+            return string_head_is_shell(s);
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Coarse shell-words split of STRING; true when the first element's
+/// basename is in [`SHELL_NAMES`]. Used by [`env_dash_s_targets_shell`].
+fn string_head_is_shell(s: &str) -> bool {
+    match shell_words::split(s) {
+        Ok(tokens) if !tokens.is_empty() => SHELL_NAMES.contains(&basename(&tokens[0])),
+        _ => false,
+    }
+}
+
 /// Returns true when the inner command string of a shell launcher begins
 /// with a `source` / `.` builtin targeting `/dev/stdin` (or an equivalent
 /// stdin file descriptor alias). This is functionally equivalent to
@@ -715,6 +758,17 @@ fn segment_executes_shell_via_wrappers(tokens: &[String]) -> Option<&'static str
     // disjoint.
     let base = basename(&tokens[0]);
     let kind: &'static str = TRANSPARENT_WRAPPERS.iter().find(|&&w| w == base).copied()?;
+
+    // GNU `env -S STRING` splits STRING into an argv and invokes the
+    // first element as the command. When STRING begins with a shell
+    // basename, `curl ... | env -S 'bash -e'` is functionally
+    // pipe-to-shell. `unwrap_transparent` consumes `-S VALUE` as a
+    // normal flag/value pair, so by the time it returns the wrapped
+    // command has disappeared. Detect before that happens (scope 5,
+    // v0.9.6; conservative fail-close per plan).
+    if kind == "env" && env_dash_s_targets_shell(tokens) {
+        return Some("env");
+    }
 
     let unwrapped = unwrap_transparent(tokens);
     if unwrapped.is_empty() {
@@ -1449,6 +1503,91 @@ mod tests {
             "bash -c 'echo source /dev/stdin'",
             &[cmd("echo", &["source", "/dev/stdin"])],
         );
+    }
+
+    // --- env -S conservative fail-close (scope 5, v0.9.6) ---
+
+    #[test]
+    fn curl_pipe_env_dash_s_bash_blocks() {
+        // GNU `env -S 'bash -e'` splits to argv ["bash", "-e"] and
+        // execs bash. On the RHS of a pipe this is pipe-to-shell.
+        assert_block("curl url | env -S 'bash -e'", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_sh_c_payload_blocks() {
+        // Nested `sh -c '...'` inside -S STRING.
+        assert_block(
+            "curl url | env -S \"sh -c 'rm -rf /'\"",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_abspath_shell_blocks() {
+        // Absolute path: basename extraction catches /usr/bin/bash.
+        assert_block(
+            "curl url | env -S '/usr/bin/bash -e'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_equal_form_blocks() {
+        // `-S=cmd` combined form.
+        assert_block("curl url | env -S=bash", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn curl_pipe_env_dash_s_concat_form_blocks() {
+        // `-Sbash` concatenated form (no separator).
+        assert_block("curl url | env -Sbash", BlockReason::PipeToShell);
+    }
+
+    // FP pins: legitimate env uses must pass through.
+
+    #[test]
+    fn env_version_not_blocked() {
+        // `env --version` is informational. `unwrap_transparent` consumes
+        // `--version` as an env flag and leaves no command (same shape as
+        // `env_bare_becomes_empty`). Critical FP pin: must NOT block.
+        assert_commands("env --version", &[]);
+    }
+
+    #[test]
+    fn env_with_dash_v_assignment_not_blocked() {
+        // `-v` verbose flag, then positional `cp a b` runs as the command.
+        assert_commands("env -v VAR=1 cp a b", &[cmd("cp", &["a", "b"])]);
+    }
+
+    #[test]
+    fn env_dash_s_var_assignment_not_blocked() {
+        // `env -S 'VAR=1 cp a b'` — `-S VALUE` is consumed as an opaque
+        // wrapper arg; the STRING is not re-parsed into tokens, so no
+        // command is surfaced to rules. FP pin: must NOT block.
+        assert_commands("env -S 'VAR=1 cp a b'", &[]);
+    }
+
+    #[test]
+    fn env_dash_s_non_shell_command_not_blocked() {
+        // First STRING element is `cp` (not a shell). Same empty-command
+        // shape; FP pin: must NOT block.
+        assert_commands("env -S 'cp a b'", &[]);
+    }
+
+    #[test]
+    fn env_dash_s_double_dash_terminates_scan() {
+        // `--` ends env option processing; the positional `cp a b`
+        // becomes the real command.
+        assert_commands("env -- cp a b", &[cmd("cp", &["a", "b"])]);
+    }
+
+    #[test]
+    fn env_dash_s_pipe_non_shell_not_blocked() {
+        // Pipe RHS is `env -S 'cat foo'` — first STRING element is `cat`
+        // (not a shell); pipe-to-shell guard returns None so the left
+        // segment returns normally.
+        assert_commands("echo x | env -S 'cat foo'", &[cmd("echo", &["x"])]);
     }
 
     // --- P1-1: Pipe-to-shell with transparent wrappers (#146, fixed in v0.9.5) ---
