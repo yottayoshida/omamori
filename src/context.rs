@@ -639,10 +639,7 @@ mod tests {
     /// `target/` arg resolves to when evaluating via
     /// `evaluate_context_with_base(&inv, &rule, &config, &test_base())`.
     fn test_base() -> PathBuf {
-        let base = PathBuf::from(format!(
-            "/tmp/omamori-ctx-test-{}",
-            std::process::id()
-        ));
+        let base = PathBuf::from(format!("/tmp/omamori-ctx-test-{}", std::process::id()));
         std::fs::create_dir_all(base.join("target")).unwrap();
         std::fs::create_dir_all(base.join("node_modules")).unwrap();
         base
