@@ -26,8 +26,9 @@ const SHELL_NAMES: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 // matching arg-consumption arm to `unwrap_transparent` silently reopens the
 // bypass, so `scripts/check-invariants.sh` invariant #9 enforces that every
 // entry here appears in both sites.
-const TRANSPARENT_WRAPPERS: &[&str] =
-    &["sudo", "env", "timeout", "nice", "nohup", "command", "exec"];
+const TRANSPARENT_WRAPPERS: &[&str] = &[
+    "sudo", "env", "timeout", "nice", "nohup", "command", "exec", "doas", "pkexec",
+];
 
 // --- Public API ---
 
@@ -443,6 +444,40 @@ fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
                         pos += 1; // skip the flag (or grouped flag)
                         if pos < len {
                             pos += 1; // skip the argv0 value
+                        }
+                    } else {
+                        pos += 1;
+                    }
+                }
+            }
+            "doas" => {
+                // OpenBSD doas(1): `doas [-Lns] [-a style] [-C config]
+                // [-u user] command [args]`. Value-consuming flags are
+                // `-a`, `-C`, `-u`; others (`-L`, `-n`, `-s`) are
+                // standalone. Pattern parallels `sudo`.
+                pos += 1;
+                while pos < len && tokens[pos].starts_with('-') {
+                    if tokens[pos] == "-a" || tokens[pos] == "-C" || tokens[pos] == "-u" {
+                        pos += 1; // skip the flag
+                        if pos < len {
+                            pos += 1; // skip the value
+                        }
+                    } else {
+                        pos += 1;
+                    }
+                }
+            }
+            "pkexec" => {
+                // polkit pkexec(1): `pkexec [--version] [--disable-internal-agent]
+                // [--keep-cwd] [--user USERNAME] PROGRAM [ARGUMENTS...]`.
+                // Value-consuming flags: `-u USER` / `--user USER`.
+                // `--user=USER` combined form is a single token (no skip).
+                pos += 1;
+                while pos < len && tokens[pos].starts_with('-') {
+                    if tokens[pos] == "-u" || tokens[pos] == "--user" {
+                        pos += 1; // skip the flag
+                        if pos < len {
+                            pos += 1; // skip the value
                         }
                     } else {
                         pos += 1;
@@ -1139,6 +1174,63 @@ mod tests {
     fn chained_wrappers() {
         assert_commands(
             "sudo env nice bash -c 'rm -rf /'",
+            &[cmd("rm", &["-rf", "/"])],
+        );
+    }
+
+    // --- doas / pkexec (scope 7, v0.9.6) ---
+
+    #[test]
+    fn doas_stripped() {
+        assert_commands("doas rm -rf /", &[cmd("rm", &["-rf", "/"])]);
+    }
+
+    #[test]
+    fn doas_with_user_flag() {
+        // `-u user` consumes the value, not the command.
+        assert_commands("doas -u root rm -rf /", &[cmd("rm", &["-rf", "/"])]);
+    }
+
+    #[test]
+    fn doas_with_auth_style_and_config() {
+        // `-a style` and `-C config` both consume a value.
+        assert_commands(
+            "doas -a persist -C /etc/doas.conf rm -rf /",
+            &[cmd("rm", &["-rf", "/"])],
+        );
+    }
+
+    #[test]
+    fn doas_with_standalone_flags() {
+        // `-L`, `-n`, `-s` are standalone (no value).
+        assert_commands("doas -Ln rm -rf /", &[cmd("rm", &["-rf", "/"])]);
+    }
+
+    #[test]
+    fn pkexec_stripped() {
+        assert_commands("pkexec rm -rf /", &[cmd("rm", &["-rf", "/"])]);
+    }
+
+    #[test]
+    fn pkexec_with_short_user_flag() {
+        assert_commands("pkexec -u root rm -rf /", &[cmd("rm", &["-rf", "/"])]);
+    }
+
+    #[test]
+    fn pkexec_with_long_user_flag() {
+        assert_commands("pkexec --user root rm -rf /", &[cmd("rm", &["-rf", "/"])]);
+    }
+
+    #[test]
+    fn pkexec_with_user_equal_combined() {
+        // `--user=root` is a single token, no value skip needed.
+        assert_commands("pkexec --user=root rm -rf /", &[cmd("rm", &["-rf", "/"])]);
+    }
+
+    #[test]
+    fn pkexec_with_standalone_flags() {
+        assert_commands(
+            "pkexec --disable-internal-agent --keep-cwd rm -rf /",
             &[cmd("rm", &["-rf", "/"])],
         );
     }
