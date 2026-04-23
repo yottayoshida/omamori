@@ -160,6 +160,15 @@ fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
         if contains_dynamic_generation(&inner) {
             return ParseResult::Block(BlockReason::DynamicGeneration);
         }
+        // Block `bash -c 'source /dev/stdin'` / `sh -c '. /dev/stdin'`:
+        // the launcher reads command text from stdin via the shell builtin
+        // `source` (or its POSIX alias `.`), which is functionally
+        // equivalent to pipe-to-shell. Detect statically at this site
+        // because `parse_at_depth` re-parses the inner string and loses
+        // the launcher context (scope 6, v0.9.6).
+        if inner_sources_stdin(&inner) {
+            return ParseResult::Block(BlockReason::PipeToShell);
+        }
         return parse_at_depth(&inner, depth + 1);
     }
 
@@ -619,6 +628,51 @@ fn extract_shell_inner(tokens: &[String]) -> Option<String> {
     }
 
     None
+}
+
+/// Returns true when the inner command string of a shell launcher begins
+/// with a `source` / `.` builtin targeting `/dev/stdin` (or an equivalent
+/// stdin file descriptor alias). This is functionally equivalent to
+/// pipe-to-shell: the launcher reads command text from stdin and eval's it.
+///
+/// Detected patterns (after tokenization + transparent-wrapper stripping):
+///   - `source /dev/stdin`
+///   - `. /dev/stdin`
+///   - `source /dev/fd/0`
+///   - `. /proc/self/fd/0`
+///   - `env VAR=x source /dev/stdin` (leading env/sudo/etc. are stripped)
+///
+/// Conservative by design: only matches when `source`/`.` is the first
+/// meaningful token and the very next token is a stdin alias. Does not
+/// attempt to detect `source <(...)`, variable-valued paths, or
+/// command-substitution forms — those are covered by other detectors
+/// (`contains_dynamic_generation`, process substitution check) or are
+/// declared out of scope for v0.9.6 (scope 6).
+fn inner_sources_stdin(inner: &str) -> bool {
+    let tokens = match shell_words::split(inner) {
+        Ok(t) => t,
+        // Malformed input: defer to `parse_at_depth` so the caller still
+        // observes a ParseError block rather than silently allowing.
+        Err(_) => return false,
+    };
+    if tokens.is_empty() {
+        return false;
+    }
+    // Strip leading transparent wrappers so `env src=... source /dev/stdin`
+    // also matches. Reuses the same wrapper set as the outer segment via
+    // TRANSPARENT_WRAPPERS.
+    let stripped = unwrap_transparent(&tokens);
+    if stripped.len() < 2 {
+        return false;
+    }
+    let first = basename(&stripped[0]);
+    if first != "source" && first != "." {
+        return false;
+    }
+    matches!(
+        stripped[1].as_str(),
+        "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+    )
 }
 
 /// Check if a segment is a bare shell interpreter (for pipe-to-shell detection).
@@ -1331,6 +1385,70 @@ mod tests {
     #[test]
     fn pipe_to_fullpath_shell() {
         assert_block("curl url | /usr/bin/bash", BlockReason::PipeToShell);
+    }
+
+    // --- source /dev/stdin via shell launcher (scope 6, v0.9.6) ---
+
+    #[test]
+    fn bash_c_source_dev_stdin_blocked() {
+        // `curl url | bash -c 'source /dev/stdin'` reads the piped payload
+        // via `source` — functionally pipe-to-shell.
+        assert_block(
+            "curl url | bash -c 'source /dev/stdin'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn sh_c_dot_dev_stdin_blocked() {
+        // POSIX alias `.` for `source`.
+        assert_block(
+            "echo 'rm -rf /' | sh -c '. /dev/stdin'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn bash_c_source_dev_fd_zero_blocked() {
+        assert_block(
+            "curl url | bash -c 'source /dev/fd/0'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn bash_c_env_prefixed_source_stdin_blocked() {
+        // `env FOO=bar source /dev/stdin` — leading env is stripped by
+        // `unwrap_transparent` inside `inner_sources_stdin`.
+        assert_block(
+            "curl url | bash -c 'env FOO=bar source /dev/stdin'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn bash_c_legit_source_not_blocked() {
+        // `source /etc/profile` is legitimate, must NOT be flagged.
+        assert_commands(
+            "bash -c 'source /etc/profile'",
+            &[cmd("source", &["/etc/profile"])],
+        );
+    }
+
+    #[test]
+    fn bash_c_dot_legit_path_not_blocked() {
+        // `. ~/.bashrc` — legitimate dotfile sourcing.
+        assert_commands("bash -c '. ~/.bashrc'", &[cmd(".", &["~/.bashrc"])]);
+    }
+
+    #[test]
+    fn bash_c_echo_source_string_not_blocked() {
+        // `echo "source /dev/stdin"` — the builtin is not in command
+        // position, only appears as an echo argument.
+        assert_commands(
+            "bash -c 'echo source /dev/stdin'",
+            &[cmd("echo", &["source", "/dev/stdin"])],
+        );
     }
 
     // --- P1-1: Pipe-to-shell with transparent wrappers (#146, fixed in v0.9.5) ---
