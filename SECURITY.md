@@ -191,6 +191,8 @@ The unwrap stack is a static analyzer, not a shell interpreter. It cannot detect
 - Commands constructed at runtime by interpreters (`python -c`, `node -e`)
 - Heredoc content
 - Encoded payloads decoded at execution time
+- **Redirection-dup stdin aliases** (`source /dev/fd/N N<&0`): shell redirection creates a synthetic file descriptor that points at stdin, then `source /dev/fd/N` reads from it. Detection would require parsing `N<&0`-style redirections and tracking fd equivalence to `/dev/stdin`. This is out of scope for v0.9.6 (Codex Phase 6-A Major #4); see [#XXX](https://github.com/yottayoshida/omamori/issues) for the v0.9.7 redirection-aware parser plan.
+- **GNU env `-S` extended escape vocabulary**: the GNU env manual defines `-S`-specific escapes (`\_`, `\n`, `\t`, `\v`, `\c`, `${VAR}`) that the conservative `shell_words::split` approximation used in `string_head_is_shell` does not honor. Inputs such as `env -S '\_bash'` or `env -S 'bash\nscript.sh'` may evade the shell-head check. Implementing a GNU-env-compatible split is outside v0.9.6 scope (declared in the [v0.9.6 plan](https://github.com/yottayoshida/omamori/pull/184) scope 5 and reaffirmed in Codex Phase 6-A Major #5).
 
 ## Hook Auto-Sync (v0.4.1+)
 
