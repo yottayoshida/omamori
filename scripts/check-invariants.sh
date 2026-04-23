@@ -204,6 +204,62 @@ else
     fail=1
 fi
 
+# ---------- Invariant #9: TRANSPARENT_WRAPPERS ↔ match-arm sync (v0.9.6, scope 7) ----------
+# `const TRANSPARENT_WRAPPERS` in src/unwrap.rs is the single source of
+# truth for basenames treated as transparent command wrappers. Every entry
+# there MUST have a corresponding match arm in `unwrap_transparent`, where
+# per-wrapper arg-consumption logic lives (sudo skips `-u/-g` values, env
+# calls `skip_env_args`, etc.). Drift would silently reopen a pipe-to-shell
+# bypass: `segment_executes_shell_via_wrappers` would still recognize the
+# wrapper via the const, but `unwrap_transparent` would fail to strip its
+# flags and leave the residual command in an inconsistent state that later
+# logic could mis-classify as safe.
+#
+# `segment_executes_shell_via_wrappers` itself reads TRANSPARENT_WRAPPERS
+# directly (Step A SoT refactor), so it is automatically in sync and needs
+# no separate check here.
+uw=src/unwrap.rs
+uw_fail=0
+if [ ! -f "$uw" ]; then
+    echo "FAIL [invariant #9a]: $uw is missing"
+    uw_fail=1
+else
+    # Extract quoted basenames from the TRANSPARENT_WRAPPERS const body.
+    wrappers=$(awk '
+        /^const TRANSPARENT_WRAPPERS/ { inside=1; next }
+        inside {
+            if (/\];/) { exit }
+            while (match($0, /"[a-zA-Z_][a-zA-Z0-9_-]*"/)) {
+                print substr($0, RSTART+1, RLENGTH-2)
+                $0 = substr($0, RSTART + RLENGTH)
+            }
+        }
+    ' "$uw")
+    if [ -z "$wrappers" ]; then
+        echo "FAIL [invariant #9b]: TRANSPARENT_WRAPPERS is empty or unparseable in $uw"
+        uw_fail=1
+    fi
+    # Extract the body of `unwrap_transparent` to scope match-arm checks
+    # (avoids matching `"sudo" =>` that might appear in a comment or test
+    # fixture elsewhere in the file).
+    ut_body=$(awk '
+        /^fn unwrap_transparent/ { inside=1 }
+        inside { print }
+        inside && /^}/ && !/^fn / { if (NR > 1) exit }
+    ' "$uw")
+    for w in $wrappers; do
+        if ! printf '%s\n' "$ut_body" | grep -qF "\"$w\" =>"; then
+            echo "FAIL [invariant #9c]: TRANSPARENT_WRAPPERS entry \"$w\" has no match arm in unwrap_transparent"
+            uw_fail=1
+        fi
+    done
+fi
+if [ "$uw_fail" -eq 0 ]; then
+    echo "#9 OK: TRANSPARENT_WRAPPERS ↔ unwrap_transparent match-arm sync intact"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"
