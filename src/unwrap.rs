@@ -17,6 +17,18 @@ const MAX_SEGMENTS: usize = 20;
 
 const SHELL_NAMES: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 
+// --- Transparent wrappers (single source of truth) ---
+//
+// Basenames recognized as transparent command wrappers by both
+// `unwrap_transparent` (arg-consumption logic per-wrapper) and
+// `segment_executes_shell_via_wrappers` (wrapper-kind identification for
+// pipe-to-shell detection). Adding a new wrapper here without adding the
+// matching arg-consumption arm to `unwrap_transparent` silently reopens the
+// bypass, so `scripts/check-invariants.sh` invariant #9 enforces that every
+// entry here appears in both sites.
+const TRANSPARENT_WRAPPERS: &[&str] =
+    &["sudo", "env", "timeout", "nice", "nohup", "command", "exec"];
+
 // --- Public API ---
 
 /// Result of parsing a command string.
@@ -308,6 +320,11 @@ fn split_on_operators(tokens: &[String]) -> Vec<(SegmentOp, Vec<String>)> {
 /// Strip transparent wrappers from the front of a token list.
 /// Handles `env` specially: skips KEY=VAL pairs and flags.
 /// Handles `timeout`, `nice`, `sudo` with their flag patterns.
+///
+/// The set of recognized wrappers is pinned by [`TRANSPARENT_WRAPPERS`]
+/// (single source of truth). Each basename listed there must have a
+/// matching match-arm below with its arg-consumption logic; otherwise
+/// `scripts/check-invariants.sh` invariant #9 fails in CI.
 fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
     let mut pos = 0;
     let len = tokens.len();
@@ -594,10 +611,10 @@ fn is_bare_shell(tokens: &[String]) -> bool {
 /// and the resulting bare `bash` is no longer in pipe context, so the
 /// pipe-to-shell signal is lost (#146 P1-1).
 ///
-/// IMPORTANT: the wrapper match arm below must stay in sync with the
-/// wrapper basenames recognized by [`unwrap_transparent`]. When adding a new
-/// transparent wrapper there, add it here as well; otherwise that wrapper
-/// silently reopens the bypass.
+/// The wrapper set is the [`TRANSPARENT_WRAPPERS`] const (single source of
+/// truth). Adding a new wrapper there without adding the matching
+/// arg-consumption arm to [`unwrap_transparent`] silently reopens the bypass;
+/// `scripts/check-invariants.sh` invariant #9 enforces sync between the two.
 fn segment_executes_shell_via_wrappers(tokens: &[String]) -> Option<&'static str> {
     if tokens.is_empty() {
         return None;
@@ -607,16 +624,8 @@ fn segment_executes_shell_via_wrappers(tokens: &[String]) -> Option<&'static str
     // `is_bare_shell` separately, so we explicitly skip it here to avoid
     // double-firing and to keep the responsibilities of the two helpers
     // disjoint.
-    let kind: &'static str = match basename(&tokens[0]) {
-        "sudo" => "sudo",
-        "env" => "env",
-        "nice" => "nice",
-        "timeout" => "timeout",
-        "nohup" => "nohup",
-        "exec" => "exec",
-        "command" => "command",
-        _ => return None,
-    };
+    let base = basename(&tokens[0]);
+    let kind: &'static str = TRANSPARENT_WRAPPERS.iter().find(|&&w| w == base).copied()?;
 
     let unwrapped = unwrap_transparent(tokens);
     if unwrapped.is_empty() {
