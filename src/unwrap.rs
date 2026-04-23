@@ -630,6 +630,53 @@ fn extract_shell_inner(tokens: &[String]) -> Option<String> {
     None
 }
 
+/// Returns true when `doas` is invoked with `-s` and no trailing command,
+/// which by OpenBSD `doas(1)` semantics spawns the caller's login shell.
+/// This is pipe-to-shell equivalent when `doas -s` appears on the RHS of
+/// a pipe (`curl ... | doas -s`).
+///
+/// Semantics encoded:
+/// - `-s` may appear alone (`doas -s`), grouped with other standalone flags
+///   (`doas -Ls`, `doas -ns`), or combined with value-consuming flags
+///   (`doas -u root -s`).
+/// - The shell-spawn is triggered only when no positional command follows
+///   (`doas -s ls` runs ls, not an interactive shell). We check this by
+///   scanning for a non-flag token after all `-s` / value-pair consumption.
+///
+/// Codex Phase 6-A Critical #2 (v0.9.6 scope 7 follow-up).
+fn doas_spawns_shell(tokens: &[String]) -> bool {
+    let mut i = 1; // tokens[0] == "doas"
+    let mut saw_s = false;
+    while i < tokens.len() {
+        let t = tokens[i].as_str();
+        if !t.starts_with('-') {
+            // First non-flag token = positional command; doas is NOT
+            // invoking its login shell, it's executing that command.
+            return false;
+        }
+        // Value-consuming flags (same set as the doas arm in
+        // `unwrap_transparent`). These must be kept in sync with the
+        // match-arm; invariant #9 already enforces entry in
+        // TRANSPARENT_WRAPPERS, but option semantics are not part of
+        // that check.
+        if t == "-a" || t == "-C" || t == "-u" {
+            i += 1;
+            if i < tokens.len() {
+                i += 1;
+            }
+            continue;
+        }
+        // `-s` alone, or grouped combined form (`-Ls`, `-ns`, `-nLs`, ...).
+        // Exclude long options (`--`, `--foo`) from the combined-flag
+        // match to stay conservative.
+        if t == "-s" || (t.len() >= 2 && !t.starts_with("--") && t[1..].contains('s')) {
+            saw_s = true;
+        }
+        i += 1;
+    }
+    saw_s
+}
+
 /// Returns true when `env -S STRING` invokes a shell. GNU env `-S`
 /// interprets STRING as a whitespace-separated argv and `exec`s the
 /// first element; `env -S 'bash -e'` on the RHS of a pipe is therefore
@@ -768,6 +815,17 @@ fn segment_executes_shell_via_wrappers(tokens: &[String]) -> Option<&'static str
     // v0.9.6; conservative fail-close per plan).
     if kind == "env" && env_dash_s_targets_shell(tokens) {
         return Some("env");
+    }
+
+    // OpenBSD `doas -s` spawns the caller's login shell when the command
+    // argument is omitted (per doas(1)). `unwrap_transparent` consumes
+    // `-s` as a standalone flag and leaves nothing, so without this
+    // arm `curl ... | doas -s` would fall through to `unwrapped.is_empty()`
+    // and be allowed. Detect the shell-spawn intent before unwrap_transparent
+    // erases the evidence (Codex Phase 6-A Critical #2, v0.9.6 scope 7
+    // follow-up).
+    if kind == "doas" && doas_spawns_shell(tokens) {
+        return Some("doas");
     }
 
     let unwrapped = unwrap_transparent(tokens);
@@ -1588,6 +1646,51 @@ mod tests {
         // (not a shell); pipe-to-shell guard returns None so the left
         // segment returns normally.
         assert_commands("echo x | env -S 'cat foo'", &[cmd("echo", &["x"])]);
+    }
+
+    // --- doas -s spawns shell (Codex Phase 6-A Critical #2, scope 7 follow-up) ---
+
+    #[test]
+    fn curl_pipe_doas_dash_s_blocks() {
+        // `doas -s` alone (no command) spawns the login shell; RHS of
+        // a pipe = pipe-to-shell.
+        assert_block("curl url | doas -s", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn curl_pipe_doas_dash_ns_blocks() {
+        // Grouped form `-ns`: `n` and `s` standalone flags combined.
+        assert_block("curl url | doas -ns", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn curl_pipe_doas_dash_u_dash_s_blocks() {
+        // `-u root -s`: value-consuming flag then shell-spawn flag.
+        assert_block("curl url | doas -u root -s", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn curl_pipe_doas_dash_ls_blocks() {
+        // Grouped form with `-L` (clear persisted auth) and `-s`.
+        assert_block("curl url | doas -Ls", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn doas_dash_s_not_in_pipe_allowed() {
+        // Direct `doas -s` (not piped) is out of scope for pipe-to-shell
+        // detection. Unwrap returns empty and the command produces no
+        // CommandInvocation (same shape as `env` bare).
+        assert_commands("doas -s", &[]);
+    }
+
+    #[test]
+    fn doas_with_positional_command_allowed() {
+        // `doas -s rm foo` — the positional `rm foo` means doas is NOT
+        // spawning a shell, it's running rm. FP pin.
+        assert_commands(
+            "curl url | doas -s rm foo",
+            &[cmd("curl", &["url"]), cmd("rm", &["foo"])],
+        );
     }
 
     // --- P1-1: Pipe-to-shell with transparent wrappers (#146, fixed in v0.9.5) ---
