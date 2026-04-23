@@ -752,17 +752,61 @@ fn inner_sources_stdin(inner: &str) -> bool {
     // also matches. Reuses the same wrapper set as the outer segment via
     // TRANSPARENT_WRAPPERS.
     let stripped = unwrap_transparent(&tokens);
-    if stripped.len() < 2 {
+    // Peel off bash builtin dispatchers (`builtin`, `command`) before
+    // testing for source/.: `bash -c 'builtin source /dev/stdin'` and
+    // `bash -c 'command source /dev/stdin'` invoke the same builtin
+    // and are just as dangerous as the bare form (Codex Phase 6-A
+    // Major #3). Strip at most one layer.
+    let head = peel_builtin_dispatcher(&stripped);
+    if head.len() < 2 {
         return false;
     }
-    let first = basename(&stripped[0]);
+    let first = basename(&head[0]);
     if first != "source" && first != "." {
         return false;
     }
     matches!(
-        stripped[1].as_str(),
+        head[1].as_str(),
         "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
     )
+}
+
+/// Strip a leading `builtin` or `command` dispatcher from a token slice.
+/// Used to canonicalize dispatcher-prefixed invocations of shell builtins
+/// before the caller inspects the head basename.
+///
+/// Handles common forms:
+///   - `builtin source /dev/stdin` → `source /dev/stdin`
+///   - `command source /dev/stdin` → `source /dev/stdin`
+///   - `command -p source /dev/stdin` → `source /dev/stdin` (skip `-p`)
+///
+/// Conservative: strips only one layer. Stacked dispatchers like
+/// `builtin command source` are rare in practice and still resolve to
+/// `source` in bash semantics, but we don't recurse to keep the fn
+/// signature simple and bound analysis work.
+fn peel_builtin_dispatcher(tokens: &[String]) -> &[String] {
+    if tokens.is_empty() {
+        return tokens;
+    }
+    let head = basename(&tokens[0]);
+    if head != "builtin" && head != "command" {
+        return tokens;
+    }
+    // Skip the dispatcher plus any of its standalone flags (`command -p`
+    // to use the default PATH, `command --` to end options).
+    let mut pos = 1;
+    while pos < tokens.len() {
+        let t = tokens[pos].as_str();
+        if t == "--" {
+            pos += 1;
+            break;
+        }
+        if !t.starts_with('-') {
+            break;
+        }
+        pos += 1;
+    }
+    &tokens[pos..]
 }
 
 /// Check if a segment is a bare shell interpreter (for pipe-to-shell detection).
@@ -1560,6 +1604,65 @@ mod tests {
         assert_commands(
             "bash -c 'echo source /dev/stdin'",
             &[cmd("echo", &["source", "/dev/stdin"])],
+        );
+    }
+
+    // --- builtin/command dispatcher unwrap (Codex Phase 6-A Major #3) ---
+
+    #[test]
+    fn bash_c_builtin_source_stdin_blocks() {
+        assert_block(
+            "curl url | bash -c 'builtin source /dev/stdin'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn bash_c_command_source_stdin_blocks() {
+        assert_block(
+            "curl url | bash -c 'command source /dev/stdin'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn bash_c_command_p_source_stdin_blocks() {
+        // `command -p source` — -p uses the default PATH, still invokes source.
+        assert_block(
+            "curl url | bash -c 'command -p source /dev/stdin'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn bash_c_builtin_dot_stdin_blocks() {
+        // POSIX alias `.` through `builtin`.
+        assert_block(
+            "echo 'rm -rf /' | bash -c 'builtin . /dev/stdin'",
+            BlockReason::PipeToShell,
+        );
+    }
+
+    #[test]
+    fn bash_c_builtin_source_legit_not_blocked() {
+        // `builtin source /etc/profile` — legitimate. `peel_builtin_dispatcher`
+        // only runs inside `inner_sources_stdin`; in normal
+        // `process_segment` parsing `builtin` is not a transparent
+        // wrapper, so it stays as the program with `source` as its first
+        // arg. Critical FP pin: must NOT block.
+        assert_commands(
+            "bash -c 'builtin source /etc/profile'",
+            &[cmd("builtin", &["source", "/etc/profile"])],
+        );
+    }
+
+    #[test]
+    fn bash_c_builtin_echo_not_blocked() {
+        // `builtin echo foo` — not a source/. invocation, must NOT block.
+        // Same shape: `builtin` is the program, `echo foo` are its args.
+        assert_commands(
+            "bash -c 'builtin echo foo'",
+            &[cmd("builtin", &["echo", "foo"])],
         );
     }
 
