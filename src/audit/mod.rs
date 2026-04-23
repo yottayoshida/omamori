@@ -1202,7 +1202,7 @@ mod tests {
             entries.push(("new", new_ts));
         }
 
-        let refs: Vec<(&str, &str)> = entries.iter().copied().collect();
+        let refs: Vec<(&str, &str)> = entries.to_vec();
         write_chain_entries(&path, &TEST_SECRET, &refs);
 
         let mut file = OpenOptions::new()
