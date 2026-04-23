@@ -82,9 +82,15 @@ pub const NEVER_REGENERABLE: &[&str] = &["src", "lib", "app", ".git", ".env", ".
 // Path normalization
 // ---------------------------------------------------------------------------
 
-/// Lexical path normalization: expand ~, resolve relative paths, remove . and ..
-/// Does NOT access the filesystem (no symlink resolution).
-pub fn normalize_path(path: &str) -> PathBuf {
+/// Lexical path normalization with an explicit base directory for relative-path
+/// resolution: expand `~`, resolve relative paths against `base`, remove `.` and
+/// `..`. Does NOT access the filesystem (no symlink resolution).
+///
+/// Internal callers that need to pin a specific base (to avoid races with
+/// concurrent `env::set_current_dir` elsewhere in the process) use this
+/// directly. Public callers that want process CWD semantics use
+/// [`normalize_path`].
+pub(crate) fn normalize_path_with_base(path: &str, base: &Path) -> PathBuf {
     // Step 1: ~ expansion
     let path = if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = env::var_os("HOME") {
@@ -96,11 +102,9 @@ pub fn normalize_path(path: &str) -> PathBuf {
         PathBuf::from(path)
     };
 
-    // Step 2: relative → absolute (based on CWD)
+    // Step 2: relative → absolute (based on explicit base, not process CWD)
     let path = if path.is_relative() {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(&path)
+        base.join(&path)
     } else {
         path
     };
@@ -123,14 +127,42 @@ pub fn normalize_path(path: &str) -> PathBuf {
     components.iter().collect()
 }
 
-/// Try to resolve the real path (symlinks included) via canonicalize().
-/// Returns Ok(canonical) if the path exists, Err(lexical) if it doesn't.
-pub fn resolve_path(raw: &str) -> (PathBuf, bool) {
-    let lexical = normalize_path(raw);
-    match fs::canonicalize(raw) {
+/// Lexical path normalization relative to the process CWD.
+///
+/// Thin wrapper over [`normalize_path_with_base`] that captures the current
+/// working directory once at entry. Public API preserved for backwards
+/// compatibility (semver).
+pub fn normalize_path(path: &str) -> PathBuf {
+    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    normalize_path_with_base(path, &base)
+}
+
+/// Try to resolve the real path (symlinks included) via `fs::canonicalize`
+/// after lexically absolutizing against `base`.
+///
+/// Because the value passed to `fs::canonicalize` is already absolute, the
+/// result is independent of the process CWD — this closes the v0.9.5
+/// `multi_target_*` quarantine root cause (#164).
+///
+/// Returns `(canonical, true)` on success, `(lexical, false)` if the path
+/// does not exist.
+pub(crate) fn resolve_path_with_base(raw: &str, base: &Path) -> (PathBuf, bool) {
+    let lexical = normalize_path_with_base(raw, base);
+    // canonicalize on the absolute lexical path, not on `raw`, so the result
+    // does not depend on the current process CWD.
+    match fs::canonicalize(&lexical) {
         Ok(canonical) => (canonical, true),
         Err(_) => (lexical, false),
     }
+}
+
+/// Try to resolve the real path (symlinks included) via canonicalize().
+/// Returns Ok(canonical) if the path exists, Err(lexical) if it doesn't.
+///
+/// Thin wrapper over [`resolve_path_with_base`] that captures process CWD.
+pub fn resolve_path(raw: &str) -> (PathBuf, bool) {
+    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    resolve_path_with_base(raw, &base)
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +234,7 @@ fn effective_regenerable_paths(paths: &[String]) -> Vec<String> {
 // Context evaluation (Tier 1: path-based)
 // ---------------------------------------------------------------------------
 
-/// Evaluate context for a matched rule and return an optional action override.
+/// Evaluate context for a matched rule with an explicit base directory.
 ///
 /// Evaluation priority (highest first):
 /// 1. protected_paths match → escalate to Block
@@ -210,10 +242,16 @@ fn effective_regenerable_paths(paths: &[String]) -> Vec<String> {
 /// 3. regenerable_paths match AND canonicalize succeeded → downgrade to LogOnly
 /// 4. regenerable_paths match AND canonicalize failed → no downgrade (fail-close)
 /// 5. No match → keep original
-pub fn evaluate_context(
+///
+/// Relative target paths in `invocation` are resolved against `base` via
+/// [`resolve_path_with_base`], so the verdict does not depend on the process
+/// CWD. Internal callers that need deterministic resolution (tests with
+/// concurrent `env::set_current_dir` neighbors) use this directly.
+pub(crate) fn evaluate_context_with_base(
     invocation: &CommandInvocation,
     _rule: &RuleConfig,
     config: &ContextConfig,
+    base: &Path,
 ) -> ContextEvaluation {
     let targets = invocation.target_args();
     if targets.is_empty() {
@@ -234,7 +272,7 @@ pub fn evaluate_context(
     };
 
     for target in &targets {
-        let (resolved, canonicalized) = resolve_path(target);
+        let (resolved, canonicalized) = resolve_path_with_base(target, base);
 
         // Priority 1: protected_paths → escalate to Block (most severe, short-circuit)
         if let Some(pattern) = matches_any_pattern(&resolved, &config.protected_paths) {
@@ -266,6 +304,19 @@ pub fn evaluate_context(
     }
 
     result
+}
+
+/// Evaluate context for a matched rule.
+///
+/// Thin wrapper over [`evaluate_context_with_base`] that captures the process
+/// CWD at entry. Public API preserved for backwards compatibility (semver).
+pub fn evaluate_context(
+    invocation: &CommandInvocation,
+    rule: &RuleConfig,
+    config: &ContextConfig,
+) -> ContextEvaluation {
+    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    evaluate_context_with_base(invocation, rule, config, &base)
 }
 
 // ---------------------------------------------------------------------------
@@ -431,15 +482,26 @@ pub fn evaluate_git_context(
 mod tests {
     use super::*;
 
-    // NOTE: Tests in this module that resolve relative paths via `fs::canonicalize`
-    // (directly or transitively through `evaluate_context` -> `resolve_path` ->
-    // `normalize_path`) depend on the process-wide CWD. They MUST be marked
-    // `#[serial_test::serial]` to avoid races with the `git_context_*` family,
-    // which mutates CWD via `env::set_current_dir`. Without serialization,
-    // `fs::canonicalize("target/")` may resolve against a `git_context_*`
-    // tempdir and flip the verdict (#164). The structural fix — threading an
-    // explicit base dir through `normalize_path` — is tracked as a v0.9.6
-    // follow-up; this quarantine is intentional patch scope.
+    // NOTE (v0.9.6 structural fix for #164):
+    // The v0.9.5 `multi_target_*` quarantine has been resolved by introducing
+    // `evaluate_context_with_base` / `resolve_path_with_base` /
+    // `normalize_path_with_base`. Tests that previously relied on the process
+    // CWD to resolve relative paths now pass an explicit base (via
+    // `test_base()`), so `fs::canonicalize` receives an absolute path and its
+    // result no longer depends on concurrent `env::set_current_dir` calls in
+    // the `git_context_*` family.
+    //
+    // As a result:
+    //   - `multi_target_*` tests no longer need `#[serial_test::serial]`.
+    //   - `git_context_*` tests still mutate CWD themselves and therefore
+    //     remain `#[serial_test::serial]`; that serialization is structural
+    //     to their intent (exercising git-aware evaluation that shells out
+    //     to `git`).
+    //
+    // v0.10.0 #175 tracks the full public-API promotion of
+    // `normalize_path`/`resolve_path`/`evaluate_context` to require an
+    // explicit `base: &Path`, at which point the process CWD can be banned
+    // outside the shim/hook entry points via `.clippy.toml` disallowed_methods.
 
     // --- normalize_path ---
 
@@ -562,6 +624,27 @@ mod tests {
         )
     }
 
+    /// Unique absolute base for context tests that need deterministic path
+    /// resolution regardless of concurrent `env::set_current_dir` elsewhere
+    /// in the process. Tied to the current PID so parallel test binaries
+    /// cannot collide either.
+    ///
+    /// Also idempotently creates fixture children (`target/`, `node_modules/`)
+    /// so that `fs::canonicalize` through `resolve_path_with_base` succeeds
+    /// and regenerable-path canonicalization tests can reach the `LogOnly`
+    /// branch. Cleanup is deliberately skipped: parallel tests in the same
+    /// PID would race on a cleanup, and the tree is tiny under `/tmp`.
+    ///
+    /// Example: `/tmp/omamori-ctx-test-12345/target/` is what a relative
+    /// `target/` arg resolves to when evaluating via
+    /// `evaluate_context_with_base(&inv, &rule, &config, &test_base())`.
+    fn test_base() -> PathBuf {
+        let base = PathBuf::from(format!("/tmp/omamori-ctx-test-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("target")).unwrap();
+        std::fs::create_dir_all(base.join("node_modules")).unwrap();
+        base
+    }
+
     #[test]
     fn context_protected_path_escalates_to_block() {
         let config = test_config();
@@ -661,15 +744,20 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // CWD-dependent via fs::canonicalize; see module note. Quarantine for #164.
     fn multi_target_protected_wins_over_regenerable() {
-        // P1-1: rm -rf target/ src/ — src/ must be caught even though target/ matches first
+        // P1-1: rm -rf target/ src/ — src/ must be caught even though target/ matches first.
+        //
+        // Uses `evaluate_context_with_base` + `test_base()` so concurrent
+        // `env::set_current_dir` in `git_context_*` tests cannot flip the
+        // verdict. This closes the v0.9.5 #164 quarantine (structural fix,
+        // v0.9.6 scope 10).
+        let base = test_base();
         let config = test_config();
         let inv = CommandInvocation::new(
             "rm".to_string(),
             vec!["-rf".to_string(), "target/".to_string(), "src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context_with_base(&inv, &test_rule(), &config, &base);
         assert_eq!(
             result.action_override,
             Some(ActionKind::Block),
@@ -678,8 +766,10 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial] // CWD-dependent via fs::canonicalize; see module note. Quarantine for #164.
     fn multi_target_all_regenerable_downgrades() {
+        // #164 structural fix: explicit base via `evaluate_context_with_base`
+        // instead of relying on process CWD. See module note.
+        let base = test_base();
         let config = test_config();
         let inv = CommandInvocation::new(
             "rm".to_string(),
@@ -689,7 +779,7 @@ mod tests {
                 "node_modules/".to_string(),
             ],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context_with_base(&inv, &test_rule(), &config, &base);
         assert_eq!(result.action_override, Some(ActionKind::LogOnly));
     }
 
