@@ -770,13 +770,20 @@ fn segment_launcher_sources_stdin(tokens: &[String]) -> bool {
 /// here-string, not the upstream pipe.
 fn segment_has_stdin_redirect(tokens: &[String]) -> bool {
     for t in tokens.iter().skip(1) {
-        // Exclude process substitution `<(...)` — it feeds a subprocess
-        // fd, not the segment's stdin. The dedicated process-substitution
-        // guard in `process_segment` blocks `bash <(...)` separately.
-        if t.starts_with("<(") {
-            continue;
+        let s = t.as_str();
+        // Exact-match standalone redirection operators. shell_words::split
+        // strips quotes, so a literal argument like `'<ignored>'` is
+        // indistinguishable by prefix from a real `<file` redirect — use
+        // exact match for the common operator forms to avoid false
+        // exemptions (Codex Round 4 P1 fix).
+        if matches!(s, "<" | "<<" | "<<<" | "0<") {
+            return true;
         }
-        if t.starts_with('<') || t.starts_with("0<") {
+        // fd-duplication-from-stdin: `<& N`, `0<& N`, `<&N`, `0<&N`.
+        // This is a narrow prefix set; an unquoted argument starting
+        // with `<&` would be meaningless as a literal, so the false-
+        // positive risk is negligible.
+        if s.starts_with("<&") || s.starts_with("0<&") {
             return true;
         }
     }
@@ -843,10 +850,17 @@ fn inner_sources_stdin(inner: &str) -> bool {
 ///   - `command source /dev/stdin` → `source /dev/stdin`
 ///   - `command -p source /dev/stdin` → `source /dev/stdin` (skip `-p`)
 ///
+/// `command -v` / `command -V` (and grouped forms like `-pv`, `-Vp`)
+/// are lookup / introspection flags — they print the resolved path or
+/// type of their argument without invoking it. Return the original
+/// tokens unchanged in that case so the caller does not mistake a
+/// benign lookup like `command -v source` for an actual `source` call
+/// (Codex Round 4 P2 fix). The same lookup-vs-execute distinction is
+/// already enforced for the outer `command` arm in `unwrap_transparent`.
+///
 /// Conservative: strips only one layer. Stacked dispatchers like
-/// `builtin command source` are rare in practice and still resolve to
-/// `source` in bash semantics, but we don't recurse to keep the fn
-/// signature simple and bound analysis work.
+/// `builtin command source` are rare and still resolve to `source`
+/// in bash semantics, but we don't recurse to keep the fn simple.
 fn peel_builtin_dispatcher(tokens: &[String]) -> &[String] {
     if tokens.is_empty() {
         return tokens;
@@ -854,6 +868,27 @@ fn peel_builtin_dispatcher(tokens: &[String]) -> &[String] {
     let head = basename(&tokens[0]);
     if head != "builtin" && head != "command" {
         return tokens;
+    }
+    // Scan the arg list for lookup flags before committing to a strip.
+    if head == "command" {
+        let mut probe = 1;
+        while probe < tokens.len() {
+            let t = tokens[probe].as_str();
+            if t == "--" {
+                break;
+            }
+            if !t.starts_with('-') {
+                break;
+            }
+            if t == "-v"
+                || t == "-V"
+                || combined_flag_contains_char(t, 'v')
+                || combined_flag_contains_char(t, 'V')
+            {
+                return tokens;
+            }
+            probe += 1;
+        }
     }
     // Skip the dispatcher plus any of its standalone flags (`command -p`
     // to use the default PATH, `command --` to end options).
@@ -1785,6 +1820,75 @@ mod tests {
         assert_commands(
             "bash -c 'builtin echo foo'",
             &[cmd("builtin", &["echo", "foo"])],
+        );
+    }
+
+    // --- command -v/-V lookup exemption (Codex Round 4 P2 fix) ---
+    //
+    // `command -v NAME` / `command -V NAME` resolve NAME's path or type
+    // without executing it. When such a lookup appears inside a pipe
+    // launcher that is otherwise exempt (e.g. via an explicit stdin
+    // redirect), `peel_builtin_dispatcher` must recognize the lookup
+    // and keep the tokens opaque, matching `unwrap_transparent`'s
+    // existing `command` handling. Without this, redirect-exempted
+    // launchers with benign `command -v source /dev/stdin` would be
+    // misclassified by `inner_sources_stdin`.
+
+    #[test]
+    fn curl_pipe_bash_c_command_v_lookup_with_redirect_not_blocked() {
+        // Redirect exemption admits the launcher; command -v must be
+        // kept opaque so `source /dev/stdin` is not misclassified.
+        assert_commands(
+            "curl url | bash -c 'command -v source /dev/stdin' < file.sh",
+            &[
+                cmd("curl", &["url"]),
+                cmd("command", &["-v", "source", "/dev/stdin"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_bash_c_command_big_v_lookup_with_redirect_not_blocked() {
+        // `-V` verbose lookup — same exemption path.
+        assert_commands(
+            "curl url | bash -c 'command -V source /dev/stdin' < file.sh",
+            &[
+                cmd("curl", &["url"]),
+                cmd("command", &["-V", "source", "/dev/stdin"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn curl_pipe_bash_c_command_pv_grouped_lookup_with_redirect_not_blocked() {
+        // Grouped `-pv` → lookup with default PATH.
+        assert_commands(
+            "curl url | bash -c 'command -pv source /dev/stdin' < file.sh",
+            &[
+                cmd("curl", &["url"]),
+                cmd("command", &["-pv", "source", "/dev/stdin"]),
+            ],
+        );
+    }
+
+    // --- redirect exemption exact-match (Codex Round 4 P1 fix) ---
+
+    #[test]
+    fn curl_pipe_bash_s_literal_lt_arg_still_blocks() {
+        // shell_words strips quotes, so `'<ignored>'` arrives as token
+        // `<ignored>`. An over-broad prefix check on `<` would exempt
+        // this as a "redirect" and reopen the pipe-to-shell bypass.
+        // The exact-match check must still Block.
+        assert_block("curl url | bash -s '<ignored>'", BlockReason::PipeToShell);
+    }
+
+    #[test]
+    fn curl_pipe_bash_c_source_stdin_literal_lt_arg_still_blocks() {
+        // Same shape as above, but with the source-stdin launcher form.
+        // `'<ignored>'` as a positional arg must not exempt the segment.
+        assert_block(
+            "curl url | bash -c 'source /dev/stdin' '<ignored>'",
+            BlockReason::PipeToShell,
         );
     }
 
