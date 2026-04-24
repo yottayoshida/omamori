@@ -1373,6 +1373,37 @@ fn basename(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    // WHY direct-call tests (not CLI spawn like `tests/hook_integration.rs`):
+    //
+    // unwrap's responsibility is the *internal* parser stage that consumes
+    // already-tokenized `shell_words` output. Going through `omamori hook-check`
+    // would force every input through the full pre-parse chain performed by
+    // `parse_at_depth` (this file, lines 81-94):
+    //   input string → normalize_compound_operators → shell_words::split →
+    //   per-segment unwrap logic.
+    // That chain performs operator splitting, quote stripping, and whitespace
+    // collapsing before unwrap's core segmentation / wrapper-peeling logic
+    // ever sees the tokens — so for malformed or edge-case inputs (e.g. the
+    // wrapper-evasion corpus in this module), a CLI-boundary test would
+    // primarily exercise `shell_words` parsing behavior and the coarse
+    // normalization layer, not unwrap's contract proper. (The hook-layer
+    // Phase 1B in `src/engine/hook.rs::check_command_for_hook` L146-151
+    // happens to run the same normalize + shell_words::split pair for a
+    // different purpose — env-tampering detection — which is why that code
+    // cite can read as equivalent to the pre-parse chain here.)
+    //
+    // Behavioral end-to-end guarantees (a real command must Block/Allow)
+    // are pinned at the hook boundary in `tests/hook_integration.rs` via
+    // `HOOK_DECISION_CASES`. That is the right layer for "does omamori
+    // actually stop `curl | env bash`?". The tests here answer a different
+    // question: "given these tokens, does unwrap surface the right inner
+    // invocation or Block reason?" — which is the seam a security review
+    // needs pinned directly against parse state, not through a shell.
+    //
+    // This comment exists because the same question came up multiple times
+    // during Codex review rounds for v0.9.6 (#178/#179/#180); keep it here
+    // so future reviewers can find the rationale without re-deriving it.
+
     use super::*;
 
     // --- Helper ---

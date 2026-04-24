@@ -387,6 +387,168 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "arg-reorder-long-flag-order-block",
     ),
+    // 15. PR4 scope 4: meta-pattern (`blocked_string_patterns`) behavioral
+    //     coverage. Previously asserted at the array-shape level in
+    //     `src/installer.rs` (`meta_patterns_cover_*`), now pinned at the
+    //     hook-check CLI boundary so the test survives a pattern-list
+    //     refactor and only fails if the attack surface actually re-opens.
+    //
+    // 15a. Direct-path rm bypassing PATH shim — full boundary coverage.
+    //      The deleted `meta_patterns_cover_rm_path_boundaries` test
+    //      pinned 2 paths × 4 token boundaries (space, double-quote, tab,
+    //      single-quote) = 8 asserts. Phase 1A runs `command.contains`
+    //      against the raw pre-quote-stripped command string, so each
+    //      boundary is an independent attack surface — `/bin/rm"` and
+    //      `/bin/rm\t` are distinct pattern entries that a refactor
+    //      could drop individually.
+    //      All cases DELIBERATELY non-recursive (`rm /tmp/x`, no `-rf`)
+    //      so the Block decision must come from the Phase 1A meta-pattern
+    //      layer, not from the Phase 2 rule `rm-recursive-to-trash`.
+    //      Codex Review PR #186 R1 (space-boundary), R2 (both paths),
+    //      R3 (non-space boundaries). Case #2 `/bin/rm -rf /tmp/x`
+    //      remains for historical coverage but is double-covered; this
+    //      group is the meta-layer guarantee.
+    // 15a.i space boundary.
+    (
+        "/bin/rm /tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-space-boundary-block",
+    ),
+    (
+        "/usr/bin/rm /tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-space-boundary-block",
+    ),
+    // 15a.ii double-quote boundary — raw command `"/bin/rm" /tmp/x`.
+    //        After shell_words strips quotes tokens are fine, but the
+    //        Phase 1A contains-check sees the raw form with the trailing
+    //        quote char right after the path.
+    (
+        "\"/bin/rm\" /tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-dquote-boundary-block",
+    ),
+    (
+        "\"/usr/bin/rm\" /tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-dquote-boundary-block",
+    ),
+    // 15a.iii tab boundary — direct path followed by TAB instead of space.
+    (
+        "/bin/rm\t/tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-tab-boundary-block",
+    ),
+    (
+        "/usr/bin/rm\t/tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-tab-boundary-block",
+    ),
+    // 15a.iv single-quote boundary — raw command `'/bin/rm' /tmp/x`.
+    (
+        "'/bin/rm' /tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-squote-boundary-block",
+    ),
+    (
+        "'/usr/bin/rm' /tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-squote-boundary-block",
+    ),
+    // 15b. omamori self-mutation attempts: subcommands that tamper with
+    //      omamori's own config / install state must be blocked.
+    (
+        "omamori config disable some-rule",
+        Decision::Block,
+        "meta-pattern-config-disable-block",
+    ),
+    (
+        "omamori config enable some-rule",
+        Decision::Block,
+        "meta-pattern-config-enable-block",
+    ),
+    (
+        "omamori uninstall",
+        Decision::Block,
+        "meta-pattern-uninstall-block",
+    ),
+    (
+        "omamori init --force",
+        Decision::Block,
+        "meta-pattern-init-force-block",
+    ),
+    (
+        "omamori override",
+        Decision::Block,
+        "meta-pattern-override-block",
+    ),
+    // 15c. Codex CLI hook / config protection (#66 T2/T3).
+    (
+        "echo payload > ~/.codex/hooks.json",
+        Decision::Block,
+        "meta-pattern-codex-hooks-json-block",
+    ),
+    (
+        "echo payload > ~/.codex/config.toml",
+        Decision::Block,
+        "meta-pattern-codex-config-toml-block",
+    ),
+    (
+        "cp config.toml config.toml.bak",
+        Decision::Block,
+        "meta-pattern-codex-config-toml-bak-block",
+    ),
+    (
+        "sed -i 's/codex_hooks = true/codex_hooks = false/' ~/.codex/config.toml",
+        Decision::Block,
+        "meta-pattern-codex-hooks-flag-block",
+    ),
+    // 15c-iso. Isolation entry for the `codex_hooks` meta-pattern: the
+    //          fixture above matches BOTH `.codex/config.toml` AND
+    //          `codex_hooks` substrings, so if `codex_hooks` is dropped from
+    //          `blocked_string_patterns()` the prior entry still Blocks via
+    //          `.codex/config.toml`. This fixture uses a staging path that
+    //          does not contain `.codex/config.toml`, `.codex/hooks.json`,
+    //          or `config.toml.bak`, so only the `codex_hooks` pattern can
+    //          trigger the Block. Same isolation regime as 15a-15b; PR #186
+    //          proxy review P1.
+    //
+    //          NOTE: if the `codex_hooks` pattern is ever refactored to a
+    //          stricter form (e.g. `codex_hooks ` trailing-space, or a word
+    //          boundary requirement), the sed-command fixture below must be
+    //          rechecked — it currently happens to include `codex_hooks `
+    //          with a trailing space inside the sed expression, but that
+    //          incidental match should not be relied on when the pattern
+    //          tightens. PR #186 proxy R5.
+    (
+        "sed -i 's/codex_hooks = true/codex_hooks = false/' /tmp/staged.toml",
+        Decision::Block,
+        "meta-pattern-codex-hooks-standalone-block",
+    ),
+    // 15d. FP guard: `rmdir` must NOT be caught by the `/bin/rm ` / `/bin/rm\t`
+    //      / etc. boundary patterns. Previously asserted structurally by
+    //      `meta_patterns_do_not_false_positive_on_rmdir` (pattern array never
+    //      contains `/bin/rmdir`), which also caught the "someone copy-pastes
+    //      a typo'd `/bin/rmdir ` into the block list" class. The bare
+    //      `rmdir /tmp/x` form does not share any substring prefix with the
+    //      /bin/rm* patterns, so direct-path rmdir pins are required to cover
+    //      the typo-injection surface the old test guarded against. PR #186
+    //      proxy review P2.
+    (
+        "rmdir /tmp/x",
+        Decision::Allow,
+        "meta-pattern-rmdir-bare-fp-guard-allow",
+    ),
+    (
+        "/bin/rmdir /tmp/x",
+        Decision::Allow,
+        "meta-pattern-bin-rmdir-fp-guard-allow",
+    ),
+    (
+        "/usr/bin/rmdir /tmp/x",
+        Decision::Allow,
+        "meta-pattern-usr-bin-rmdir-fp-guard-allow",
+    ),
 ];
 
 /// Cross-OS invariant: the same bash input must yield the same Decision on
@@ -423,6 +585,40 @@ fn corpus_includes_both_decisions() {
         .any(|(_, d, _)| *d == Decision::Block);
     assert!(has_allow, "corpus must include at least one Allow case");
     assert!(has_block, "corpus must include at least one Block case");
+}
+
+/// Pin the minimum size of the `meta-pattern-*` sub-corpus introduced by PR4
+/// (#146 scope 4). `corpus_includes_both_decisions` only guarantees one
+/// Allow + one Block exist anywhere in HOOK_DECISION_CASES, so a refactor
+/// that silently drops the 15a-15d entries (10+ fixtures) would still pass
+/// because unrelated entries keep both Decisions alive. This test pins the
+/// category floor directly — the thesis of PR4 is that "silent pattern
+/// drop" must fail the suite, so the corpus that encodes that guarantee
+/// must itself be guarded from silent drop. PR #186 proxy review P2.
+#[test]
+fn corpus_includes_meta_pattern_coverage() {
+    let meta_pattern_count = HOOK_DECISION_CASES
+        .iter()
+        .filter(|(_, _, cat)| cat.starts_with("meta-pattern-"))
+        .count();
+    // Floor rationale: the 4 deleted installer unit tests mapped to
+    //   - rm_path_boundaries: 2 paths × 4 boundaries = 8 fixtures
+    //   - config_modification: 5 keywords (incl. override)         = 5 fixtures
+    //   - codex_protection:   4 original keywords                   = 4 fixtures
+    //                         + 1 isolation fixture for codex_hooks = 5 fixtures
+    //   - do_not_false_positive_on_rmdir: bare + 2 direct paths     = 3 fixtures
+    // → 8 + 5 + 5 + 3 = 21 behavioral fixtures in HEAD (4 of 5 categories
+    // map 1:1 from the deleted unit tests; codex_protection gained +1 from
+    // the R4 isolation requirement). Floor set to 18 to allow minor tactical
+    // reshuffles (up to 3-fixture drift) without drift, while still catching
+    // an accidental category-level deletion. PR #186 R5 proxy corrected the
+    // prior 20/18 arithmetic to 21/18.
+    assert!(
+        meta_pattern_count >= 18,
+        "meta-pattern corpus (#146 scope 4) must have ≥18 entries; got {meta_pattern_count}. \
+         If you are intentionally removing entries, verify the attack/FP surfaces still \
+         have isolated behavioral coverage and update this floor."
+    );
 }
 
 /// Pin the Block exit code contract at exactly 2. The `cross_os_invariant`
