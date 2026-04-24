@@ -393,16 +393,24 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
     //     hook-check CLI boundary so the test survives a pattern-list
     //     refactor and only fails if the attack surface actually re-opens.
     //
-    // 15a. Direct-path rm bypassing PATH shim, /usr/bin variant.
-    //      DELIBERATELY non-recursive (`rm /tmp/x`, no `-rf`) so the
-    //      Block decision must come from the Phase 1A meta-pattern layer
-    //      (`/usr/bin/rm ` substring), not from the Phase 2 rule layer
-    //      `rm-recursive-to-trash` (which would only trigger on `-rf`).
-    //      Without this isolation the test would still pass after the
-    //      meta-pattern `/usr/bin/rm ` is dropped, because the rule layer
-    //      would catch the `-rf` form independently. Codex Review PR #186.
-    //      (Note: case #2 `/bin/rm -rf /tmp/x` has the same double-coverage
-    //      weakness but is out of scope for PR4 — tracked for later polish.)
+    // 15a. Direct-path rm bypassing PATH shim, both /bin and /usr/bin
+    //      variants. DELIBERATELY non-recursive (`rm /tmp/x`, no `-rf`)
+    //      so the Block decision must come from the Phase 1A meta-pattern
+    //      layer (`/bin/rm ` / `/usr/bin/rm ` substring), not from the
+    //      Phase 2 rule layer `rm-recursive-to-trash` (which would only
+    //      trigger on `-rf`). Without this isolation the test would still
+    //      pass after the meta-pattern is dropped, because the rule layer
+    //      would catch the `-rf` form independently. Codex Review PR #186
+    //      R1 (/usr/bin variant) + R2 (/bin variant) — the deleted
+    //      `meta_patterns_cover_rm_path_boundaries` test pinned both paths
+    //      against 4 boundaries each, so both must be pinned here too.
+    //      (Case #2 `/bin/rm -rf /tmp/x` remains for historical coverage
+    //      but is double-covered; this pair is the meta-layer guarantee.)
+    (
+        "/bin/rm /tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-direct-path-block",
+    ),
     (
         "/usr/bin/rm /tmp/x",
         Decision::Block,
