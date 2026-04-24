@@ -387,6 +387,76 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "arg-reorder-long-flag-order-block",
     ),
+    // 15. PR4 scope 4: meta-pattern (`blocked_string_patterns`) behavioral
+    //     coverage. Previously asserted at the array-shape level in
+    //     `src/installer.rs` (`meta_patterns_cover_*`), now pinned at the
+    //     hook-check CLI boundary so the test survives a pattern-list
+    //     refactor and only fails if the attack surface actually re-opens.
+    //
+    // 15a. Direct-path rm bypassing PATH shim, /usr/bin variant.
+    //      (/bin/rm variant is already covered by case #2.)
+    (
+        "/usr/bin/rm -rf /tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-block",
+    ),
+    // 15b. omamori self-mutation attempts: subcommands that tamper with
+    //      omamori's own config / install state must be blocked.
+    (
+        "omamori config disable some-rule",
+        Decision::Block,
+        "meta-pattern-config-disable-block",
+    ),
+    (
+        "omamori config enable some-rule",
+        Decision::Block,
+        "meta-pattern-config-enable-block",
+    ),
+    (
+        "omamori uninstall",
+        Decision::Block,
+        "meta-pattern-uninstall-block",
+    ),
+    (
+        "omamori init --force",
+        Decision::Block,
+        "meta-pattern-init-force-block",
+    ),
+    (
+        "omamori override",
+        Decision::Block,
+        "meta-pattern-override-block",
+    ),
+    // 15c. Codex CLI hook / config protection (#66 T2/T3).
+    (
+        "echo payload > ~/.codex/hooks.json",
+        Decision::Block,
+        "meta-pattern-codex-hooks-json-block",
+    ),
+    (
+        "echo payload > ~/.codex/config.toml",
+        Decision::Block,
+        "meta-pattern-codex-config-toml-block",
+    ),
+    (
+        "cp config.toml config.toml.bak",
+        Decision::Block,
+        "meta-pattern-codex-config-toml-bak-block",
+    ),
+    (
+        "sed -i 's/codex_hooks = true/codex_hooks = false/' ~/.codex/config.toml",
+        Decision::Block,
+        "meta-pattern-codex-hooks-flag-block",
+    ),
+    // 15d. FP guard: `rmdir` must NOT be caught by the `/bin/rm ` boundary
+    //      pattern. Previously asserted by
+    //      `meta_patterns_do_not_false_positive_on_rmdir` at the array
+    //      level; now pinned as a behavioral Allow at the hook boundary.
+    (
+        "rmdir /tmp/x",
+        Decision::Allow,
+        "meta-pattern-rmdir-fp-guard-allow",
+    ),
 ];
 
 /// Cross-OS invariant: the same bash input must yield the same Decision on

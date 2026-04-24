@@ -955,20 +955,15 @@ mod tests {
     }
 
     // --- Meta-pattern tests (blocked_string_patterns, Phase 1) ---
-
-    #[test]
-    fn meta_patterns_cover_rm_path_boundaries() {
-        let patterns = blocked_string_patterns();
-        for path in &["/bin/rm", "/usr/bin/rm"] {
-            for boundary in &[" ", "\"", "\t", "'"] {
-                let needle = format!("{path}{boundary}");
-                assert!(
-                    patterns.iter().any(|(p, _)| *p == needle),
-                    "blocked_string_patterns should cover: {path}{boundary:?}"
-                );
-            }
-        }
-    }
+    //
+    // Behavioral coverage of `blocked_string_patterns()` now lives in
+    // `tests/hook_integration.rs` (category 15a-15d of HOOK_DECISION_CASES)
+    // as CLI exit-code assertions against `omamori hook-check`. That form
+    // survives internal refactors of the pattern list (renames, grouping,
+    // moving to a const table) and only fails when the attack surface
+    // actually re-opens — which is what the test is there to protect
+    // against. The previous array-shape assertions here tested the data
+    // structure rather than the guarantee and were removed in PR #v096-pr4.
 
     #[test]
     fn protected_env_vars_constant_covers_all_detectors() {
@@ -986,33 +981,6 @@ mod tests {
             assert!(
                 PROTECTED_ENV_VARS.contains(var),
                 "PROTECTED_ENV_VARS should include {var}"
-            );
-        }
-    }
-
-    #[test]
-    fn meta_patterns_cover_config_modification() {
-        let patterns = blocked_string_patterns();
-        for keyword in &[
-            "config disable",
-            "config enable",
-            "omamori uninstall",
-            "omamori init --force",
-        ] {
-            assert!(
-                patterns.iter().any(|(p, _)| p.contains(keyword)),
-                "should block: {keyword}"
-            );
-        }
-    }
-
-    #[test]
-    fn meta_patterns_do_not_false_positive_on_rmdir() {
-        let patterns = blocked_string_patterns();
-        for (pattern, _) in &patterns {
-            assert!(
-                !pattern.contains("/bin/rmdir"),
-                "pattern should not match rmdir: {pattern}"
             );
         }
     }
@@ -1548,21 +1516,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn meta_patterns_cover_codex_protection() {
-        let patterns = blocked_string_patterns();
-        for keyword in &[
-            ".codex/hooks.json",
-            ".codex/config.toml",
-            "config.toml.bak",
-            "codex_hooks",
-        ] {
-            assert!(
-                patterns.iter().any(|(p, _)| p.contains(keyword)),
-                "should block: {keyword}"
-            );
-        }
-    }
+    // meta_patterns_cover_codex_protection was moved to
+    // tests/hook_integration.rs as behavioral CLI exit-code assertions
+    // (HOOK_DECISION_CASES category 15c). See the note above
+    // `protected_env_vars_constant_covers_all_detectors` for rationale.
 
     #[test]
     fn blocked_string_patterns_include_omamori_override() {

@@ -509,32 +509,37 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // --- Verify chain integrity (helper for tests) ---
-
-    fn check_chain_manual(events: &[serde_json::Value], secret: Option<&[u8; 32]>) -> bool {
-        let genesis = genesis_hash(secret);
-        let mut expected_prev = genesis;
-
-        for (i, event) in events.iter().enumerate() {
-            let parsed: AuditEvent = serde_json::from_value(event.clone()).unwrap();
-            let recomputed = compute_entry_hash(secret, &parsed);
-            let recorded = event["entry_hash"].as_str().unwrap_or("");
-
-            if recomputed != recorded {
-                eprintln!("hash mismatch at index {i}");
-                return false;
-            }
-
-            let prev = event["prev_hash"].as_str().unwrap_or("");
-            if prev != expected_prev {
-                eprintln!("prev_hash mismatch at index {i}");
-                return false;
-            }
-
-            expected_prev = recorded.to_string();
-        }
-        true
-    }
+    // --- Golden hex vectors (PR #v096-pr4) ---
+    //
+    // WHY golden vectors (not a self-verifying helper):
+    //   The previous form recomputed `compute_entry_hash` inside the test
+    //   and compared it against the recorded `entry_hash`. Since both sides
+    //   flow through the same function, an algorithm-level regression
+    //   (HMAC key derivation change, field order change, genesis marker
+    //   change) would produce a matching pair on both sides and the test
+    //   would silently pass. Goldens break that symmetry by pinning the
+    //   exact bytes a v0.9.x reader must accept.
+    //
+    // How to regenerate (if a deliberate algorithm change lands):
+    //   Temporarily add a `#[test] fn tmp_print` that prints
+    //   `genesis_hash(Some(&TEST_SECRET))` and each `events[i]["entry_hash"]`
+    //   for `make_event("cmd0"..="cmd4")`, run with `--nocapture`, paste the
+    //   output below, then delete the tmp test. The inputs are deterministic
+    //   because `make_event` uses a fixed timestamp ("2026-01-01T00:00:00Z")
+    //   and `AuditLogger::append` does not overwrite the event timestamp.
+    const GOLDEN_GENESIS: &str = "d9c14c4fc7dbc19fce81268a054a22fa092e4946cc762823bd641e156233030b";
+    const GOLDEN_ENTRY_HASHES: [&str; 5] = [
+        // seq=0, command="cmd0"
+        "ff8d28e58ca55a781c908beb827387f22418350d8b7399b2fdecae1a1f805bf2",
+        // seq=1, command="cmd1"
+        "23473c102da2cc4b56081e1bd9746628feba3c0daf566bb4ecdc7170b085f81f",
+        // seq=2, command="cmd2"
+        "c1c2d820311b47c2b16acbca62dd7b2be7951045bd7514130f3ea22031d8bf6d",
+        // seq=3, command="cmd3"
+        "bd394c8964cf47715e2ad67d78184f7a5cf5be21eb651c885d791c2885d075b3",
+        // seq=4, command="cmd4"
+        "3554f31aac0e3a9ea21afb2f572e09e343c841c21faf2ebf2208f89fc687d165",
+    ];
 
     #[test]
     fn chain_integrity_verification() {
@@ -546,7 +551,36 @@ mod tests {
         }
 
         let events = read_events(&logger.path);
-        assert!(check_chain_manual(&events, Some(&TEST_SECRET)));
+        assert_eq!(events.len(), 5);
+
+        // Pin genesis against the golden: if the HMAC marker changes
+        // (e.g. key_id derivation, domain separator), this fails first.
+        assert_eq!(
+            events[0]["prev_hash"].as_str().unwrap(),
+            GOLDEN_GENESIS,
+            "genesis hash divergence — HMAC key or domain-separator changed?"
+        );
+
+        // Pin each entry's recorded entry_hash + prev_hash chain against
+        // the golden. Using hardcoded hex breaks the symmetry of the old
+        // self-verifying helper (compute_entry_hash on both sides).
+        for (i, expected) in GOLDEN_ENTRY_HASHES.iter().enumerate() {
+            assert_eq!(
+                events[i]["entry_hash"].as_str().unwrap(),
+                *expected,
+                "entry_hash at seq={i} drifted from golden — algorithm change?"
+            );
+            let expected_prev = if i == 0 {
+                GOLDEN_GENESIS
+            } else {
+                GOLDEN_ENTRY_HASHES[i - 1]
+            };
+            assert_eq!(
+                events[i]["prev_hash"].as_str().unwrap(),
+                expected_prev,
+                "prev_hash at seq={i} broke chain linkage from golden"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -560,15 +594,38 @@ mod tests {
             logger.append(make_event(&format!("cmd{i}"))).unwrap();
         }
 
-        // Tamper: change command in second entry
+        // Tamper: change command in second entry on disk.
         let content = fs::read_to_string(&logger.path).unwrap();
         let tampered = content.replacen("cmd1", "HACKED", 1);
         fs::write(&logger.path, tampered).unwrap();
 
         let events = read_events(&logger.path);
-        assert!(
-            !check_chain_manual(&events, Some(&TEST_SECRET)),
-            "tampered chain should fail verification"
+        assert_eq!(events.len(), 3);
+
+        // Tamper detection contract:
+        //   (a) The *recorded* entry_hash on the tampered line is still the
+        //       pre-tamper golden (attacker only flipped a payload byte).
+        //   (b) Recomputing the hash from the post-tamper payload yields a
+        //       different digest. That divergence is the detection signal.
+        // Pinning both sides against goldens (not against each other) ensures
+        // a future algorithm change can't paper over a real tamper.
+        let parsed_seq1: AuditEvent = serde_json::from_value(events[1].clone()).unwrap();
+        let recomputed_seq1 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq1);
+
+        assert_eq!(
+            events[1]["entry_hash"].as_str().unwrap(),
+            GOLDEN_ENTRY_HASHES[1],
+            "tampered line should still carry the pre-tamper recorded hash"
+        );
+        assert_ne!(
+            recomputed_seq1, GOLDEN_ENTRY_HASHES[1],
+            "recomputed hash over tampered payload must diverge from golden — \
+             this is the tamper signal"
+        );
+        assert_ne!(
+            recomputed_seq1,
+            events[1]["entry_hash"].as_str().unwrap(),
+            "recomputed vs. recorded divergence is the end-to-end detection test"
         );
 
         let _ = fs::remove_dir_all(&dir);
