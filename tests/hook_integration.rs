@@ -503,14 +503,43 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "meta-pattern-codex-hooks-flag-block",
     ),
-    // 15d. FP guard: `rmdir` must NOT be caught by the `/bin/rm ` boundary
-    //      pattern. Previously asserted by
-    //      `meta_patterns_do_not_false_positive_on_rmdir` at the array
-    //      level; now pinned as a behavioral Allow at the hook boundary.
+    // 15c-iso. Isolation entry for the `codex_hooks` meta-pattern: the
+    //          fixture above matches BOTH `.codex/config.toml` AND
+    //          `codex_hooks` substrings, so if `codex_hooks` is dropped from
+    //          `blocked_string_patterns()` the prior entry still Blocks via
+    //          `.codex/config.toml`. This fixture uses a staging path that
+    //          does not contain `.codex/config.toml`, `.codex/hooks.json`,
+    //          or `config.toml.bak`, so only the `codex_hooks` pattern can
+    //          trigger the Block. Same isolation regime as 15a-15b; PR #186
+    //          proxy review P1.
+    (
+        "sed -i 's/codex_hooks = true/codex_hooks = false/' /tmp/staged.toml",
+        Decision::Block,
+        "meta-pattern-codex-hooks-standalone-block",
+    ),
+    // 15d. FP guard: `rmdir` must NOT be caught by the `/bin/rm ` / `/bin/rm\t`
+    //      / etc. boundary patterns. Previously asserted structurally by
+    //      `meta_patterns_do_not_false_positive_on_rmdir` (pattern array never
+    //      contains `/bin/rmdir`), which also caught the "someone copy-pastes
+    //      a typo'd `/bin/rmdir ` into the block list" class. The bare
+    //      `rmdir /tmp/x` form does not share any substring prefix with the
+    //      /bin/rm* patterns, so direct-path rmdir pins are required to cover
+    //      the typo-injection surface the old test guarded against. PR #186
+    //      proxy review P2.
     (
         "rmdir /tmp/x",
         Decision::Allow,
-        "meta-pattern-rmdir-fp-guard-allow",
+        "meta-pattern-rmdir-bare-fp-guard-allow",
+    ),
+    (
+        "/bin/rmdir /tmp/x",
+        Decision::Allow,
+        "meta-pattern-bin-rmdir-fp-guard-allow",
+    ),
+    (
+        "/usr/bin/rmdir /tmp/x",
+        Decision::Allow,
+        "meta-pattern-usr-bin-rmdir-fp-guard-allow",
     ),
 ];
 
@@ -548,6 +577,38 @@ fn corpus_includes_both_decisions() {
         .any(|(_, d, _)| *d == Decision::Block);
     assert!(has_allow, "corpus must include at least one Allow case");
     assert!(has_block, "corpus must include at least one Block case");
+}
+
+/// Pin the minimum size of the `meta-pattern-*` sub-corpus introduced by PR4
+/// (#146 scope 4). `corpus_includes_both_decisions` only guarantees one
+/// Allow + one Block exist anywhere in HOOK_DECISION_CASES, so a refactor
+/// that silently drops the 15a-15d entries (10+ fixtures) would still pass
+/// because unrelated entries keep both Decisions alive. This test pins the
+/// category floor directly — the thesis of PR4 is that "silent pattern
+/// drop" must fail the suite, so the corpus that encodes that guarantee
+/// must itself be guarded from silent drop. PR #186 proxy review P2.
+#[test]
+fn corpus_includes_meta_pattern_coverage() {
+    let meta_pattern_count = HOOK_DECISION_CASES
+        .iter()
+        .filter(|(_, _, cat)| cat.starts_with("meta-pattern-"))
+        .count();
+    // Floor rationale: the 4 deleted installer unit tests pinned
+    //   - rm_path_boundaries: 2 paths × 4 boundaries = 8 patterns
+    //   - config_modification: 5 keywords (incl. override)
+    //   - codex_protection:   4 keywords (.codex/hooks.json,
+    //                         .codex/config.toml, config.toml.bak,
+    //                         codex_hooks — last one isolated in 15c-iso)
+    //   - do_not_false_positive_on_rmdir: 3 FP guards (bare + 2 paths)
+    // → 8 + 5 + 4 + 3 = 20 behavioral fixtures. Floor set to 18 to allow
+    // minor tactical reshuffles without drift, while still catching an
+    // accidental category-level deletion.
+    assert!(
+        meta_pattern_count >= 18,
+        "meta-pattern corpus (#146 scope 4) must have ≥18 entries; got {meta_pattern_count}. \
+         If you are intentionally removing entries, verify the attack/FP surfaces still \
+         have isolated behavioral coverage and update this floor."
+    );
 }
 
 /// Pin the Block exit code contract at exactly 2. The `cross_os_invariant`

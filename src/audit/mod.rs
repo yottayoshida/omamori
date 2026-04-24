@@ -520,13 +520,32 @@ mod tests {
     //   would silently pass. Goldens break that symmetry by pinning the
     //   exact bytes a v0.9.x reader must accept.
     //
+    // All inputs the goldens depend on (change any and the hex must be
+    // regenerated). PR #186 proxy review P3 — earlier comment only listed
+    // timestamp; these additional inputs also feed the HMAC:
+    //   - `TEST_SECRET = [0x42u8; 32]`
+    //   - `test_logger` defaults: `key_id: "default"`,
+    //     `retention_days: 0`, path under temp dir
+    //   - `make_event` defaults: `timestamp: "2026-01-01T00:00:00Z"`,
+    //     `provider: "test"`, `action/result: "passthrough"`,
+    //     `target_count: 0`, `target_hash: "hmac-sha256:test"`,
+    //     `detection_layer: Some("layer1")`, all optional chain fields None
+    //   - `AuditLogger::append` populates `chain_version`, `seq`,
+    //     `prev_hash`, `key_id`, `entry_hash` on each event before write
+    //     and does NOT overwrite `timestamp`
+    //   - `compute_entry_hash` via `HashableEvent::from_event`
+    //     (see `src/audit/chain.rs`)
+    //
     // How to regenerate (if a deliberate algorithm change lands):
-    //   Temporarily add a `#[test] fn tmp_print` that prints
-    //   `genesis_hash(Some(&TEST_SECRET))` and each `events[i]["entry_hash"]`
-    //   for `make_event("cmd0"..="cmd4")`, run with `--nocapture`, paste the
-    //   output below, then delete the tmp test. The inputs are deterministic
-    //   because `make_event` uses a fixed timestamp ("2026-01-01T00:00:00Z")
-    //   and `AuditLogger::append` does not overwrite the event timestamp.
+    //   Run `chain_integrity_verification` with a temporary
+    //   `println!("{events:#?}");` inserted after `read_events(&logger.path)`.
+    //   Read the printed `entry_hash` and `prev_hash` fields
+    //   (events[0].prev_hash == genesis). Paste below and delete the
+    //   `println!`. Do NOT regenerate by calling `compute_entry_hash`
+    //   directly on a `make_event(...)` result — the chain fields
+    //   (seq / prev_hash / key_id) would be `None` and the digest would
+    //   diverge from what `append` writes. Changing `test_logger` defaults
+    //   (key_id, retention_days, etc.) also invalidates these goldens.
     const GOLDEN_GENESIS: &str = "d9c14c4fc7dbc19fce81268a054a22fa092e4946cc762823bd641e156233030b";
     const GOLDEN_ENTRY_HASHES: [&str; 5] = [
         // seq=0, command="cmd0"

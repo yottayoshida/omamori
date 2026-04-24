@@ -1377,13 +1377,16 @@ mod tests {
     //
     // unwrap's responsibility is the *internal* parser stage that consumes
     // already-tokenized `shell_words` output. Going through `omamori hook-check`
-    // would force every input through the full shell parser chain (bash →
-    // shell_words → normalize_compound_operators → unwrap). That chain also
-    // performs quote stripping, operator splitting, and whitespace collapsing
-    // before unwrap ever sees the tokens — so for malformed or edge-case
-    // inputs (e.g. the wrapper-evasion corpus in this module), the CLI
-    // boundary would test `shell_words` parsing behavior, not unwrap's
-    // contract.
+    // would force every input through the full pre-parse chain:
+    //   JSON `tool_input.command` → normalize_compound_operators →
+    //   shell_words::split → unwrap.
+    // (See `src/engine/hook.rs::check_command_for_hook` lines 146-154 for
+    // the actual order; `normalize_compound_operators` runs before
+    // `shell_words::split`.) That chain performs operator splitting,
+    // quote stripping, and whitespace collapsing before unwrap ever sees
+    // the tokens — so for malformed or edge-case inputs (e.g. the
+    // wrapper-evasion corpus in this module), the CLI boundary would test
+    // `shell_words` parsing behavior, not unwrap's contract.
     //
     // Behavioral end-to-end guarantees (a real command must Block/Allow)
     // are pinned at the hook boundary in `tests/hook_integration.rs` via
