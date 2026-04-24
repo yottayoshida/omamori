@@ -393,28 +393,67 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
     //     hook-check CLI boundary so the test survives a pattern-list
     //     refactor and only fails if the attack surface actually re-opens.
     //
-    // 15a. Direct-path rm bypassing PATH shim, both /bin and /usr/bin
-    //      variants. DELIBERATELY non-recursive (`rm /tmp/x`, no `-rf`)
+    // 15a. Direct-path rm bypassing PATH shim — full boundary coverage.
+    //      The deleted `meta_patterns_cover_rm_path_boundaries` test
+    //      pinned 2 paths × 4 token boundaries (space, double-quote, tab,
+    //      single-quote) = 8 asserts. Phase 1A runs `command.contains`
+    //      against the raw pre-quote-stripped command string, so each
+    //      boundary is an independent attack surface — `/bin/rm"` and
+    //      `/bin/rm\t` are distinct pattern entries that a refactor
+    //      could drop individually.
+    //      All cases DELIBERATELY non-recursive (`rm /tmp/x`, no `-rf`)
     //      so the Block decision must come from the Phase 1A meta-pattern
-    //      layer (`/bin/rm ` / `/usr/bin/rm ` substring), not from the
-    //      Phase 2 rule layer `rm-recursive-to-trash` (which would only
-    //      trigger on `-rf`). Without this isolation the test would still
-    //      pass after the meta-pattern is dropped, because the rule layer
-    //      would catch the `-rf` form independently. Codex Review PR #186
-    //      R1 (/usr/bin variant) + R2 (/bin variant) — the deleted
-    //      `meta_patterns_cover_rm_path_boundaries` test pinned both paths
-    //      against 4 boundaries each, so both must be pinned here too.
-    //      (Case #2 `/bin/rm -rf /tmp/x` remains for historical coverage
-    //      but is double-covered; this pair is the meta-layer guarantee.)
+    //      layer, not from the Phase 2 rule `rm-recursive-to-trash`.
+    //      Codex Review PR #186 R1 (space-boundary), R2 (both paths),
+    //      R3 (non-space boundaries). Case #2 `/bin/rm -rf /tmp/x`
+    //      remains for historical coverage but is double-covered; this
+    //      group is the meta-layer guarantee.
+    // 15a.i space boundary.
     (
         "/bin/rm /tmp/x",
         Decision::Block,
-        "meta-pattern-bin-rm-direct-path-block",
+        "meta-pattern-bin-rm-space-boundary-block",
     ),
     (
         "/usr/bin/rm /tmp/x",
         Decision::Block,
-        "meta-pattern-usr-bin-rm-direct-path-block",
+        "meta-pattern-usr-bin-rm-space-boundary-block",
+    ),
+    // 15a.ii double-quote boundary — raw command `"/bin/rm" /tmp/x`.
+    //        After shell_words strips quotes tokens are fine, but the
+    //        Phase 1A contains-check sees the raw form with the trailing
+    //        quote char right after the path.
+    (
+        "\"/bin/rm\" /tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-dquote-boundary-block",
+    ),
+    (
+        "\"/usr/bin/rm\" /tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-dquote-boundary-block",
+    ),
+    // 15a.iii tab boundary — direct path followed by TAB instead of space.
+    (
+        "/bin/rm\t/tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-tab-boundary-block",
+    ),
+    (
+        "/usr/bin/rm\t/tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-tab-boundary-block",
+    ),
+    // 15a.iv single-quote boundary — raw command `'/bin/rm' /tmp/x`.
+    (
+        "'/bin/rm' /tmp/x",
+        Decision::Block,
+        "meta-pattern-bin-rm-squote-boundary-block",
+    ),
+    (
+        "'/usr/bin/rm' /tmp/x",
+        Decision::Block,
+        "meta-pattern-usr-bin-rm-squote-boundary-block",
     ),
     // 15b. omamori self-mutation attempts: subcommands that tamper with
     //      omamori's own config / install state must be blocked.
