@@ -3763,4 +3763,38 @@ mod tests {
         ];
         assert!(segment_has_stdin_redirect(&tokens));
     }
+
+    // =========================================================================
+    // 14. PR3 scope 1: argument reordering is detection-agnostic
+    //     (existing match_rule is order-independent; pin the invariant).
+    //     scope 2 (verb-position ${IFS}/ANSI-C $'...' detection) was
+    //     retracted after Codex review found bypasses in the narrow
+    //     fail-close (e.g. `$'rm' -rf /tmp` passed, `X=rm; $X -rf`
+    //     passed). Deferred to v0.9.7 #176 with a raw-segment approach.
+    // =========================================================================
+
+    #[test]
+    fn arg_reorder_rm_rf_order_flipped() {
+        // rm's -r and -f can appear in any order or combined. Both surface
+        // the same program+args to the rule layer; reordering does not
+        // change matching (match_rule iterates args independently).
+        assert_commands("rm -rf /tmp/x", &[cmd("rm", &["-rf", "/tmp/x"])]);
+        assert_commands("rm -r -f /tmp/x", &[cmd("rm", &["-r", "-f", "/tmp/x"])]);
+        assert_commands("rm -f -r /tmp/x", &[cmd("rm", &["-f", "-r", "/tmp/x"])]);
+        assert_commands(
+            "rm --force --recursive /tmp/x",
+            &[cmd("rm", &["--force", "--recursive", "/tmp/x"])],
+        );
+        assert_commands(
+            "rm --recursive --force /tmp/x",
+            &[cmd("rm", &["--recursive", "--force", "/tmp/x"])],
+        );
+    }
+
+    #[test]
+    fn arg_reorder_path_before_flags() {
+        // Target path before flags: `rm /tmp/x -rf` is valid POSIX and
+        // must surface identically.
+        assert_commands("rm /tmp/x -rf", &[cmd("rm", &["/tmp/x", "-rf"])]);
+    }
 }

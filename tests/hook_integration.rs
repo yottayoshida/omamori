@@ -372,6 +372,21 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Allow,
         "env-dash-u-bare-ls-allow",
     ),
+    // 14. PR3 scope 1: argument reordering is match_rule-agnostic.
+    //     `rm -rf /tmp/x` and `rm /tmp/x -rf` both surface as `rm` with
+    //     the same arg set — rule layer matches independently of order.
+    //     (scope 2 verb-position expansion deferred to v0.9.7 #176 —
+    //     Codex review found bypasses in the narrow fail-close.)
+    (
+        "rm /tmp/x -rf",
+        Decision::Block,
+        "arg-reorder-path-before-flags-block",
+    ),
+    (
+        "rm --recursive --force /tmp/x",
+        Decision::Block,
+        "arg-reorder-long-flag-order-block",
+    ),
 ];
 
 /// Cross-OS invariant: the same bash input must yield the same Decision on
