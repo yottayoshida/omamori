@@ -191,6 +191,8 @@ The unwrap stack is a static analyzer, not a shell interpreter. It cannot detect
 - Commands constructed at runtime by interpreters (`python -c`, `node -e`)
 - Heredoc content
 - Encoded payloads decoded at execution time
+- **Redirection-dup stdin aliases** (`source /dev/fd/N N<&0`): shell redirection creates a synthetic file descriptor that points at stdin, then `source /dev/fd/N` reads from it. Detection would require parsing `N<&0`-style redirections and tracking fd equivalence to `/dev/stdin`. This is out of scope for v0.9.6 (Codex Phase 6-A Major #4); v0.9.7 will track a redirection-aware parser plan. Note that the common case `bash -c 'source /dev/stdin' < file` IS handled — an explicit stdin redirect exempts the segment from pipe-to-shell detection — but `N<&0` fd-dup patterns still slip through.
+- **GNU env `-S STRING` attack surface is closed by a coarse rule**: any `env -S` invocation on the RHS of a pipe is blocked unconditionally, regardless of STRING contents. The rule covers all known evasion angles (leading `KEY=VAL` assignments, leading env flags `-i`/`-u`/`-C`, trailing argv, `--` terminator, nested `-S`, and the full GNU escape vocabulary `\_`/`\n`/`\t`/`\v`/`\c`/`${VAR}`). This is strictly stronger than the finer-grained `string_head_is_shell` predicate used in earlier PR2 iterations, which repeatedly leaked one angle at a time (Codex Phase 6-A Rounds 1–3). Legitimate `env -S` use is concentrated in shebang lines (`#!/usr/bin/env -S prog args`), which are resolved by the kernel before an omamori hook sees the command — no regression to shebang-based workflows.
 
 ## Hook Auto-Sync (v0.4.1+)
 
