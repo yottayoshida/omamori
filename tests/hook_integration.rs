@@ -394,11 +394,19 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
     //     refactor and only fails if the attack surface actually re-opens.
     //
     // 15a. Direct-path rm bypassing PATH shim, /usr/bin variant.
-    //      (/bin/rm variant is already covered by case #2.)
+    //      DELIBERATELY non-recursive (`rm /tmp/x`, no `-rf`) so the
+    //      Block decision must come from the Phase 1A meta-pattern layer
+    //      (`/usr/bin/rm ` substring), not from the Phase 2 rule layer
+    //      `rm-recursive-to-trash` (which would only trigger on `-rf`).
+    //      Without this isolation the test would still pass after the
+    //      meta-pattern `/usr/bin/rm ` is dropped, because the rule layer
+    //      would catch the `-rf` form independently. Codex Review PR #186.
+    //      (Note: case #2 `/bin/rm -rf /tmp/x` has the same double-coverage
+    //      weakness but is out of scope for PR4 — tracked for later polish.)
     (
-        "/usr/bin/rm -rf /tmp/x",
+        "/usr/bin/rm /tmp/x",
         Decision::Block,
-        "meta-pattern-usr-bin-rm-block",
+        "meta-pattern-usr-bin-rm-direct-path-block",
     ),
     // 15b. omamori self-mutation attempts: subcommands that tamper with
     //      omamori's own config / install state must be blocked.
