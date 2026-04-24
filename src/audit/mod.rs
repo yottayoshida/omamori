@@ -534,7 +534,10 @@ mod tests {
     //     `prev_hash`, `key_id`, `entry_hash` on each event before write
     //     and does NOT overwrite `timestamp`
     //   - `compute_entry_hash` via `HashableEvent::from_event`
-    //     (see `src/audit/chain.rs`)
+    //     (see `src/audit/chain.rs` — the field order of `HashableEvent`
+    //     is additionally SECURITY-pinned by golden test GR-002; reordering
+    //     fields invalidates these entry-hash goldens even if the HMAC
+    //     algorithm itself is unchanged)
     //
     // How to regenerate (if a deliberate algorithm change lands):
     //   Run `chain_integrity_verification` with a temporary

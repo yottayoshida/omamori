@@ -512,6 +512,14 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
     //          or `config.toml.bak`, so only the `codex_hooks` pattern can
     //          trigger the Block. Same isolation regime as 15a-15b; PR #186
     //          proxy review P1.
+    //
+    //          NOTE: if the `codex_hooks` pattern is ever refactored to a
+    //          stricter form (e.g. `codex_hooks ` trailing-space, or a word
+    //          boundary requirement), the sed-command fixture below must be
+    //          rechecked — it currently happens to include `codex_hooks `
+    //          with a trailing space inside the sed expression, but that
+    //          incidental match should not be relied on when the pattern
+    //          tightens. PR #186 proxy R5.
     (
         "sed -i 's/codex_hooks = true/codex_hooks = false/' /tmp/staged.toml",
         Decision::Block,
@@ -593,16 +601,18 @@ fn corpus_includes_meta_pattern_coverage() {
         .iter()
         .filter(|(_, _, cat)| cat.starts_with("meta-pattern-"))
         .count();
-    // Floor rationale: the 4 deleted installer unit tests pinned
-    //   - rm_path_boundaries: 2 paths × 4 boundaries = 8 patterns
-    //   - config_modification: 5 keywords (incl. override)
-    //   - codex_protection:   4 keywords (.codex/hooks.json,
-    //                         .codex/config.toml, config.toml.bak,
-    //                         codex_hooks — last one isolated in 15c-iso)
-    //   - do_not_false_positive_on_rmdir: 3 FP guards (bare + 2 paths)
-    // → 8 + 5 + 4 + 3 = 20 behavioral fixtures. Floor set to 18 to allow
-    // minor tactical reshuffles without drift, while still catching an
-    // accidental category-level deletion.
+    // Floor rationale: the 4 deleted installer unit tests mapped to
+    //   - rm_path_boundaries: 2 paths × 4 boundaries = 8 fixtures
+    //   - config_modification: 5 keywords (incl. override)         = 5 fixtures
+    //   - codex_protection:   4 original keywords                   = 4 fixtures
+    //                         + 1 isolation fixture for codex_hooks = 5 fixtures
+    //   - do_not_false_positive_on_rmdir: bare + 2 direct paths     = 3 fixtures
+    // → 8 + 5 + 5 + 3 = 21 behavioral fixtures in HEAD (4 of 5 categories
+    // map 1:1 from the deleted unit tests; codex_protection gained +1 from
+    // the R4 isolation requirement). Floor set to 18 to allow minor tactical
+    // reshuffles (up to 3-fixture drift) without drift, while still catching
+    // an accidental category-level deletion. PR #186 R5 proxy corrected the
+    // prior 20/18 arithmetic to 21/18.
     assert!(
         meta_pattern_count >= 18,
         "meta-pattern corpus (#146 scope 4) must have ≥18 entries; got {meta_pattern_count}. \
