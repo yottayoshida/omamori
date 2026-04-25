@@ -17,6 +17,13 @@ use crate::unwrap;
 // ---------------------------------------------------------------------------
 
 /// Result of checking a command string through the hook pipeline.
+///
+/// Crate-internal: consumed by `run_hook_check_command` /
+/// `run_cursor_hook` for stderr framing, and by the in-tree property test
+/// (`crate::property_tests`, `#[cfg(test)]`) for cross-layer verdict
+/// comparison. Not re-exported — downstream callers must invoke the AI-
+/// tool hook entry point (`omamori hook-check`) instead, so phase
+/// short-circuits and rule loading both run.
 pub(crate) enum HookCheckResult {
     /// Command is allowed.
     Allow,
@@ -117,18 +124,20 @@ fn detect_env_var_tampering(tokens: &[String]) -> Option<&'static str> {
     None
 }
 
-/// Three-phase hook check:
-/// Phase 1A: String-level meta-patterns (path/config/uninstall)
-/// Phase 1B: Token-level env var tampering detection (whitespace-resilient)
-/// Phase 2: Token-level unwrap stack → rule matching
+/// Phase 1A (meta-patterns), Phase 1B (env tampering), and the structural
+/// branch of Phase 2 (parse-error / pipe-to-shell). Returns
+/// `Err(verdict)` for any early-return case, or `Ok(invocations)` for the
+/// caller to apply rule matching against a chosen rule slice.
 ///
-/// SECURITY (T8): The `Config::default()` fallback on load_config failure is
-/// intentional fail-safe behavior. DO NOT replace with `?` operator.
-pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
+/// Both `check_command_for_hook` and `check_command_for_hook_with_rules`
+/// share this prefix so the production wrapper does not pay
+/// `load_config(None)` when Phase 1A/1B/structural short-circuits the
+/// verdict.
+fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckResult> {
     // Phase 1A: String-level meta-patterns (path/config/uninstall)
     for (pattern, reason) in installer::blocked_string_patterns() {
         if command.contains(pattern) {
-            return HookCheckResult::BlockMeta(reason);
+            return Err(HookCheckResult::BlockMeta(reason));
         }
     }
 
@@ -147,49 +156,95 @@ pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
     if let Ok(tokens) = shell_words::split(&normalized)
         && let Some(reason) = detect_env_var_tampering(&tokens)
     {
-        return HookCheckResult::BlockMeta(reason);
+        return Err(HookCheckResult::BlockMeta(reason));
     }
 
-    // Phase 2: Unwrap stack → rule matching
-    let parse_result = unwrap::parse_command_string(command);
-
-    match parse_result {
-        unwrap::ParseResult::Block(reason) => HookCheckResult::BlockStructural(format!(
+    // Phase 2 parse: structural block (parse error / pipe-to-shell etc.)
+    match unwrap::parse_command_string(command) {
+        unwrap::ParseResult::Block(reason) => Err(HookCheckResult::BlockStructural(format!(
             "omamori hook: blocked — {}",
             reason.message()
-        )),
-        unwrap::ParseResult::Commands(invocations) => {
-            // Load config to get rules
-            // SECURITY (T8): fail-safe fallback — do NOT use ? here
-            let load_result = match load_config(None) {
-                Ok(r) => r,
-                Err(_) => {
-                    // Config load failure → use default rules (fail-safe, not fail-open)
-                    ConfigLoadResult {
-                        config: config::Config::default(),
-                        warnings: vec![],
-                    }
-                }
+        ))),
+        unwrap::ParseResult::Commands(invocations) => Ok(invocations),
+    }
+}
+
+/// Apply Phase 2 rule matching against an explicit rule slice. Returns the
+/// first matching rule's `BlockRule` verdict, or `Allow`.
+fn match_invocations_against_rules(
+    command: &str,
+    invocations: &[CommandInvocation],
+    rules: &[crate::rules::RuleConfig],
+) -> HookCheckResult {
+    for inv in invocations {
+        if let Some(rule) = match_rule(rules, inv) {
+            let chain_desc = format_unwrap_chain(command, inv);
+            let msg = rule
+                .message
+                .clone()
+                .unwrap_or_else(|| format!("matched rule: {}", rule.name));
+            return HookCheckResult::BlockRule {
+                rule_name: rule.name.clone(),
+                message: msg,
+                unwrap_chain: chain_desc,
             };
-
-            for inv in &invocations {
-                if let Some(rule) = match_rule(&load_result.config.rules, inv) {
-                    let chain_desc = format_unwrap_chain(command, inv);
-                    let msg = rule
-                        .message
-                        .clone()
-                        .unwrap_or_else(|| format!("matched rule: {}", rule.name));
-                    return HookCheckResult::BlockRule {
-                        rule_name: rule.name.clone(),
-                        message: msg,
-                        unwrap_chain: chain_desc,
-                    };
-                }
-            }
-
-            HookCheckResult::Allow
         }
     }
+    HookCheckResult::Allow
+}
+
+/// Three-phase hook check, evaluating against rules loaded from on-disk
+/// config with a `Config::default()` fail-safe fallback.
+///
+/// Phase 1A: String-level meta-patterns (path/config/uninstall)
+/// Phase 1B: Token-level env var tampering detection (whitespace-resilient)
+/// Phase 2: Token-level unwrap stack → rule matching
+///
+/// `load_config(None)` runs lazily — only when Phase 2 actually reaches
+/// the rule-matching arm. Phase 1A/1B/structural short-circuits pay zero
+/// disk I/O.
+///
+/// SECURITY (T8): The `Config::default()` fallback on `load_config` failure
+/// is intentional fail-safe behavior, not fail-open.
+pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
+    let invocations = match check_pre_phase_2(command) {
+        Ok(invs) => invs,
+        Err(verdict) => return verdict,
+    };
+    // Phase 2 reached — load on-disk config now (fail-safe fallback per T8).
+    let load_result = load_config(None).unwrap_or_else(|_| ConfigLoadResult {
+        config: config::Config::default(),
+        warnings: vec![],
+    });
+    match_invocations_against_rules(command, &invocations, &load_result.config.rules)
+}
+
+/// Three-phase hook check, evaluating Phase 2 rule matching against an
+/// explicitly provided rule slice instead of loading config from disk.
+///
+/// Test-only (`#[cfg(test)]`). Production code paths call
+/// [`check_command_for_hook`] so that the user's on-disk
+/// `~/.config/omamori/config.toml` overrides take effect. Compiling this
+/// helper out of the production binary makes the trust-boundary
+/// guarantee structural: a downstream integration cannot call a
+/// security-looking API with `Config::default().rules`, stale rules, or
+/// an empty slice to silently skip user policy overrides, because the
+/// symbol does not exist in the released binary.
+///
+/// The cross-layer property test (`crate::property_tests`) calls this
+/// helper with `Config::default().rules` to keep both layers' verdicts
+/// evaluated against the same canonical rule set, independent of any
+/// ambient developer or CI config file.
+#[cfg(test)]
+pub(crate) fn check_command_for_hook_with_rules(
+    command: &str,
+    rules: &[crate::rules::RuleConfig],
+) -> HookCheckResult {
+    let invocations = match check_pre_phase_2(command) {
+        Ok(invs) => invs,
+        Err(verdict) => return verdict,
+    };
+    match_invocations_against_rules(command, &invocations, rules)
 }
 
 /// Format the unwrap chain for display: "rm -rf / (via bash -c)"
