@@ -131,6 +131,32 @@ For what omamori **cannot** catch, see [Structural Limitations](#structural-limi
 | **Community** | Gemini CLI, Cline, others | Layer 1 only. Not E2E tested. |
 | **Fallback** | Any tool setting `AI_GUARD=1` | Layer 1 only. |
 
+### How omamori handles new / renamed tools
+
+AI tools rotate fast: Claude Code adds a tool one week, Cursor renames one the next, a third CLI ships next month. omamori is installed locally and updated by `brew upgrade` on your schedule, so a tool-name allowlist baked into the binary would always be slightly behind reality.
+
+Instead of recognising tools by name, omamori inspects the **shape** of the `tool_input` payload that the AI agent sends:
+
+| Shape we recognise | Routes to |
+|---|---|
+| `tool_input.command` or `tool_input.cmd` is a string | Full Bash pipeline (meta-patterns, env-tampering, unwrap stack) |
+| `tool_input.file_path` or `tool_input.path` is a string | FileOp / protected-path checks |
+| `tool_input.url` is a string (and no shell/file fields) | Read-only — allowed |
+| Wrong type on any of the above (e.g. `command: 42`) | Fails closed (Block) |
+| None of the above | *Observable fail-open* — see below |
+
+A tool calling itself `FuturePlanWriter` but carrying a `command` field still reaches the shell pipeline. A renamed Edit tool with `file_path` still reaches the protected-path check. The classifier prioritises shell-shape over file-shape over url-shape, so a payload that mixes `command` and `url` cannot dodge into the read-only branch.
+
+**Observable fail-open** (`tool_input` has no shape we recognise): omamori still allows the call — we won't start blocking unreviewed tools retroactively, that breaks user workflows on every legitimate AI update — but the silence is gone. `stderr` carries a one-line hint per unique tool name, and an `unknown_tool_fail_open` event is appended to the audit chain. Review them later with:
+
+```bash
+omamori audit unknown
+```
+
+`omamori doctor` also surfaces a "Last 30 days: N unknown-tool fail-opens" line whenever the count is non-zero, so you don't have to remember to look.
+
+This trade-off is deliberate: stricter (block-by-default-on-unknown-shape) would close the protection gap further but would also block every legitimate new tool until omamori shipped a release. Opt-in strict mode is tracked for a follow-up release.
+
 ## Context-Aware Evaluation
 
 omamori can adjust actions based on what the command targets:

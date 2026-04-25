@@ -14,7 +14,8 @@ pub mod verify;
 // --- Public re-exports (maintain `omamori::audit::*` API paths) ---
 pub use secret::{RotationResult, rotate_key};
 pub use verify::{
-    AuditError, AuditSummary, ShowOptions, VerifyResult, audit_summary, show_entries, verify_chain,
+    AuditError, AuditSummary, ShowOptions, VerifyResult, audit_summary,
+    count_unknown_tool_fail_opens_within, show_entries, verify_chain,
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
@@ -1051,6 +1052,7 @@ mod tests {
             rule: None,
             provider: None,
             json: false,
+            action: None,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1087,6 +1089,7 @@ mod tests {
             rule: Some("rm".to_string()),
             provider: None,
             json: false,
+            action: None,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1107,6 +1110,7 @@ mod tests {
             rule: None,
             provider: None,
             json: true,
+            action: None,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1134,6 +1138,7 @@ mod tests {
             rule: None,
             provider: None,
             json: false,
+            action: None,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1160,6 +1165,7 @@ mod tests {
             rule: None,
             provider: None,
             json: false,
+            action: None,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1621,6 +1627,7 @@ mod tests {
             rule: None,
             provider: None,
             json: false,
+            action: None,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1789,6 +1796,7 @@ mod tests {
             rule: None,
             provider: None,
             json: false,
+            action: None,
         };
         let mut buf = Vec::new();
         let err = show_entries(&config, &opts, &mut buf).unwrap_err();

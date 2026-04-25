@@ -55,6 +55,11 @@ pub struct ShowOptions {
     pub rule: Option<String>,
     pub provider: Option<String>,
     pub json: bool,
+    /// PR6 (#182): exact-match filter on `action`. Used by
+    /// `omamori audit unknown` to surface the `unknown_tool_fail_open`
+    /// events the hook layer records when a tool drifts past
+    /// shape-based routing.
+    pub action: Option<String>,
 }
 
 pub struct AuditSummary {
@@ -255,6 +260,13 @@ pub fn show_entries(
         {
             continue;
         }
+        // PR6 (#182): action is an exact-match filter (not substring)
+        // because action labels are a small closed enum; substring
+        // would let `--action allow` match the `unknown_tool_fail_open`
+        // result label and confuse users.
+        if opts.action.as_ref().is_some_and(|f| event.action != *f) {
+            continue;
+        }
 
         entries.push_back(event);
         if entries.len() > capacity {
@@ -337,6 +349,59 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         retention_days: config.retention_days,
         path_error,
     }
+}
+
+// ---------------------------------------------------------------------------
+// PR6 (#182): unknown-tool fail-open observability
+// ---------------------------------------------------------------------------
+
+/// Count `unknown_tool_fail_open` audit events whose timestamp falls
+/// within the last `days` days. Used by `omamori doctor` to surface
+/// silent forward-compat fail-opens that drifted past structure-based
+/// routing.
+///
+/// Returns 0 on any read/parse failure — this is a UX surface, not a
+/// security gate, and doctor must never error out a healthy install
+/// because the audit log happened to be unreadable.
+pub fn count_unknown_tool_fail_opens_within(config: &AuditConfig, days: u32) -> u64 {
+    if !config.enabled {
+        return 0;
+    }
+    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let file = match open_read_nofollow(&path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let cutoff = OffsetDateTime::now_utc() - time::Duration::days(i64::from(days));
+
+    let reader = std::io::BufReader::new(file);
+    let mut count: u64 = 0;
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let event: AuditEvent = match serde_json::from_str(trimmed) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if event.action != "unknown_tool_fail_open" {
+            continue;
+        }
+        let ts = match OffsetDateTime::parse(&event.timestamp, &Rfc3339) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if ts >= cutoff {
+            count += 1;
+        }
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------

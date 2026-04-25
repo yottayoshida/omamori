@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Changed
+
+- **Unknown / forward-compat tools now route by `tool_input` shape, not `tool_name`** ([#182](https://github.com/yottayoshida/omamori/issues/182)). The previous `HookInput::UnknownTool` branch unconditionally allowed any tool whose name omamori did not recognise — meaning a provider-side rename (Claude Code → Cursor → Codex → next-week's CLI) of a write or exec tool would silently bypass Layer 2 protection. The hook now inspects `tool_input` field structure independently of the tool name: a `command`/`cmd` string routes through the full Bash pipeline; a `file_path`/`path` string routes through FileOp / protected-path checks; a `url` string is treated as read-only (allowed); anything else falls through to an *observable* fail-open. Wrong-type routing fields (e.g. `command: 42`) now fail closed rather than dropping into the unknown branch.
+- **Observable fail-open for genuinely unknown shapes**. When a tool's `tool_input` matches none of the recognised shapes, omamori still allows the call (we keep user workflow alive rather than starting to block unreviewed tools retroactively), but the silence is gone: stderr now carries a one-line, tool-name-deduplicated hint pointing at the new review surface, and an `unknown_tool_fail_open` event is appended to the audit chain. The `tool_input` payload structure (number of recognised top-level keys) is recorded so an analyst can see at a glance whether the tool sent zero fields, one field, or many. No `CHAIN_VERSION` bump — this is a new value for the existing `action` field, parsers that don't recognise the value treat it as opaque.
+
+### Added
+
+- **`omamori audit unknown`** subcommand. Surfaces every `unknown_tool_fail_open` event in the audit log, paginated like `audit show` (`--last N`, `--json`); defaults to `--all` so review is complete by default. This is the user-facing endpoint of the stderr hint above — an answer to "review what?".
+- **`omamori audit show --action <name>`**. Generic exact-match filter on the `action` field; `audit unknown` is sugar over this.
+- **`omamori doctor` "Last 30 days" line**. When the audit log carries any `unknown_tool_fail_open` events from the last 30 days, doctor surfaces the count and points at `omamori audit unknown`. Skipped when zero so doctor stays quiet on healthy installs.
+
+### Security
+
+- **Forward-compat fail-open closed** ([#182](https://github.com/yottayoshida/omamori/issues/182), Codex adversarial-review ② A-2 critical). Before this change, a hostile or merely renamed tool could carry a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` and the entire shell pipeline (meta-pattern detection, env-tampering checks, unwrap stack) would never run because `HookInput::UnknownTool` short-circuited to allow. Equivalent payloads now Block at exit code 2.
+
+### Notes for users
+
+- No config or installation change. macOS-only.
+- Existing audit logs continue to verify against the same hash chain; `CHAIN_VERSION` is unchanged. `omamori audit verify` should pass after upgrading.
+- If you have downstream tooling parsing audit JSON: the `action` field can now carry the new value `"unknown_tool_fail_open"` (in addition to the existing `passthrough`/`block`/`trash`/etc.). `result` for those events is `"allow"`, `command` carries the unrecognised tool name, and `target_count` is the count of recognised top-level keys in `tool_input`.
+
 ## [0.9.5] - 2026-04-20
 
 **Summary**: Security patch ([#146](https://github.com/yottayoshida/omamori/issues/146) P1-1) + Ubuntu CI quarantine ([#164](https://github.com/yottayoshida/omamori/issues/164)) + docs refresh ([#167](https://github.com/yottayoshida/omamori/issues/167)). Closes the documented `curl URL | env bash` / `curl URL | sudo bash` wrapper-evasion gap. Runtime behavior is otherwise unchanged — omamori remains macOS-only.

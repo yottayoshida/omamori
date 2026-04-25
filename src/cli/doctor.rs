@@ -95,6 +95,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         let ok_count = items.iter().filter(|i| i.status == CheckStatus::Ok).count();
         println!("omamori: all healthy");
         println!("  {ok_count}/{total} checks passed");
+        print_unknown_tool_fail_open_summary();
         if verbose {
             println!();
             print_all_items(items);
@@ -119,6 +120,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     }
 
     println!();
+    print_unknown_tool_fail_open_summary();
     let has_fixable = problems.iter().any(|i| {
         i.remediation
             .as_ref()
@@ -139,6 +141,23 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         Ok(1)
     } else {
         Ok(2)
+    }
+}
+
+/// PR6 (#182): print a summary of `unknown_tool_fail_open` events from
+/// the last 30 days. Skipped when zero so doctor stays quiet on healthy
+/// installs (per UX release blocker: ゼロは noise 回避).
+///
+/// Best-effort: any error loading config / reading the audit log makes
+/// this a silent no-op rather than failing doctor.
+fn print_unknown_tool_fail_open_summary() {
+    let Ok(load_result) = crate::config::load_config(None) else {
+        return;
+    };
+    let count = crate::audit::count_unknown_tool_fail_opens_within(&load_result.config.audit, 30);
+    if count > 0 {
+        println!("  Last 30 days: {count} unknown-tool fail-open(s) detected");
+        println!("  Review: omamori audit unknown");
     }
 }
 

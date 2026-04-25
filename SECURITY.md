@@ -183,6 +183,19 @@ The `omamori cursor-hook` subcommand uses the same `check_command_for_hook()` pi
 | `$(...)` or backtick in shell launcher inner | BLOCK |
 | OOM / panic | Process exit (hook failure = AI tool blocks) |
 
+### Scope: unknown / new tools (v0.9.6+)
+
+AI tool platforms ship new tools and rename existing ones on their own cadence; omamori is locally installed and updated on the user's cadence. A `tool_name` allowlist baked into the binary would always be slightly behind reality, so we route by **payload shape** instead of by name. See `README.md` → "How omamori handles new / renamed tools" for the full table.
+
+The threat we care about: a provider-side rename of a write/exec tool silently bypasses Layer 2. Pre-v0.9.6, `HookInput::UnknownTool` short-circuited to allow regardless of the carried `tool_input`. Codex adversarial-review ② A-2 (2026-04-23, critical) flagged this as a forward-compat fail-open, and v0.9.6 closes it: a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` now reaches the full shell pipeline (meta-patterns, env-tampering, unwrap stack) on the strength of the `command` field alone. Wrong-type routing fields (`command: 42`) fail closed.
+
+The residual risk is `tool_input` shapes we don't recognise at all (no `command`/`cmd`/`file_path`/`path`/`url`). That's still **Allow**, on purpose: starting to block unreviewed payload shapes would break user workflow on every legitimate AI tool update. But the silence is gone — the call is recorded as an `unknown_tool_fail_open` event in the audit chain, stderr carries a one-line dedup'd hint, and `omamori doctor` surfaces a 30-day count. Users review the events with `omamori audit unknown`.
+
+This is a **trade-off, not a complete mitigation**. Threat-model implications:
+- An adversary aware of this scope could intentionally craft a `tool_input` shape that matches none of our known fields — say `{"prompt":"...","payload":"..."}` — to land in the observable fail-open branch. The damage they can do that way is limited (whatever the AI tool itself ends up doing with that payload is outside omamori's enforcement layer), and the call leaves a trail in `audit unknown`.
+- Stricter posture (block-by-default-on-unrecognised-shape) is tracked as opt-in `strict-mode` for a follow-up release, for users who would rather break workflow than allow an unobserved tool.
+- Audit log integrity: events use the existing `action` field with a new value (`"unknown_tool_fail_open"`); no `CHAIN_VERSION` bump, no schema break, parsers that don't recognise the value treat it as opaque.
+
 ### Hook Limitations
 
 The unwrap stack is a static analyzer, not a shell interpreter. It cannot detect:
