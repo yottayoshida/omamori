@@ -848,7 +848,20 @@ fn unknown_tool_url_allowed_read_only() {
 
 /// Truly unknown shape (e.g. `query` field): observable fail-open.
 /// Decision is Allow (we preserve user workflow), but stderr must
-/// carry the audit-review hint so the silence is gone.
+/// carry the audit-review hint AND an `unknown_tool_fail_open` event
+/// must land in the audit log with `detection_layer = "shape-routing"`.
+///
+/// The audit-side assertions (added in R7 per proxy R6 P2 finding A-1)
+/// retroactively pin three R5 narrative promises that were previously
+/// guaranteed only by stderr-text checks: (1) `detection_layer` carries
+/// the new `"shape-routing"` value (not the `create_event` default
+/// `"layer1"`), (2) the audit append actually happened (not silently
+/// dropped), (3) `target_count` borrows the count of recognised
+/// top-level keys in `tool_input` (1 here, since `query` is the only
+/// key). Without these assertions, a future commit could wire
+/// `audit_log_unknown_tool_fail_open` to a no-op stub or change the
+/// detection_layer string, and the only signal would be a SIEM
+/// downstream noticing the schema drift weeks later.
 #[test]
 fn unknown_tool_unrecognised_shape_observable_fail_open() {
     let (base, hook_path, shim_dir) = setup_hook_env("unk-shape");
@@ -857,7 +870,8 @@ fn unknown_tool_unrecognised_shape_observable_fail_open() {
         serde_json::json!({ "query": "what time is it" }),
     );
     let (_, stderr, exit) = run_hook_script(&hook_path, &shim_dir, &json);
-    let _ = std::fs::remove_dir_all(&base);
+
+    // --- stderr observability assertions (R5 narrative pin) ---
     assert_eq!(
         decision_from_exit(exit),
         Decision::Allow,
@@ -871,6 +885,55 @@ fn unknown_tool_unrecognised_shape_observable_fail_open() {
         stderr.contains("omamori audit unknown"),
         "PR6: stderr must point users at the review surface, got: {stderr}"
     );
+
+    // --- audit log observability assertions (R7 / proxy R6 A-1) ---
+    // Audit log path: <test_home>/.local/share/omamori/audit.jsonl,
+    // where `test_home == base` per `run_hook_script`'s HOME isolation.
+    let audit_path = base.join(".local/share/omamori/audit.jsonl");
+    assert!(
+        audit_path.exists(),
+        "PR6 R7: unknown_tool_fail_open event must reach the audit log; \
+         audit.jsonl is missing at {audit_path:?}"
+    );
+    let audit_contents = std::fs::read_to_string(&audit_path).expect("read audit.jsonl");
+    let last_line = audit_contents
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .expect("audit.jsonl must contain at least one entry after fail-open");
+    let event: serde_json::Value =
+        serde_json::from_str(last_line).expect("audit.jsonl tail must be valid JSON");
+
+    assert_eq!(
+        event["action"], "unknown_tool_fail_open",
+        "PR6 R7: audit event must carry action=\"unknown_tool_fail_open\" \
+         so SIEM filters and `omamori audit unknown` can isolate these \
+         events; got event={event}"
+    );
+    assert_eq!(
+        event["detection_layer"], "shape-routing",
+        "PR6 R7 (proxy R6 A-1 / P1 fix): audit event must carry \
+         detection_layer=\"shape-routing\" — the create_event default \
+         \"layer1\" is wrong here because no Layer 1 detector ran. \
+         A regression that drops this override silently inflates SIEM \
+         Layer-1-hit aggregations; got event={event}"
+    );
+    assert_eq!(
+        event["result"], "allow",
+        "PR6 R7: audit event must record result=allow (the hook decision \
+         is unchanged from the original fail-open behaviour)"
+    );
+    assert_eq!(
+        event["command"], "FutureSearchTool",
+        "PR6 R7: audit event command field borrows the unrecognised \
+         tool_name (per documented Known Limitation in CHANGELOG)"
+    );
+    assert_eq!(
+        event["target_count"], 1,
+        "PR6 R7: audit event target_count borrows the count of \
+         tool_input top-level keys (1 here: only `query`)"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// SECURITY: type-mismatch on a routing field is a malformed payload,
