@@ -29,6 +29,14 @@ use util::{binary_name, print_usage, usage_text};
 pub use cli::policy_test::{PolicyTestResult, run_policy_tests};
 pub use engine::hook::{fuzz_check_command_for_hook, fuzz_extract_hook_input};
 
+// Crate-internal property tests (cross-layer Layer 1 ⟹ Layer 2 invariant).
+// Lives in-tree so it can call `pub(crate)` helpers like
+// `check_command_for_hook_with_rules` without exposing a security-relevant
+// helper to downstream crates. See `src/property_tests.rs` and
+// `engine::hook::check_command_for_hook_with_rules` doc.
+#[cfg(test)]
+mod property_tests;
+
 #[derive(Debug)]
 pub enum AppError {
     Usage(String),

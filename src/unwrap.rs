@@ -26,7 +26,12 @@ const SHELL_NAMES: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 // matching arg-consumption arm to `unwrap_transparent` silently reopens the
 // bypass, so `scripts/check-invariants.sh` invariant #9 enforces that every
 // entry here appears in both sites.
-const TRANSPARENT_WRAPPERS: &[&str] = &[
+//
+// `pub(crate)` exposure: the cross-layer property test
+// (`crate::property_tests`, v0.9.6 PR5) compares this SoT against its own
+// wrapper-kind enum to catch generator drift when a new transparent wrapper
+// is added here without matching property coverage.
+pub(crate) const TRANSPARENT_WRAPPERS: &[&str] = &[
     "sudo", "env", "timeout", "nice", "nohup", "command", "exec", "doas", "pkexec",
 ];
 

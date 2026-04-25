@@ -226,7 +226,10 @@ if [ ! -f "$uw" ]; then
 else
     # Extract quoted basenames from the TRANSPARENT_WRAPPERS const body.
     wrappers=$(awk '
-        /^const TRANSPARENT_WRAPPERS/ { inside=1; next }
+        # Match visibility-prefixed const declarations:
+        # `const TRANSPARENT_WRAPPERS`, `pub const ...`, `pub(crate) const ...` etc.
+        # `pub(crate)` was added by v0.9.6 PR5 for the property test SoT check.
+        /^(pub(\([a-z]+\))?[[:space:]]+)?const TRANSPARENT_WRAPPERS/ { inside=1; next }
         inside {
             if (/\];/) { exit }
             while (match($0, /"[a-zA-Z_][a-zA-Z0-9_-]*"/)) {
