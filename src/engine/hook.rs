@@ -486,8 +486,16 @@ fn log_unknown_tool_hint_dedup(tool_name: &str) {
 }
 
 /// Append an `unknown_tool_fail_open` event to the audit chain.
-/// Best-effort — failure to load config or write the audit log must
-/// never block the hook decision (we already decided to allow).
+///
+/// Best-effort with respect to the hook *decision* (we already decided
+/// to allow; an audit failure must never flip that), but **not silent**
+/// with respect to observability. PR6 promises users that they can
+/// review fail-opens via `omamori audit unknown`; if the append fails
+/// the user must learn that the promise is unreliable for this event,
+/// otherwise the stderr hint and the doctor count line both become
+/// false advertising in the exact failure mode where they matter most
+/// (broken audit log / missing HMAC secret / disk full / permissions).
+/// Codex round 3 P2.
 fn audit_log_unknown_tool_fail_open(
     tool_name: &str,
     tool_input: &serde_json::Value,
@@ -495,11 +503,23 @@ fn audit_log_unknown_tool_fail_open(
 ) {
     let load_result = match load_config(None) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!(
+                "omamori warning: could not record unknown_tool_fail_open event for '{tool_name}' \
+                 — config load failed: {e}. The 'omamori audit unknown' review surface is \
+                 incomplete for this event."
+            );
+            return;
+        }
     };
     let logger = match crate::audit::AuditLogger::from_config(&load_result.config.audit) {
         Some(l) => l,
-        None => return,
+        None => {
+            // Audit disabled in config — that's a user choice, not an
+            // error, so stay quiet (the user opted out of the review
+            // surface entirely).
+            return;
+        }
     };
 
     // Synthetic invocation: the "command" field of the audit event will
@@ -521,7 +541,12 @@ fn audit_log_unknown_tool_fail_open(
     // didn't classify").
     event.target_count = tool_input.as_object().map(|o| o.len()).unwrap_or(0);
 
-    let _ = logger.append(event);
+    if let Err(e) = logger.append(event) {
+        eprintln!(
+            "omamori warning: failed to record unknown_tool_fail_open event for '{tool_name}': {e}. \
+             The 'omamori audit unknown' review surface is incomplete for this event."
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

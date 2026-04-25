@@ -958,9 +958,30 @@ fn install_generates_integrity_baseline() {
 
 /// Run `omamori hook-check --provider claude-code` with given stdin input.
 /// Returns (stdout, stderr, exit_code).
+///
+/// HOME / XDG isolation (PR6 R3 / Codex round 3 P3): the hook-check
+/// path now writes audit events on the unknown-tool fail-open route
+/// (`audit_log_unknown_tool_fail_open`). Without isolation, running
+/// `cargo test --test cli` on a developer machine would append
+/// synthetic `unknown_tool_fail_open` events for fixtures like
+/// `FutureTool2027` to the user's real `~/.local/share/omamori/audit.jsonl`.
+/// We point HOME and the XDG dirs at a per-test temp directory; the
+/// hook-check binary inherits these env vars and resolves both
+/// config and audit paths to the temp dir.
 fn run_hook_check(input: &str) -> (String, String, i32) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_home = std::env::temp_dir().join(format!("omamori-cli-hookcheck-{nanos}"));
+    let _ = std::fs::create_dir_all(&test_home);
+
     let mut child = Command::new(binary())
         .args(["hook-check", "--provider", "claude-code"])
+        .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
+        .env("XDG_DATA_HOME", test_home.join(".local/share"))
+        .env("XDG_CACHE_HOME", test_home.join(".cache"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -978,6 +999,7 @@ fn run_hook_check(input: &str) -> (String, String, i32) {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
+    let _ = std::fs::remove_dir_all(&test_home);
     (stdout, stderr, exit_code)
 }
 
