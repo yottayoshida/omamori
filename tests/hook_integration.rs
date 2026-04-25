@@ -87,9 +87,29 @@ fn run_hook_script(hook_path: &Path, shim_dir: &Path, input: &str) -> (String, S
         current_path
     );
 
+    // Isolate HOME / XDG dirs to the temp base so tests cannot read or
+    // append to the developer's real ~/.local/share/omamori or config.
+    // PR6 introduced an audit-log write path
+    // (`audit_log_unknown_tool_fail_open`) that triggers on the
+    // unknown-shape integration case; without HOME isolation that
+    // append lands in the host user's audit log. Codex round 2 P2.
+    //
+    // We derive the test home from the hook script path (each test
+    // gets its own unique base via `setup_hook_env`, and the hook
+    // script lives at `<base>/hooks/...`).
+    let test_home = hook_path
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("hook_path must be at <base>/hooks/<file>")
+        .to_path_buf();
+
     let mut child = Command::new("/bin/sh")
         .arg(hook_path)
         .env("PATH", injected_path)
+        .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
+        .env("XDG_DATA_HOME", test_home.join(".local/share"))
+        .env("XDG_CACHE_HOME", test_home.join(".cache"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -890,5 +910,29 @@ fn mixed_payload_prefers_tool_input_blocks_dangerous_inner() {
         decision_from_exit(exit),
         Decision::Block,
         "PR6 Codex R1: mixed payload must route through tool_input.command and Block"
+    );
+}
+
+/// PR6 Codex round 2 regression guard (E2E): the symmetric case —
+/// dangerous top-level `command` paired with a benign `tool_input`
+/// non-shell shape (`query`, etc.). MUST Block. The round 1 fix had
+/// folded all `tool_input`-present cases into one dispatch and let
+/// this scenario silently turn into UnknownTool fail-open (Allow).
+/// Pinning E2E ensures a future refactor cannot collapse the priority
+/// chain again.
+#[test]
+fn mixed_payload_top_level_command_blocks_when_tool_input_unknown_shape() {
+    let (base, hook_path, shim_dir) = setup_hook_env("mixed-toplevel");
+    let raw = r#"{
+        "command": "/bin/rm -rf /tmp/x",
+        "tool_name": "FutureSearch",
+        "tool_input": { "query": "what time is it" }
+    }"#;
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, raw);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "PR6 Codex R2: top-level command must win over tool_input non-shell shape"
     );
 }

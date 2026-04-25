@@ -739,16 +739,34 @@ fn has_routing_field_with_wrong_type(tool_input: &serde_json::Value) -> bool {
 
 /// Parse PreToolUse hook stdin into a typed `HookInput`.
 ///
-/// **Priority order (Codex PR6 round 1 regression fix)**: `tool_input`
-/// is inspected *before* the top-level `command` field. A mixed payload
-/// like `{"command":"echo ok","tool_input":{"command":"rm -rf /"}}` —
-/// either a probe or a legitimate Cursor-then-Claude-Code dual-shape
-/// hook — must route through the dangerous inner `tool_input.command`,
-/// not the safe-looking top-level one. The top-level `command` field is
-/// a legacy Cursor-style fallback used *only* when `tool_input` is
-/// absent. An earlier draft of this function flipped that priority and
-/// reopened a forward-compat fail-open within the very PR meant to
-/// close it; Codex caught it.
+/// **Priority chain** — pre-PR6 ordering preserved + extended for v0.9.6:
+///
+/// 1. `tool_input.command` / `tool_input.cmd` (most-specific dangerous shape)
+/// 2. top-level `command` (legacy Cursor-style fallback; *also* the
+///    safety net for mixed Cursor-and-Claude-Code payloads where a
+///    dangerous top-level command would otherwise be ignored if
+///    `tool_input` happened to carry only a non-shell shape)
+/// 3. `tool_input.file_path` / `tool_input.path` (FileOp routing)
+/// 4. `tool_input.url` (ReadOnlyUrl)
+/// 5. `tool_input` present but unrecognised shape → `UnknownTool`
+///    (observable fail-open downstream)
+/// 6. Bare `tool_name` with neither shape → `UnknownTool` with null input
+///
+/// Two regression-driven priority pins worth calling out:
+///
+/// - **PR6 R1 (Codex round 1)**: tool_input shell-command must beat
+///   top-level command. Mixed payload `{"command":"echo ok",
+///   "tool_input":{"command":"rm -rf /"}}` MUST route through the
+///   inner command. An earlier draft inverted this and reopened the
+///   very forward-compat fail-open this PR set out to close.
+///
+/// - **PR6 R2 (Codex round 2)**: top-level command must beat
+///   tool_input non-shell shapes. Mixed payload
+///   `{"command":"/bin/rm -rf /tmp/x","tool_name":"X","tool_input":
+///   {"query":"x"}}` MUST route the top-level shell command, not
+///   silently allow as UnknownTool. Pre-PR6 code did this; my round-1
+///   fix collapsed steps 2–5 into one tool_input dispatch and lost
+///   the middle priority. This priority chain restores all 6 steps.
 fn extract_hook_input(input: &str) -> HookInput {
     let v = match serde_json::from_str::<serde_json::Value>(input) {
         Ok(v) => v,
@@ -756,38 +774,36 @@ fn extract_hook_input(input: &str) -> HookInput {
     };
 
     let tool_name = v.get("tool_name").and_then(|t| t.as_str());
+    let ti = v.get("tool_input");
 
-    // Priority 1: tool_input present → route by structure.
-    if let Some(ti) = v.get("tool_input") {
-        match ti.as_object() {
-            Some(obj) if !obj.is_empty() => {}
-            _ => return HookInput::MalformedMissingField,
-        }
-        // SECURITY: a recognised field with the wrong type is a malformed
-        // payload, not a fall-through to UnknownTool fail-open.
-        if has_routing_field_with_wrong_type(ti) {
-            return HookInput::MalformedMissingField;
-        }
-        return match classify_input_shape(ti) {
-            InputShape::ShellCommand(cmd) => HookInput::Command(cmd.to_string()),
-            InputShape::FileOp(path) => HookInput::FileOp {
-                tool: tool_name.unwrap_or("unknown").to_string(),
-                path: path.to_string(),
-            },
-            InputShape::ReadOnlyUrl | InputShape::Unknown => match tool_name {
-                Some(name) => HookInput::UnknownTool {
-                    tool_name: name.to_string(),
-                    tool_input: ti.clone(),
-                },
-                None => HookInput::MalformedMissingField,
-            },
-        };
+    // Pre-classify tool_input once so each priority gate can consult
+    // the result without re-parsing. Type validation (wrong-type
+    // routing fields → MalformedMissingField) happens here so that a
+    // bad payload short-circuits before any priority gate.
+    let ti_object_check = ti.map(|t| {
+        let object_ok = matches!(t.as_object(), Some(obj) if !obj.is_empty());
+        let wrong_type = has_routing_field_with_wrong_type(t);
+        (t, object_ok, wrong_type)
+    });
+
+    if let Some((_, false, _)) = ti_object_check {
+        return HookInput::MalformedMissingField;
+    }
+    if let Some((_, _, true)) = ti_object_check {
+        return HookInput::MalformedMissingField;
     }
 
-    // Priority 2: no tool_input — try legacy Cursor-style top-level
-    // `command`. This branch is the historical Cursor hook contract;
-    // PreToolUse from Claude Code always carries `tool_input`, so this
-    // path should not trigger for Claude-Code-shaped hooks.
+    let ti_shape = ti.map(classify_input_shape);
+
+    // Priority 1: tool_input shell-command shape (highest danger surface).
+    if let Some(InputShape::ShellCommand(cmd)) = ti_shape {
+        return HookInput::Command(cmd.to_string());
+    }
+
+    // Priority 2: top-level `command` — legacy Cursor-style fallback,
+    // also the safety net so a dangerous top-level command paired with
+    // a benign `tool_input` (e.g. `{"query":"…"}`) cannot dodge into
+    // UnknownTool fail-open.
     if let Some(cmd_val) = v.get("command") {
         return match cmd_val.as_str() {
             Some(cmd) => HookInput::Command(cmd.to_string()),
@@ -795,7 +811,26 @@ fn extract_hook_input(input: &str) -> HookInput {
         };
     }
 
-    // Priority 3: bare tool_name with neither tool_input nor command.
+    // Priority 3-5: remaining tool_input shapes (FileOp / ReadOnlyUrl /
+    // Unknown). Reached only when no shell-command surface fired.
+    if let Some(shape) = ti_shape {
+        return match shape {
+            InputShape::ShellCommand(_) => unreachable!("handled at Priority 1"),
+            InputShape::FileOp(path) => HookInput::FileOp {
+                tool: tool_name.unwrap_or("unknown").to_string(),
+                path: path.to_string(),
+            },
+            InputShape::ReadOnlyUrl | InputShape::Unknown => match tool_name {
+                Some(name) => HookInput::UnknownTool {
+                    tool_name: name.to_string(),
+                    tool_input: ti.expect("ti_shape implies ti was Some").clone(),
+                },
+                None => HookInput::MalformedMissingField,
+            },
+        };
+    }
+
+    // Priority 6: bare tool_name with neither tool_input nor command.
     if let Some(name) = tool_name {
         return HookInput::UnknownTool {
             tool_name: name.to_string(),
@@ -1140,15 +1175,69 @@ mod tests {
         }
     }
 
-    /// Counterpart pin: top-level `command` is consulted ONLY when
-    /// `tool_input` is absent. Without this pin a future refactor could
-    /// silently drop the legacy Cursor-style fallback.
+    /// Counterpart pin: top-level `command` is consulted when
+    /// `tool_input` is absent OR carries no shell-command shape.
+    /// Without this pin a future refactor could silently drop the
+    /// legacy Cursor-style fallback.
     #[test]
     fn extract_hook_input_top_level_command_used_when_tool_input_absent() {
         let input = r#"{"command":"ls -la"}"#;
         match extract_hook_input(input) {
             HookInput::Command(cmd) => assert_eq!(cmd, "ls -la"),
             other => panic!("expected legacy top-level Command, got: {other:?}"),
+        }
+    }
+
+    /// PR6 Codex round 2 regression guard: a mixed payload where the
+    /// dangerous shell command sits at top-level and `tool_input`
+    /// carries a benign non-shell shape (`query`, `text`, etc.) MUST
+    /// route the top-level command. Round 1 fix collapsed all
+    /// `tool_input`-present cases into the tool_input dispatch and
+    /// silently turned this scenario into UnknownTool fail-open.
+    #[test]
+    fn extract_hook_input_top_level_command_wins_over_unknown_shape() {
+        let input = r#"{
+            "command": "/bin/rm -rf /tmp/x",
+            "tool_name": "FutureSearch",
+            "tool_input": { "query": "x" }
+        }"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(
+                cmd, "/bin/rm -rf /tmp/x",
+                "top-level command must win over tool_input non-shell shape"
+            ),
+            other => panic!("expected top-level Command (R2 regression guard), got: {other:?}"),
+        }
+    }
+
+    /// Variant: top-level command + `tool_input.url` (read-only fetch
+    /// shape). The dangerous top-level command must still win — the
+    /// read-only routing must not provide cover for shell commands.
+    #[test]
+    fn extract_hook_input_top_level_command_wins_over_url_shape() {
+        let input = r#"{
+            "command": "/bin/rm -rf /tmp/x",
+            "tool_name": "FutureFetch",
+            "tool_input": { "url": "https://example.com" }
+        }"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(cmd, "/bin/rm -rf /tmp/x"),
+            other => panic!("expected top-level Command, got: {other:?}"),
+        }
+    }
+
+    /// Variant: top-level command + `tool_input.file_path`. File-op
+    /// routing must NOT shadow the dangerous shell command.
+    #[test]
+    fn extract_hook_input_top_level_command_wins_over_file_op_shape() {
+        let input = r#"{
+            "command": "/bin/rm -rf /tmp/x",
+            "tool_name": "FutureEditor",
+            "tool_input": { "file_path": "/tmp/x" }
+        }"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(cmd, "/bin/rm -rf /tmp/x"),
+            other => panic!("expected top-level Command, got: {other:?}"),
         }
     }
 
