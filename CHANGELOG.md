@@ -24,8 +24,9 @@ The format is based on Keep a Changelog.
 ### Notes for users
 
 - No config or installation change. macOS-only.
+- **Protection guarantee is unchanged**: any payload carrying a recognised dangerous shape (`command`/`cmd`/`file_path`/`path`) still routes through the full pipeline regardless of `tool_name`. The new `unknown_tool_fail_open` events are observability noise on legitimate tools whose `tool_input` shape is not yet in the catalogue, not a regression in protection.
 - Existing audit logs continue to verify against the same hash chain; `CHAIN_VERSION` is unchanged. `omamori audit verify` should pass after upgrading.
-- If you have downstream tooling parsing audit JSON: the `action` field can now carry the new value `"unknown_tool_fail_open"` (in addition to the existing `passthrough`/`block`/`trash`/etc.), and `detection_layer` can now carry the new value `"shape-routing"` for those events. `result` is `"allow"`, `command` borrows the unrecognised tool name, and `target_count` borrows the count of recognised top-level keys in `tool_input`. Filter on `action == "unknown_tool_fail_open"` rather than relying on the borrowed semantics of `command` or `target_count`; dedicated columns will land in a future release.
+- If you have downstream tooling parsing audit JSON: **filter on `action == "unknown_tool_fail_open"` first** to isolate these events from your existing aggregations. Within those events, `result` is `"allow"`, `detection_layer` is `"shape-routing"`, and `command` / `target_count` are borrowed columns (carrying `tool_name` and `tool_input` top-level key count respectively); aggregations across action types over either column will be skewed. Dedicated columns are tracked for a future omamori release.
 
 ### Known limitations carried into a future release
 

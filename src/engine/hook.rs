@@ -469,8 +469,11 @@ fn run_hook_check_unknown_tool(
             // per invocation — `omamori hook-check` is a short-lived
             // process (1 invocation = 1 dispatch), so a process-local
             // dedup guard would be dead code. If user noise becomes a
-            // problem, session-level dedup is tracked for a future
-            // release alongside opt-in strict-mode.
+            // problem, session-level dedup is one of the follow-ups
+            // tracked for a future release. See `SECURITY.md` →
+            // "Scope: unknown / new tools" for the full set
+            // (catalogue widening, dedicated audit columns, opt-in
+            // strict-mode, session-level dedup).
             eprintln!(
                 "omamori: unknown tool '{tool_name}' routed as fail-open. \
                  Review via 'omamori audit unknown'"
