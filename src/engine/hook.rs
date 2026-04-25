@@ -535,7 +535,9 @@ fn audit_log_unknown_tool_fail_open(
     // Override action label so `omamori audit unknown` (and SIEM filters)
     // can pick these out without parsing detection_layer. New string
     // value — old parsers treat it as opaque, no schema break, no
-    // CHAIN_VERSION bump needed (Codex ② C-1 裁定維持).
+    // CHAIN_VERSION bump needed (preserves the Codex ② C-1 ruling that
+    // detection_layer's semantic contract must not silently shift in a
+    // patch release).
     event.action = "unknown_tool_fail_open".to_string();
     event.result = "allow".to_string();
     // Override detection_layer: `create_event` defaults to "layer1"

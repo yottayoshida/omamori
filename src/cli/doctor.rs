@@ -146,7 +146,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
 
 /// PR6 (#182): print a summary of `unknown_tool_fail_open` events from
 /// the last 30 days. Skipped when zero so doctor stays quiet on healthy
-/// installs (per UX release blocker: ゼロは noise 回避).
+/// installs (per UX release blocker: zero must not generate noise).
 ///
 /// Best-effort: any error loading config / reading the audit log makes
 /// this a silent no-op rather than failing doctor.
