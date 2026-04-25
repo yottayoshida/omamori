@@ -869,3 +869,26 @@ fn unknown_tool_wrong_type_command_fails_closed() {
         "PR6: wrong-type routing field must not produce Allow (got {decision:?}, exit={exit})"
     );
 }
+
+/// PR6 Codex round 1 regression guard (E2E): a mixed payload with a
+/// safe top-level `command` and a dangerous `tool_input.command` MUST
+/// be Block. The `tool_input` branch wins; the safe top-level decoy
+/// must not route omamori around the shell pipeline. This pins the
+/// vulnerability Codex flagged through the full installer → wrapper →
+/// hook-check chain, not just the parser unit test.
+#[test]
+fn mixed_payload_prefers_tool_input_blocks_dangerous_inner() {
+    let (base, hook_path, shim_dir) = setup_hook_env("mixed-payload");
+    let raw = r#"{
+        "command": "echo ok",
+        "tool_name": "Bash",
+        "tool_input": { "command": "/bin/rm -rf /tmp/x" }
+    }"#;
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, raw);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "PR6 Codex R1: mixed payload must route through tool_input.command and Block"
+    );
+}

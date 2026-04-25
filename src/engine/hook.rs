@@ -738,13 +738,56 @@ fn has_routing_field_with_wrong_type(tool_input: &serde_json::Value) -> bool {
 }
 
 /// Parse PreToolUse hook stdin into a typed `HookInput`.
+///
+/// **Priority order (Codex PR6 round 1 regression fix)**: `tool_input`
+/// is inspected *before* the top-level `command` field. A mixed payload
+/// like `{"command":"echo ok","tool_input":{"command":"rm -rf /"}}` —
+/// either a probe or a legitimate Cursor-then-Claude-Code dual-shape
+/// hook — must route through the dangerous inner `tool_input.command`,
+/// not the safe-looking top-level one. The top-level `command` field is
+/// a legacy Cursor-style fallback used *only* when `tool_input` is
+/// absent. An earlier draft of this function flipped that priority and
+/// reopened a forward-compat fail-open within the very PR meant to
+/// close it; Codex caught it.
 fn extract_hook_input(input: &str) -> HookInput {
     let v = match serde_json::from_str::<serde_json::Value>(input) {
         Ok(v) => v,
         Err(_) => return HookInput::MalformedJson,
     };
 
-    // Cursor-style top-level "command" takes precedence (legacy contract).
+    let tool_name = v.get("tool_name").and_then(|t| t.as_str());
+
+    // Priority 1: tool_input present → route by structure.
+    if let Some(ti) = v.get("tool_input") {
+        match ti.as_object() {
+            Some(obj) if !obj.is_empty() => {}
+            _ => return HookInput::MalformedMissingField,
+        }
+        // SECURITY: a recognised field with the wrong type is a malformed
+        // payload, not a fall-through to UnknownTool fail-open.
+        if has_routing_field_with_wrong_type(ti) {
+            return HookInput::MalformedMissingField;
+        }
+        return match classify_input_shape(ti) {
+            InputShape::ShellCommand(cmd) => HookInput::Command(cmd.to_string()),
+            InputShape::FileOp(path) => HookInput::FileOp {
+                tool: tool_name.unwrap_or("unknown").to_string(),
+                path: path.to_string(),
+            },
+            InputShape::ReadOnlyUrl | InputShape::Unknown => match tool_name {
+                Some(name) => HookInput::UnknownTool {
+                    tool_name: name.to_string(),
+                    tool_input: ti.clone(),
+                },
+                None => HookInput::MalformedMissingField,
+            },
+        };
+    }
+
+    // Priority 2: no tool_input — try legacy Cursor-style top-level
+    // `command`. This branch is the historical Cursor hook contract;
+    // PreToolUse from Claude Code always carries `tool_input`, so this
+    // path should not trigger for Claude-Code-shaped hooks.
     if let Some(cmd_val) = v.get("command") {
         return match cmd_val.as_str() {
             Some(cmd) => HookInput::Command(cmd.to_string()),
@@ -752,45 +795,15 @@ fn extract_hook_input(input: &str) -> HookInput {
         };
     }
 
-    let tool_name = v.get("tool_name").and_then(|t| t.as_str());
-
-    let Some(ti) = v.get("tool_input") else {
-        // No tool_input at all — only a bare tool_name is degenerate.
-        return match tool_name {
-            Some(name) => HookInput::UnknownTool {
-                tool_name: name.to_string(),
-                tool_input: serde_json::Value::Null,
-            },
-            None => HookInput::MalformedMissingField,
+    // Priority 3: bare tool_name with neither tool_input nor command.
+    if let Some(name) = tool_name {
+        return HookInput::UnknownTool {
+            tool_name: name.to_string(),
+            tool_input: serde_json::Value::Null,
         };
-    };
-
-    // tool_input must be a non-empty object.
-    match ti.as_object() {
-        Some(obj) if !obj.is_empty() => {}
-        _ => return HookInput::MalformedMissingField,
     }
 
-    // SECURITY: a recognised field with the wrong type is a malformed
-    // payload, not a fall-through to UnknownTool fail-open.
-    if has_routing_field_with_wrong_type(ti) {
-        return HookInput::MalformedMissingField;
-    }
-
-    match classify_input_shape(ti) {
-        InputShape::ShellCommand(cmd) => HookInput::Command(cmd.to_string()),
-        InputShape::FileOp(path) => HookInput::FileOp {
-            tool: tool_name.unwrap_or("unknown").to_string(),
-            path: path.to_string(),
-        },
-        InputShape::ReadOnlyUrl | InputShape::Unknown => match tool_name {
-            Some(name) => HookInput::UnknownTool {
-                tool_name: name.to_string(),
-                tool_input: ti.clone(),
-            },
-            None => HookInput::MalformedMissingField,
-        },
-    }
+    HookInput::MalformedMissingField
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,6 +1098,58 @@ mod tests {
             classify_input_shape(&v),
             InputShape::ShellCommand("rm -rf /")
         );
+    }
+
+    /// PR6 Codex round 1 regression guard: when a payload carries BOTH
+    /// a top-level `command` (Cursor-style legacy) and a `tool_input`
+    /// object, the dangerous `tool_input.command` MUST win — top-level
+    /// `command` is only the fallback when `tool_input` is absent. An
+    /// earlier draft inverted this and let `{"command":"safe",
+    /// "tool_input":{"command":"rm -rf /tmp/x"}}` route through the
+    /// safe top-level, reopening the very forward-compat fail-open
+    /// this PR set out to close.
+    #[test]
+    fn extract_hook_input_mixed_payload_prefers_tool_input() {
+        let input = r#"{
+            "command": "echo ok",
+            "tool_name": "Bash",
+            "tool_input": { "command": "rm -rf /tmp/x" }
+        }"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(
+                cmd, "rm -rf /tmp/x",
+                "tool_input.command must take priority over top-level command"
+            ),
+            other => panic!("expected Command from tool_input, got: {other:?}"),
+        }
+    }
+
+    /// Same priority pin, but with an unknown tool_name and an alias
+    /// `cmd` field. Mixed payload via the alias path must still prefer
+    /// `tool_input`.
+    #[test]
+    fn extract_hook_input_mixed_payload_prefers_tool_input_alias() {
+        let input = r#"{
+            "command": "echo ok",
+            "tool_name": "FutureExec",
+            "tool_input": { "cmd": "/bin/rm -rf /tmp/x" }
+        }"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(cmd, "/bin/rm -rf /tmp/x"),
+            other => panic!("expected Command from tool_input.cmd, got: {other:?}"),
+        }
+    }
+
+    /// Counterpart pin: top-level `command` is consulted ONLY when
+    /// `tool_input` is absent. Without this pin a future refactor could
+    /// silently drop the legacy Cursor-style fallback.
+    #[test]
+    fn extract_hook_input_top_level_command_used_when_tool_input_absent() {
+        let input = r#"{"command":"ls -la"}"#;
+        match extract_hook_input(input) {
+            HookInput::Command(cmd) => assert_eq!(cmd, "ls -la"),
+            other => panic!("expected legacy top-level Command, got: {other:?}"),
+        }
     }
 
     #[test]
