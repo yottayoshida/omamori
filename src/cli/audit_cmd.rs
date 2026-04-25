@@ -13,6 +13,9 @@ pub(crate) fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
         Some("verify") => run_audit_verify(args),
         Some("show") => run_audit_show(args),
         Some("key") => run_audit_key(args),
+        // PR6 (#182): surface unknown-tool fail-open events.
+        // Sugar over `audit show --action unknown_tool_fail_open --all`.
+        Some("unknown") => run_audit_unknown(args),
         Some(other) => Err(AppError::Usage(format!(
             "unknown audit subcommand: {other}\n\n{}",
             audit_usage()
@@ -85,6 +88,7 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
         rule: None,
         provider: None,
         json: false,
+        action: None,
     };
 
     let mut index = 3usize;
@@ -123,6 +127,15 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
                 );
                 index += 2;
             }
+            "--action" => {
+                opts.action = Some(
+                    args.get(index + 1)
+                        .and_then(|v| v.to_str())
+                        .ok_or_else(|| AppError::Usage("--action requires a value".to_string()))?
+                        .to_string(),
+                );
+                index += 2;
+            }
             "--json" => {
                 opts.json = true;
                 index += 1;
@@ -146,6 +159,64 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
         }
         Err(e) => {
             eprintln!("omamori audit show: {e}");
+            Ok(1)
+        }
+    }
+}
+
+/// `omamori audit unknown` — show all `unknown_tool_fail_open` events.
+///
+/// This is the user-facing review surface promised in the stderr hint
+/// emitted by the hook layer when a tool drifts past structure-based
+/// routing. We default to `--all` so users see every fail-open since
+/// the audit log started; `--last N` and `--json` work the same as
+/// `audit show`.
+fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
+    let mut opts = audit::ShowOptions {
+        last: None, // default --all so review is complete
+        rule: None,
+        provider: None,
+        json: false,
+        action: Some("unknown_tool_fail_open".to_string()),
+    };
+
+    let mut index = 3usize;
+    while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
+        match arg {
+            "--last" => {
+                let value = args
+                    .get(index + 1)
+                    .and_then(|v| v.to_str())
+                    .ok_or_else(|| AppError::Usage("--last requires a number".to_string()))?;
+                opts.last =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        AppError::Usage(format!("invalid number for --last: {value}"))
+                    })?);
+                index += 2;
+            }
+            "--json" => {
+                opts.json = true;
+                index += 1;
+            }
+            other => {
+                return Err(AppError::Usage(format!(
+                    "unknown 'audit unknown' flag: {other}\n\n{}",
+                    audit_usage()
+                )));
+            }
+        }
+    }
+
+    let load_result = load_config(None)?;
+    let mut stdout = std::io::stdout().lock();
+    match audit::show_entries(&load_result.config.audit, &opts, &mut stdout) {
+        Ok(()) => Ok(0),
+        Err(audit::AuditError::FileNotFound) => {
+            println!("omamori audit: no entries recorded yet");
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("omamori audit unknown: {e}");
             Ok(1)
         }
     }
@@ -197,5 +268,7 @@ fn audit_usage() -> &'static str {
   omamori audit show --all                       View all entries
   omamori audit show --rule <name>               Filter by rule (substring match)
   omamori audit show --provider <name>           Filter by provider
+  omamori audit show --action <name>             Filter by action (exact match)
+  omamori audit unknown [--last N] [--json]      Show forward-compat fail-opens for unknown tools (#182)
   omamori audit key rotate                       Rotate HMAC signing key"
 }

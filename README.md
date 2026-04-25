@@ -131,6 +131,41 @@ For what omamori **cannot** catch, see [Structural Limitations](#structural-limi
 | **Community** | Gemini CLI, Cline, others | Layer 1 only. Not E2E tested. |
 | **Fallback** | Any tool setting `AI_GUARD=1` | Layer 1 only. |
 
+### How omamori handles new / renamed tools
+
+AI tools rotate fast: Claude Code adds a tool one week, Cursor renames one the next, a third CLI ships next month. omamori is installed locally and updated by `brew upgrade` on your schedule, so a tool-name allowlist baked into the binary would always be slightly behind reality.
+
+Instead of recognising tools by name, omamori inspects the **shape** of the `tool_input` payload that the AI agent sends:
+
+| Shape we recognise | Routes to |
+|---|---|
+| `tool_input.command` or `tool_input.cmd` is a string | Full Bash pipeline (meta-patterns, env-tampering, unwrap stack) |
+| `tool_input.file_path` or `tool_input.path` is a string | FileOp / protected-path checks |
+| `tool_input.url` is a string (and no shell/file fields) | Read-only — allowed |
+| Wrong type on any of the above (e.g. `command: 42`) | Fails closed (Block) |
+| None of the above | *Observable fail-open* — see below |
+
+A tool calling itself `FuturePlanWriter` but carrying a `command` field still reaches the shell pipeline. A renamed Edit tool with `file_path` still reaches the protected-path check. The classifier prioritises shell-shape over file-shape over url-shape, so a payload that mixes `command` and `url` cannot dodge into the read-only branch.
+
+**Observable fail-open** (`tool_input` has no shape we recognise): omamori still allows the call — we won't start blocking unreviewed tools retroactively, that breaks user workflows on every legitimate AI update — but the silence is gone. `stderr` carries a one-line hint per invocation, and an `unknown_tool_fail_open` event is appended to the audit chain. Review them later with:
+
+```bash
+omamori audit unknown
+```
+
+`omamori doctor` also surfaces a "Last 30 days: N unknown-tool fail-opens" line whenever the count is non-zero, so you don't have to remember to look.
+
+#### Scope and limitations
+
+The recognised shape catalogue today (`command`/`cmd`/`file_path`/`path`/`url`) is intentionally narrow. Several legitimate Claude Code tools — for instance `NotebookEdit` (`notebook_path`), `Task` (`subagent_type` / `prompt`), `TodoWrite` (`todos`), `WebSearch` (`query`) — currently land in the unknown branch and emit a fail-open event on every invocation.
+
+Practical implications:
+
+- **The `audit unknown` review surface and `doctor`'s 30-day count are an *upper bound* on adversarial activity, not a lower bound.** They include this legitimate-tool noise. If you see "Last 30 days: 50 unknown-tool fail-opens", most of those are routine `Glob` / `Task` / `TodoWrite` calls, not bypass attempts. Treat the count as a "drift indicator" — a sudden spike or a tool name you don't recognise is worth investigating; a steady non-zero baseline is expected.
+- **The protection guarantee is unchanged**: payloads carrying a recognised dangerous shape (`command`, `cmd`, `file_path`, `path`) still route through the full pipeline regardless of `tool_name`. The noise issue is about observability, not the protection layer.
+
+A future omamori release will offer **opt-in strict-mode** so that users can choose between the current fail-open and a fail-closed posture for unrecognised shapes, plus a wider shape catalogue and dedicated audit columns to separate signal from noise. Until then the trade-off above is the deliberate posture.
+
 ## Context-Aware Evaluation
 
 omamori can adjust actions based on what the command targets:

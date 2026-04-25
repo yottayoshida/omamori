@@ -87,9 +87,29 @@ fn run_hook_script(hook_path: &Path, shim_dir: &Path, input: &str) -> (String, S
         current_path
     );
 
+    // Isolate HOME / XDG dirs to the temp base so tests cannot read or
+    // append to the developer's real ~/.local/share/omamori or config.
+    // PR6 introduced an audit-log write path
+    // (`audit_log_unknown_tool_fail_open`) that triggers on the
+    // unknown-shape integration case; without HOME isolation that
+    // append lands in the host user's audit log. Codex round 2 P2.
+    //
+    // We derive the test home from the hook script path (each test
+    // gets its own unique base via `setup_hook_env`, and the hook
+    // script lives at `<base>/hooks/...`).
+    let test_home = hook_path
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("hook_path must be at <base>/hooks/<file>")
+        .to_path_buf();
+
     let mut child = Command::new("/bin/sh")
         .arg(hook_path)
         .env("PATH", injected_path)
+        .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
+        .env("XDG_DATA_HOME", test_home.join(".local/share"))
+        .env("XDG_CACHE_HOME", test_home.join(".cache"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -727,5 +747,255 @@ fn layer2_blocks_curl_pipe_sudo_bash() {
         decision_from_exit(exit),
         Decision::Block,
         "P1-1 sentinel: curl|sudo bash must Block at the hook layer (#146)"
+    );
+}
+
+// =============================================================================
+// PR6 (#182): unknown-tool fail-open fix — structure-based routing tests
+// =============================================================================
+//
+// Pre-PR6, `HookInput::UnknownTool` was a forward-compat fail-open: any
+// `tool_name` Claude Code added or renamed silently bypassed Layer 2.
+// These tests pin the new behavior end-to-end through the installed
+// hook script + shim chain (the same harness used by the cross-OS
+// invariant suite above).
+//
+// Test naming: `unknown_tool_<shape>_routes_to_<destination>`.
+
+fn pretooluse_unknown_with_input(tool_name: &str, tool_input: serde_json::Value) -> String {
+    serde_json::json!({
+        "tool_name": tool_name,
+        "tool_input": tool_input,
+    })
+    .to_string()
+}
+
+/// `tool_name=FuturePlanWriter` (unrecognised) carrying
+/// `tool_input.command="rm -rf /"` MUST be routed to the shell pipeline
+/// and Block. The pre-PR6 implementation would have allowed this — that
+/// is the forward-compat fail-open Codex ② A-2 flagged.
+#[test]
+fn unknown_tool_command_routed_to_bash() {
+    let (base, hook_path, shim_dir) = setup_hook_env("unk-cmd");
+    let json = pretooluse_unknown_with_input(
+        "FuturePlanWriter",
+        serde_json::json!({ "command": "/bin/rm -rf /tmp/x" }),
+    );
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "PR6: unknown tool with tool_input.command must reach shell pipeline and Block"
+    );
+}
+
+/// Same intent, alias field name (`cmd` instead of `command`). The
+/// classifier must treat them equivalently — otherwise an attacker
+/// could route through `cmd` and skip checks.
+#[test]
+fn unknown_tool_cmd_alias_routed_to_bash() {
+    let (base, hook_path, shim_dir) = setup_hook_env("unk-cmd-alias");
+    let json = pretooluse_unknown_with_input(
+        "FutureExec",
+        serde_json::json!({ "cmd": "/bin/rm -rf /tmp/x" }),
+    );
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "PR6: tool_input.cmd alias must route to shell pipeline (parity with command)"
+    );
+}
+
+/// File-op shape with a protected path: `tool_input.file_path` pointing
+/// at omamori's own config must be Block, regardless of `tool_name`.
+#[test]
+fn unknown_tool_file_path_protected_blocks() {
+    let (base, hook_path, shim_dir) = setup_hook_env("unk-fileop");
+    let protected = base.join(".local/share/omamori/audit-secret");
+    let json = pretooluse_unknown_with_input(
+        "FutureEditor",
+        serde_json::json!({ "file_path": protected.to_string_lossy() }),
+    );
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "PR6: unknown tool with file_path on a protected path must Block (FileOp routing)"
+    );
+}
+
+/// `tool_input.url` shape is read-only by contract (WebFetch / WebSearch
+/// class). Must Allow.
+#[test]
+fn unknown_tool_url_allowed_read_only() {
+    let (base, hook_path, shim_dir) = setup_hook_env("unk-url");
+    let json = pretooluse_unknown_with_input(
+        "FutureFetch",
+        serde_json::json!({ "url": "https://example.com" }),
+    );
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Allow,
+        "PR6: read-only url shape must Allow"
+    );
+}
+
+/// Truly unknown shape (e.g. `query` field): observable fail-open.
+/// Decision is Allow (we preserve user workflow), but stderr must
+/// carry the audit-review hint AND an `unknown_tool_fail_open` event
+/// must land in the audit log with `detection_layer = "shape-routing"`.
+///
+/// The audit-side assertions (added in R7 per proxy R6 P2 finding A-1)
+/// retroactively pin three R5 narrative promises that were previously
+/// guaranteed only by stderr-text checks: (1) `detection_layer` carries
+/// the new `"shape-routing"` value (not the `create_event` default
+/// `"layer1"`), (2) the audit append actually happened (not silently
+/// dropped), (3) `target_count` borrows the count of recognised
+/// top-level keys in `tool_input` (1 here, since `query` is the only
+/// key). Without these assertions, a future commit could wire
+/// `audit_log_unknown_tool_fail_open` to a no-op stub or change the
+/// detection_layer string, and the only signal would be a SIEM
+/// downstream noticing the schema drift weeks later.
+#[test]
+fn unknown_tool_unrecognised_shape_observable_fail_open() {
+    let (base, hook_path, shim_dir) = setup_hook_env("unk-shape");
+    let json = pretooluse_unknown_with_input(
+        "FutureSearchTool",
+        serde_json::json!({ "query": "what time is it" }),
+    );
+    let (_, stderr, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+
+    // --- stderr observability assertions (R5 narrative pin) ---
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Allow,
+        "PR6: unknown shape must Allow (observable fail-open keeps workflow alive)"
+    );
+    assert!(
+        stderr.contains("unknown tool 'FutureSearchTool'"),
+        "PR6: stderr must surface the tool name so the fail-open is observable, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("omamori audit unknown"),
+        "PR6: stderr must point users at the review surface, got: {stderr}"
+    );
+
+    // --- audit log observability assertions (R7 / proxy R6 A-1) ---
+    // Audit log path: <test_home>/.local/share/omamori/audit.jsonl,
+    // where `test_home == base` per `run_hook_script`'s HOME isolation.
+    let audit_path = base.join(".local/share/omamori/audit.jsonl");
+    assert!(
+        audit_path.exists(),
+        "PR6 R7: unknown_tool_fail_open event must reach the audit log; \
+         audit.jsonl is missing at {audit_path:?}"
+    );
+    let audit_contents = std::fs::read_to_string(&audit_path).expect("read audit.jsonl");
+    let last_line = audit_contents
+        .lines()
+        .rfind(|l| !l.trim().is_empty())
+        .expect("audit.jsonl must contain at least one entry after fail-open");
+    let event: serde_json::Value =
+        serde_json::from_str(last_line).expect("audit.jsonl tail must be valid JSON");
+
+    assert_eq!(
+        event["action"], "unknown_tool_fail_open",
+        "PR6 R7: audit event must carry action=\"unknown_tool_fail_open\" \
+         so SIEM filters and `omamori audit unknown` can isolate these \
+         events; got event={event}"
+    );
+    assert_eq!(
+        event["detection_layer"], "shape-routing",
+        "PR6 R7 (proxy R6 A-1 / P1 fix): audit event must carry \
+         detection_layer=\"shape-routing\" — the create_event default \
+         \"layer1\" is wrong here because no Layer 1 detector ran. \
+         A regression that drops this override silently inflates SIEM \
+         Layer-1-hit aggregations; got event={event}"
+    );
+    assert_eq!(
+        event["result"], "allow",
+        "PR6 R7: audit event must record result=allow (the hook decision \
+         is unchanged from the original fail-open behaviour)"
+    );
+    assert_eq!(
+        event["command"], "FutureSearchTool",
+        "PR6 R7: audit event command field borrows the unrecognised \
+         tool_name (per documented Known Limitation in CHANGELOG)"
+    );
+    assert_eq!(
+        event["target_count"], 1,
+        "PR6 R7: audit event target_count borrows the count of \
+         tool_input top-level keys (1 here: only `query`)"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// SECURITY: type-mismatch on a routing field is a malformed payload,
+/// NOT a fall-through to fail-open. Tested via integer in `command`.
+#[test]
+fn unknown_tool_wrong_type_command_fails_closed() {
+    let (base, hook_path, shim_dir) = setup_hook_env("unk-wrongtype");
+    // tool_input.command is an integer — MUST not be allowed.
+    let raw = r#"{"tool_name":"FutureBash","tool_input":{"command":42}}"#;
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, raw);
+    let _ = std::fs::remove_dir_all(&base);
+    let decision = decision_from_exit(exit);
+    assert_ne!(
+        decision,
+        Decision::Allow,
+        "PR6: wrong-type routing field must not produce Allow (got {decision:?}, exit={exit})"
+    );
+}
+
+/// PR6 Codex round 1 regression guard (E2E): a mixed payload with a
+/// safe top-level `command` and a dangerous `tool_input.command` MUST
+/// be Block. The `tool_input` branch wins; the safe top-level decoy
+/// must not route omamori around the shell pipeline. This pins the
+/// vulnerability Codex flagged through the full installer → wrapper →
+/// hook-check chain, not just the parser unit test.
+#[test]
+fn mixed_payload_prefers_tool_input_blocks_dangerous_inner() {
+    let (base, hook_path, shim_dir) = setup_hook_env("mixed-payload");
+    let raw = r#"{
+        "command": "echo ok",
+        "tool_name": "Bash",
+        "tool_input": { "command": "/bin/rm -rf /tmp/x" }
+    }"#;
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, raw);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "PR6 Codex R1: mixed payload must route through tool_input.command and Block"
+    );
+}
+
+/// PR6 Codex round 2 regression guard (E2E): the symmetric case —
+/// dangerous top-level `command` paired with a benign `tool_input`
+/// non-shell shape (`query`, etc.). MUST Block. The round 1 fix had
+/// folded all `tool_input`-present cases into one dispatch and let
+/// this scenario silently turn into UnknownTool fail-open (Allow).
+/// Pinning E2E ensures a future refactor cannot collapse the priority
+/// chain again.
+#[test]
+fn mixed_payload_top_level_command_blocks_when_tool_input_unknown_shape() {
+    let (base, hook_path, shim_dir) = setup_hook_env("mixed-toplevel");
+    let raw = r#"{
+        "command": "/bin/rm -rf /tmp/x",
+        "tool_name": "FutureSearch",
+        "tool_input": { "query": "what time is it" }
+    }"#;
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, raw);
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "PR6 Codex R2: top-level command must win over tool_input non-shell shape"
     );
 }
