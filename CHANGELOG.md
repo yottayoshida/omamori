@@ -9,7 +9,7 @@ The format is based on Keep a Changelog.
 ### Changed
 
 - **Unknown / forward-compat tools now route by `tool_input` shape, not `tool_name`** ([#182](https://github.com/yottayoshida/omamori/issues/182)). The previous `HookInput::UnknownTool` branch unconditionally allowed any tool whose name omamori did not recognise — meaning a provider-side rename (Claude Code → Cursor → Codex → next-week's CLI) of a write or exec tool would silently bypass Layer 2 protection. The hook now inspects `tool_input` field structure independently of the tool name: a `command`/`cmd` string routes through the full Bash pipeline; a `file_path`/`path` string routes through FileOp / protected-path checks; a `url` string is treated as read-only (allowed); anything else falls through to an *observable* fail-open. Wrong-type routing fields (e.g. `command: 42`) now fail closed rather than dropping into the unknown branch.
-- **Observable fail-open for genuinely unknown shapes**. When a tool's `tool_input` matches none of the recognised shapes, omamori still allows the call (we keep user workflow alive rather than starting to block unreviewed tools retroactively), but the silence is gone: stderr now carries a one-line, tool-name-deduplicated hint pointing at the new review surface, and an `unknown_tool_fail_open` event is appended to the audit chain. The `tool_input` payload structure (number of recognised top-level keys) is recorded so an analyst can see at a glance whether the tool sent zero fields, one field, or many. No `CHAIN_VERSION` bump — this is a new value for the existing `action` field, parsers that don't recognise the value treat it as opaque.
+- **Observable fail-open for genuinely unknown shapes**. When a tool's `tool_input` matches none of the recognised shapes, omamori still allows the call (we keep user workflow alive rather than starting to block unreviewed tools retroactively), but the silence is gone: stderr now carries a one-line hint pointing at the new review surface, and an `unknown_tool_fail_open` event is appended to the audit chain. The `tool_input` payload structure (number of recognised top-level keys) is recorded so an analyst can see at a glance whether the tool sent zero fields, one field, or many. No `CHAIN_VERSION` bump — this introduces new values for the existing `action` field (`"unknown_tool_fail_open"`) and `detection_layer` field (`"shape-routing"`); parsers that don't recognise the values treat them as opaque.
 
 ### Added
 
@@ -25,7 +25,17 @@ The format is based on Keep a Changelog.
 
 - No config or installation change. macOS-only.
 - Existing audit logs continue to verify against the same hash chain; `CHAIN_VERSION` is unchanged. `omamori audit verify` should pass after upgrading.
-- If you have downstream tooling parsing audit JSON: the `action` field can now carry the new value `"unknown_tool_fail_open"` (in addition to the existing `passthrough`/`block`/`trash`/etc.). `result` for those events is `"allow"`, `command` carries the unrecognised tool name, and `target_count` is the count of recognised top-level keys in `tool_input`.
+- If you have downstream tooling parsing audit JSON: the `action` field can now carry the new value `"unknown_tool_fail_open"` (in addition to the existing `passthrough`/`block`/`trash`/etc.), and `detection_layer` can now carry the new value `"shape-routing"` for those events. `result` is `"allow"`, `command` borrows the unrecognised tool name, and `target_count` borrows the count of recognised top-level keys in `tool_input`. Filter on `action == "unknown_tool_fail_open"` rather than relying on the borrowed semantics of `command` or `target_count`; dedicated columns will land in a future release.
+
+### Known limitations carried into a future release
+
+The recognised shape catalogue (`command`/`cmd`/`file_path`/`path`/`url`) is intentionally narrow in this release. Several known-good Claude Code tools — `NotebookEdit` (`notebook_path`), `Task` (`subagent_type`/`prompt`), `TodoWrite` (`todos`), `WebSearch` (`query`), and similar — currently land in the unknown branch and emit a fail-open event on every invocation. Practical implications:
+
+- `omamori audit unknown` and `omamori doctor`'s 30-day count are an **upper bound on adversarial activity, not a lower bound** — they include this routine legitimate-tool noise. Treat the count as a drift indicator: a sudden spike or an unfamiliar tool name is the actionable signal, not a steady non-zero baseline.
+- The protection guarantee is **unchanged**: payloads carrying a recognised dangerous shape (`command`/`cmd`/`file_path`/`path`) reach the full pipeline regardless of `tool_name`. The noise is an observability artefact, not a hole in the routing.
+- `target_count` and `command` borrow existing audit columns with adjusted semantics for `unknown_tool_fail_open` events specifically; downstream analytics that aggregate either column across action types will see skewed distributions. Filter by `action` first.
+
+A future omamori release will widen the shape catalogue, add dedicated audit columns, ship opt-in `strict-mode` (fail-closed on unrecognised shapes), and add session-level stderr dedup. See `SECURITY.md` → "Scope: unknown / new tools" for the full trade-off.
 
 ## [0.9.5] - 2026-04-20
 

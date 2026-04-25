@@ -189,12 +189,26 @@ AI tool platforms ship new tools and rename existing ones on their own cadence; 
 
 The threat we care about: a provider-side rename of a write/exec tool silently bypasses Layer 2. Pre-v0.9.6, `HookInput::UnknownTool` short-circuited to allow regardless of the carried `tool_input`. Codex adversarial-review ② A-2 (2026-04-23, critical) flagged this as a forward-compat fail-open, and v0.9.6 closes it: a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` now reaches the full shell pipeline (meta-patterns, env-tampering, unwrap stack) on the strength of the `command` field alone. Wrong-type routing fields (`command: 42`) fail closed.
 
-The residual risk is `tool_input` shapes we don't recognise at all (no `command`/`cmd`/`file_path`/`path`/`url`). That's still **Allow**, on purpose: starting to block unreviewed payload shapes would break user workflow on every legitimate AI tool update. But the silence is gone — the call is recorded as an `unknown_tool_fail_open` event in the audit chain, stderr carries a one-line dedup'd hint, and `omamori doctor` surfaces a 30-day count. Users review the events with `omamori audit unknown`.
+The residual risk is `tool_input` shapes we don't recognise at all (no `command`/`cmd`/`file_path`/`path`/`url`). That's still **Allow**, on purpose: starting to block unreviewed payload shapes would break user workflow on every legitimate AI tool update. But the silence is gone — the call is recorded as an `unknown_tool_fail_open` event in the audit chain, stderr carries a one-line hint, and `omamori doctor` surfaces a 30-day count. Users review the events with `omamori audit unknown`.
 
 This is a **trade-off, not a complete mitigation**. Threat-model implications:
+
 - An adversary aware of this scope could intentionally craft a `tool_input` shape that matches none of our known fields — say `{"prompt":"...","payload":"..."}` — to land in the observable fail-open branch. The damage they can do that way is limited (whatever the AI tool itself ends up doing with that payload is outside omamori's enforcement layer), and the call leaves a trail in `audit unknown`.
 - Stricter posture (block-by-default-on-unrecognised-shape) is tracked as opt-in `strict-mode` for a follow-up release, for users who would rather break workflow than allow an unobserved tool.
-- Audit log integrity: events use the existing `action` field with a new value (`"unknown_tool_fail_open"`); no `CHAIN_VERSION` bump, no schema break, parsers that don't recognise the value treat it as opaque.
+- Audit log integrity: events use the existing `action` field with a new value (`"unknown_tool_fail_open"`) and the existing `detection_layer` field with a new value (`"shape-routing"`); no `CHAIN_VERSION` bump, no schema break, parsers that don't recognise the values treat them as opaque.
+
+#### Known limitations carried into v0.9.6
+
+The shape catalogue is intentionally narrow in v0.9.6 and several known-good Claude Code tools land in the unknown branch — `NotebookEdit` (`notebook_path`), `Task` (`subagent_type`/`prompt`), `TodoWrite` (`todos`), `WebSearch` (`query`), and similar. Operationally:
+
+| Surface | Behavior in v0.9.6 | Honest read |
+|---|---|---|
+| **Protection** (does the dangerous shape reach the unwrap stack?) | Routes correctly: `command`/`cmd`/`file_path`/`path` always reach the full pipeline regardless of `tool_name` | Effective. The forward-compat fail-open Codex ② A-2 flagged is closed for the dangerous-shape class. |
+| **Observability** (`audit unknown` count, `doctor` 30-day line) | Includes legitimate-tool noise on every `Glob` / `Task` / `TodoWrite` / `WebSearch` invocation | **Upper bound on adversarial activity, not a lower bound**. A baseline of routine fail-opens is expected; spikes or unfamiliar tool names are the actionable signal. |
+| **Audit schema borrowing** | `target_count` re-used to record `tool_input` top-level key count for `unknown_tool_fail_open` events; `command` field re-used to carry `tool_name` | Downstream analytics that aggregate these columns across action types will see skewed distributions. Use `action == "unknown_tool_fail_open"` as the filter, not field semantics. |
+| **stderr dedup** (per the original release-blocker UX wording) | One stderr line per hook-check invocation; no in-process dedup — `omamori hook-check` is short-lived (1 process = 1 dispatch), so a process-local guard would be dead code | Each fail-open emits one line. If user noise becomes a problem, session-level dedup will land alongside strict-mode. |
+
+A future omamori release will address these by (1) widening the shape catalogue to cover known legitimate tool fields, (2) adding dedicated audit columns so `unknown_tool_fail_open` events do not borrow `target_count` / `command` semantics, (3) opt-in `strict-mode` so users can fail-closed on unrecognised shapes, and (4) session-level stderr dedup.
 
 ### Hook Limitations
 

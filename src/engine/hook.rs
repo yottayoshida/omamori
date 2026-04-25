@@ -396,11 +396,24 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
 // `tool_name` Claude Code added or renamed silently bypassed Layer 2.
 // We now (1) re-classify the carried `tool_input` against `InputShape`
 // in case an alias field (`cmd`/`path`) slipped past extract, (2) for
-// truly unknown shapes, log to stderr (deduplicated by tool_name) and
-// append a marked event to the audit chain so users can review what
-// drifted past omamori. The final disposition stays *allow* — we
-// preserve user workflow rather than start blocking unreviewed tools
-// retroactively, but the silence is gone.
+// truly unknown shapes, log to stderr and append a marked event to the
+// audit chain so users can review what drifted past omamori. The final
+// disposition stays *allow* — we preserve user workflow rather than
+// start blocking unreviewed tools retroactively, but the silence is
+// gone.
+//
+// **Scope and known noise (Known Limitation)**: legitimate Claude Code
+// tools whose `tool_input` shape is not in our recognised set (e.g.
+// NotebookEdit's `notebook_path`, Task's `subagent_type`, TodoWrite's
+// `todos`, WebSearch's `query`) currently land in the unknown branch
+// and emit fail-open events on every invocation. Counts surfaced via
+// `omamori audit unknown` and `omamori doctor`'s 30-day line are an
+// **upper bound on adversarial activity**, not a lower bound — they
+// include this legitimate noise. An opt-in strict-mode that lets users
+// choose between fail-open (today) and fail-closed (block) for
+// unrecognised shapes is planned for a future omamori release. See
+// `SECURITY.md` → "Scope: unknown / new tools" for the trade-off
+// rationale.
 
 fn run_hook_check_unknown_tool(
     tool_name: &str,
@@ -450,38 +463,24 @@ fn run_hook_check_unknown_tool(
             Ok(0)
         }
         InputShape::Unknown => {
-            // Observable fail-open: stderr hint (dedup'd) + audit event
-            // + allow. The allow keeps user workflow alive; the hint +
-            // audit make the silence a thing of the past.
-            log_unknown_tool_hint_dedup(tool_name);
+            // Observable fail-open: stderr hint + audit event + allow.
+            // The allow keeps user workflow alive; the hint + audit
+            // make the silence a thing of the past. One stderr line
+            // per invocation — `omamori hook-check` is a short-lived
+            // process (1 invocation = 1 dispatch), so a process-local
+            // dedup guard would be dead code. If user noise becomes a
+            // problem, session-level dedup is tracked for a future
+            // release alongside opt-in strict-mode.
+            eprintln!(
+                "omamori: unknown tool '{tool_name}' routed as fail-open. \
+                 Review via 'omamori audit unknown'"
+            );
             audit_log_unknown_tool_fail_open(tool_name, tool_input, provider);
             print_hook_check_allow_response(&format!(
                 "omamori: unknown tool '{tool_name}' routed as fail-open — allowed"
             ));
             Ok(0)
         }
-    }
-}
-
-/// Process-local dedup guard so the same `tool_name` does not spam stderr
-/// inside a single hook-check invocation. (Each hook-check runs in its
-/// own short-lived process, so the guard's effective lifetime is one
-/// invocation — but if a future caller batches multiple checks, the
-/// dedup still holds.)
-fn log_unknown_tool_hint_dedup(tool_name: &str) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-
-    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let dedup = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let inserted = match dedup.lock() {
-        Ok(mut guard) => guard.insert(tool_name.to_string()),
-        Err(_) => true, // poisoned: log anyway, don't go silent
-    };
-    if inserted {
-        eprintln!(
-            "omamori: unknown tool '{tool_name}' routed as fail-open. Review via 'omamori audit unknown'"
-        );
     }
 }
 
@@ -536,9 +535,22 @@ fn audit_log_unknown_tool_fail_open(
     // CHAIN_VERSION bump needed (Codex ② C-1 裁定維持).
     event.action = "unknown_tool_fail_open".to_string();
     event.result = "allow".to_string();
+    // Override detection_layer: `create_event` defaults to "layer1"
+    // because every existing caller is a Layer 1 / Layer 2 verdict.
+    // Unknown-tool fail-open is neither — it's the shape-routing
+    // dispatch deciding "no recognised shape, allow + record". A SIEM
+    // counting "Layer 1 detector hits" would otherwise inflate with
+    // these events. Like `action`, `detection_layer` is a string field
+    // that older parsers treat as opaque — no schema break.
+    event.detection_layer = Some("shape-routing".to_string());
     // target_count = number of recognised top-level keys in tool_input
     // (helps analysts see "shape we saw was empty" vs. "had keys we
-    // didn't classify").
+    // didn't classify"). Note: this borrows the existing `target_count`
+    // column with a different semantic for `unknown_tool_fail_open`
+    // events specifically; downstream analytics that aggregate
+    // `target_count` across action types will be skewed by these
+    // events. A dedicated column is tracked for a future omamori
+    // release.
     event.target_count = tool_input.as_object().map(|o| o.len()).unwrap_or(0);
 
     if let Err(e) = logger.append(event) {
