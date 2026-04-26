@@ -4,32 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [Unreleased]
+## [0.9.6] - 2026-04-26
+
+**Summary**: Shell-Layer Hardening Phase 2 ([#146](https://github.com/yottayoshida/omamori/issues/146) P2) + structure-based unknown-tool routing ([#182](https://github.com/yottayoshida/omamori/issues/182)) + observable fail-open with `audit unknown` / `doctor` 30-day line. Closes the v0.9.5-deferred `env -S 'bash -e'` / `bash -c 'source /dev/stdin'` pipe-RHS gaps, the net-new-in-v0.9.6 `doas` / `pkexec` privilege-escalation wrapper closure (PR2 scope 7), and the newly-identified `HookInput::UnknownTool` short-circuit-allow (Codex adversarial-review ② A-2, #182) that bypassed the full pipeline on any tool name omamori did not recognise. Cross-layer Layer 1 → Layer 2 implication pinned via 256-case `proptest` (#146 P1-4); the v0.9.5 Ubuntu CI quarantine ([#164](https://github.com/yottayoshida/omamori/issues/164)) is resolved structurally via [#183](https://github.com/yottayoshida/omamori/pull/183); README and SECURITY restructured for navigation. Runtime behavior is otherwise unchanged — omamori remains macOS-only.
+
+### Added
+
+- **`omamori audit unknown`** subcommand. Surfaces every `unknown_tool_fail_open` event in the audit log, paginated like `audit show` (`--last N`, `--json`); defaults to `--all` so review is complete by default. This is the user-facing review endpoint paired with the on-call stderr hint emitted at every unknown-shape invocation — an answer to "review what?".
+- **`omamori audit show --action <name>`**. Generic exact-match filter on the `action` field; `audit unknown` is sugar over this.
+- **`omamori doctor` "Last 30 days" line**. When the audit log carries any `unknown_tool_fail_open` events from the last 30 days, doctor surfaces the count and points at `omamori audit unknown`. Skipped when zero so doctor stays quiet on healthy installs.
 
 ### Changed
 
 - **Unknown / forward-compat tools now route by `tool_input` shape, not `tool_name`** ([#182](https://github.com/yottayoshida/omamori/issues/182)). The previous `HookInput::UnknownTool` branch unconditionally allowed any tool whose name omamori did not recognise — meaning a provider-side rename (Claude Code → Cursor → Codex → next-week's CLI) of a write or exec tool would silently bypass Layer 2 protection. The hook now inspects `tool_input` field structure independently of the tool name: a `command`/`cmd` string routes through the full Bash pipeline; a `file_path`/`path` string routes through FileOp / protected-path checks; a `url` string is treated as read-only (allowed); anything else falls through to an *observable* fail-open. Wrong-type routing fields (e.g. `command: 42`) now fail closed rather than dropping into the unknown branch.
 - **Observable fail-open for genuinely unknown shapes**. When a tool's `tool_input` matches none of the recognised shapes, omamori still allows the call (we keep user workflow alive rather than starting to block unreviewed tools retroactively), but the silence is gone: stderr now carries a one-line hint pointing at the new review surface, and an `unknown_tool_fail_open` event is appended to the audit chain. The `tool_input` payload structure (number of recognised top-level keys) is recorded so an analyst can see at a glance whether the tool sent zero fields, one field, or many. No `CHAIN_VERSION` bump — this introduces new values for the existing `action` field (`"unknown_tool_fail_open"`) and `detection_layer` field (`"shape-routing"`); parsers that don't recognise the values treat them as opaque.
 
-### Added
-
-- **`omamori audit unknown`** subcommand. Surfaces every `unknown_tool_fail_open` event in the audit log, paginated like `audit show` (`--last N`, `--json`); defaults to `--all` so review is complete by default. This is the user-facing endpoint of the stderr hint above — an answer to "review what?".
-- **`omamori audit show --action <name>`**. Generic exact-match filter on the `action` field; `audit unknown` is sugar over this.
-- **`omamori doctor` "Last 30 days" line**. When the audit log carries any `unknown_tool_fail_open` events from the last 30 days, doctor surfaces the count and points at `omamori audit unknown`. Skipped when zero so doctor stays quiet on healthy installs.
-
 ### Security
 
 - **Pipe-RHS bypass closures (Shell-Layer Hardening Phase 2)** ([#184](https://github.com/yottayoshida/omamori/pull/184), #146 P2). Three additional pipe-to-shell evasion surfaces blocked: `curl URL | env -S 'bash -e'` split-string form (PR2 scope 5, coarse-rule closure regardless of STRING contents), `curl URL | bash -c 'source /dev/stdin'` shell-launcher form with inner `source` / `.` (POSIX dot) builtin reading `/dev/stdin` / `/dev/fd/0` / `/proc/self/fd/0` (PR2 scope 6, layered on the v0.9.5 coarse pipe-RHS rule), and `curl URL | doas bash` / `curl URL | pkexec bash` privilege-escalation wrappers (PR2 scope 7). Legitimate use cases stay Allow (`env -S` shebang lines, `bash -c 'source /dev/stdin' < file` non-pipe redirect, `doas -u user <non-shell-cmd>` FP-pinned). See SECURITY.md → Known Limitations table A and `tests/hook_integration.rs` corpus entries `pipe-wrapper-evasion-env-dash-s-block` / `pipe-launcher-source-stdin-block` / `pipe-wrapper-evasion-doas-block` / `pipe-wrapper-evasion-pkexec-block`.
 - **Forward-compat fail-open closed** ([#182](https://github.com/yottayoshida/omamori/issues/182), Codex adversarial-review ② A-2 critical). Before this change, a hostile or merely renamed tool could carry a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` and the entire shell pipeline (meta-pattern detection, env-tampering checks, unwrap stack) would never run because `HookInput::UnknownTool` short-circuited to allow. Equivalent payloads now Block at exit code 2.
 
-### Notes for users
+### For users
 
 - No config or installation change. macOS-only.
 - **Protection guarantee is unchanged**: any payload carrying a recognised dangerous shape (`command`/`cmd`/`file_path`/`path`) still routes through the full pipeline regardless of `tool_name`. The new `unknown_tool_fail_open` events are observability noise on legitimate tools whose `tool_input` shape is not yet in the catalogue, not a regression in protection.
 - Existing audit logs continue to verify against the same hash chain; `CHAIN_VERSION` is unchanged. `omamori audit verify` should pass after upgrading.
 - If you have downstream tooling parsing audit JSON: **filter on `action == "unknown_tool_fail_open"` first** to isolate these events from your existing aggregations. Within those events, `result` is `"allow"`, `detection_layer` is `"shape-routing"`, and `command` / `target_count` are borrowed columns (carrying `tool_name` and `tool_input` top-level key count respectively); aggregations across action types over either column will be skewed. Dedicated columns are tracked for a future omamori release.
 
-### Known limitations carried into a future release
+### For contributors (CI)
+
+- **Ubuntu CI quarantine resolved structurally** ([#183](https://github.com/yottayoshida/omamori/pull/183), closes #164): The v0.9.5 `#[serial_test::serial]` quarantine on `context::tests::multi_target_*` is now resolved by threading an explicit base directory through `normalize_path` via new `pub(crate)` helpers (`normalize_path_with_base` / `resolve_path_with_base` / `evaluate_context_with_base`). Context tests no longer depend on process-wide CWD; Ubuntu `Test` CI no longer needs serial-test annotations on these paths.
+- **Structural test quality migration** ([#186](https://github.com/yottayoshida/omamori/pull/186), refs #146 scope 4): 4 structural array-shape tests (`meta_patterns_cover_*`) migrated from internal-array assertions into the `tests/hook_integration.rs` E2E corpus where they pin observable Block / Allow behavior. Audit chain hash tests are now pinned against golden hex vectors instead of self-verifying helpers, eliminating the `(if helper passes) ⟹ (test passes)` tautology.
+
+### Docs
+
+- **README philosophy flip** ([#191](https://github.com/yottayoshida/omamori/pull/191)): the philosophy block is surfaced before Quick Start so first-time readers see the *why* before the *how*.
+- **README H2 hierarchy compressed from 13 to 9** ([#192](https://github.com/yottayoshida/omamori/pull/192)): Quick Start purified, tool compatibility consolidated, a Real-world Effect section added, and Scope and Limitations merged. First-time-reader navigation cost is reduced without losing detail.
+- **`SECURITY.md` "How to read this document" navigation table** ([#192](https://github.com/yottayoshida/omamori/pull/192)): a role-based reading-order table at the top of the file (operator / security researcher / contributor), deep-linking each role's recommended path through the principal sections (Security Model / Design Invariants / Bypass Corpus Testing / Audit Log / AI-assisted Contribution Invariants / etc.) so readers can jump to the path appropriate for their use case without scrolling.
+- **`SECURITY.md` Known Limitations 3-way split** ([#191](https://github.com/yottayoshida/omamori/pull/191)): the previously-mixed table is now grouped into (A) closures landed in the v0.9.x series, (B) out-of-scope by design decision, and (C) structural limits of static shell-word analysis — so readers can distinguish a closure-pending row from a scope-by-design or static-analysis-bound row.
+- **`docs/dogfood/2026-04-23-codex-notion-mcp-reauth.md` translated to English** ([#192](https://github.com/yottayoshida/omamori/pull/192)) per the repo's English-default documentation convention.
+
+### Known limitations (carried into a future release)
 
 The recognised shape catalogue (`command`/`cmd`/`file_path`/`path`/`url`) is intentionally narrow in this release. Several known-good Claude Code tools — `NotebookEdit` (`notebook_path`), `Task` (`subagent_type`/`prompt`), `TodoWrite` (`todos`), `WebSearch` (`query`), and similar — currently land in the unknown branch and emit a fail-open event on every invocation. Practical implications:
 
@@ -47,6 +62,8 @@ A future omamori release will widen the shape catalogue, add dedicated audit col
 - [#186](https://github.com/yottayoshida/omamori/pull/186) — `test: structural test quality (#146 scope 4)`. Migrates 4 structural array-shape tests (`meta_patterns_cover_*`) into the `hook_integration.rs` E2E corpus, pins audit chain hash tests against golden hex vectors instead of self-verifying helpers, and documents the parse-result-layer rationale in-file for `unwrap` tests. 5 Codex rounds and a Claude proxy second pass; surfaced the `behavioral-pin-isolation` skill (1 fixture = 1 pattern isolate) and the `codex-proxy-review-operation` skill. Refs #146 scope 4.
 - [#188](https://github.com/yottayoshida/omamori/pull/188) — `test(property): cross-layer Layer 1 → Layer 2 property test (#146 P1-4)`. Pins the one-way implication "Layer 1 destructive ⟹ Layer 2 Block" with a 256-case `proptest 1.11`, covering 6 destructive built-in rules × 14 wrapper variants. Trust boundary made structural via `#[cfg(test)]` gate on `check_command_for_hook_with_rules` — the hermetic helper does not exist in the released binary. Lib tests 595 → 600. Refs #146 P1-4 / #187 (deferred to v0.9.7).
 - [#189](https://github.com/yottayoshida/omamori/pull/189) — `feat(hook): structure-based routing for unknown tools (#182)`. Replaces the old `HookInput::UnknownTool` short-circuit-allow with structure-based routing on `tool_input` shape (`command`/`cmd` → Bash pipeline, `file_path`/`path` → FileOp, `url` → read-only allow, otherwise observable fail-open). Adds `audit unknown` / `audit show --action` / `doctor` 30-day-line as the user-facing review surface. 6 rounds (Codex R1-R3 + Claude proxy R4-R6). Defers 4 P3 findings to #190. Closes #182.
+- [#191](https://github.com/yottayoshida/omamori/pull/191) — `docs(release): philosophy flip + Known Limitations 3-way split`. README narrative restructure (philosophy block surfaced before Quick Start), `SECURITY.md` Known Limitations split into (A) closures landed in the v0.9.x series, (B) out-of-scope by design decision, and (C) structural limits of static shell-word analysis, and CHANGELOG `### Security` narrative balance fix (the prior PR6-bias under-represented PR2's pipe-RHS work). Codex R1-R3 + Claude proxy R4 (4 rounds total); proxy R4 surfaced the narrative-balance gap. Doc-only.
+- [#192](https://github.com/yottayoshida/omamori/pull/192) — `docs: README 9-H2 restructure + SECURITY navigation + dogfood EN`. README compressed from 13 H2 to 9 H2 (Quick Start purification, Tool Compatibility consolidation, new Real-world Effect section, Scope and Limitations consolidation), `SECURITY.md` top-of-file navigation block, `docs/dogfood/2026-04-23-codex-notion-mcp-reauth.md` translated to English, and a narrative-gluing fix that resolved PR7 proxy R4 P3-1 and P3-2. Doc-only.
 
 ## [0.9.5] - 2026-04-20
 
