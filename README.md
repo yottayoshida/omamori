@@ -121,7 +121,7 @@ Available for Claude Code, Cursor, and Codex CLI.
 
 **File protection**: AI Edit/Write operations on omamori's own files (config, hooks, audit log, integrity baseline, Claude Code settings.json) are blocked. See [SECURITY.md](SECURITY.md) for the full protected file list.
 
-For what omamori **cannot** catch, see [Structural Limitations](#structural-limitations).
+For what omamori **does not** catch — by design or by structural limit — see [Structural Limitations](#structural-limitations).
 
 ## Supported Tools
 
@@ -282,7 +282,7 @@ These are inherent to the PATH shim approach and documented honestly:
 
 - **Full-path execution** (`/bin/rm`) bypasses the shim — mitigated by Layer 2 hooks
 - **`sudo`** changes PATH — omamori blocks when it detects elevated execution
-- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected. [Investigated and deferred](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools
+- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected. [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools
 - **Obfuscated commands** (base64, variable indirection) — cannot be detected by static analysis
 - **AI self-bypass** — `config disable`/`uninstall` are blocked; direct file editing blocked by hooks (Claude Code only)
 

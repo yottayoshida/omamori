@@ -114,7 +114,7 @@ Core immutability uses structural enforcement (binary ignores config overrides f
 - Full-path execution such as `/bin/rm` or `/usr/bin/git` can bypass the PATH shim. Mitigated by Layer 2 hooks (Claude Code + Cursor).
 - `find -exec /bin/rm {} \;` bypasses both the find shim and the rm shim because rm is invoked via absolute path. Partially mitigated by Layer 2 hooks.
 - `sudo` may change PATH before the shim runs.
-- Interpreter commands (`python -c "shutil.rmtree(...)"`) are not detected by the unwrap stack (which handles bash/sh/zsh/dash/ksh only). [Investigated and deferred](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools (Claude Code, Cursor, Codex CLI).
+- Interpreter commands (`python -c "shutil.rmtree(...)"`) are not detected by the unwrap stack (which handles bash/sh/zsh/dash/ksh only). [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools (Claude Code, Cursor, Codex CLI).
 - **Dynamic command generation** (`bash -c "$(cmd)"`, backtick substitution) inside shell launchers is **blocked** (fail-close) because the inner content cannot be statically analyzed.
 - **Obfuscated commands** (base64 encoding, heredoc, variable indirection, string concatenation outside shell launchers) **cannot be detected**. This is a fundamental limitation of static analysis.
 - **Bypass-by-substitution**: AI agents may attempt alternative commands (e.g., `rmdir`, `unlink`, `python os.rmdir()`) when their primary method is blocked. The unwrap stack partially mitigates this for shell launcher wrapping, but cannot prevent all substitution patterns. Protocol-level enforcement (#14 MCP) is the structural answer.
@@ -144,7 +144,7 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 
 | Capability | Detection |
 |-----------|-----------|
-| Shell wrappers (`sudo`, `env`, `nohup`, `timeout`, `nice`, `exec`, `command`) | Stripped recursively to expose inner command |
+| Shell wrappers (`sudo`, `env`, `nohup`, `timeout`, `nice`, `exec`, `command`, `doas`, `pkexec`) | Stripped recursively to expose inner command |
 | Shell launchers (`bash -c`, `sh -c`, `zsh -c`, `dash -c`, `ksh -c`) | Inner command extracted and recursively parsed |
 | Full-path shells (`/usr/local/bin/bash -c`) | Recognized via basename matching |
 | Combined flags (`bash -lc`) | Detected via flag suffix matching |
@@ -262,21 +262,38 @@ omamori maintains a bypass corpus — a set of tests that verify both "what we b
 
 ### Known limitations (KNOWN_LIMIT)
 
-These attack vectors **cannot** be detected by omamori's design. They are documented as comments in the test source and listed here for transparency:
+These cover everything omamori does *not* protect against, separated by why. (A) closures that landed in the v0.9.x series, (B) out-of-scope decisions, and (C) structural / parser-level limits the current static-analysis approach cannot bridge without product-level changes. Test source comments use the `KNOWN_LIMIT` label.
+
+#### A. Closed in v0.9.x series
+
+| Attack vector | Closed in | Notes |
+|---------------|-----------|-------|
+| `export -n CLAUDECODE` | v0.9.2 | Phase 1B token detection. `export -n VARNAME` and `export -nVARNAME` (combined form) blocked alongside `unset` and `env -u`. See `src/engine/hook.rs::detect_env_var_tampering` and `tests/hook_integration.rs` corpus entries `export-n` / `export-n-attached`. |
+| `curl URL \| env bash` / `curl URL \| sudo bash` (+ wrapper variants) | v0.9.5 | Pipe-to-shell detection runs before transparent-wrapper unwrapping, covering 7 wrappers (`sudo`, `env`, `nice`, `timeout`, `nohup`, `exec`, `command`) with chained / absolute-path (`/usr/bin/env`, `/bin/sudo`) / stdin-flag (`-s`, `-`, `/dev/stdin`) / option-value (`-O optname`, `-o optname`, `--rcfile FILE`) / grouped-short (`-la argv0`, `-pv`) / `\|&` (stdout+stderr pipe) variants. Info-only flags (`--version`, `--help`, `--dump-strings`, `--dump-po-strings`, `--rpm-requires`, `-D`) and positional script paths remain Allow. See `src/unwrap.rs::tests` prefixed `curl_pipe_*` / `env_*` / `command_*` / `exec_*`. Refs [#170](https://github.com/yottayoshida/omamori/pull/170), #146 P1-1. |
+| `curl URL \| env -S 'bash -e'` (split-string form) | v0.9.6 | Coarse-rule closure: any pipe-RHS invocation of `env -S` is blocked unconditionally regardless of STRING contents. Covers leading `KEY=VAL` assignments, leading env flags (`-i`/`-u`/`-C`), trailing argv, `--` terminator, nested `-S`, and the full GNU escape vocabulary (`\_`/`\n`/`\t`/`\v`/`\c`/`${VAR}`). False-positive bound: legitimate `env -S` use is concentrated in shebang lines (`#!/usr/bin/env -S prog args`), resolved by the kernel before an omamori hook sees the command. See `src/unwrap.rs` env-S handling and `tests/hook_integration.rs` corpus entry `pipe-wrapper-evasion-env-dash-s-block`. PR2 ([#184](https://github.com/yottayoshida/omamori/pull/184)) scope 5. |
+| `curl URL \| bash -c 'source /dev/stdin'` (shell launcher reading piped payload) | v0.9.6 | Note: the v0.9.5 coarse rule already blocks any bare shell on a pipe RHS as pipe-to-shell (modulo info-only flags / positional script paths listed in the v0.9.5 row). The v0.9.6 scope 6 closure is the **launcher-internal detection** layered on top: an inner `source` or `.` (POSIX dot) builtin reading `/dev/stdin`, `/dev/fd/0`, or `/proc/self/fd/0` is recognised at the launcher boundary as a tested subset of the broader pipe-to-shell policy. The non-pipe common case `bash -c 'source /dev/stdin' < file` (explicit stdin redirect) remains Allow. `eval` / `exec` reading runtime stdin are **not yet** in the launcher-boundary closure — those remain in C below. See `tests/hook_integration.rs` corpus entry `pipe-launcher-source-stdin-block`. PR2 ([#184](https://github.com/yottayoshida/omamori/pull/184)) scope 6. |
+| `curl URL \| doas bash` / `curl URL \| pkexec bash` (privilege-escalation wrappers) | v0.9.6 | OpenBSD `doas` and polkit `pkexec` are recognised as transparent elevation wrappers; pipe-RHS `doas bash` / `pkexec bash` block. Legitimate `doas -u user <non-shell-cmd>` remains Allow (FP-pinned). See `tests/hook_integration.rs` corpus entries `pipe-wrapper-evasion-doas-block` / `pipe-wrapper-evasion-pkexec-block`. PR2 ([#184](https://github.com/yottayoshida/omamori/pull/184)) scope 7. |
+| Forward-compat fail-open on renamed tools | v0.9.6 | `HookInput::UnknownTool` no longer short-circuit-allows. `tool_input` shape (`command`/`cmd`/`file_path`/`path`/`url`) routes through the full pipeline regardless of `tool_name`; wrong-type fields (e.g. `command: 42`) fail closed. Unrecognised shapes still allow but emit `unknown_tool_fail_open` audit events and a one-line stderr hint per invocation. Refs [#182](https://github.com/yottayoshida/omamori/issues/182). |
+
+#### B. Out of scope by design decision
+
+| Attack vector | Decision | Rationale |
+|---------------|----------|-----------|
+| `python -c "shutil.rmtree(...)"` (interpreter family: `python -c` / `node -e` / `perl -e` / `ruby -e`) | [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74) | Zero real-world incidents in target tools (Claude Code, Cursor, Codex CLI); full-block approach disproportionate to the risk; protocol-level enforcement ([#14](https://github.com/yottayoshida/omamori/issues/14) MCP) is the right layer. |
+
+#### C. Structural limits of static shell-word analysis
+
+These are not closures pending future work — the current static-analysis pipeline cannot reach them without OS-level cooperation, runtime evaluation, or a product-level scope decision.
 
 | Attack vector | Why undetectable |
 |---------------|-----------------|
-| `sudo rm -rf` | sudo changes PATH before shim runs; shim is never invoked |
+| `sudo rm -rf` (Layer 1 shim only — direct human execution outside AI hook input) | sudo changes PATH before the Layer 1 shim runs; shim is never invoked. AI hook input still reaches Layer 2, where `sudo` is unwrapped as a transparent wrapper — so AI-issued `sudo rm -rf` is detected there (see Hook Coverage). The residual is direct human execution outside hook coverage. (Note: `curl URL \| sudo bash` pipe-RHS is closed — see A above.) |
 | `alias rm='/bin/rm'` | Alias/function overrides bypass string matching in hooks |
-| `env -i rm -rf` | Clears all env vars including detectors; undetectable by hooks |
+| `env -i rm -rf` (Layer 1 shim only — direct human execution outside AI hook input) | Clears all env vars including detectors before the Layer 1 shim runs. AI hook input still reaches Layer 2, where `env -i` is unwrapped as a transparent wrapper — so AI-issued `env -i rm -rf` is detected there. The residual is direct human execution outside hook coverage. |
 | Obfuscated commands (base64, hex, variable expansion) | Static analysis cannot decode runtime-constructed commands |
-| ~~`export -n CLAUDECODE`~~ | **Closed in v0.9.2 (Phase 1B token detection).** `export -n VARNAME` and `export -nVARNAME` (combined form) are now blocked at the hook layer alongside `unset` and `env -u`. See `src/engine/hook.rs::detect_env_var_tampering` and `tests/hook_integration.rs` corpus entries `export-n` / `export-n-attached`. |
-| `python -c "shutil.rmtree(...)"` | Python/Node interpreters not in shell list; [investigated, zero incidents in target tools](https://github.com/yottayoshida/omamori/issues/74) |
-| `bash -c "$VAR"` where VAR is set earlier | Variable expansion requires runtime evaluation |
-| ~~`curl URL \| env bash` / `curl URL \| sudo bash`~~ | **Closed in v0.9.5 ([#170](https://github.com/yottayoshida/omamori/pull/170), #146 P1-1).** Pipe-to-shell detection runs before transparent-wrapper unwrapping, covering 7 wrappers (`sudo`, `env`, `nice`, `timeout`, `nohup`, `exec`, `command`) including chained wrappers, absolute-path variants (`/usr/bin/env`, `/bin/sudo`), stdin-mode flags (`-s`, `-`, `/dev/stdin`), option-value flags (`-O optname`, `-o optname`, `--rcfile FILE`), grouped short options (`-la argv0`, `-pv`), and `\|&` (stdout+stderr pipe). Info-only flags (`--version`, `--help`, `--dump-strings`, `--dump-po-strings`, `--rpm-requires`, `-D`) and positional script paths remain Allow. See `src/unwrap.rs::tests` prefixed `curl_pipe_*` / `env_*` / `command_*` / `exec_*` (134+ tests) for the full surface. |
-| `curl URL \| env -S 'bash -e'` (split-string form) | `env -S` parses its quoted argument as its own command line and is not split by `shell-words` at the outer level. The current implementation skips `-S` value content, leaving this variant outside Layer 2 detection. Tracked as v0.9.6 follow-up to #146. |
-| `bash -c 'source /dev/stdin'` and other stdin-consuming shell built-ins | Shell launchers with `-c` are recursively parsed, but the stdin-consuming inner (`source`, `eval`, `exec` reading `/dev/stdin`) reads its body at runtime from a pipe. omamori has no visibility into runtime stdin contents. Tracked as v0.9.6 follow-up. |
-| `curl URL \| source /dev/stdin` / `\| eval ...` (interpreters outside `SHELL_NAMES`) | Current `SHELL_NAMES = [bash, sh, zsh, dash, ksh]` does not include `source`, `eval`, or interpreter families (`python -c`, `perl -e`, `node -e`, `ruby -e`). Pipe-to-shell detection is bound to this list. Expanding the list has real false-positive risk (`cat data \| python -c 'parse'`); requires product-level discussion. Tracked as v0.9.6 follow-up. |
+| `bash -c "$VAR"` (VAR set earlier in the same shell) | Variable expansion requires runtime evaluation |
+| `source /dev/fd/N N<&0` (redirection-dup stdin alias) | Shell redirection creates a synthetic file descriptor that points at stdin, then `source /dev/fd/N` reads from it. Detection would require parsing `N<&0`-style redirections and tracking fd equivalence to `/dev/stdin`. v0.9.7 will track a redirection-aware parser plan. (Note: the direct case `bash -c 'source /dev/stdin'` after a pipe is closed — see A above.) |
+| `curl URL \| source /dev/stdin` / `\| eval ...` (interpreters outside `SHELL_NAMES`, used directly on the pipe RHS) | Current `SHELL_NAMES = [bash, sh, zsh, dash, ksh]` does not include `source`, `eval`, or interpreter families (`python -c`, `perl -e`, `node -e`, `ruby -e`). Pipe-to-shell detection is bound to this list; expanding it has real false-positive risk (`cat data \| python -c 'parse'`) and requires product-level discussion. (Note: when `source` / `eval` are invoked *inside* a shell launcher like `bash -c 'source /dev/stdin'`, that case is closed — see A above.) |
 
 ## AI Config Bypass Guard (v0.3.2+)
 
