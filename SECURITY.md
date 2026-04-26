@@ -1,5 +1,19 @@
 # SECURITY
 
+## How to read this document
+
+This document covers omamori's security model, threat analysis, and known limitations. Different readers want different things:
+
+| If you are... | Read in this order |
+|---|---|
+| **An operator** evaluating omamori for your team | [Security Model](#security-model) → [What It Protects](#what-it-protects-v090) → [Structural Limits](#structural-limits) → [Hook Coverage (Layer 2)](#hook-coverage-layer-2) → [Safe Defaults](#safe-defaults) |
+| **A security researcher** auditing the design | [Design Invariants](#design-invariants-v090) → [Bypass Corpus Testing](#bypass-corpus-testing-v041) → [Audit Log](#audit-log-v070) → [Integrity Monitoring](#integrity-monitoring-v050) |
+| **A contributor** preparing a PR | [AI-assisted Contribution Invariants](#ai-assisted-contribution-invariants-v093) |
+
+For end-user installation and CLI usage, see [README.md](README.md). For known limitations classified by closure status — closed in v0.9.x / decided out of scope / structural — jump to [Bypass Corpus Testing → Known limitations (KNOWN_LIMIT)](#known-limitations-known_limit).
+
+---
+
 ## Security Model
 
 `omamori` is a PATH-shim safeguard for AI-triggered shell commands. It reduces risk for a narrow set of destructive commands, but it is not a sandbox and it does not claim complete mediation.

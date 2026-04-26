@@ -1,29 +1,26 @@
-# 2026-04-23 Codex による Notion MCP 再認証で omamori hook が発火した実録
+# 2026-04-23: omamori hook fired during Codex CLI Notion MCP re-authentication
 
-## 概要
+## Summary
 
-Codex CLI で Notion MCP の再認証 (`codex mcp login notion`) を実行した際、
-Codex が事前調査として `~/.codex/config.toml` を読もうとして、omamori hook が
-複数段にわたって阻止した実ログ。v0.9.5 で強化した Codex config 保護と
-oracle attack prevention (wrapper-evasion 対策) が本番で機能することを確認した。
+When Codex CLI ran `mcp login notion` (re-authentication for the Notion MCP server), Codex first attempted to read `~/.codex/config.toml` to locate the auth setting. omamori hooks blocked the reads in cascade. This is a real-world transcript validating that the v0.9.5 Codex config-protection layer and oracle-attack prevention work in production.
 
-## シナリオ
+## Scenario
 
-- ユーザー: yotta
-- AI エージェント: Codex CLI
-- 目的: Notion MCP の OAuth 再認証
-- 環境: omamori v0.9.5 (2026-04-20 release) が有効
+- User: yotta
+- AI agent: Codex CLI
+- Goal: OAuth re-authentication for Notion MCP
+- Environment: omamori v0.9.5 (released 2026-04-20)
 
-## 実ログ抜粋
+## Transcript excerpts
 
-### 1. Codex の調査意図
+### 1. Codex's investigation intent
 
 ```
-Notion MCP の認証設定を確認して、再認証に使うコマンドか設定箇所を特定する。
-まず config.toml と notion 関連の定義を読む。
+Confirm Notion MCP auth setup, then determine the re-auth command or config location.
+First, read config.toml and any notion-related definitions.
 ```
 
-### 2. omamori hook が直接参照を阻止
+### 2. omamori hook blocks direct config read
 
 ```
 PreToolUse hook (blocked)
@@ -35,9 +32,9 @@ feedback: omamori hook: blocked — blocked attempt to edit Codex config
 hint: run `omamori explain -- sed -n '1,220p' /Users/i.yoshida/.codex/config.toml` for details
 ```
 
-`rg` / `sed` による Codex config の直接参照はどちらも `blocked` で停止。
+Both `rg` and `sed` reading the Codex `config.toml` were blocked.
 
-### 3. omamori explain ネストによる bypass 試行も阻止
+### 3. Nested `omamori explain` bypass attempt also blocked
 
 ```
 PreToolUse hook (blocked)
@@ -45,68 +42,67 @@ feedback: omamori hook: blocked — blocked attempt to run explain via AI (oracl
 hint: run `omamori explain -- omamori explain -- sed -n '1,220p' /Users/i.yoshida/.codex/config.toml` for details
 ```
 
-hint として示された `omamori explain -- ...` を Codex がそのまま実行しようとしたが、
-oracle attack prevention が起動してネストを弾いた。
+The hint omamori emitted included an `omamori explain -- ...` invocation. Codex tried to execute the hint as-is, but oracle-attack prevention rejected the nested form.
 
-### 4. Codex が別経路へ転換
+### 4. Codex pivots to a different path
 
 ```
-設定読取は保護されているので、Codex CLI 側の再認証導線を探す。
-codex のヘルプから Notion/MCP の認証サブコマンドを確認する。
+Config reads are protected, so look up the Codex CLI re-auth flow.
+Check Codex's help for the Notion / MCP auth subcommand.
 ```
 
-その後、`codex mcp --help` → `codex mcp list` → `codex mcp login notion` で
-OAuth フローを起動し、ブラウザ認可で再認証完了。
+Codex then ran `codex mcp --help` → `codex mcp list` → `codex mcp login notion` to start the OAuth flow, completing re-authentication via the browser.
 
-## 観察ポイント
+## Observations
 
-### 狙い通りに動いた箇所
+### Behaviours that worked as designed
 
-| 挙動 | 評価 |
-|------|------|
-| `rg` による config.toml 参照をブロック | OK |
-| `sed` による config.toml 参照をブロック | OK |
-| `omamori explain -- omamori explain -- ...` のネストをブロック | OK (oracle attack prevention) |
-| hint を出して yotta 本人が後追い検証できる経路を残した | OK |
+| Behaviour | Outcome |
+|---|---|
+| `rg` reading `config.toml` | Blocked |
+| `sed` reading `config.toml` | Blocked |
+| `omamori explain -- omamori explain -- ...` nesting | Blocked (oracle-attack prevention) |
+| Hint emitted so the user can verify after the fact | Preserved |
 
-### v0.9.5 の wrapper-evasion 対策との関連
+### Relation to v0.9.5 closures
 
-v0.9.5 Phase 6-A で Codex が 8 ラウンドかけて unwrap.rs を攻めた結果、
-`bash -s ARG` / `|&` / option-value flags / `command -v/-V` introspection 等の
-bypass 経路を全て塞いだ。今回のログは、そのあとで別の AI が実運用で
-config 読取を試みたら、すべて検知側が先に反応する状態になっていることを
-裏付けている。
+This case validates the v0.9.5 hardening shipped in PR [#170](https://github.com/yottayoshida/omamori/pull/170):
 
-### 設計意図の確認
+- Pipe-to-shell with transparent wrappers is closed: `curl URL | env bash`, `curl URL | sudo bash`, and 7 wrapper variants (`sudo`, `env`, `nice`, `timeout`, `nohup`, `exec`, `command`) including chained, absolute-path, stdin-flag, and option-value forms.
+- File-protection hooks block direct reads of `config.toml`, audit logs, hook scripts, and integrity baselines from AI-issued commands.
+- Oracle-attack prevention blocks AI-issued `omamori explain` so the policy engine cannot be used as a probe.
 
-- 「AI から Codex config を読ませない」 → **達成**
-- 「別 AI が omamori explain を oracle として使うのを防ぐ」 → **達成**
-- 「yotta 本人の後追いデバッグ経路は残す (hint)」 → **達成**
+The 2026-04-23 transcript captures *another* AI in real-world operation hitting the protection layer first (config read blocked, explain-as-oracle blocked) without finding any of the closed bypass paths.
 
-## 補足: omamori 起因ではない周辺ノイズ
+### Design intent confirmed
 
-同じ transcript に以下のエラーも混在していたが、これは omamori 由来ではなく
-Codex 側の hook 設定問題として分離整理した。
+- "AI cannot read Codex config" → **achieved**
+- "Other AI cannot use omamori explain as an oracle" → **achieved**
+- "User-side after-the-fact verification path is preserved (hint)" → **achieved**
+
+## Note: peripheral noise not caused by omamori
+
+The same transcript also contained these errors, which are not from omamori but from the Codex hook configuration:
 
 ```
 UserPromptSubmit hook (failed) error: hook exited with code 127
 PreToolUse hook (failed) error: PreToolUse hook returned unsupported permissionDecision:allow
 ```
 
-- exit 127 = command not found (Codex の hook 定義内で参照されている別コマンドが PATH 解決失敗)
-- `permissionDecision:allow` = Codex hook API が受け付けない値 (Claude Code の hook API と仕様差)
+- exit 127 = command not found (a different command referenced inside Codex's hook definitions failed PATH resolution).
+- `permissionDecision:allow` = the Codex hook API does not accept this value (it is a Claude Code hook API value; the two have a spec-level difference).
 
-## 引用用途
+## Citation use cases
 
-この実録は今後以下の用途で引用可能:
+This transcript can be cited in:
 
-- omamori README の「実運用での効果」セクション
-- v1.0 に向けた dogfooding 証跡
-- ブログ記事「他 AI に自分の設定を覗かせない」の素材
-- 外部レビュー・監査時の挙動エビデンス
+- The omamori README "Real-world Effect" section.
+- v1.0 dogfooding evidence.
+- A blog post such as "Preventing other AIs from peeking at your config".
+- External review / audit evidence.
 
-## 関連
+## Related
 
-- v0.9.5 plan: `investigation/` 配下の Codex Phase 6-A ログ
-- SECURITY.md: wrapper-evasion 対策
-- unwrap.rs: bash wrapper 攻撃面の網羅実装
+- v0.9.5 plan: Codex Phase 6-A logs under `investigation/`.
+- `SECURITY.md`: wrapper-evasion section.
+- `src/unwrap.rs`: bash-wrapper attack-surface coverage.
