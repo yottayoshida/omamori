@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [Unreleased]
+## [0.9.6] - 2026-04-26
+
+**Summary**: Shell-Layer Hardening Phase 2 ([#146](https://github.com/yottayoshida/omamori/issues/146) P2) + structure-based unknown-tool routing ([#182](https://github.com/yottayoshida/omamori/issues/182)) + observable fail-open with `audit unknown` / `doctor` 30-day line. Closes the v0.9.5-deferred `env -S 'bash -e'` / `bash -c 'source /dev/stdin'` / `doas` / `pkexec` pipe-RHS gaps and the `HookInput::UnknownTool` short-circuit-allow that bypassed the full pipeline on any tool name omamori did not recognise. Cross-layer Layer 1 → Layer 2 implication pinned via 256-case `proptest` ([#187](https://github.com/yottayoshida/omamori/issues/187) P1-4); README and SECURITY restructured for navigation. Runtime behavior is otherwise unchanged — omamori remains macOS-only.
 
 ### Changed
 
