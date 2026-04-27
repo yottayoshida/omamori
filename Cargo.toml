@@ -47,7 +47,7 @@ hmac = "0.12"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "1.1"
-toml_edit = "0.22"
+toml_edit = "0.25"
 trash = "5.2"
 shell-words = "1.1"
 
