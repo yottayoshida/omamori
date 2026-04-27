@@ -125,7 +125,7 @@ fn layer2_blocks(command: &str, rules: &[RuleConfig]) -> bool {
     matches!(
         check_command_for_hook_with_rules(command, rules),
         HookCheckResult::BlockMeta(_)
-            | HookCheckResult::BlockStructural(_)
+            | HookCheckResult::BlockStructural { .. }
             | HookCheckResult::BlockRule { .. }
     )
 }

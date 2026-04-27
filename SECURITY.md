@@ -197,6 +197,36 @@ The `omamori cursor-hook` subcommand uses the same `check_command_for_hook()` pi
 | `$(...)` or backtick in shell launcher inner | BLOCK |
 | OOM / panic | Process exit (hook failure = AI tool blocks) |
 
+### Layer 2 Deny Coverage (v0.9.7+)
+
+Pre-v0.9.7, Layer 2 hook deny verdicts (`BlockMeta` / `BlockRule` / `BlockStructural`) wrote to stderr but did not append to the HMAC audit chain. The marketed moat — tamper-evident audit chain that survives the AI agent itself — therefore covered Layer 1 (PATH shim) cleanly but had a structural gap at Layer 2. v0.9.7 closes that gap: every Layer 2 deny verdict appends an audit event with `action = "block"`, `result = "block"`, and `detection_layer` from the v0.9.7 taxonomy.
+
+| Verdict | `detection_layer` value |
+|---------|------------------------|
+| `BlockMeta` (string-level meta-pattern, env-tampering) | `"layer2:meta-pattern"` |
+| `BlockRule` (token-level rule match) | `"layer2:rule"` (with `rule_id` carrying the matched rule name) |
+| `BlockStructural` with transparent wrapper | `"layer2:pipe-to-shell:{wrapper}"` (e.g. `"layer2:pipe-to-shell:env"`, `"layer2:pipe-to-shell:sudo"`; wrapper basename comes from `unwrap::TRANSPARENT_WRAPPERS`) |
+| `BlockStructural` without wrapper (parse error / depth / dynamic generation / process substitution / bare-shell pipe RHS) | `"layer2:structural"` |
+
+#### Channel separation (v0.9.5 invariant maintained)
+
+Wrapper kind flows into the audit log only. Block-reason **stderr** text remains the v0.9.5 fixed string (`"pipe to shell interpreter"` for all pipe-to-shell variants regardless of wrapper). The two channels are deliberately separated: an AI agent observing only stderr cannot iterate on wrapper variants (`env bash` blocked → try `sudo bash` → blocked → try `nice bash` → ...) because the block message is identical, while a forensic operator reading the audit log gets full attribution including the specific wrapper basename.
+
+#### Audit-append failure semantics (SEC-7)
+
+Layer 2 deny audit append is **best-effort with respect to the hook decision** but **not silent with respect to observability**: an append failure (config load error, audit secret missing, disk full, permissions) does not flip the block decision (the user's command stays blocked at exit code 2), but a stderr warning surfaces so the user knows the audit chain has a gap for that event. This mirrors the `audit_log_unknown_tool_fail_open` (PR6) pattern: fail-close on the safety-critical decision, fail-open on observability.
+
+#### Schema migration note (parser developers)
+
+CHAIN_VERSION stays at `1`. The new `detection_layer` values follow the precedent set by v0.9.6's `"shape-routing"` value (PR6): they are added to the existing string field with no schema break, and parsers that do not recognise the new values must treat them as opaque. SIEM pipelines that filter on `detection_layer == "layer1"` only will silently exclude the new Layer 2 deny events; pipelines that want full Layer 2 coverage should match `detection_layer` values starting with `"layer2:"`.
+
+`is_valid_detection_layer` (in `src/engine/hook.rs`) validates against a fixed taxonomy — static prefixes (`"layer1"`, `"shape-routing"`, `"layer2:meta-pattern"`, `"layer2:rule"`, `"layer2:structural"`) plus the `"layer2:pipe-to-shell:"` prefix paired with a wrapper basename from `unwrap::TRANSPARENT_WRAPPERS`. Adding a new transparent wrapper to that constant automatically becomes a valid detection_layer extension; adding a new top-level layer category requires an explicit constant update.
+
+#### What is *not* covered
+
+- **Cursor hooks** (`run_cursor_hook` in `src/engine/hook.rs`) still emit deny verdicts to stderr only. Audit-chain integration for the Cursor path will follow in a separate PR; the protection guarantee for Cursor is unchanged but observability remains stderr-only for that provider in v0.9.7.
+- **Layer 2 allow events** (every `omamori hook-check` that returns 0) are not appended. The chain captures deny narrative end-to-end, not full traffic.
+
 ### Scope: unknown / new tools (v0.9.6+)
 
 AI tool platforms ship new tools and rename existing ones on their own cadence; omamori is locally installed and updated on the user's cadence. A `tool_name` allowlist baked into the binary would always be slightly behind reality, so we route by **payload shape** instead of by name. See `README.md` → "How omamori handles new / renamed tools" for the full table.

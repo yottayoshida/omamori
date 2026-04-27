@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Security
+
+- **Layer 2 hook deny events now appear in the HMAC audit chain** ([#181](https://github.com/yottayoshida/omamori/issues/181) B-1). Pre-v0.9.7, deny verdicts at the claude-pretooluse hook layer (`BlockMeta` / `BlockRule` / `BlockStructural`) wrote to stderr but did not append to the audit chain — the marketed moat covered Layer 1 (PATH shim) but had a structural gap at Layer 2. Every deny verdict now appends an audit event with `action = "block"`, `result = "block"`, before the stderr message is printed, so the chain reflects the deny narrative end-to-end. Best-effort with respect to the decision: an append failure surfaces a stderr warning but does not flip the block.
+- **Wrapper kind in `detection_layer`** ([#181](https://github.com/yottayoshida/omamori/issues/181) C-1). Layer 2 deny events now carry `detection_layer` values from a fixed v0.9.7 taxonomy: `"layer2:meta-pattern"` (string-level), `"layer2:rule"` (token-level rule match), `"layer2:pipe-to-shell:{wrapper}"` (transparent-wrapper pipe-to-shell, where `{wrapper}` is the basename from `unwrap::TRANSPARENT_WRAPPERS` — `env`, `sudo`, `timeout`, `nice`, `nohup`, `command`, `exec`, `doas`, `pkexec`), or `"layer2:structural"` (parse error / depth / dynamic generation / bare-shell pipe RHS). CHAIN_VERSION remains `1` — these are new string values for the existing field, following the v0.9.6 PR6 `"shape-routing"` precedent. No schema break; old parsers treat new values as opaque.
+- **Block-reason stderr text invariant maintained**. Wrapper kind flows into the audit log only — stderr text stays the v0.9.5 fixed string (`"pipe to shell interpreter"` for all pipe-to-shell variants regardless of wrapper). The two channels are deliberately separated so an AI agent observing only stderr cannot iterate on wrapper variants while a forensic operator reading the audit log gets full attribution.
+
+### Migration notes
+
+- `audit.jsonl` schema: `detection_layer` may now contain values starting with `"layer2:"` in addition to the existing `"layer1"` and `"shape-routing"`. SIEM pipelines that filter on `detection_layer == "layer1"` will silently exclude the new Layer 2 deny events; pipelines wanting full Layer 2 coverage should match values starting with `"layer2:"`.
+- No config or installation change required. Layer 2 deny events from v0.9.7 onwards are interleaved with the existing Layer 1 events in the same chain; `omamori audit verify` continues to validate both forms.
+
 ## [0.9.6] - 2026-04-26
 
 **Summary**: Shell-Layer Hardening Phase 2 ([#146](https://github.com/yottayoshida/omamori/issues/146) P2) + structure-based unknown-tool routing ([#182](https://github.com/yottayoshida/omamori/issues/182)) + observable fail-open with `audit unknown` / `doctor` 30-day line. Closes the v0.9.5-deferred `env -S 'bash -e'` / `bash -c 'source /dev/stdin'` pipe-RHS gaps, the net-new-in-v0.9.6 `doas` / `pkexec` privilege-escalation wrapper closure (PR2 scope 7), and the newly-identified `HookInput::UnknownTool` short-circuit-allow (Codex adversarial-review ② A-2, #182) that bypassed the full pipeline on any tool name omamori did not recognise. Cross-layer Layer 1 → Layer 2 implication pinned via 256-case `proptest` (#146 P1-4); the v0.9.5 Ubuntu CI quarantine ([#164](https://github.com/yottayoshida/omamori/issues/164)) is resolved structurally via [#183](https://github.com/yottayoshida/omamori/pull/183); README and SECURITY restructured for navigation. Runtime behavior is otherwise unchanged — omamori remains macOS-only.

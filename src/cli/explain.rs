@@ -226,7 +226,12 @@ fn evaluate_layer2(command_str: &str) -> Layer2Result {
                 detail,
             }
         }
-        HookCheckResult::BlockStructural(message) => Layer2Result {
+        HookCheckResult::BlockStructural {
+            message,
+            wrapper_kind: _,
+        } => Layer2Result {
+            // `wrapper_kind` is forensic-side only (audit `detection_layer`),
+            // not surfaced via `omamori explain`. v0.9.7 #181 C-1.
             blocked: true,
             phase: "structural".to_string(),
             detail: message,
