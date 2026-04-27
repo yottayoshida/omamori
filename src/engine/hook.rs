@@ -36,7 +36,20 @@ pub(crate) enum HookCheckResult {
         unwrap_chain: Option<String>,
     },
     /// Command is blocked by the unwrap stack (structural block: pipe-to-shell, etc.).
-    BlockStructural(String),
+    ///
+    /// `wrapper_kind` carries the transparent-wrapper basename
+    /// (e.g. `Some("env")`, `Some("sudo")`) for `BlockReason::PipeToShell`
+    /// origins, or `None` for bare-shell / process-substitution / parse-error
+    /// / depth-exceeded etc. The wrapper name flows from
+    /// `unwrap::BlockReason::PipeToShell { wrapper }` and is forensic-only —
+    /// it is recorded in the audit log `detection_layer` field as
+    /// `"layer2:pipe-to-shell:{wrapper}"` but MUST NOT leak to stderr (see
+    /// `message` field, which carries the v0.9.5 fixed string regardless of
+    /// wrapper). v0.9.7 #181 C-1.
+    BlockStructural {
+        message: String,
+        wrapper_kind: Option<&'static str>,
+    },
 }
 
 /// Check if token at `idx` is in command position (start of a segment).
@@ -161,10 +174,20 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
 
     // Phase 2 parse: structural block (parse error / pipe-to-shell etc.)
     match unwrap::parse_command_string(command) {
-        unwrap::ParseResult::Block(reason) => Err(HookCheckResult::BlockStructural(format!(
-            "omamori hook: blocked — {}",
-            reason.message()
-        ))),
+        unwrap::ParseResult::Block(reason) => {
+            // Carry the wrapper basename through to the audit log via
+            // `wrapper_kind`. `message` stays wrapper-agnostic (block-reason
+            // text is the v0.9.5 fixed string) so the AI-iteration channel
+            // and the forensic channel remain separated. v0.9.7 #181 C-1.
+            let wrapper_kind = match &reason {
+                unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
+                _ => None,
+            };
+            Err(HookCheckResult::BlockStructural {
+                message: format!("omamori hook: blocked — {}", reason.message()),
+                wrapper_kind,
+            })
+        }
         unwrap::ParseResult::Commands(invocations) => Ok(invocations),
     }
 }
@@ -350,6 +373,18 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
             Ok(0)
         }
         HookCheckResult::BlockMeta(reason) => {
+            // Append BEFORE printing stderr so the audit chain reflects the
+            // deny narrative even if the user's terminal is being scraped by
+            // an AI agent that crashes between the two writes. Append is
+            // best-effort with respect to the decision (SEC-7) — failure
+            // surfaces a stderr warning but the block stays.
+            audit_log_hook_block(
+                command,
+                provider,
+                None,
+                None,
+                "layer2:meta-pattern".to_string(),
+            );
             eprintln!("omamori hook: blocked — {reason}");
             if verbose {
                 eprintln!("  provider: {provider}");
@@ -367,6 +402,13 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
                 .as_deref()
                 .map(|c| format!(" ({c})"))
                 .unwrap_or_default();
+            audit_log_hook_block(
+                command,
+                provider,
+                Some(&rule_name),
+                unwrap_chain.clone(),
+                "layer2:rule".to_string(),
+            );
             eprintln!("omamori hook: blocked — {message}{chain_str}");
             if verbose {
                 eprintln!("  provider: {provider}");
@@ -376,7 +418,20 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
             eprintln!("  hint: run `omamori explain -- {command}` for details");
             Ok(2)
         }
-        HookCheckResult::BlockStructural(message) => {
+        HookCheckResult::BlockStructural {
+            message,
+            wrapper_kind,
+        } => {
+            // `wrapper_kind` flows into the audit `detection_layer` field as
+            // `"layer2:pipe-to-shell:{wrapper}"` for forensic attribution but
+            // is intentionally NOT printed to stderr — block-reason text
+            // stays wrapper-agnostic per v0.9.5 invariant
+            // (`block_reason_text_stability_across_wrappers`).
+            let detection_layer = match wrapper_kind {
+                Some(w) => format!("layer2:pipe-to-shell:{w}"),
+                None => "layer2:structural".to_string(),
+            };
+            audit_log_hook_block(command, provider, None, None, detection_layer);
             eprintln!("{message}");
             if verbose {
                 eprintln!("  provider: {provider}");
@@ -567,6 +622,122 @@ fn audit_log_unknown_tool_fail_open(
 }
 
 // ---------------------------------------------------------------------------
+// Layer 2 hook deny audit logging (#181 B-1 / C-1, v0.9.7 PR2)
+// ---------------------------------------------------------------------------
+//
+// `run_hook_check_command` previously emitted block decisions to stderr but
+// did not append an audit event. The marketed moat — HMAC tamper-evident
+// audit chain that survives the AI agent itself — therefore covered Layer 1
+// (PATH shim) but had a structural gap at Layer 2 (PreToolUse hook). v0.9.7
+// closes that gap: every Layer 2 deny verdict (BlockMeta / BlockRule /
+// BlockStructural) appends an audit event before printing stderr, so the
+// chain reflects the deny narrative end-to-end.
+//
+// Block-reason stderr text remains the v0.9.5 fixed string regardless of
+// wrapper kind — only the audit log carries the wrapper-kind disclosure
+// (forensic channel). The two channels are deliberately separated so an AI
+// agent that observes only stderr cannot iterate on wrapper variants while
+// a forensic operator reading the audit log still gets full attribution.
+//
+// SEC-7: audit-append failure MUST NOT flip the block decision (fail-close
+// on decision, fail-open on observability).
+// SEC-8: detection_layer values come from a fixed taxonomy validated by
+// `is_valid_detection_layer`.
+
+/// Static prefix entries for `detection_layer`. Pipe-to-shell wrapper kinds
+/// are validated separately against `unwrap::TRANSPARENT_WRAPPERS` (single
+/// source of truth) so adding a new wrapper there does not require updating
+/// this constant. SEC-8.
+const VALID_DETECTION_LAYERS_STATIC: &[&str] = &[
+    "layer1",
+    "shape-routing",
+    "layer2:meta-pattern",
+    "layer2:rule",
+    "layer2:structural",
+];
+
+/// Validate that `detection_layer` value falls within the v0.9.7 taxonomy.
+/// Used as `debug_assert!` predicate in audit append paths — production
+/// builds skip the check, but a violation in tests fails CI. SEC-8.
+fn is_valid_detection_layer(s: &str) -> bool {
+    if VALID_DETECTION_LAYERS_STATIC.contains(&s) {
+        return true;
+    }
+    if let Some(rest) = s.strip_prefix("layer2:pipe-to-shell:") {
+        return crate::unwrap::TRANSPARENT_WRAPPERS.contains(&rest);
+    }
+    false
+}
+
+/// Append a Layer 2 hook deny event to the audit chain.
+///
+/// Mirrors `audit_log_unknown_tool_fail_open` structure but with deny
+/// semantics: `action = "block"`, `result = "block"`,
+/// `detection_layer = "layer2:{kind}[:{wrapper}]"` from the v0.9.7 taxonomy.
+///
+/// Best-effort with respect to the hook *decision*: an audit-append failure
+/// MUST NOT flip the block decision (SEC-7). On failure, the caller has
+/// already chosen to block — we only surface a stderr warning so the user
+/// knows the audit chain has a gap for this event. v0.9.7 #181 B-1.
+fn audit_log_hook_block(
+    command: &str,
+    provider: &str,
+    rule_name: Option<&str>,
+    unwrap_chain: Option<String>,
+    detection_layer_value: String,
+) {
+    debug_assert!(
+        is_valid_detection_layer(&detection_layer_value),
+        "detection_layer value must come from VALID_DETECTION_LAYERS taxonomy: got {detection_layer_value:?}"
+    );
+
+    let load_result = match load_config(None) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "omamori warning: could not record Layer 2 hook deny event for {command:?} \
+                 — config load failed: {e}. The 'omamori audit show --action block' surface \
+                 is incomplete for this event."
+            );
+            return;
+        }
+    };
+    let logger = match crate::audit::AuditLogger::from_config(&load_result.config.audit) {
+        Some(l) => l,
+        None => {
+            // Audit disabled in config — user opted out, stay quiet.
+            return;
+        }
+    };
+
+    let invocation = CommandInvocation::new(command.to_string(), Vec::new());
+    let detectors = vec![provider.to_string()];
+    let outcome = crate::actions::ActionOutcome::Blocked {
+        message: "blocked at Layer 2 hook".to_string(),
+    };
+
+    let mut event = logger.create_event(&invocation, None, &detectors, &outcome);
+    // Override action/result/detection_layer to surface Layer 2 deny semantics.
+    // `create_event` defaults to action = matched_rule.action or "passthrough"
+    // and detection_layer = "layer1"; both are wrong for Layer 2 deny path.
+    event.action = "block".to_string();
+    event.result = "block".to_string();
+    event.detection_layer = Some(detection_layer_value);
+    event.rule_id = rule_name.map(String::from);
+    // unwrap_chain is Vec<String> in the schema for forward-compat with
+    // multi-step rewrite chains; today we only carry the single-line summary
+    // produced by `format_unwrap_chain`, wrapped in a 1-element vec.
+    event.unwrap_chain = unwrap_chain.map(|c| vec![c]);
+
+    if let Err(e) = logger.append(event) {
+        eprintln!(
+            "omamori warning: failed to record Layer 2 hook deny event for {command:?}: {e}. \
+             The 'omamori audit show --action block' surface is incomplete for this event."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cursor hook handler
 // ---------------------------------------------------------------------------
 
@@ -630,7 +801,13 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
                 Some("This command was blocked by omamori safety guard. Use a safer alternative."),
             );
         }
-        HookCheckResult::BlockStructural(message) => {
+        HookCheckResult::BlockStructural {
+            message,
+            wrapper_kind: _,
+        } => {
+            // `wrapper_kind` is forensic-side only and stays out of the
+            // user-facing cursor response for the same v0.9.5 reason as the
+            // claude-pretooluse path. v0.9.7 #181 C-1.
             eprintln!("omamori cursor-hook: BLOCKED ({message})");
             print_cursor_response(
                 false,
@@ -1013,7 +1190,7 @@ mod tests {
                     "expected rm-related rule, got: {rule_name}"
                 );
             }
-            HookCheckResult::BlockMeta(_) | HookCheckResult::BlockStructural(_) => {}
+            HookCheckResult::BlockMeta(_) | HookCheckResult::BlockStructural { .. } => {}
             HookCheckResult::Allow => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: rm -rf / was ALLOWED — fail-close fallback is broken");
@@ -1037,7 +1214,8 @@ mod tests {
                         HookCheckResult::BlockMeta(r) => format!("BlockMeta({r})"),
                         HookCheckResult::BlockRule { rule_name, .. } =>
                             format!("BlockRule({rule_name})"),
-                        HookCheckResult::BlockStructural(r) => format!("BlockStructural({r})"),
+                        HookCheckResult::BlockStructural { message: r, .. } =>
+                            format!("BlockStructural({r})"),
                         HookCheckResult::Allow => unreachable!(),
                     }
                 );
@@ -1345,7 +1523,7 @@ mod tests {
 
         match check_command_for_hook("unset CLAUDECODE") {
             HookCheckResult::BlockMeta(_) => {}
-            HookCheckResult::BlockRule { .. } | HookCheckResult::BlockStructural(_) => {}
+            HookCheckResult::BlockRule { .. } | HookCheckResult::BlockStructural { .. } => {}
             HookCheckResult::Allow => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: 'unset CLAUDECODE' was ALLOWED — meta-pattern is broken");
@@ -1391,7 +1569,9 @@ mod tests {
                     HookCheckResult::BlockRule { rule_name, .. } => {
                         format!("BlockRule({rule_name})")
                     }
-                    HookCheckResult::BlockStructural(r) => format!("BlockStructural({r})"),
+                    HookCheckResult::BlockStructural { message: r, .. } => {
+                        format!("BlockStructural({r})")
+                    }
                     _ => unreachable!(),
                 };
                 restore_config(old_xdg, old_home, dir);
@@ -1411,7 +1591,9 @@ mod tests {
                     HookCheckResult::BlockRule { rule_name, .. } => {
                         format!("BlockRule({rule_name})")
                     }
-                    HookCheckResult::BlockStructural(r) => format!("BlockStructural({r})"),
+                    HookCheckResult::BlockStructural { message: r, .. } => {
+                        format!("BlockStructural({r})")
+                    }
                     HookCheckResult::Allow => unreachable!(),
                 };
                 restore_config(old_xdg, old_home, dir);
