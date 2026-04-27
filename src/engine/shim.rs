@@ -180,7 +180,7 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
         Some(arr) => {
             let omamori_entry = arr
                 .iter()
-                .find(|e| installer::entry_is_omamori_managed(e, base_dir));
+                .find(|e| installer::is_omamori_owned_entry(e, base_dir));
             match omamori_entry {
                 None => true,
                 Some(e) => {

@@ -754,7 +754,7 @@ pub(crate) fn merge_claude_settings(
         .unwrap_or_else(|| PathBuf::from("/"));
     let existing_idx = arr
         .iter()
-        .position(|e| entry_is_omamori_managed(e, &install_root));
+        .position(|e| is_omamori_owned_entry(e, &install_root));
 
     if let Some(idx) = existing_idx {
         if arr[idx] == entry {
@@ -817,6 +817,39 @@ pub(crate) fn entry_is_omamori_managed(entry: &serde_json::Value, base_dir: &Pat
         let unquoted = c.trim_matches('\'').trim_matches('"');
         Path::new(unquoted).starts_with(base_dir)
     })
+}
+
+/// Returns true if `entry` is OWNED by omamori — i.e., omamori has the right
+/// to replace or remove the entire entry without losing user data.
+///
+/// Ownership criteria (all must hold):
+/// 1. The entry contains an omamori command (`entry_is_omamori_managed`).
+/// 2. The entry does NOT have any sibling user hooks. Specifically:
+///    - the `hooks` array has at most 1 element, AND
+///    - the legacy flat `command` field is not present alongside a non-empty
+///      `hooks` array.
+///
+/// If a user has manually merged the omamori command into an entry that also
+/// contains their own hook, that entry is NOT owned by omamori — replacing
+/// or removing the whole entry would silently destroy the user's hook. Such
+/// hybrid entries are left alone (omamori treats them as user territory).
+pub(crate) fn is_omamori_owned_entry(entry: &serde_json::Value, base_dir: &Path) -> bool {
+    if !entry_is_omamori_managed(entry, base_dir) {
+        return false;
+    }
+    let hooks_size = entry
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let has_flat = entry.get("command").is_some();
+    if hooks_size > 1 {
+        return false; // sibling hook exists in `hooks` array
+    }
+    if has_flat && hooks_size > 0 {
+        return false; // mixed legacy flat + new nested → user-merged shape
+    }
+    true
 }
 
 /// True if `matcher` is a legacy form that the current Claude Code parser
@@ -989,7 +1022,7 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
         .and_then(|v| v.as_array_mut())
         .map(|arr| {
             let before = arr.len();
-            arr.retain(|e| !entry_is_omamori_managed(e, base_dir));
+            arr.retain(|e| !is_omamori_owned_entry(e, base_dir));
             arr.len() != before
         })
         .unwrap_or(false);
@@ -2374,6 +2407,130 @@ mod tests {
             "custom-base-dir managed entry must be recognised"
         );
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn merge_claude_does_not_replace_hybrid_entry() {
+        // R2 regression (Codex Round 2): a "hybrid" entry — one that contains
+        // BOTH the omamori command and a user-managed sibling hook — must NOT
+        // be replaced wholesale, or the user's sibling hook is lost. Merge
+        // should leave the hybrid alone and push a separate canonical entry.
+        let dir = fresh_test_dir("r2-hybrid-merge");
+        let script = fake_script(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let hybrid = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "/usr/local/bin/userhook"},
+                        {"type": "command", "command": omamori_cmd}
+                    ]
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&hybrid).unwrap(),
+        )
+        .unwrap();
+
+        let _ = with_test_home(&dir, || {
+            merge_claude_settings(&claude_dir, &script).unwrap()
+        });
+
+        // After: hybrid still has both hooks (user hook survived), and a
+        // separate canonical omamori entry was pushed.
+        let raw = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = doc
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            arr.len(),
+            2,
+            "hybrid entry must be preserved + canonical pushed"
+        );
+        // The original hybrid entry retains both inner hooks
+        let hybrid_entry = arr
+            .iter()
+            .find(|e| {
+                e.pointer("/hooks")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len() == 2)
+                    .unwrap_or(false)
+            })
+            .expect("hybrid entry must still have 2 inner hooks");
+        let inner = hybrid_entry
+            .pointer("/hooks")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(
+            inner
+                .iter()
+                .any(|h| h.get("command").and_then(|c| c.as_str())
+                    == Some("/usr/local/bin/userhook")),
+            "user-managed sibling hook must survive"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remove_claude_settings_entry_preserves_hybrid_entry() {
+        // R2 regression (Codex Round 2): uninstall must not delete a hybrid
+        // entry, because it contains a user hook. Only canonical (omamori-
+        // owned) entries are removed.
+        let dir = fresh_test_dir("r2-hybrid-uninstall");
+        let script = fake_script(&dir);
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let hybrid_only = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "/usr/local/bin/userhook"},
+                        {"type": "command", "command": omamori_cmd}
+                    ]
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&hybrid_only).unwrap(),
+        )
+        .unwrap();
+
+        let omamori_root = dir.join(".omamori");
+        remove_claude_settings_entry(&omamori_root).unwrap();
+
+        // Hybrid entry must survive intact
+        let raw = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = doc
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(arr.len(), 1, "hybrid entry must not be deleted");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

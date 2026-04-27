@@ -413,7 +413,7 @@ fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
         .and_then(|v| v.as_array())
         .and_then(|arr| {
             arr.iter()
-                .find(|e| installer::entry_is_omamori_managed(e, base_dir))
+                .find(|e| installer::is_omamori_owned_entry(e, base_dir))
         });
 
     let Some(entry) = entry else {
@@ -1519,6 +1519,58 @@ mod tests {
             item.detail.contains("matcher"),
             "detail should mention matcher: {}",
             item.detail
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_claude_settings_fails_when_only_hybrid_entry_exists() {
+        // R2 regression (Codex Round 2): if the user has merged the omamori
+        // command into a hybrid entry (with sibling user hooks), there is no
+        // canonical omamori-owned entry. Doctor must report this as Fail
+        // ("Layer 2 not omamori-controlled"), not silently green by reading
+        // the user's sibling hook script.
+        let dir = std::env::temp_dir().join(format!("omamori-int-hybrid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&script, installer::render_hook_script()).unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let hybrid_only = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "/usr/local/bin/userhook"},
+                        {"type": "command", "command": omamori_cmd}
+                    ]
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&hybrid_only).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
+        assert_eq!(
+            item.status,
+            CheckStatus::Fail,
+            "hybrid-only state must be Fail (no canonical entry)"
         );
 
         match saved {
