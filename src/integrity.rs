@@ -352,6 +352,156 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
     }
 }
 
+/// Verify that `~/.claude/settings.json` is wired up correctly (#196 Bonus).
+///
+/// Confirms:
+/// 1. settings.json exists and parses as JSON
+/// 2. `hooks.PreToolUse` contains an omamori-managed entry (`command` path
+///    inside `~/.omamori/`)
+/// 3. The matcher is current spec (`"Bash"` simple string), not legacy
+///    (`"*"` or boolean) which the current parser silently rejects
+/// 4. The command points at a real file whose sha256 matches the bundled
+///    hook script (T2 tampering detection)
+///
+/// Closes the "doctor 12/12 green but Layer 2 dormant" gap from #196:
+/// a green doctor report now guarantees Layer 2 is active.
+fn check_claude_settings_integration() -> CheckItem {
+    let name = "claude-code-settings".to_string();
+    let category = "Hooks";
+
+    let claude_dir = installer::claude_home_dir();
+    let settings_path = claude_dir.join("settings.json");
+
+    if !settings_path.exists() {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Warn,
+            detail: "(no ~/.claude/settings.json — Claude Code not configured)".to_string(),
+            remediation: Some(Remediation::RunInstall),
+        };
+    }
+
+    let raw = match fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckItem {
+                category,
+                name,
+                status: CheckStatus::Warn,
+                detail: format!("(read error: {e})"),
+                remediation: Some(Remediation::RunInstall),
+            };
+        }
+    };
+
+    let doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            return CheckItem {
+                category,
+                name,
+                status: CheckStatus::Warn,
+                detail: format!("(JSON parse error: {e})"),
+                remediation: Some(Remediation::RunInstall),
+            };
+        }
+    };
+
+    let omamori_prefix = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".omamori").display().to_string())
+        .unwrap_or_default();
+
+    let entry = doc
+        .pointer("/hooks/PreToolUse")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().find(|e| {
+                let cmd = e
+                    .pointer("/hooks/0/command")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| e.get("command").and_then(|v| v.as_str()));
+                cmd.map(|c| {
+                    let unquoted = c.trim_matches('\'').trim_matches('"');
+                    !omamori_prefix.is_empty() && unquoted.contains(&omamori_prefix)
+                })
+                .unwrap_or(false)
+            })
+        });
+
+    let Some(entry) = entry else {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Fail,
+            detail: "(omamori PreToolUse hook missing — Layer 2 not active)".to_string(),
+            remediation: Some(Remediation::RunInstall),
+        };
+    };
+
+    let matcher = entry.get("matcher").and_then(|m| m.as_str()).unwrap_or("");
+    if matcher != "Bash" {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "(matcher = {matcher:?}, expected \"Bash\" — legacy form silently rejected)"
+            ),
+            remediation: Some(Remediation::RunInstall),
+        };
+    }
+
+    let cmd_str = entry
+        .pointer("/hooks/0/command")
+        .and_then(|v| v.as_str())
+        .or_else(|| entry.get("command").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let cmd_path = cmd_str.trim_matches('\'').trim_matches('"');
+    let script_path = Path::new(cmd_path);
+    if !script_path.exists() {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Fail,
+            detail: format!("(script path missing: {cmd_path})"),
+            remediation: Some(Remediation::RunInstall),
+        };
+    }
+
+    let actual = match fs::read_to_string(script_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckItem {
+                category,
+                name,
+                status: CheckStatus::Warn,
+                detail: format!("(script read error: {e})"),
+                remediation: Some(Remediation::RegenerateHooks),
+            };
+        }
+    };
+    let expected_hash = installer::hook_content_hash(&installer::render_hook_script());
+    let actual_hash = installer::hook_content_hash(&actual);
+    if actual_hash != expected_hash {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Fail,
+            detail: "(script content hash mismatch — possible tampering)".to_string(),
+            remediation: Some(Remediation::RegenerateHooks),
+        };
+    }
+
+    CheckItem {
+        category,
+        name,
+        status: CheckStatus::Ok,
+        detail: "(active — Layer 2 wired up)".to_string(),
+        remediation: None,
+    }
+}
+
 /// Compare a shim's resolved target against the baseline record.
 /// Returns `true` (match) when baseline is absent, entry is missing, or paths agree.
 fn shim_matches_baseline(
@@ -491,6 +641,9 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
             remediation: Some(Remediation::RunInstall),
         }
     });
+
+    // claude-code-settings — verify ~/.claude/settings.json is wired up (#196)
+    items.push(check_claude_settings_integration());
 
     // cursor-hooks.snippet.json — hash comparison + dangling path detection (#56, T8)
     let cursor_snippet = hooks_dir.join("cursor-hooks.snippet.json");
@@ -1293,6 +1446,116 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // ---------------------------------------------------------------------
+    // check_claude_settings_integration tests (#196 Bonus)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn check_claude_settings_warns_when_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-int-no-claude-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration();
+        assert_eq!(item.status, CheckStatus::Warn);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_claude_settings_fails_on_legacy_matcher() {
+        let dir = std::env::temp_dir().join(format!("omamori-int-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&script, installer::render_hook_script()).unwrap();
+
+        let stale = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "command": script.display().to_string()
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration();
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert!(
+            item.detail.contains("matcher"),
+            "detail should mention matcher: {}",
+            item.detail
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn check_claude_settings_ok_when_wired_up() {
+        let dir = std::env::temp_dir().join(format!("omamori-int-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&script, installer::render_hook_script()).unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let current = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration();
+        assert_eq!(item.status, CheckStatus::Ok, "details: {}", item.detail);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
         let _ = fs::remove_dir_all(dir);
     }
 }

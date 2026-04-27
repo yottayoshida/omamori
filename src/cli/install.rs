@@ -70,6 +70,29 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
             snippet.display()
         );
     }
+    match &result.claude_settings_outcome {
+        Some(installer::ClaudeSettingsOutcome::Created) => {
+            println!("  [done] Claude Code settings.json: created ~/.claude/settings.json");
+        }
+        Some(installer::ClaudeSettingsOutcome::Merged) => {
+            println!("  [done] Claude Code settings.json: merged into ~/.claude/settings.json");
+        }
+        Some(installer::ClaudeSettingsOutcome::AlreadyPresent) => {
+            println!("  [skip] Claude Code settings.json: already configured");
+        }
+        Some(installer::ClaudeSettingsOutcome::MatcherMigrated) => {
+            println!(
+                "  [migrated] Claude Code settings.json: matcher migrated to current spec (\"Bash\")"
+            );
+        }
+        Some(installer::ClaudeSettingsOutcome::Skipped(reason)) => {
+            println!("  [warn] Claude Code settings.json: {reason}");
+            println!(
+                "         Manual merge needed: cat ~/.omamori/hooks/claude-settings.snippet.json"
+            );
+        }
+        None => {}
+    }
     if let Some(cursor_snippet) = &result.cursor_hook_snippet {
         println!("  [done] Cursor hook snippet: {}", cursor_snippet.display());
     }
@@ -156,16 +179,6 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         "  [todo] Add to your shell profile (~/.zshrc or ~/.bashrc):\n\n    export PATH=\"{}:$PATH\"",
         result.shim_dir.display()
     );
-    if result.settings_snippet.is_some() {
-        let hooks_dir = result
-            .hook_script
-            .as_ref()
-            .map(|p| p.parent().unwrap().display().to_string())
-            .unwrap_or_default();
-        println!(
-            "\n  [todo] Apply Claude Code hook (copy snippet to settings.json):\n\n    cat {hooks_dir}/claude-settings.snippet.json"
-        );
-    }
     if result.cursor_hook_snippet.is_some() {
         let hooks_dir = result
             .cursor_hook_snippet
