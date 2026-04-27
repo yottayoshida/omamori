@@ -214,6 +214,11 @@ pub fn uninstall(base_dir: &Path) -> Result<UninstallResult, AppError> {
         eprintln!("omamori: warning — failed to clean Codex hooks.json: {e}");
     }
 
+    // Remove omamori entry from Claude Code settings.json (preserve other entries) (#196)
+    if let Err(e) = remove_claude_settings_entry(base_dir) {
+        eprintln!("omamori: warning — failed to clean Claude settings: {e}");
+    }
+
     // Remove integrity baseline
     let integrity_path = base_dir.join(".integrity.json");
     if integrity_path.exists() {
@@ -739,13 +744,17 @@ pub(crate) fn merge_claude_settings(
         }
     };
 
-    // Find existing omamori-managed entry: command path inside ~/.omamori/
-    let omamori_prefix = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".omamori").display().to_string())
-        .unwrap_or_default();
+    // Derive omamori install root from script_path: <base_dir>/hooks/<script>.
+    // Using script_path (not $HOME/.omamori) makes identification work with
+    // custom `--base-dir` installs as well.
+    let install_root = script_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
     let existing_idx = arr
         .iter()
-        .position(|e| entry_is_omamori_managed(e, &omamori_prefix));
+        .position(|e| entry_is_omamori_managed(e, &install_root));
 
     if let Some(idx) = existing_idx {
         if arr[idx] == entry {
@@ -780,25 +789,34 @@ pub(crate) fn merge_claude_settings(
     Ok(ClaudeSettingsOutcome::Merged)
 }
 
-/// Returns true if `entry` is an omamori-managed PreToolUse entry, identified
-/// by its command path being inside `~/.omamori/`.
-fn entry_is_omamori_managed(entry: &serde_json::Value, omamori_prefix: &str) -> bool {
-    if omamori_prefix.is_empty() {
-        return false;
+/// Returns true if `entry` is an omamori-managed PreToolUse entry.
+///
+/// Identification: any `command` field inside this entry (whether in the
+/// nested `hooks` array, or the legacy flat `command` field on the matcher
+/// object itself) starts with `base_dir` (the omamori install root,
+/// typically `~/.omamori`).
+///
+/// Walks the full `hooks` array (not just `hooks[0]`) so that an omamori
+/// command sitting at index 1+ in a multi-hook entry is still detected.
+/// Uses `Path::starts_with` (component-wise) instead of substring contains
+/// so that, e.g., `~/.omamori-bak/...` does not match `~/.omamori`.
+pub(crate) fn entry_is_omamori_managed(entry: &serde_json::Value, base_dir: &Path) -> bool {
+    let mut commands: Vec<&str> = Vec::new();
+    if let Some(arr) = entry.get("hooks").and_then(|v| v.as_array()) {
+        for h in arr {
+            if let Some(c) = h.get("command").and_then(|v| v.as_str()) {
+                commands.push(c);
+            }
+        }
     }
-    // Two command shapes to detect during migration:
-    //   New: { matcher, hooks: [{ type: "command", command: "..." }] }
-    //   Legacy flat: { matcher, command: "..." }
-    let cmd = entry
-        .pointer("/hooks/0/command")
-        .and_then(|v| v.as_str())
-        .or_else(|| entry.get("command").and_then(|v| v.as_str()));
-    let Some(cmd) = cmd else {
-        return false;
-    };
-    // Strip surrounding shell quoting that shell_words::quote may have applied.
-    let cmd_unquoted = cmd.trim_matches('\'').trim_matches('"');
-    cmd_unquoted.contains(omamori_prefix)
+    if let Some(c) = entry.get("command").and_then(|v| v.as_str()) {
+        commands.push(c);
+    }
+    commands.iter().any(|c| {
+        // Strip surrounding shell quoting that shell_words::quote may have applied.
+        let unquoted = c.trim_matches('\'').trim_matches('"');
+        Path::new(unquoted).starts_with(base_dir)
+    })
 }
 
 /// True if `matcher` is a legacy form that the current Claude Code parser
@@ -946,6 +964,44 @@ pub(crate) fn merge_codex_hooks(
 
     atomic_write(&hooks_path, &serde_json::to_string_pretty(&doc).unwrap())?;
     Ok(CodexHooksOutcome::Merged)
+}
+
+/// Remove omamori's entry from `~/.claude/settings.json` during uninstall.
+/// Preserves the user's other hooks. Identifies the omamori entry by
+/// `entry_is_omamori_managed(e, base_dir)`. Symlinks and parse errors
+/// are skipped silently — the user can clean up manually if needed.
+fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
+    let settings_path = claude_home_dir().join("settings.json");
+    if !settings_path.exists() {
+        return Ok(());
+    }
+    if settings_path.is_symlink() || !is_real_file(&settings_path) {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&settings_path)?;
+    let mut doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let modified = doc
+        .pointer_mut("/hooks/PreToolUse")
+        .and_then(|v| v.as_array_mut())
+        .map(|arr| {
+            let before = arr.len();
+            arr.retain(|e| !entry_is_omamori_managed(e, base_dir));
+            arr.len() != before
+        })
+        .unwrap_or(false);
+
+    if modified {
+        atomic_write_with_mode(
+            &settings_path,
+            &serde_json::to_string_pretty(&doc).unwrap(),
+            0o600,
+        )?;
+    }
+    Ok(())
 }
 
 /// Remove omamori's entry from `~/.codex/hooks.json` during uninstall.
@@ -2250,5 +2306,139 @@ mod tests {
             Some(env!("CARGO_PKG_VERSION")),
             "must embed omamori version"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // R1 fix tests (Codex Round 1 findings)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn entry_is_omamori_managed_rejects_lookalike_dirs() {
+        // P2-1 (Codex R1): substring contains was treating ~/.omamori-bak
+        // as managed. Path::starts_with should reject it.
+        let base = Path::new("/home/u/.omamori");
+        let entry_bak = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "/home/u/.omamori-bak/hooks/x.sh" }]
+        });
+        let entry_real = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "/home/u/.omamori/hooks/x.sh" }]
+        });
+        assert!(!entry_is_omamori_managed(&entry_bak, base));
+        assert!(entry_is_omamori_managed(&entry_real, base));
+    }
+
+    #[test]
+    fn entry_is_omamori_managed_walks_full_hooks_array() {
+        // P2-3 (Codex R1): hooks[1..] should be checked, not just hooks[0].
+        let base = Path::new("/opt/omamori");
+        let entry_at_idx1 = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [
+                { "type": "command", "command": "/usr/local/bin/userhook" },
+                { "type": "command", "command": "/opt/omamori/hooks/script.sh" }
+            ]
+        });
+        assert!(entry_is_omamori_managed(&entry_at_idx1, base));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn merge_claude_handles_custom_base_dir() {
+        // P2-2 (Codex R1): identification must work for `--base-dir` installs,
+        // not just the default ~/.omamori prefix.
+        let dir = fresh_test_dir("p2-base");
+        let custom_base = dir.join("custom-omamori");
+        let hooks_dir = custom_base.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let script = hooks_dir.join("claude-pretooluse.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // First merge under custom base — should Create
+        let r1 = with_test_home(&dir, || {
+            merge_claude_settings(&claude_dir, &script).unwrap()
+        });
+        assert!(matches!(r1, ClaudeSettingsOutcome::Created));
+
+        // Second merge — must recognise the existing entry as managed
+        // (otherwise it would push a duplicate)
+        let r2 = with_test_home(&dir, || {
+            merge_claude_settings(&claude_dir, &script).unwrap()
+        });
+        assert!(
+            matches!(r2, ClaudeSettingsOutcome::AlreadyPresent),
+            "custom-base-dir managed entry must be recognised"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remove_claude_settings_entry_preserves_user_hooks() {
+        // P1-2 (Codex R1): uninstall must remove the omamori entry but leave
+        // user-managed hooks intact.
+        let dir = fresh_test_dir("p1-uninstall");
+        let script = fake_script(&dir);
+
+        // Set HOME so claude_home_dir() resolves to <dir>/.claude
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // First, install the omamori entry alongside a user hook
+        let user_doc = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Edit",
+                    "hooks": [{ "type": "command", "command": "/usr/local/bin/userhook" }]
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&user_doc).unwrap(),
+        )
+        .unwrap();
+        merge_claude_settings(&claude_dir, &script).unwrap();
+
+        // Sanity: 2 entries
+        let raw = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            doc.pointer("/hooks/PreToolUse")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
+            Some(2)
+        );
+
+        // Now run uninstall removal
+        let omamori_root = dir.join(".omamori");
+        remove_claude_settings_entry(&omamori_root).unwrap();
+
+        // After: 1 entry, the user's
+        let raw = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = doc
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(arr.len(), 1, "user entry preserved, omamori removed");
+        assert_eq!(
+            arr[0].pointer("/hooks/0/command").and_then(|v| v.as_str()),
+            Some("/usr/local/bin/userhook")
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 }

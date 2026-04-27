@@ -365,7 +365,7 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
 ///
 /// Closes the "doctor 12/12 green but Layer 2 dormant" gap from #196:
 /// a green doctor report now guarantees Layer 2 is active.
-fn check_claude_settings_integration() -> CheckItem {
+fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
     let name = "claude-code-settings".to_string();
     let category = "Hooks";
 
@@ -408,25 +408,12 @@ fn check_claude_settings_integration() -> CheckItem {
         }
     };
 
-    let omamori_prefix = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".omamori").display().to_string())
-        .unwrap_or_default();
-
     let entry = doc
         .pointer("/hooks/PreToolUse")
         .and_then(|v| v.as_array())
         .and_then(|arr| {
-            arr.iter().find(|e| {
-                let cmd = e
-                    .pointer("/hooks/0/command")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| e.get("command").and_then(|v| v.as_str()));
-                cmd.map(|c| {
-                    let unquoted = c.trim_matches('\'').trim_matches('"');
-                    !omamori_prefix.is_empty() && unquoted.contains(&omamori_prefix)
-                })
-                .unwrap_or(false)
-            })
+            arr.iter()
+                .find(|e| installer::entry_is_omamori_managed(e, base_dir))
         });
 
     let Some(entry) = entry else {
@@ -467,6 +454,29 @@ fn check_claude_settings_integration() -> CheckItem {
             detail: format!("(script path missing: {cmd_path})"),
             remediation: Some(Remediation::RunInstall),
         };
+    }
+
+    // Verify the script is executable. Without execute bit, the kernel
+    // refuses to run it and Layer 2 is silently inactive even though the
+    // sha256 may match. Hash-only check would give a false-positive green.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(script_path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0);
+        if mode & 0o111 == 0 {
+            return CheckItem {
+                category,
+                name,
+                status: CheckStatus::Fail,
+                detail: format!(
+                    "(script not executable: mode {:o} — Layer 2 inactive)",
+                    mode & 0o777
+                ),
+                remediation: Some(Remediation::RegenerateHooks),
+            };
+        }
     }
 
     let actual = match fs::read_to_string(script_path) {
@@ -643,7 +653,7 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     });
 
     // claude-code-settings — verify ~/.claude/settings.json is wired up (#196)
-    items.push(check_claude_settings_integration());
+    items.push(check_claude_settings_integration(base_dir));
 
     // cursor-hooks.snippet.json — hash comparison + dangling path detection (#56, T8)
     let cursor_snippet = hooks_dir.join("cursor-hooks.snippet.json");
@@ -1464,7 +1474,7 @@ mod tests {
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &dir) };
 
-        let item = check_claude_settings_integration();
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
         assert_eq!(item.status, CheckStatus::Warn);
 
         match saved {
@@ -1503,11 +1513,67 @@ mod tests {
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &dir) };
 
-        let item = check_claude_settings_integration();
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
         assert_eq!(item.status, CheckStatus::Fail);
         assert!(
             item.detail.contains("matcher"),
             "detail should mention matcher: {}",
+            item.detail
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn check_claude_settings_fails_on_non_executable_script() {
+        // P1-4 (Codex R1): if the script is not executable, hash match alone
+        // would falsely report green. Mode check must catch this.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("omamori-int-noexec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&script, installer::render_hook_script()).unwrap();
+        // Non-executable mode (0o600 — read+write only)
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let current = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
+        assert_eq!(
+            item.status,
+            CheckStatus::Fail,
+            "non-executable script must fail the integration check"
+        );
+        assert!(
+            item.detail.contains("not executable"),
+            "detail should mention executability: {}",
             item.detail
         );
 
@@ -1529,6 +1595,12 @@ mod tests {
         fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
         fs::write(&script, installer::render_hook_script()).unwrap();
+        // P1-4: ok-state requires the script to be executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
         let current = serde_json::json!({
@@ -1549,7 +1621,7 @@ mod tests {
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &dir) };
 
-        let item = check_claude_settings_integration();
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
         assert_eq!(item.status, CheckStatus::Ok, "details: {}", item.detail);
 
         match saved {
