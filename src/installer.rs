@@ -1017,15 +1017,46 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
         Err(_) => return Ok(()),
     };
 
-    let modified = doc
+    let mut modified = false;
+
+    if let Some(arr) = doc
         .pointer_mut("/hooks/PreToolUse")
         .and_then(|v| v.as_array_mut())
-        .map(|arr| {
-            let before = arr.len();
-            arr.retain(|e| !is_omamori_owned_entry(e, base_dir));
-            arr.len() != before
-        })
-        .unwrap_or(false);
+    {
+        // Pass 1: drop entries owned by omamori (single-hook canonical entries).
+        let before = arr.len();
+        arr.retain(|e| !is_omamori_owned_entry(e, base_dir));
+        if arr.len() != before {
+            modified = true;
+        }
+
+        // Pass 2: surgical cleanup of hybrid entries.
+        // For any remaining entry that still contains the omamori command as
+        // a sibling alongside user hooks, remove just the omamori inner
+        // hook(s) so the entry no longer points at a deleted script. User
+        // sibling hooks are preserved.
+        for entry in arr.iter_mut() {
+            if !entry_is_omamori_managed(entry, base_dir) {
+                continue;
+            }
+            if let Some(hooks_arr) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                let h_before = hooks_arr.len();
+                hooks_arr.retain(|h| {
+                    let cmd = h.get("command").and_then(|v| v.as_str());
+                    let is_omamori = cmd
+                        .map(|c| {
+                            let unquoted = c.trim_matches('\'').trim_matches('"');
+                            Path::new(unquoted).starts_with(base_dir)
+                        })
+                        .unwrap_or(false);
+                    !is_omamori
+                });
+                if hooks_arr.len() != h_before {
+                    modified = true;
+                }
+            }
+        }
+    }
 
     if modified {
         atomic_write_with_mode(
@@ -2407,6 +2438,67 @@ mod tests {
             "custom-base-dir managed entry must be recognised"
         );
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remove_claude_surgically_removes_omamori_from_hybrid() {
+        // R3 regression (Codex Round 3): uninstall must surgically remove
+        // the omamori inner hook from a hybrid entry, even though the
+        // entry as a whole is left intact (it carries a user sibling).
+        // Otherwise, a dead pointer to the deleted script remains.
+        let dir = fresh_test_dir("r3-hybrid-surgical");
+        let script = fake_script(&dir);
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let hybrid = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "/usr/local/bin/userhook"},
+                        {"type": "command", "command": omamori_cmd}
+                    ]
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&hybrid).unwrap(),
+        )
+        .unwrap();
+
+        let omamori_root = dir.join(".omamori");
+        remove_claude_settings_entry(&omamori_root).unwrap();
+
+        let raw = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = doc
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(arr.len(), 1, "hybrid entry must survive uninstall");
+
+        // Inner hooks: only user hook remains, omamori inner hook removed
+        let inner = arr[0].pointer("/hooks").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(inner.len(), 1, "only user hook should remain");
+        assert_eq!(
+            inner[0].get("command").and_then(|c| c.as_str()),
+            Some("/usr/local/bin/userhook"),
+            "user hook preserved"
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
