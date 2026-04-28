@@ -1031,10 +1031,12 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
         }
 
         // Pass 2: surgical cleanup of hybrid entries.
-        // For any remaining entry that still contains the omamori command as
-        // a sibling alongside user hooks, remove just the omamori inner
-        // hook(s) so the entry no longer points at a deleted script. User
-        // sibling hooks are preserved.
+        // For any remaining entry that still contains the omamori hook as a
+        // sibling alongside user hooks, remove ONLY the inner hook whose
+        // command points at the canonical omamori script
+        // (`<base_dir>/hooks/claude-pretooluse.sh`). User-managed hooks that
+        // happen to live under the omamori base dir are NOT touched.
+        let omamori_script_path = base_dir.join("hooks").join("claude-pretooluse.sh");
         for entry in arr.iter_mut() {
             if !entry_is_omamori_managed(entry, base_dir) {
                 continue;
@@ -1043,13 +1045,13 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
                 let h_before = hooks_arr.len();
                 hooks_arr.retain(|h| {
                     let cmd = h.get("command").and_then(|v| v.as_str());
-                    let is_omamori = cmd
+                    let is_canonical_omamori = cmd
                         .map(|c| {
                             let unquoted = c.trim_matches('\'').trim_matches('"');
-                            Path::new(unquoted).starts_with(base_dir)
+                            Path::new(unquoted) == omamori_script_path
                         })
                         .unwrap_or(false);
-                    !is_omamori
+                    !is_canonical_omamori
                 });
                 if hooks_arr.len() != h_before {
                     modified = true;
@@ -2438,6 +2440,72 @@ mod tests {
             "custom-base-dir managed entry must be recognised"
         );
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remove_claude_does_not_touch_user_hook_inside_omamori_dir() {
+        // R4 regression (Codex Round 4): the surgical pass must match the
+        // CANONICAL omamori script path, not any path under base_dir.
+        // A user who chooses to store their own hook script inside the omamori
+        // base dir (e.g. for organizational convenience) must keep it intact.
+        let dir = fresh_test_dir("r4-user-in-omamori");
+        let script = fake_script(&dir);
+        let user_inside = dir.join(".omamori").join("hooks").join("user-hook.sh");
+        fs::write(&user_inside, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let user_cmd = shell_words::quote(&user_inside.display().to_string()).into_owned();
+        let hybrid = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": user_cmd.clone()},
+                        {"type": "command", "command": omamori_cmd}
+                    ]
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&hybrid).unwrap(),
+        )
+        .unwrap();
+
+        let omamori_root = dir.join(".omamori");
+        remove_claude_settings_entry(&omamori_root).unwrap();
+
+        let raw = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = doc
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(arr.len(), 1);
+        let inner = arr[0].pointer("/hooks").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            inner.len(),
+            1,
+            "user hook stored inside omamori base dir must survive"
+        );
+        let surviving = inner[0].get("command").and_then(|c| c.as_str()).unwrap();
+        assert!(
+            surviving.contains("user-hook.sh"),
+            "the surviving hook must be the user's, not the omamori canonical: {surviving}"
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
