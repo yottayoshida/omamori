@@ -44,8 +44,11 @@ pub(crate) fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError
     // Step 2b: Auto-setup Codex hooks if CODEX_CI detected but not configured
     let codex_setup = installer::auto_setup_codex_if_needed(&base_dir);
 
-    // Step 3: If hooks were regenerated or Codex was set up, update baseline
-    if hooks_regenerated || codex_setup {
+    // Step 2c: Re-merge ~/.claude/settings.json if version stale or matcher legacy (#196)
+    let settings_synced = ensure_settings_current();
+
+    // Step 3: If anything was regenerated, update baseline
+    if hooks_regenerated || codex_setup || settings_synced {
         update_baseline_silent(&base_dir);
     }
 
@@ -123,6 +126,99 @@ pub(crate) fn ensure_hooks_current_at(base_dir: &Path) -> bool {
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code settings.json auto-sync (#196, UX R3)
+// ---------------------------------------------------------------------------
+
+/// Check if `~/.claude/settings.json` is current; if not, re-merge omamori entry.
+fn ensure_settings_current() -> bool {
+    ensure_settings_current_at(&installer::default_base_dir())
+}
+
+/// Testable version that accepts a base directory.
+///
+/// Two re-sync triggers:
+/// 1. omamori entry's `x-omamori-version` field != current omamori version
+///    (set when the schema or hook semantics change between releases)
+/// 2. omamori entry's `matcher` is in legacy form (silently rejected by the
+///    current Claude Code parser — would leave Layer 2 dormant)
+///
+/// On either trigger, calls `merge_claude_settings()` to re-merge the entry
+/// in the current schema (UX R3: brew-upgrade auto-sync).
+///
+/// Returns `true` only when a re-merge was performed and produced an outcome
+/// other than `AlreadyPresent`. Read errors, parse errors, and "Claude Code
+/// not installed" all return `false` — recovery is the install command's
+/// responsibility, not the shim's.
+pub(crate) fn ensure_settings_current_at(base_dir: &Path) -> bool {
+    let claude_dir = installer::claude_home_dir();
+    ensure_settings_current_for(base_dir, &claude_dir)
+}
+
+/// Inner implementation that takes `claude_dir` explicitly. Test entry point.
+pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) -> bool {
+    if !installer::is_real_directory(claude_dir) {
+        return false;
+    }
+    let settings_path = claude_dir.join("settings.json");
+    let raw = match std::fs::read_to_string(&settings_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // Determine resync need:
+    //   1. omamori entry missing → resync (closes the entry-missing silent gap)
+    //   2. entry present but version stale or matcher legacy → resync
+    //   3. entry present and current → no-op
+    let needs_resync = match doc.pointer("/hooks/PreToolUse").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let omamori_entry = arr
+                .iter()
+                .find(|e| installer::is_omamori_owned_entry(e, base_dir));
+            match omamori_entry {
+                None => true,
+                Some(e) => {
+                    let version = e
+                        .get("x-omamori-version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let matcher = e.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
+                    version != env!("CARGO_PKG_VERSION") || matcher != "Bash"
+                }
+            }
+        }
+        None => true,
+    };
+
+    if !needs_resync {
+        return false;
+    }
+
+    let script_path = base_dir.join("hooks/claude-pretooluse.sh");
+    match installer::merge_claude_settings(claude_dir, &script_path) {
+        Ok(installer::ClaudeSettingsOutcome::AlreadyPresent) => false,
+        Ok(installer::ClaudeSettingsOutcome::Skipped(reason)) => {
+            eprintln!("omamori: failed to auto-sync Claude settings ({reason})");
+            false
+        }
+        Ok(_) => {
+            eprintln!(
+                "omamori: Claude settings auto-synced to v{}",
+                env!("CARGO_PKG_VERSION")
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("omamori: failed to auto-sync Claude settings ({e})");
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -585,5 +681,227 @@ mod tests {
                 "non-strict mode should return None on append failure"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // ensure_settings_current_for tests (#196 UX R3)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn ensure_settings_skips_when_claude_dir_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-no-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let claude_dir = dir.join("does-not-exist");
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        assert!(!result);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ensure_settings_skips_when_settings_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-no-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        assert!(!result);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_settings_resyncs_on_legacy_matcher() {
+        let dir = std::env::temp_dir().join(format!("omamori-shim-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        std::fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let stale = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{"type": "command", "command": omamori_cmd}]
+                }]
+            }
+        });
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        // The shim resolves script_path from <base_dir>/hooks/...
+        let base_hooks = dir.join("hooks");
+        std::fs::create_dir_all(&base_hooks).unwrap();
+        std::fs::write(
+            base_hooks.join("claude-pretooluse.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        assert!(result, "should re-sync when matcher is legacy");
+
+        let raw = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            doc.pointer("/hooks/PreToolUse/0/matcher")
+                .and_then(|v| v.as_str()),
+            Some("Bash")
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_settings_resyncs_when_entry_missing() {
+        // P1-1 (Codex R1): if settings.json exists with user hooks but no
+        // omamori entry, the shim must merge one in, not silently no-op.
+        let dir = std::env::temp_dir().join(format!("omamori-shim-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join("hooks");
+        std::fs::create_dir_all(&omamori_hooks).unwrap();
+        std::fs::write(
+            omamori_hooks.join("claude-pretooluse.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+
+        // settings.json exists with only a user hook (no omamori)
+        let user_doc = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Edit",
+                    "hooks": [{ "type": "command", "command": "/usr/local/bin/userhook" }]
+                }]
+            }
+        });
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&user_doc).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        // base_dir = dir, so omamori install root used by entry detection is `dir`
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        assert!(result, "must resync when omamori entry is missing");
+
+        // Verify the omamori entry was added (and user entry preserved)
+        let raw = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = doc
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(arr.len(), 2, "user entry + new omamori entry");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_settings_returns_false_on_skipped() {
+        // P1-3 (Codex R1): merge result Skipped (e.g. symlink target) must NOT
+        // be reported as a successful re-sync.
+        let dir = std::env::temp_dir().join(format!("omamori-shim-skipped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        // Symlink settings.json — merge_claude_settings will return Skipped
+        let real = dir.join("real-settings.json");
+        // Stale entry to trigger needs_resync
+        let stale = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "*",
+                    "hooks": [{ "type": "command", "command": format!("{}/hooks/x.sh", dir.display()) }]
+                }]
+            }
+        });
+        std::fs::write(&real, serde_json::to_string_pretty(&stale).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, claude_dir.join("settings.json")).unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        assert!(!result, "Skipped outcome must return false (not success)");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ensure_settings_no_op_when_current() {
+        let dir = std::env::temp_dir().join(format!("omamori-shim-current-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        std::fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let current = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
+                }]
+            }
+        });
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        assert!(!result, "should be a no-op when settings are current");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
