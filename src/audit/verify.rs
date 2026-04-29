@@ -284,9 +284,18 @@ pub fn show_entries(
             writeln!(out)?;
         }
     } else {
+        // COMMAND and ACTION columns were widened in v0.9.7 (#190 B-2).
+        // PR6 reused the COMMAND column to carry `tool_name` (e.g. `NotebookEdit`,
+        // `FuturePlanWriter`) and the ACTION column to carry `unknown_tool_fail_open`
+        // (22 chars), both of which overflowed the original `{:<8}` / `{:<15}` widths
+        // and pushed every later column out of alignment. v0.9.7 deny-path additions
+        // (#181) similarly carry `block` plus `detection_layer` strings such as
+        // `layer2:pipe-to-shell:env`. Widening to 24 / 24 keeps a single shared
+        // format function across event classes; a per-class formatter remains an
+        // option if a future event class outgrows 24.
         writeln!(
             out,
-            "{:<20} {:<12} {:<8} {:<15} {:<8} RULE",
+            "{:<20} {:<12} {:<24} {:<24} {:<8} RULE",
             "TIMESTAMP", "PROVIDER", "COMMAND", "ACTION", "RESULT"
         )?;
         for event in &entries {
@@ -303,7 +312,7 @@ pub fn show_entries(
             let ts = display_timestamp(&event.timestamp);
             writeln!(
                 out,
-                "{:<20} {:<12} {:<8} {:<15} {:<8} {rule}",
+                "{:<20} {:<12} {:<24} {:<24} {:<8} {rule}",
                 ts, event.provider, event.command, event.action, event.result
             )?;
         }

@@ -1127,6 +1127,59 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// v0.9.7 #190 B-2 regression: column alignment must survive PR6
+    /// `unknown_tool_fail_open` events without overflow. The pre-v0.9.7
+    /// format `{:<8}` (COMMAND) / `{:<15}` (ACTION) overflowed when
+    /// `tool_name` exceeded 8 chars or when `action == "unknown_tool_fail_open"`
+    /// (22 chars). v0.9.7 widened to `{:<24}` / `{:<24}`. This test pins
+    /// the byte position of every column boundary so a silent reversion to
+    /// the legacy widths fails CI before it reaches an operator's
+    /// `audit show` output.
+    #[test]
+    fn show_pr6_unknown_tool_fail_open_keeps_columns_aligned() {
+        let dir = test_dir("show-pr6-alignment");
+        let logger = test_logger(&dir);
+
+        let mut event = make_event("FuturePlanWriter"); // 16-char tool_name (PR6)
+        event.action = "unknown_tool_fail_open".to_string(); // 22-char label (PR6)
+        event.result = "allow".to_string();
+        event.detection_layer = Some("shape-routing".to_string());
+        logger.append(event).unwrap();
+
+        let opts = ShowOptions {
+            last: Some(1),
+            rule: None,
+            provider: None,
+            json: false,
+            action: None,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "header + 1 row, got:\n{output}");
+        let header = lines[0];
+        let row = lines[1];
+
+        // Format string: "{:<20} {:<12} {:<24} {:<24} {:<8} RULE"
+        // Column starts (in bytes): 0 / 21 / 34 / 59 / 84 / 93
+        assert_eq!(header.find("TIMESTAMP"), Some(0));
+        assert_eq!(header.find("PROVIDER"), Some(21));
+        assert_eq!(header.find("COMMAND"), Some(34));
+        assert_eq!(header.find("ACTION"), Some(59));
+        assert_eq!(header.find("RESULT"), Some(84));
+        assert_eq!(header.find("RULE"), Some(93));
+
+        // Body row: 16-char tool_name fills bytes 34..50, then padding to 58.
+        assert_eq!(&row[34..50], "FuturePlanWriter");
+        // 22-char action label fills bytes 59..81, then padding to 83.
+        assert_eq!(&row[59..81], "unknown_tool_fail_open");
+        // RESULT column at byte 84 ("allow" = 5 chars, padded to 8).
+        assert_eq!(&row[84..89], "allow");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn show_table_hides_hashes() {
         let dir = test_dir("show-hides");

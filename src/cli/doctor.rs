@@ -150,6 +150,16 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
 ///
 /// Best-effort: any error loading config / reading the audit log makes
 /// this a silent no-op rather than failing doctor.
+///
+/// Clock-skew assumption (#190 B-4, v0.9.7+): the cutoff is computed as
+/// `OffsetDateTime::now_utc() - Duration::days(30)` and applied as a `>=`
+/// filter on `event.timestamp` (see [`crate::audit::count_unknown_tool_fail_opens_within`]).
+/// Significant NTP rewinds or other clock anomalies move the cutoff window
+/// and silently shrink or zero the count. The surfaced number is a drift
+/// indicator, not a forensic counter; SECURITY.md `## Scope: unknown / new
+/// tools (v0.9.6+)` carries the user-facing version of this caveat (full
+/// heading quoted to make a future rename a hard build/lint signal rather
+/// than a silent partial-substring miss).
 fn print_unknown_tool_fail_open_summary() {
     let Ok(load_result) = crate::config::load_config(None) else {
         return;
