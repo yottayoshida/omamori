@@ -235,6 +235,8 @@ The threat we care about: a provider-side rename of a write/exec tool silently b
 
 The residual risk is `tool_input` shapes we don't recognise at all (no `command`/`cmd`/`file_path`/`path`/`url`). That's still **Allow**, on purpose: starting to block unreviewed payload shapes would break user workflow on every legitimate AI tool update. But the silence is gone — the call is recorded as an `unknown_tool_fail_open` event in the audit chain, stderr carries a one-line hint, and `omamori doctor` surfaces a 30-day count. Users review the events with `omamori audit unknown`.
 
+The 30-day count assumes a roughly correct, monotonic OS clock. The cutoff is computed as `now_utc() - 30 days` and applied as a `>=` filter on the per-event RFC 3339 timestamp, so significant NTP rewinds or other clock anomalies move the cutoff window and silently shrink or zero the count. Treat the surfaced number as a drift indicator, not a forensic counter — investigate spikes via `omamori audit unknown` and HMAC-verify suspicious windows with `omamori audit verify` rather than relying on the doctor count alone.
+
 This is a **trade-off, not a complete mitigation**. Threat-model implications:
 
 - An adversary aware of this scope could intentionally craft a `tool_input` shape that matches none of our known fields — say `{"prompt":"...","payload":"..."}` — to land in the observable fail-open branch. The damage they can do that way is limited (whatever the AI tool itself ends up doing with that payload is outside omamori's enforcement layer), and the call leaves a trail in `audit unknown`.
@@ -490,6 +492,14 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 
 **Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `blocked_command_patterns` operates at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing — use your AI tool's sandbox (Codex CLI sandbox (on by default), Claude Code `/sandbox`, Cursor agent sandbox) or a dedicated tool like [nono](https://github.com/always-further/nono).
 
+### Audit Log Read Access (v0.9.7+)
+
+`audit.jsonl` is user-readable by design. On a shared user account, anything that can read the home directory can also infer AI tool usage patterns — tool names, timestamps, command columns (and, for `unknown_tool_fail_open` events, top-level `tool_input` key counts) — from the audit log. Target paths are HMAC-hashed (`target_hash`), so concrete file paths are not disclosed, but the existence and shape of activity is.
+
+This is consistent with the same-user OS threat model: HMAC integrity protects against forgery and tampering, not against read access. Encryption-at-rest is out of scope; the secret would live in the same home directory the attacker is already presumed able to read, which would not change the threat surface.
+
+Operators who treat AI tool usage itself as confidential should run AI tools under a dedicated OS user, mount the audit directory on an encrypted volume keyed outside the home directory, or both.
+
 ### Secret Loss
 
 If the secret file is deleted or unreadable:
@@ -598,6 +608,25 @@ Entries written before v0.7.0 lack chain fields. When `append()` encounters a le
 | Chain structure (prev_hash linkage) | Via `--json` only | Machine consumers need full provenance for forensics/SIEM. HMAC protection means chain fields cannot be forged without secret |
 
 **Recommendation**: Run `omamori audit verify` directly in a terminal, not through an AI agent. AI agents can read stdout and may misrepresent results to the user.
+
+## Known Operational Caveats
+
+### Layer 2 meta-pattern false-positives on developer workflows (v0.9.7+)
+
+Layer 2 meta-pattern matching uses substring inclusion (`command.contains(pattern)`) on the full Bash command string. This is correct for the protection guarantee — `unset CLAUDECODE` anywhere in a command must block, including inside `echo`. The same broadness produces false-positive blocks on developer workflows that *describe* protected configuration without modifying it. Reproducible cases observed during omamori's own development:
+
+- `git commit -m '...'` where the commit message body mentions paths like `~/.claude/settings.json`, `.integrity.json`, `audit.jsonl`, or `audit-secret` (release-note prose, threat-model documentation, this very file)
+- `grep` / `rg` invocations that pass these strings as search arguments
+- AI-assisted code-review prompts that surface protected-path words densely in a single Bash invocation (e.g. quoting threat-model excerpts inline)
+
+These blocks are correct under the v0.9.7 design: the meta-pattern cannot tell *describing* from *modifying* without a full shell parse, and conservatively blocks both. Workarounds for legitimate developer workflows:
+
+1. Pass commit messages via file: `git commit -F /tmp/msg.txt` keeps the trigger words off the command line.
+2. Split contiguous strings on the Bash command line: e.g. `A=audit B=.jsonl; rg "$A$B"` — the meta-pattern matches the *literal* command string, not its expanded form.
+3. Use AI-tool file-edit interfaces (Read / Edit / Write) instead of Bash for reading or modifying file content; those routes go through `is_protected_file_path`, which is path-aware and does not false-positive on incidental substring mentions in unrelated files.
+4. Use the Codex MCP channel (`mcp__codex__codex`, `mcp__codex__review`) for AI review prompts that necessarily quote protected paths; the MCP transport bypasses the Bash PreToolUse hook entirely.
+
+This is a known trade-off, not a bug. Loosening the meta-pattern toward syntactic precision (e.g. tokenizing every Bash command before substring matching) would weaken the protection against obfuscated access to `audit-secret` / `.integrity.json` and is therefore not on the roadmap. The trade-off is documented here so operators reading omamori's own commit history understand that an occasional false-positive block during development is *evidence the layer is working*, not a regression to investigate.
 
 ## AI-assisted Contribution Invariants (v0.9.3+)
 
