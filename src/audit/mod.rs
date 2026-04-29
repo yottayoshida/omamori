@@ -654,6 +654,198 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// PR #187 item 4 / PR #186 proxy R4 P3-5 deferred.
+    ///
+    /// Tamper class: physical reorder of two adjacent on-disk events. Each
+    /// event still carries its original (unchanged) entry_hash, but the
+    /// hash-chain linkage between adjacent on-disk entries breaks because
+    /// each `prev_hash` references the predecessor of its *original*
+    /// position, not the predecessor at its new physical position.
+    #[test]
+    fn chain_tamper_reorder_detected() {
+        let dir = test_dir("chain-tamper-reorder");
+        let logger = test_logger(&dir);
+
+        for i in 0..3 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Swap on-disk positions of seq=1 and seq=2 lines.
+        let reordered = format!("{}\n{}\n{}\n", lines[0], lines[2], lines[1]);
+        fs::write(&logger.path, reordered).unwrap();
+
+        let events = read_events(&logger.path);
+        assert_eq!(events.len(), 3);
+
+        // After reorder:
+        //   on-disk position 0 = original seq=0 (entry_hash = GOLDEN[0])
+        //   on-disk position 1 = original seq=2 (entry_hash = GOLDEN[2])
+        //   on-disk position 2 = original seq=1 (entry_hash = GOLDEN[1])
+        // Detection: position-1's recorded prev_hash references GOLDEN[1]
+        // (its original predecessor seq=1's hash), but its on-disk
+        // predecessor is position-0 whose entry_hash is GOLDEN[0]. The
+        // adjacent-pair linkage breaks.
+        assert_eq!(
+            events[1]["entry_hash"].as_str().unwrap(),
+            GOLDEN_ENTRY_HASHES[2],
+            "reordered position 1 carries original seq=2's entry_hash (unchanged by reorder)"
+        );
+        assert_eq!(
+            events[1]["prev_hash"].as_str().unwrap(),
+            GOLDEN_ENTRY_HASHES[1],
+            "position 1's prev_hash still references its original predecessor (seq=1)"
+        );
+        assert_ne!(
+            events[1]["prev_hash"].as_str().unwrap(),
+            events[0]["entry_hash"].as_str().unwrap(),
+            "after reorder, prev_hash linkage between adjacent on-disk entries breaks — \
+             this is the reorder tamper signal"
+        );
+
+        // End-to-end detector check (Codex Round 1 P0): the underlying signal
+        // is necessary but not sufficient — `verify_chain` is what the omamori
+        // CLI actually invokes to surface tamper, so a future regression in
+        // `verify_chain`'s prev_hash-linkage check would silently flip every
+        // chain_tamper_* test back to passing without detection. Pin both
+        // layers (raw signal + detector E2E).
+        let verify_result = verify::verify_chain(&verify_config(&dir))
+            .expect("verify_chain must run on a non-symlink test dir");
+        assert!(
+            verify_result.broken_at.is_some(),
+            "verify_chain must report broken_at = Some(_) after on-disk reorder; got None"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR #187 item 4 / PR #186 proxy R4 P3-5 deferred.
+    ///
+    /// Tamper class: physical deletion of a middle event (seq=1). After
+    /// deletion, the surviving seq=2 entry sits at on-disk position 1
+    /// but its `prev_hash` still references the deleted seq=1's hash.
+    /// The on-disk predecessor (seq=0) carries a different entry_hash,
+    /// so the chain breaks at the deletion point.
+    #[test]
+    fn chain_tamper_middle_deletion_detected() {
+        let dir = test_dir("chain-tamper-middle-deletion");
+        let logger = test_logger(&dir);
+
+        for i in 0..3 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Drop the middle line (original seq=1).
+        let truncated = format!("{}\n{}\n", lines[0], lines[2]);
+        fs::write(&logger.path, truncated).unwrap();
+
+        let events = read_events(&logger.path);
+        assert_eq!(events.len(), 2);
+
+        // Surviving on-disk position 1 = original seq=2.
+        assert_eq!(
+            events[1]["entry_hash"].as_str().unwrap(),
+            GOLDEN_ENTRY_HASHES[2],
+            "surviving position 1 carries original seq=2's entry_hash"
+        );
+        assert_eq!(
+            events[1]["prev_hash"].as_str().unwrap(),
+            GOLDEN_ENTRY_HASHES[1],
+            "surviving position 1 still references the deleted seq=1's hash"
+        );
+        assert_ne!(
+            events[1]["prev_hash"].as_str().unwrap(),
+            events[0]["entry_hash"].as_str().unwrap(),
+            "after middle-deletion, prev_hash points to a vanished hash — \
+             this is the deletion tamper signal"
+        );
+
+        // End-to-end detector check (Codex Round 1 P0): see
+        // `chain_tamper_reorder_detected` for the rationale on pinning
+        // `verify_chain` in addition to the raw on-disk signal.
+        let verify_result = verify::verify_chain(&verify_config(&dir))
+            .expect("verify_chain must run on a non-symlink test dir");
+        assert!(
+            verify_result.broken_at.is_some(),
+            "verify_chain must report broken_at = Some(_) after middle-deletion; got None"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR #187 item 4 / PR #186 proxy R4 P3-5 deferred.
+    ///
+    /// Tamper class: overwrite `prev_hash` on the genesis event (seq=0).
+    /// Without the HMAC secret an attacker cannot forge a valid prev_hash
+    /// — genesis is HMAC(secret, "omamori-genesis-v1"). Any overwrite
+    /// produces a value != GOLDEN_GENESIS. The recorded entry_hash on
+    /// seq=0 stays at GOLDEN[0] (attacker only flipped prev_hash bytes),
+    /// but recomputing the entry_hash over the post-tamper payload now
+    /// diverges from GOLDEN[0]. Both signals fire.
+    #[test]
+    fn chain_tamper_genesis_rewrite_detected() {
+        let dir = test_dir("chain-tamper-genesis-rewrite");
+        let logger = test_logger(&dir);
+
+        for i in 0..3 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+
+        let forged = "0000000000000000000000000000000000000000000000000000000000000000";
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let tampered = content.replacen(GOLDEN_GENESIS, forged, 1);
+        fs::write(&logger.path, tampered).unwrap();
+
+        let events = read_events(&logger.path);
+        assert_eq!(events.len(), 3);
+
+        // Signal 1: genesis prev_hash diverges from golden.
+        assert_ne!(
+            events[0]["prev_hash"].as_str().unwrap(),
+            GOLDEN_GENESIS,
+            "genesis-rewrite must surface as prev_hash divergence from golden genesis"
+        );
+        assert_eq!(
+            events[0]["prev_hash"].as_str().unwrap(),
+            forged,
+            "tampered prev_hash value is observable as the rewritten content"
+        );
+
+        // Signal 2: recorded entry_hash stays at golden (only prev_hash bytes
+        // were touched), but recomputing entry_hash over the post-tamper
+        // payload diverges from golden — same end-to-end signal as
+        // chain_tamper_detected above, applied to the genesis event.
+        assert_eq!(
+            events[0]["entry_hash"].as_str().unwrap(),
+            GOLDEN_ENTRY_HASHES[0],
+            "attacker only flipped prev_hash bytes; entry_hash byte sequence unchanged"
+        );
+        let parsed_seq0: AuditEvent = serde_json::from_value(events[0].clone()).unwrap();
+        let recomputed_seq0 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq0);
+        assert_ne!(
+            recomputed_seq0, GOLDEN_ENTRY_HASHES[0],
+            "recomputed entry_hash over tampered (prev_hash-rewritten) genesis payload \
+             diverges from golden — this is the genesis-rewrite tamper signal"
+        );
+
+        // End-to-end detector check (Codex Round 1 P0): see
+        // `chain_tamper_reorder_detected` for the rationale on pinning
+        // `verify_chain` in addition to the raw on-disk signal.
+        let verify_result = verify::verify_chain(&verify_config(&dir))
+            .expect("verify_chain must run on a non-symlink test dir");
+        assert!(
+            verify_result.broken_at.is_some(),
+            "verify_chain must report broken_at = Some(_) after genesis-rewrite; got None"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // --- create_event ---
 
     #[test]
