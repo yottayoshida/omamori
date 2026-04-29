@@ -502,6 +502,25 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "meta-pattern-override-block",
     ),
+    // 15b-DI9. DI-9 behavioral pins for `omamori doctor --fix` and
+    //          `omamori explain` `blocked_string_patterns()` entries
+    //          (declared at `src/installer.rs:425-432`). Inherited gap
+    //          from the deleted `meta_patterns_cover_config_modification`
+    //          unit test — neither PR4 nor the rest of HOOK_DECISION_CASES
+    //          carried behavioral coverage for these two patterns. PR4's
+    //          thesis applies universally: every `blocked_string_patterns()`
+    //          entry should have at least one behavioral fixture somewhere.
+    //          PR #187 item 2 / PR #186 R5 P3 B3.
+    (
+        "omamori doctor --fix",
+        Decision::Block,
+        "meta-pattern-doctor-fix-block",
+    ),
+    (
+        "omamori explain some-rule",
+        Decision::Block,
+        "meta-pattern-explain-block",
+    ),
     // 15c. Codex CLI hook / config protection (#66 T2/T3).
     (
         "echo payload > ~/.codex/hooks.json",
@@ -571,6 +590,32 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
     ),
 ];
 
+/// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
+/// entries. Catches category-selective drop that the global ≥18 floor in
+/// `corpus_includes_meta_pattern_coverage` misses (e.g. deleting all 8
+/// `15a` rm boundary fixtures and adding 8 new fixtures elsewhere keeps
+/// the total ≥ 18 but silently drops rm coverage). Sum is 23 — the full
+/// HEAD count including the PR #187 DI-9 additions.
+///
+/// Each prefix anchors with a trailing `-` to prevent accidental
+/// sub-prefix matching: `meta-pattern-bin-rm-` does NOT match
+/// `meta-pattern-bin-rmdir-` because the next char after `rm` is `-` vs
+/// `d`. PR #187 item 1 / PR #186 R5 P3 B2.
+const META_PATTERN_CATEGORY_FLOORS: &[(&str, usize)] = &[
+    ("meta-pattern-bin-rm-", 4),        // 15a (bin side, 4 boundary types)
+    ("meta-pattern-usr-bin-rm-", 4),    // 15a (usr/bin side, 4 boundary types)
+    ("meta-pattern-config-", 2),        // 15b (config disable / enable)
+    ("meta-pattern-init-force-", 1),    // 15b
+    ("meta-pattern-uninstall-", 1),     // 15b
+    ("meta-pattern-override-", 1),      // 15b
+    ("meta-pattern-doctor-fix-", 1),    // 15b-DI9 (PR #187 item 2)
+    ("meta-pattern-explain-", 1),       // 15b-DI9 (PR #187 item 2)
+    ("meta-pattern-codex-", 5),         // 15c (4 keywords) + 15c-iso standalone
+    ("meta-pattern-rmdir-", 1),         // 15d FP guard
+    ("meta-pattern-bin-rmdir-", 1),     // 15d FP guard
+    ("meta-pattern-usr-bin-rmdir-", 1), // 15d FP guard
+];
+
 /// Cross-OS invariant: the same bash input must yield the same Decision on
 /// every supported OS. Runs the entire corpus in one temp env to keep install
 /// cost at one-per-test.
@@ -627,18 +672,36 @@ fn corpus_includes_meta_pattern_coverage() {
     //   - codex_protection:   4 original keywords                   = 4 fixtures
     //                         + 1 isolation fixture for codex_hooks = 5 fixtures
     //   - do_not_false_positive_on_rmdir: bare + 2 direct paths     = 3 fixtures
-    // → 8 + 5 + 5 + 3 = 21 behavioral fixtures in HEAD (4 of 5 categories
-    // map 1:1 from the deleted unit tests; codex_protection gained +1 from
-    // the R4 isolation requirement). Floor set to 18 to allow minor tactical
-    // reshuffles (up to 3-fixture drift) without drift, while still catching
-    // an accidental category-level deletion. PR #186 R5 proxy corrected the
-    // prior 20/18 arithmetic to 21/18.
+    // → 8 + 5 + 5 + 3 = 21 behavioral fixtures from PR #146 scope 4.
+    // PR #187 item 2 added 2 DI-9 fixtures (doctor --fix, explain) for a
+    // HEAD total of 23. Floor stays at 18 to allow tactical drift while
+    // still catching wholesale category-level deletion. Per-category
+    // selective drop (e.g. deleting all 15a rm-boundary fixtures and
+    // adding 8 unrelated new ones) is caught by `META_PATTERN_CATEGORY_FLOORS`
+    // below. PR #186 R5 proxy corrected the prior 20/18 arithmetic.
     assert!(
         meta_pattern_count >= 18,
         "meta-pattern corpus (#146 scope 4) must have ≥18 entries; got {meta_pattern_count}. \
          If you are intentionally removing entries, verify the attack/FP surfaces still \
          have isolated behavioral coverage and update this floor."
     );
+
+    // Per-category floor map: catches category-selective drop that the
+    // global ≥18 floor would miss (the same total can be hit by deleting
+    // an entire category and replacing it with unrelated new fixtures).
+    // PR #187 item 1 / PR #186 R5 P3 B2.
+    for (prefix, floor) in META_PATTERN_CATEGORY_FLOORS {
+        let count = HOOK_DECISION_CASES
+            .iter()
+            .filter(|(_, _, cat)| cat.starts_with(prefix))
+            .count();
+        assert!(
+            count >= *floor,
+            "meta-pattern category '{prefix}*' must have ≥{floor} entries; got {count}. \
+             Category-selective deletion would silently drop this surface coverage even \
+             when the global ≥18 floor still passes."
+        );
+    }
 }
 
 /// Pin the Block exit code contract at exactly 2. The `cross_os_invariant`
