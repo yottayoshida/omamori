@@ -263,6 +263,46 @@ else
     fail=1
 fi
 
+# ---------- Invariant #10: PR6 routing surface symbols (v0.9.6+, #190 B-1) ----------
+# `enum InputShape` / `fn classify_input_shape` / `fn has_routing_field_with_wrong_type`
+# in `src/engine/hook.rs` are the structural pins for v0.9.6's payload-shape
+# routing of unknown tools (#182). Renaming or deleting any of them silently
+# narrows the only contract that catches forward-compat fail-open: a payload
+# carrying `command` / `cmd` / `file_path` / `path` must reach the full pipeline
+# regardless of `tool_name`. Unit and integration tests would still pass on a
+# rename if call sites moved together, but the routing identity would drift
+# away from SECURITY.md's narrative. Pin the symbols here as a CI gate.
+#
+# Note on target file: issue #190 B-1 referenced `tests/hook_integration.rs`,
+# but the three named symbols live in `src/engine/hook.rs` (production code,
+# not test). The invariant pins the actual definition site. The trailing `\(`
+# anchors `fn classify_input_shape` against the test helper
+# `fn classify_input_shape_command_priority_over_url` (same prefix, no paren).
+hk=src/engine/hook.rs
+hk_fail=0
+if [ ! -f "$hk" ]; then
+    echo "FAIL [invariant #10a]: $hk is missing"
+    hk_fail=1
+else
+    if ! grep -qE 'enum InputShape\b' "$hk"; then
+        echo "FAIL [invariant #10b]: $hk must define 'enum InputShape'"
+        hk_fail=1
+    fi
+    if ! grep -qE 'fn classify_input_shape\(' "$hk"; then
+        echo "FAIL [invariant #10c]: $hk must define 'fn classify_input_shape('"
+        hk_fail=1
+    fi
+    if ! grep -qE 'fn has_routing_field_with_wrong_type\(' "$hk"; then
+        echo "FAIL [invariant #10d]: $hk must define 'fn has_routing_field_with_wrong_type('"
+        hk_fail=1
+    fi
+fi
+if [ "$hk_fail" -eq 0 ]; then
+    echo "#10 OK: PR6 routing surface symbols intact"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"
