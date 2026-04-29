@@ -34,11 +34,6 @@ The format is based on Keep a Changelog.
 - **`SECURITY.md ### Audit Log Read Access (v0.9.7+)`** ([#190](https://github.com/yottayoshida/omamori/issues/190) B-3). New subsection under Audit Log → Defense Boundary. `audit.jsonl` is `chmod 644` (user-readable) by design; HMAC integrity protects against forgery and tampering, not against read access. Operators who treat AI tool usage itself as confidential are pointed at dedicated OS users / encrypted volumes keyed outside the home directory.
 - **SECURITY.md doctor 30-day clock-skew caveat** ([#190](https://github.com/yottayoshida/omamori/issues/190) B-4). New paragraph in "Scope: unknown / new tools" plus matching doc-comment on `src/cli/doctor.rs::print_unknown_tool_fail_open_summary`. Treat the count as a drift indicator, not a forensic counter — significant NTP rewinds skew the cutoff window.
 
-### Docs
-
-- **ACCEPTANCE_TEST.md S-2 / S-6 §前提 / A-1 fixes** ([#194](https://github.com/yottayoshida/omamori/issues/194)). S-2 target changed from `/tmp/nonexistent` (trash-redirect on the `rm-recursive-to-trash` rule, exit 1) to `/etc/fstab` (system-owned, trash move EPERMs, fail-close → true deny). S-6 §前提 expanded with "Claude Code 安全層との precedence" warning + shim PATH-precedence verification (`which rm` should resolve to `~/.omamori/shim/rm`); the existing trailer "Layer 1 (S-*) は AI env 非依存" was corrected since shim's non-protected fast path passes through real `rm` (`src/engine/shim.rs:313`) — `CLAUDECODE=1` is required for every S-*/H-*/T-*/A-* row, not just Layer 2 / Tamper / Doctor / Audit. A-1 changed from `omamori audit` (help-only output) to `omamori audit show --rule rm-recursive-to-trash --last 5` with action-vs-result column semantics noted inline.
-- **README**: no v0.9.7-specific narrative restructure (PR3 already updated the install --hooks line "applied automatically. No action needed." to be structurally true via the new merge logic).
-
 ### For users
 
 - No installation change required. `omamori install --hooks` is now genuinely automatic for Claude Code settings.json — the `[todo]` line in the previous output is gone. `brew upgrade omamori` followed by any shim invocation auto-syncs both hooks and settings.json — no manual steps required.
@@ -51,6 +46,11 @@ The format is based on Keep a Changelog.
 - **Invariant #10** (`scripts/check-invariants.sh`, [#190](https://github.com/yottayoshida/omamori/issues/190) B-1). Pins existence of three v0.9.6 PR6 routing symbols in `src/engine/hook.rs`: `enum InputShape`, `fn classify_input_shape(`, `fn has_routing_field_with_wrong_type(`. Catches silent rename of the routing identity that would un-do v0.9.6's forward-compat fail-open closure.
 - **Invariants #6f / #6g / #6h** ([#187](https://github.com/yottayoshida/omamori/issues/187) item 3 + Codex Round 1 P1). #6f pins `fn corpus_includes_meta_pattern_coverage` existence (the floor function itself is subject to silent drop). #6g pins `meta_pattern_count >= (18..23)` literal range. #6h pins `META_PATTERN_CATEGORY_FLOORS` const + iteration so the per-category guard cannot be silently removed leaving the global floor as the only protection.
 - **Dependabot cargo ecosystem disabled** ([#202](https://github.com/yottayoshida/omamori/pull/202)). Cargo dependency updates are now manual via `cargo update`; the github-actions ecosystem (security-relevant) remains on monthly patch-only schedule per the v0.9.4 narrow config audit.
+
+### Docs
+
+- **ACCEPTANCE_TEST.md S-2 / S-6 §前提 / A-1 fixes** ([#194](https://github.com/yottayoshida/omamori/issues/194)). S-2 target changed from `/tmp/nonexistent` (trash-redirect on the `rm-recursive-to-trash` rule, exit 1) to `/etc/fstab` (system-owned, trash move EPERMs, fail-close → true deny). S-6 §前提 expanded with "Claude Code 安全層との precedence" warning + shim PATH-precedence verification (`which rm` should resolve to `~/.omamori/shim/rm`); the existing trailer "Layer 1 (S-*) は AI env 非依存" was corrected since shim's non-protected fast path passes through real `rm` (`src/engine/shim.rs:313`) — `CLAUDECODE=1` is required for every S-*/H-*/T-*/A-* row, not just Layer 2 / Tamper / Doctor / Audit. A-1 changed from `omamori audit` (help-only output) to `omamori audit show --rule rm-recursive-to-trash --last 5` with action-vs-result column semantics noted inline.
+- **README**: no v0.9.7-specific narrative restructure (PR3 already updated the install --hooks line "applied automatically. No action needed." to be structurally true via the new merge logic).
 
 ### Migration notes
 
