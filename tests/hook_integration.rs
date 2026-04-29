@@ -504,7 +504,9 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
     ),
     // 15b-DI9. DI-9 behavioral pins for `omamori doctor --fix` and
     //          `omamori explain` `blocked_string_patterns()` entries
-    //          (declared at `src/installer.rs:425-432`). Inherited gap
+    //          (declared inside `blocked_string_patterns()` in
+    //          `src/installer.rs`; line numbers omitted because they drift).
+    //          Inherited gap
     //          from the deleted `meta_patterns_cover_config_modification`
     //          unit test — neither PR4 nor the rest of HOOK_DECISION_CASES
     //          carried behavioral coverage for these two patterns. PR4's

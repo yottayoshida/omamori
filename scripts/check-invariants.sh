@@ -130,6 +130,21 @@ else
         echo "FAIL [invariant #6g]: meta-pattern global floor 'meta_pattern_count >= 18..23' must be present"
         hi_fail=1
     fi
+    # #6h (PR #187 Codex R1 P1): pin the per-category floor map itself.
+    # #6f and #6g pin only the global floor; without #6h, a future commit
+    # could delete `META_PATTERN_CATEGORY_FLOORS` and its iteration, leaving
+    # the global ≥18 floor as the only guard. That re-opens the
+    # category-selective drop attack PR #187 item 1 was designed to close.
+    # Pin both the const declaration and the iteration site so neither half
+    # of the per-category guard can be silently removed.
+    if ! grep -qF 'const META_PATTERN_CATEGORY_FLOORS' "$hi"; then
+        echo "FAIL [invariant #6h]: PR #187 item 1 per-category floor map 'const META_PATTERN_CATEGORY_FLOORS' must be retained"
+        hi_fail=1
+    fi
+    if ! grep -qF 'for (prefix, floor) in META_PATTERN_CATEGORY_FLOORS' "$hi"; then
+        echo "FAIL [invariant #6h]: per-category floor iteration 'for (prefix, floor) in META_PATTERN_CATEGORY_FLOORS' must be retained"
+        hi_fail=1
+    fi
 fi
 if [ "$hi_fail" -eq 0 ]; then
     echo "#6 OK: hook integration suite has required structure"

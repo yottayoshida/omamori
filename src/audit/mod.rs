@@ -705,6 +705,19 @@ mod tests {
              this is the reorder tamper signal"
         );
 
+        // End-to-end detector check (Codex Round 1 P0): the underlying signal
+        // is necessary but not sufficient — `verify_chain` is what the omamori
+        // CLI actually invokes to surface tamper, so a future regression in
+        // `verify_chain`'s prev_hash-linkage check would silently flip every
+        // chain_tamper_* test back to passing without detection. Pin both
+        // layers (raw signal + detector E2E).
+        let verify_result = verify::verify_chain(&verify_config(&dir))
+            .expect("verify_chain must run on a non-symlink test dir");
+        assert!(
+            verify_result.broken_at.is_some(),
+            "verify_chain must report broken_at = Some(_) after on-disk reorder; got None"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -750,6 +763,16 @@ mod tests {
             events[0]["entry_hash"].as_str().unwrap(),
             "after middle-deletion, prev_hash points to a vanished hash — \
              this is the deletion tamper signal"
+        );
+
+        // End-to-end detector check (Codex Round 1 P0): see
+        // `chain_tamper_reorder_detected` for the rationale on pinning
+        // `verify_chain` in addition to the raw on-disk signal.
+        let verify_result = verify::verify_chain(&verify_config(&dir))
+            .expect("verify_chain must run on a non-symlink test dir");
+        assert!(
+            verify_result.broken_at.is_some(),
+            "verify_chain must report broken_at = Some(_) after middle-deletion; got None"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -808,6 +831,16 @@ mod tests {
             recomputed_seq0, GOLDEN_ENTRY_HASHES[0],
             "recomputed entry_hash over tampered (prev_hash-rewritten) genesis payload \
              diverges from golden — this is the genesis-rewrite tamper signal"
+        );
+
+        // End-to-end detector check (Codex Round 1 P0): see
+        // `chain_tamper_reorder_detected` for the rationale on pinning
+        // `verify_chain` in addition to the raw on-disk signal.
+        let verify_result = verify::verify_chain(&verify_config(&dir))
+            .expect("verify_chain must run on a non-symlink test dir");
+        assert!(
+            verify_result.broken_at.is_some(),
+            "verify_chain must report broken_at = Some(_) after genesis-rewrite; got None"
         );
 
         let _ = fs::remove_dir_all(&dir);
