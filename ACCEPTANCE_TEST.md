@@ -18,20 +18,27 @@
 > （block されたように見えず、かえって実害が出る）。Claude Code セッション内から実行する場合は
 > セッションが env を継承するので不要だが、素ターミナルから走らせる場合は必須。
 >
-> Layer 1 (S-\*) は AI env 非依存で常時発火するので、`CLAUDECODE` の有無に影響しない。
+> S-\* も同じ shim を経由するので、`CLAUDECODE` 不在時は shim 自身が `protected==false` で
+> fast-path を取り、real `rm` を直接実行する (`src/engine/shim.rs:313`)。「Layer 1 とは
+> Layer 2 hook を介さず PATH shim だけが評価する経路」のことであって、「AI env 検知に
+> 依存しない」という意味ではない。S-\* も含め全テストで `CLAUDECODE=1` を必ず維持すること。
 
-> ⚠️ **Claude Code セッション内 vs 素ターミナルの使い分け (Layer 1 isolation)**
+> ⚠️ **Claude Code セッション内 vs 素ターミナルの使い分け (Claude Code 安全層との precedence)**
 >
 > S-1 / S-6 / T-1 等の "明らかに破壊的なコマンド" は Claude Code 自体の destructive-action
 > 安全層が omamori shim より先に拒否することがある。Claude Code 経由で deny されても
 > omamori shim 単独の動作証明にはならず、二重防御で実害ゼロを担保しているだけ。
 >
-> omamori shim 単独の動作を検証したい場合は **素ターミナル** で実行する
-> (`unset CLAUDECODE` や別シェル等で AI env を解除した状態)。ただし素ターミナルで shim が
-> 無効になっていると `rm -rf` が真に削除されるので、`which rm` で **shim が PATH 先頭** に
-> いることを **必ず先に確認** してから走らせること。`which rm` の出力が
-> `~/.local/share/omamori/shims/rm` 系であれば shim 経路、`/bin/rm` や `/usr/bin/rm` なら
-> shim が外れている（その状態で本テストは実行しない）。
+> omamori shim 単独の動作を検証したい場合は **素ターミナル** (Claude Code を経由しない別シェル
+> セッション) で実行する。ただし上の §前提 の通り omamori shim/hook は AI env 検知時のみ発火
+> するので、素ターミナルでも `export CLAUDECODE=1` を **必ず維持** すること
+> (`unset` は禁止 — env が外れると shim は real `rm` を直接実行する fast-path に落ち、
+> S-\* 全てが真に削除される動作に退行する)。
+>
+> 加えて `which rm` で **shim が PATH 先頭** にいることを必ず先に確認
+> (`~/.omamori/shim/rm` であれば shim 経路、`/bin/rm` や `/usr/bin/rm` なら shim が外れている
+> — その状態で本テストは走らせない)。`omamori install` 既定の shim base は `~/.omamori/shim`
+> (`src/installer.rs:87`)。`--base-dir` で別 base を指定した場合はその下の `shim/` を確認する。
 
 ```bash
 # omamori がインストール済みであること
@@ -53,7 +60,7 @@ touch dummy.txt
 | # | コマンド | 期待結果 | PASS |
 |---|---------|---------|------|
 | S-1 | `rm -rf /` | **ブロック**。omamori のメッセージが出る (素ターミナル推奨 — §前提参照) | [ ] |
-| S-2 | `rm -r -f ~/.ssh/known_hosts` | **ブロック**。`-r -f` の分割引数でも検出。NEVER_REGENERABLE な `~/.ssh` 配下は context override で必ず deny になる (ファイル実在の有無に依存しない) | [ ] |
+| S-2 | `rm -r -f /etc/fstab` | **ブロック**。`-r -f` の分割引数でも検出。`/etc/fstab` は system-owned (root:wheel 0644) なので `rm-recursive-to-trash` ルールが trash 移動を試みた時点で `EPERM` で失敗し、SECURITY.md "Trash failure → fail-close" により omamori が rm の本実行を refuse する (true deny)。`context` 評価の有無や `~/.ssh/*` の NEVER_REGENERABLE 分類には依存しない | [ ] |
 | S-3 | `git reset --hard` | **ブロック**。stash 代替を提示 | [ ] |
 | S-4 | `git push --force` | **ブロック** | [ ] |
 | S-5 | `git clean -fd` | **ブロック** | [ ] |
@@ -111,7 +118,7 @@ touch dummy.txt
 
 | # | テスト内容 | 期待結果 | PASS |
 |---|-----------|---------|------|
-| A-1 | S-1 実行後に `omamori audit show --action block --last 5` | 直近 5 件にブロックイベントが含まれる (rule_id `recursive_rm`、command `rm`、target が `/` 由来) | [ ] |
+| A-1 | S-1 実行後に `omamori audit show --rule rm-recursive-to-trash --last 5` | 直近 5 件に S-1 由来のイベントが含まれる (rule_id `rm-recursive-to-trash`、command `rm`、result 列が block 系の表示)。`--action block` でフィルタしても catch できない点に注意: `audit/mod.rs:138` で `action` 列はルールの **意図** (`Trash`) を保持し、実際の outcome (block) は `result` 列側に入る | [ ] |
 | A-2 | 監査ログファイルが存在する | `~/.local/share/omamori/audit.jsonl` が存在する（XDG Base Directory 準拠） | [ ] |
 
 ---
