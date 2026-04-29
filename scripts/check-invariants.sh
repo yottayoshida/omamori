@@ -111,6 +111,25 @@ else
         echo "FAIL [invariant #6e]: $hi must not gate tests on target_os"
         hi_fail=1
     fi
+    # #6f (PR #187 item 3): pin existence of the floor test itself. PR4 (#146
+    # scope 4) introduced `corpus_includes_meta_pattern_coverage` to encode
+    # the "silent pattern drop must fail the suite" guarantee, but the floor
+    # function is itself subject to silent drop — a contributor who deletes
+    # the function body passes CI quietly. Pin the function name here so
+    # physical removal fails CI before reaching review.
+    if ! grep -qF 'fn corpus_includes_meta_pattern_coverage' "$hi"; then
+        echo "FAIL [invariant #6f]: PR #146 scope 4 floor test 'fn corpus_includes_meta_pattern_coverage' must be retained — it pins the silent-drop guarantee and is itself subject to silent drop"
+        hi_fail=1
+    fi
+    # #6g (PR #187 item 3): pin the global meta-pattern floor at >= 18.
+    # The exact range allows the head count to drift to 23 (PR #187 added
+    # 2 DI-9 entries for total 23) without re-flagging this invariant on
+    # every legitimate corpus growth. Floor below 18 means tactical drift
+    # has eaten the safety margin and this should fail CI.
+    if ! grep -qE 'meta_pattern_count >= *(18|19|20|21|22|23)' "$hi"; then
+        echo "FAIL [invariant #6g]: meta-pattern global floor 'meta_pattern_count >= 18..23' must be present"
+        hi_fail=1
+    fi
 fi
 if [ "$hi_fail" -eq 0 ]; then
     echo "#6 OK: hook integration suite has required structure"
