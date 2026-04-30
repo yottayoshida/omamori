@@ -628,6 +628,28 @@ These blocks are correct under the v0.9.7 design: the meta-pattern cannot tell *
 
 This is a known trade-off, not a bug. Loosening the meta-pattern toward syntactic precision (e.g. tokenizing every Bash command before substring matching) would weaken the protection against obfuscated access to `audit-secret` / `.integrity.json` and is therefore not on the roadmap. The trade-off is documented here so operators reading omamori's own commit history understand that an occasional false-positive block during development is *evidence the layer is working*, not a regression to investigate.
 
+### Test-suite pollution of contributor `~/.claude/settings.json` (v0.9.7)
+
+Running `cargo test` against omamori's own test suite on a machine that has Claude Code installed (i.e. a real `~/.claude/` directory exists) can leave dead entries in `~/.claude/settings.json` under `hooks.PreToolUse`. Affected entries point at temporary install paths under `$TMPDIR/omamori-install-*/hooks/claude-pretooluse.sh` that no longer exist after the test run cleans up. Bash tool invocations in Claude Code subsequently emit non-blocking errors per dead entry on every command. Filed as [#210](https://github.com/yottayoshida/omamori/issues/210) (closed not planned).
+
+**Scope**: contributors only. Production install paths (`brew install omamori`, `cargo install omamori`, manual `omamori install --hooks`) all use the canonical `base_dir = ~/.omamori`, so registered command paths are permanent across runs and dedup works correctly. The accumulation is gated behind running `cargo test` on a machine with a real `~/.claude/` directory.
+
+**Cause** (for contributors who want to understand the mechanism): seven test sites invoke `omamori install --hooks --base-dir /tmp/...` (six as a subprocess, one in-process) without overriding `HOME`. The child process's `merge_claude_settings` resolves `claude_home_dir()` from the developer's real `$HOME` and writes the test-only base_dir path into the developer's real `~/.claude/settings.json`. After test cleanup removes the base_dir, the entry's `command` path becomes a broken reference. Each test run adds another entry because the dedup logic in `is_omamori_owned_entry` keys on the current install_root and cannot recognize prior runs' base_dirs as owned.
+
+**Manual cleanup** (sufficient for current contributor population — the maintainer):
+
+```bash
+cp ~/.claude/settings.json ~/.claude/settings.json.bak.$(date +%Y%m%d_%H%M%S)
+jq '.hooks.PreToolUse |= map(select(.hooks[0].command | test("omamori-install-") | not))' \
+  ~/.claude/settings.json > /tmp/settings.cleaned.json && \
+  jq . /tmp/settings.cleaned.json > /dev/null && \
+  mv /tmp/settings.cleaned.json ~/.claude/settings.json
+```
+
+This filter assumes the live entry's command path does not contain `omamori-install-` (i.e. is `~/.omamori/hooks/...` or similar canonical path).
+
+**Why no automatic fix**: a full automated cleanup would require ~500 lines (test HOME isolation across 7 sites + dedup logic strengthening + warning UX + CI lint to prevent regression) for an issue with zero impact on production users and a one-line manual cleanup for contributors. The cost/value did not justify implementation in v0.9.7. If the contributor population grows or a related issue surfaces (e.g. [#206](https://github.com/yottayoshida/omamori/issues/206) OpenClaw hook coexistence touches the same identification logic), this can be reopened. See [#210 close comment](https://github.com/yottayoshida/omamori/issues/210#issuecomment-4350136214) for the full investigation log.
+
 ## AI-assisted Contribution Invariants (v0.9.3+)
 
 omamori is developed with AI coding assistants (Claude Code / Codex). That
