@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [0.9.7] - 2026-04-29
+## [0.9.7] - 2026-04-30
 
 **Summary**: HMAC tamper-evident audit chain moat completion + `install --hooks` automation. Three structural closures tightened against silent gaps the v0.9.6 ship surfaced: (1) Layer 2 hook deny verdicts (`BlockMeta` / `BlockRule` / `BlockStructural`) now append to the HMAC audit chain — the marketed tamper-evident moat covered Layer 1 (PATH shim) end-to-end but had a structural gap at Layer 2 ([#181](https://github.com/yottayoshida/omamori/issues/181)); (2) `omamori install --hooks` automatically merges into `~/.claude/settings.json` instead of printing a `[todo]` snippet, with omamori-managed legacy-matcher entries auto-migrated and user-managed entries preserved verbatim ([#196](https://github.com/yottayoshida/omamori/issues/196)); (3) `omamori doctor` parses settings.json and verifies the omamori-managed entry's matcher syntax + script_path SHA-256, so doctor green now structurally implies Layer 2 active. Plus shim auto-sync extension (`ensure_settings_current()` parallels `ensure_hooks_current()`) so brew upgrade does not leave stale config behind, doc / test polish (#190, #194, #187), and a new SECURITY.md `## Known Operational Caveats` section documenting the meta-pattern false-positive surface that omamori's own development surfaces (commit messages, grep arguments, AI-review prompts that quote protected paths).
 
