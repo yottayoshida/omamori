@@ -113,7 +113,7 @@ jobs:
         # Pin cargo-tarpaulin via taiki-e/install-action. `fallback: none`
         # disables the silent fallback-to-`cargo install`, so a registry
         # hiccup cannot cause the job to silently build an unpinned binary.
-        uses: taiki-e/install-action@58e862542551f667fa44c8a2a4a1d64ad477c96a # v2.75.17
+        uses: taiki-e/install-action@7769b73c2ec98c38dfcf2e18c83cfd4880c038c1 # v2.75.27
         with:
           tool: cargo-tarpaulin@0.35.2
           fallback: none
