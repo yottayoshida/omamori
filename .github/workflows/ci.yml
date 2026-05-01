@@ -55,6 +55,28 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
       - run: cargo test --locked
 
+  # Compile-check the criterion bench harnesses on the same macOS+Ubuntu
+  # matrix as `test`. This catches API drift between the lib crate and
+  # the bench harnesses (`omamori::unwrap::parse_command_string`,
+  # `omamori::{fuzz_check_command_for_hook,fuzz_extract_hook_input}`,
+  # `omamori::audit::*`) without paying the wall-clock cost of running
+  # the benches in CI (CI runner variance makes those numbers
+  # unreliable; measurement stays local). Regression budget = observe-
+  # only for v0.9.8.
+  bench-compile:
+    name: Bench compile-check
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    needs: action-pin-check
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - run: cargo bench --no-run --locked
+
   clippy:
     name: Clippy
     strategy:

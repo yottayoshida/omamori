@@ -54,3 +54,30 @@ shell-words = "1.1"
 [dev-dependencies]
 serial_test = "3"
 proptest = "1.11"
+criterion = "0.8.2"
+
+# Benchmarks live under `benches/` and are excluded from the crate tarball
+# via the `include` allowlist above (Invariant #4 / SECURITY.md). They run
+# locally with `cargo bench` and in CI as a compile-only check
+# (`cargo bench --no-run`). Regression budget for v0.9.8 is observe-only;
+# relative-comparison gating shifts in v0.9.9+.
+#
+# `[lib] bench = false` suppresses the implicit dummy bench harness Rust
+# would otherwise attach to the library crate, which would conflict with
+# `harness = false` on the explicit benches below (and emits warnings on
+# stable when no `#[bench]` items exist).
+
+[lib]
+bench = false
+
+[[bench]]
+name = "unwrap_parse"
+harness = false
+
+[[bench]]
+name = "hook_check"
+harness = false
+
+[[bench]]
+name = "audit_append"
+harness = false

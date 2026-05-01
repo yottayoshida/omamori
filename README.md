@@ -6,6 +6,8 @@
 [![License](https://img.shields.io/crates/l/omamori)](LICENSE-MIT)
 
 > Safety guard for AI CLI tools. Blocks dangerous commands — and resists being disabled.
+>
+> Hook check completes in **<0.1ms** — no perceivable latency.
 
 When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori intercepts destructive operations and replaces them with safe alternatives.
 
@@ -115,6 +117,8 @@ Available for Claude Code, Cursor, and Codex CLI.
 - Per-install secret; file paths HMAC-hashed (never stored in plaintext).
 - Set `retention_days` in config to automatically prune old entries — chain integrity is preserved across pruning.
 - Logging enabled by default; retention is opt-in via config.
+
+**Performance**: hook check completes in **well under 0.1ms** — typically ~1 µs to block, ~57 µs to allow. Subprocess startup by the AI tool itself dominates the cost, so omamori adds no perceivable latency. Measured locally with `cargo bench`; see [#124](https://github.com/yottayoshida/omamori/issues/124) for methodology and `benches/` for reproducible harnesses.
 
 **Self-defense**: AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting, config modification, and audit log/secret access via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
 
