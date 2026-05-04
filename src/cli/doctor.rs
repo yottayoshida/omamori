@@ -112,31 +112,30 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         let total = section_items.len();
         let all_ok = pass == total;
 
+        println!("  {} {pass}/{total}", section.heading());
         if all_ok {
-            println!("  {} {pass}/{total}", section.heading());
-        } else {
-            println!("  {} {pass}/{total}", section.heading());
-            for item in section_items {
-                if item.status == CheckStatus::Ok {
-                    if verbose {
-                        println!(
-                            "    {:<6} {} {}",
-                            item.status.label(),
-                            item.name,
-                            item.detail
-                        );
-                    }
-                    continue;
+            continue;
+        }
+        for item in section_items {
+            if item.status == CheckStatus::Ok {
+                if verbose {
+                    println!(
+                        "    {:<6} {} {}",
+                        item.status.label(),
+                        item.name,
+                        item.detail
+                    );
                 }
-                println!(
-                    "    {:<6} {} {}",
-                    item.status.label(),
-                    item.name,
-                    item.detail
-                );
-                if let Some(ref rem) = item.remediation {
-                    println!("           {}", remediation_hint(rem, ai_env));
-                }
+                continue;
+            }
+            println!(
+                "    {:<6} {} {}",
+                item.status.label(),
+                item.name,
+                item.detail
+            );
+            if let Some(ref rem) = item.remediation {
+                println!("           {}", remediation_hint(rem, ai_env));
             }
         }
     }
