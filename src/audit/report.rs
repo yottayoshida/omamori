@@ -12,8 +12,8 @@ use std::io::BufRead;
 use std::path::Path;
 
 use serde::Serialize;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use super::secret::{default_audit_path, open_read_nofollow};
 use super::verify::verify_chain;
