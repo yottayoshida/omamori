@@ -511,7 +511,7 @@ Operators who treat AI tool usage itself as confidential should run AI tools und
 
 **Design boundaries**:
 - Duration window is capped at 90 days (SEC-R4). Longer history is available via `audit show --all`.
-- `--json` output is limited to 7 fields (SEC-R2): `period_days`, `actual_window_days`, `total_blocks`, `by_layer`, `by_provider`, `chain_status`, `unknown_tool_fail_opens`. Per-rule breakdowns are human-only to avoid exposing attack optimization information to machine consumers.
+- `--json` output is limited to 7 fields (SEC-R2): `period_days`, `actual_window_days`, `total_blocks`, `by_layer`, `by_provider`, `chain_status`, `unknown_tool_fail_opens`. Per-rule breakdowns are not included in `report` output (human or JSON) to avoid exposing attack optimization information; use `audit show --rule <name>` for per-rule investigation.
 - Provider aggregation uses the `provider` field (e.g. `claude-code`, `codex-cli`), not internal wrapper names (channel separation maintained per v0.9.5 invariant).
 - Unknown-tool shapes are reported as counts only; detailed tool names require `audit unknown` (SEC-R7).
 

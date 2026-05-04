@@ -188,7 +188,7 @@ echo "exit=$?"
 |---|---|---|---|---|
 | Rep-1 | `omamori report` | `exit = 0 ∧ stdout ~~ /omamori report/` | default 7d report | [ ] |
 | Rep-2 | `omamori report --last 30d` | `exit = 0 ∧ stdout ~~ /last 30 days/` | explicit duration | [ ] |
-| Rep-3 | `omamori report --json \| jq keys` | `exit = 0 ∧ 7 keys (period_days, actual_window_days, total_blocks, by_layer, by_provider, chain_status, unknown_tool_fail_opens)` | SEC-R2 JSON schema | [ ] |
+| Rep-3 | `omamori report --json \| jq '[keys \| length == 7, has("by_rule") \| not] \| all'` | `exit = 0 ∧ output = true` | SEC-R2 JSON schema: exactly 7 fields, no by_rule | [ ] |
 | Rep-4 | `omamori report --last 91d` | `exit ≠ 0 ∧ stderr ~~ /out of range/` | SEC-R4 upper bound | [ ] |
 | Rep-5 | `omamori report --last 7` | `exit ≠ 0 ∧ stderr ~~ /invalid duration/` | no-unit rejection | [ ] |
 | Rep-6 | `omamori report --last 1d` | `exit = 0` | SEC-R4 lower bound | [ ] |

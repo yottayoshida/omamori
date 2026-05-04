@@ -189,8 +189,8 @@ fn aggregate_events(path: &Path, days: u32) -> Option<EventStats> {
             continue;
         }
 
-        // Count blocks (action = "deny")
-        if event.action == "deny" {
+        // Count blocks (action = "block", written by rules.rs Block variant)
+        if event.action == "block" {
             stats.total_blocks += 1;
 
             // by_layer: classify detection_layer into 3 buckets

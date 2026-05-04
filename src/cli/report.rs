@@ -116,13 +116,9 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
         );
     }
 
-    // Chain integrity
+    // Chain integrity (always shown; verbose adds seq detail)
     match &report.chain_status {
-        ChainStatus::Intact => {
-            if verbose {
-                println!("  Audit log: intact");
-            }
-        }
+        ChainStatus::Intact => println!("  Audit log: intact"),
         ChainStatus::Broken { at_seq } => {
             if verbose {
                 println!("  Audit log: broken at seq {at_seq}");
@@ -130,9 +126,7 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
                 println!("  Audit log: broken");
             }
         }
-        ChainStatus::Unavailable => {
-            println!("  Audit log: unavailable");
-        }
+        ChainStatus::Unavailable => println!("  Audit log: unavailable"),
     }
 
     // Follow-ups
@@ -239,6 +233,49 @@ mod tests {
         assert_eq!(json["total_blocks"], 0);
         assert_eq!(json["unknown_tool_fail_opens"], 0);
         assert_eq!(json["chain_status"]["status"], "unavailable");
+    }
+
+    #[test]
+    fn run_command_default_succeeds() {
+        let args: Vec<OsString> = vec!["omamori".into(), "report".into()];
+        let code = run_report_command(&args).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn run_command_with_last_flag() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "report".into(),
+            "--last".into(),
+            "30d".into(),
+        ];
+        let code = run_report_command(&args).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn run_command_with_json_flag() {
+        let args: Vec<OsString> = vec!["omamori".into(), "report".into(), "--json".into()];
+        let code = run_report_command(&args).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn run_command_invalid_duration_errors() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "report".into(),
+            "--last".into(),
+            "91d".into(),
+        ];
+        assert!(run_report_command(&args).is_err());
+    }
+
+    #[test]
+    fn run_command_unknown_flag_errors() {
+        let args: Vec<OsString> = vec!["omamori".into(), "report".into(), "--bogus".into()];
+        assert!(run_report_command(&args).is_err());
     }
 
     #[test]
