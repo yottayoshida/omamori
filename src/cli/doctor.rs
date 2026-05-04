@@ -522,7 +522,7 @@ fn print_all_items(items: &[CheckItem]) {
 // JSON output
 // ---------------------------------------------------------------------------
 
-fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i32, AppError> {
+fn build_json_output(items: &[CheckItem], fix_mode: bool) -> serde_json::Value {
     let json_items: Vec<serde_json::Value> = items
         .iter()
         .map(|item| {
@@ -558,7 +558,7 @@ fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i
         serde_json::json!({ "pass": pass, "total": section_items.len() })
     };
 
-    let output = serde_json::json!({
+    serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "mode": if fix_mode { "fix" } else { "diagnose" },
         "summary": {
@@ -568,13 +568,16 @@ fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i
             "integrity": section_summary(&sections[2].1),
         },
         "items": json_items,
-    });
+    })
+}
 
+fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i32, AppError> {
+    let output = build_json_output(items, fix_mode);
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
 
-    if has_fail {
+    if items.iter().any(|i| i.status == CheckStatus::Fail) {
         Ok(1)
-    } else if has_warn {
+    } else if items.iter().any(|i| i.status == CheckStatus::Warn) {
         Ok(2)
     } else {
         Ok(0)
@@ -823,40 +826,8 @@ mod tests {
                 remediation: Some(Remediation::RegenerateHooks),
             },
         ];
-        // Capture stdout by parsing the JSON that print_json produces
-        // (print_json writes to stdout, but we can verify structure via
-        // the same construction logic)
-        let sections = super::super::checks_display::group_by_section(&items);
-        let section_summary = |section_items: &[&CheckItem]| -> serde_json::Value {
-            let pass = section_items
-                .iter()
-                .filter(|i| i.status == CheckStatus::Ok)
-                .count();
-            serde_json::json!({ "pass": pass, "total": section_items.len() })
-        };
 
-        let output = serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "mode": "diagnose",
-            "summary": {
-                "protection_status": "fail",
-                "layer1": section_summary(&sections[0].1),
-                "layer2": section_summary(&sections[1].1),
-                "integrity": section_summary(&sections[2].1),
-            },
-            "items": items.iter().map(|item| {
-                let mut obj = serde_json::json!({
-                    "category": item.category,
-                    "name": item.name,
-                    "status": item.status.label(),
-                    "detail": item.detail,
-                });
-                if let Some(ref rem) = item.remediation {
-                    obj["remediation"] = serde_json::json!(remediation_to_str(rem));
-                }
-                obj
-            }).collect::<Vec<_>>(),
-        });
+        let output = build_json_output(&items, false);
 
         // Backward compat: items[] still present with expected shape
         let items_arr = output["items"].as_array().unwrap();
@@ -864,10 +835,11 @@ mod tests {
         assert!(items_arr[0].get("category").is_some());
         assert!(items_arr[0].get("name").is_some());
         assert!(items_arr[0].get("status").is_some());
+        assert_eq!(items_arr[1]["remediation"], "regenerate_hooks");
 
         // Additive: summary block present
         let summary = output.get("summary").unwrap();
-        assert!(summary.get("protection_status").is_some());
+        assert_eq!(summary["protection_status"], "fail");
         assert!(summary.get("layer1").is_some());
         assert!(summary.get("layer2").is_some());
         assert!(summary.get("integrity").is_some());
@@ -877,5 +849,9 @@ mod tests {
         assert_eq!(summary["layer1"]["total"], 1);
         assert_eq!(summary["layer2"]["pass"], 0);
         assert_eq!(summary["layer2"]["total"], 1);
+
+        // Top-level keys: version, mode, summary, items
+        assert!(output.get("version").is_some());
+        assert_eq!(output["mode"], "diagnose");
     }
 }
