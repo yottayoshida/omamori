@@ -219,7 +219,7 @@ fn aggregate_events(path: &Path, days: u32) -> Option<EventStats> {
 fn classify_layer(detection_layer: Option<&str>) -> String {
     match detection_layer {
         Some("layer1") => "layer1".to_string(),
-        Some(dl) if dl.starts_with("layer2") => "layer2".to_string(),
+        Some(dl) if dl == "layer2" || dl.starts_with("layer2:") => "layer2".to_string(),
         Some("shape-routing") => "shape-routing".to_string(),
         Some(dl) => dl.to_string(), // preserve unknown values
         None => "unclassified".to_string(),
@@ -237,8 +237,17 @@ mod tests {
         assert_eq!(classify_layer(Some("layer2:meta-pattern")), "layer2");
         assert_eq!(classify_layer(Some("layer2:pipe-to-shell:sudo")), "layer2");
         assert_eq!(classify_layer(Some("layer2:structural")), "layer2");
+        assert_eq!(classify_layer(Some("layer2")), "layer2");
         assert_eq!(classify_layer(Some("shape-routing")), "shape-routing");
         assert_eq!(classify_layer(None), "unclassified");
+    }
+
+    #[test]
+    fn test_classify_layer_rejects_false_prefixes() {
+        assert_eq!(classify_layer(Some("layer20")), "layer20");
+        assert_eq!(classify_layer(Some("layer2evil")), "layer2evil");
+        assert_eq!(classify_layer(Some("layer2/")), "layer2/");
+        assert_eq!(classify_layer(Some("layer3")), "layer3");
     }
 
     #[test]
@@ -256,6 +265,90 @@ mod tests {
         assert!(report.by_layer.is_empty());
         assert!(report.by_provider.is_empty());
         assert_eq!(report.chain_status, ChainStatus::Unavailable);
+    }
+
+    fn make_event_line(
+        action: &str,
+        provider: &str,
+        detection_layer: Option<&str>,
+        minutes_ago: i64,
+    ) -> String {
+        let ts = OffsetDateTime::now_utc() - time::Duration::minutes(minutes_ago);
+        let ts_str = ts.format(&Rfc3339).unwrap();
+        let dl = match detection_layer {
+            Some(v) => format!("\"{v}\""),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"timestamp":"{ts_str}","provider":"{provider}","command":"test","rule_id":null,"action":"{action}","result":"done","target_count":0,"target_hash":"","detection_layer":{dl}}}"#,
+        )
+    }
+
+    fn write_temp_audit(lines: &[String], tag: &str) -> std::path::PathBuf {
+        let dir = std::env::var("HOME").unwrap();
+        let path = std::path::PathBuf::from(dir)
+            .join(format!(".omamori-test-{}-{tag}.jsonl", std::process::id()));
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn test_action_block_counted_deny_ignored() {
+        let lines = vec![
+            make_event_line("block", "claude-code", Some("layer1"), 10),
+            make_event_line("block", "claude-code", Some("layer2:rule"), 20),
+            make_event_line("deny", "claude-code", Some("layer1"), 30),
+            make_event_line("allow", "claude-code", Some("layer1"), 40),
+        ];
+        let path = write_temp_audit(&lines, "action");
+        let stats = aggregate_events(&path, 1).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(stats.total_blocks, 2);
+        assert_eq!(*stats.by_layer.get("layer1").unwrap_or(&0), 1);
+        assert_eq!(*stats.by_layer.get("layer2").unwrap_or(&0), 1);
+    }
+
+    #[test]
+    fn test_empty_provider_mapped_to_none() {
+        let lines = vec![make_event_line("block", "", Some("layer1"), 10)];
+        let path = write_temp_audit(&lines, "provider");
+        let stats = aggregate_events(&path, 1).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(stats.total_blocks, 1);
+        assert_eq!(*stats.by_provider.get("none").unwrap_or(&0), 1);
+        assert!(!stats.by_provider.contains_key(""));
+    }
+
+    #[test]
+    fn test_unknown_tool_fail_open_isolation() {
+        let lines = vec![
+            make_event_line("unknown_tool_fail_open", "claude-code", Some("layer1"), 10),
+            make_event_line("unknown_tool_fail_open", "codex", None, 20),
+            make_event_line("block", "claude-code", Some("layer1"), 30),
+        ];
+        let path = write_temp_audit(&lines, "unknown");
+        let stats = aggregate_events(&path, 1).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(stats.unknown_tool_fail_opens, 2);
+        assert_eq!(stats.total_blocks, 1);
+        assert_eq!(stats.by_layer.len(), 1);
+        assert_eq!(stats.by_provider.len(), 1);
+    }
+
+    #[test]
+    fn test_events_outside_window_excluded() {
+        let lines = vec![
+            make_event_line("block", "claude-code", Some("layer1"), 10),
+            make_event_line("block", "claude-code", Some("layer1"), 60 * 24 * 8),
+        ];
+        let path = write_temp_audit(&lines, "window");
+        let stats = aggregate_events(&path, 7).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(stats.total_blocks, 1);
     }
 
     #[test]
