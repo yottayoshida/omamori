@@ -5,13 +5,16 @@
 //! - `retention`: Automatic pruning of old entries
 //! - `secret`: HMAC key management, symlink-safe I/O, key rotation
 //! - `verify`: Chain verification, entry display, summary for CLI
+//! - `report`: Aggregation for `omamori report` (v0.10.0, #221)
 
 pub mod chain;
+pub mod report;
 pub mod retention;
 pub mod secret;
 pub mod verify;
 
 // --- Public re-exports (maintain `omamori::audit::*` API paths) ---
+pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, rotate_key};
 pub use verify::{
     AuditError, AuditSummary, ShowOptions, VerifyResult, audit_summary,
