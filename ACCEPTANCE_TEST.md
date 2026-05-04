@@ -171,8 +171,8 @@ echo "exit=$?"
 omamori report --last 30d
 echo "exit=$?"
 
-# Rep-3: JSON output
-omamori report --json | jq keys
+# Rep-3: JSON schema (SEC-R2: 7 fields, no by_rule)
+omamori report --json | jq '[keys | length == 7, has("by_rule") | not] | all'
 echo "exit=$?"
 
 # Rep-4: out-of-range duration
