@@ -131,7 +131,11 @@ mod tests {
         let groups = group_by_section(&items);
         assert!(groups[0].1.is_empty(), "Layer1 should be empty");
         assert!(groups[1].1.is_empty(), "Layer2 should be empty");
-        assert_eq!(groups[2].1.len(), 2, "both unknowns should land in Integrity");
+        assert_eq!(
+            groups[2].1.len(),
+            2,
+            "both unknowns should land in Integrity"
+        );
     }
 
     #[test]
