@@ -8,6 +8,7 @@
 //! - `config_cmd`: `omamori config/override/init` + config mutation
 
 pub(crate) mod audit_cmd;
+pub(crate) mod checks_display;
 pub(crate) mod config_cmd;
 pub(crate) mod doctor;
 pub(crate) mod explain;
