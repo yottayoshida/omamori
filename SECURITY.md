@@ -505,6 +505,18 @@ This is consistent with the same-user OS threat model: HMAC integrity protects a
 
 Operators who treat AI tool usage itself as confidential should run AI tools under a dedicated OS user, mount the audit directory on an encrypted volume keyed outside the home directory, or both.
 
+### Report Read Access (v0.10.0+)
+
+`omamori report` aggregates audit log data into summary statistics (block counts by layer/provider, unknown-tool fail-open counts, chain integrity status). This is the same data surface as `audit show` — read-only, no AI environment guard — consistent with the same-user OS threat model established above.
+
+**Design boundaries**:
+- Duration window is capped at 90 days (SEC-R4). Longer history is available via `audit show --all`.
+- `--json` output is limited to 7 fields (SEC-R2): `period_days`, `actual_window_days`, `total_blocks`, `by_layer`, `by_provider`, `chain_status`, `unknown_tool_fail_opens`. Per-rule breakdowns are not included in `report` output (human or JSON) to avoid exposing attack optimization information; use `audit show --rule <name>` for per-rule investigation.
+- Provider aggregation uses the `provider` field (e.g. `claude-code`, `codex-cli`), not internal wrapper names (channel separation maintained per v0.9.5 invariant).
+- Unknown-tool shapes are reported as counts only; detailed tool names require `audit unknown` (SEC-R7).
+
+**Accepted risk**: An AI agent polling `omamori report --json` on a schedule can observe activity patterns (block frequency, provider distribution). This is inherent to the same-user model — the agent can already read `audit.jsonl` directly. The report subcommand adds convenience, not new information surface.
+
 ### Secret Loss
 
 If the secret file is deleted or unreadable:
