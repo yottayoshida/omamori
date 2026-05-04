@@ -8,10 +8,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::AppError;
+use crate::audit::report::{ChainStatus, aggregate_report};
 use crate::engine::guard::guard_ai_config_modification;
 use crate::installer;
 use crate::integrity::{self, CheckItem, CheckStatus, Remediation};
 use crate::util::usage_text;
+
+use super::checks_display::group_by_section;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -84,90 +87,129 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
 // ---------------------------------------------------------------------------
 
 fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
+    let has_fail = items.iter().any(|i| i.status == CheckStatus::Fail);
+    let has_warn = items.iter().any(|i| i.status == CheckStatus::Warn);
+
+    // Top-line: Protection status
+    let status_word = if has_fail {
+        "FAIL"
+    } else if has_warn {
+        "WARN"
+    } else {
+        "OK"
+    };
+    println!("Protection status: {status_word}");
+    println!();
+
+    let sections = group_by_section(items);
+    let ai_env = is_ai_environment();
+
+    for (section, section_items) in &sections {
+        let pass = section_items
+            .iter()
+            .filter(|i| i.status == CheckStatus::Ok)
+            .count();
+        let total = section_items.len();
+        let all_ok = pass == total;
+
+        if all_ok {
+            println!("  {} {pass}/{total}", section.heading());
+        } else {
+            println!("  {} {pass}/{total}", section.heading());
+            for item in section_items {
+                if item.status == CheckStatus::Ok {
+                    if verbose {
+                        println!(
+                            "    {:<6} {} {}",
+                            item.status.label(),
+                            item.name,
+                            item.detail
+                        );
+                    }
+                    continue;
+                }
+                println!(
+                    "    {:<6} {} {}",
+                    item.status.label(),
+                    item.name,
+                    item.detail
+                );
+                if let Some(ref rem) = item.remediation {
+                    println!("           {}", remediation_hint(rem, ai_env));
+                }
+            }
+        }
+    }
+
+    // Section 4: Recent risk signals (from audit aggregation)
+    print_risk_signals_section();
+
+    println!();
+
     let problems: Vec<_> = items
         .iter()
         .filter(|i| i.status != CheckStatus::Ok)
         .collect();
-
-    if problems.is_empty() {
-        // Healthy: 3-line summary
-        let total = items.len();
-        let ok_count = items.iter().filter(|i| i.status == CheckStatus::Ok).count();
-        println!("omamori: all healthy");
-        println!("  {ok_count}/{total} checks passed");
-        print_unknown_tool_fail_open_summary();
-        if verbose {
-            println!();
-            print_all_items(items);
-        } else {
-            println!("  run `omamori doctor --verbose` for full details");
-        }
-        return Ok(0);
-    }
-
-    // Unhealthy: show problems only
-    println!("omamori doctor: {} issue(s) found\n", problems.len());
-
-    for item in &problems {
-        let label = item.status.label();
-        println!(
-            "  {:<6} [{}] {} {}",
-            label, item.category, item.name, item.detail
-        );
-        if let Some(ref rem) = item.remediation {
-            println!("         {}", remediation_hint(rem));
+    if !problems.is_empty() {
+        let has_fixable = problems.iter().any(|i| {
+            i.remediation
+                .as_ref()
+                .is_some_and(|r| !matches!(r, Remediation::ManualOnly(_)))
+        });
+        if has_fixable {
+            println!("  run `omamori doctor --fix` to auto-repair");
         }
     }
 
-    println!();
-    print_unknown_tool_fail_open_summary();
-    let has_fixable = problems.iter().any(|i| {
-        i.remediation
-            .as_ref()
-            .is_some_and(|r| !matches!(r, Remediation::ManualOnly(_)))
-    });
-    if has_fixable {
-        println!("  run `omamori doctor --fix` to auto-repair");
-    }
-
-    if verbose {
+    if verbose && !items.is_empty() {
         println!();
         println!("All checks:");
         print_all_items(items);
+    } else if problems.is_empty() {
+        println!("  run `omamori doctor --verbose` for full details");
     }
 
-    // exit code: 1 if any Fail, 2 if only Warn
-    if problems.iter().any(|i| i.status == CheckStatus::Fail) {
+    if has_fail {
         Ok(1)
-    } else {
+    } else if has_warn {
         Ok(2)
+    } else {
+        Ok(0)
     }
 }
 
-/// PR6 (#182): print a summary of `unknown_tool_fail_open` events from
-/// the last 30 days. Skipped when zero so doctor stays quiet on healthy
-/// installs (per UX release blocker: zero must not generate noise).
+/// Section 4: Recent risk signals from audit aggregation (last 30 days).
 ///
-/// Best-effort: any error loading config / reading the audit log makes
-/// this a silent no-op rather than failing doctor.
-///
-/// Clock-skew assumption (#190 B-4, v0.9.7+): the cutoff is computed as
-/// `OffsetDateTime::now_utc() - Duration::days(30)` and applied as a `>=`
-/// filter on `event.timestamp` (see [`crate::audit::count_unknown_tool_fail_opens_within`]).
-/// Significant NTP rewinds or other clock anomalies move the cutoff window
-/// and silently shrink or zero the count. The surfaced number is a drift
-/// indicator, not a forensic counter; SECURITY.md `## Scope: unknown / new
-/// tools (v0.9.6+)` carries the user-facing version of this caveat (full
-/// heading quoted to make a future rename a hard build/lint signal rather
-/// than a silent partial-substring miss).
-fn print_unknown_tool_fail_open_summary() {
+/// Uses `aggregate_report` from PR 1 to surface blocks and unknown-tool
+/// fail-opens. Zero counts are suppressed (healthy install = quiet).
+/// Best-effort: config/audit read failures → silent no-op.
+fn print_risk_signals_section() {
     let Ok(load_result) = crate::config::load_config(None) else {
         return;
     };
-    let count = crate::audit::count_unknown_tool_fail_opens_within(&load_result.config.audit, 30);
-    if count > 0 {
-        println!("  Last 30 days: {count} unknown-tool fail-open(s) detected");
-        println!("  Review: omamori audit unknown");
+    let report = aggregate_report(&load_result.config.audit, 30);
+
+    let has_blocks = report.total_blocks > 0;
+    let has_unknown = report.unknown_tool_fail_opens > 0;
+    let chain_broken = matches!(report.chain_status, ChainStatus::Broken { .. });
+
+    if !has_blocks && !has_unknown && !chain_broken {
+        println!("  [Risk signals] Last 30 days: quiet");
+        return;
+    }
+
+    println!("  [Risk signals] Last 30 days");
+    if has_blocks {
+        println!("    {} block(s)", report.total_blocks);
+    }
+    if has_unknown {
+        println!(
+            "    {} unknown-tool fail-open(s) — review: omamori audit unknown",
+            report.unknown_tool_fail_opens
+        );
+    }
+    if let ChainStatus::Broken { .. } = &report.chain_status {
+        println!("    chain: broken — run omamori audit verify");
     }
 }
 
@@ -226,7 +268,7 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 1. RunInstall (covers shims + hooks + baseline)
     if needs_install {
-        print!("  [install] re-running full install...");
+        print!("  [Layer 1] re-running full install...");
         match run_install_repair(base_dir) {
             Ok(()) => {
                 println!(" [fixed]");
@@ -241,7 +283,7 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 2. RegenerateHooks (only if install wasn't needed)
     if needs_regen_hooks {
-        print!("  [hooks] regenerating hook scripts...");
+        print!("  [Layer 2] regenerating hook scripts...");
         match installer::regenerate_hooks(base_dir) {
             Ok(()) => {
                 println!(" [fixed]");
@@ -256,7 +298,7 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 3. ChmodConfig
     for path in &chmod_targets {
-        print!("  [config] chmod 600 {}...", path.display());
+        print!("  [Integrity] chmod 600 {}...", path.display());
         match chmod_600(path) {
             Ok(()) => {
                 println!(" [fixed]");
@@ -271,7 +313,7 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 4. RegenerateBaseline (LAST per DI-10)
     if needs_regen_baseline {
-        print!("  [baseline] regenerating integrity baseline...");
+        print!("  [Integrity] regenerating integrity baseline...");
         match regen_baseline(base_dir) {
             Ok(()) => {
                 println!(" [fixed]");
@@ -416,34 +458,43 @@ fn chmod_600(_path: &Path) -> Result<(), AppError> {
 // Display helpers
 // ---------------------------------------------------------------------------
 
-fn remediation_hint(rem: &Remediation) -> String {
-    match rem {
-        Remediation::RunInstall => "fix: run `omamori install`".to_string(),
-        Remediation::RegenerateHooks => "fix: run `omamori install --hooks`".to_string(),
-        Remediation::RegenerateBaseline => {
-            "fix: run `omamori install` to update baseline".to_string()
+/// SEC-R5: in AI environments, suppress literal commands to prevent
+/// AI agents from learning repair invocations as attack surface.
+fn remediation_hint(rem: &Remediation, ai_env: bool) -> String {
+    if ai_env {
+        match rem {
+            Remediation::ManualOnly(hint) => format!("manual: {hint}"),
+            _ => "fix: run omamori doctor --fix directly in your terminal (not via AI)".to_string(),
         }
-        Remediation::ChmodConfig(path) => format!("fix: run `chmod 600 {}`", path.display()),
-        Remediation::ManualOnly(hint) => format!("manual: {hint}"),
+    } else {
+        match rem {
+            Remediation::RunInstall => "fix: run `omamori install`".to_string(),
+            Remediation::RegenerateHooks => "fix: run `omamori install --hooks`".to_string(),
+            Remediation::RegenerateBaseline => {
+                "fix: run `omamori install` to update baseline".to_string()
+            }
+            Remediation::ChmodConfig(path) => format!("fix: run `chmod 600 {}`", path.display()),
+            Remediation::ManualOnly(hint) => format!("manual: {hint}"),
+        }
     }
 }
 
+/// Lightweight AI environment check reusing the detector infrastructure.
+fn is_ai_environment() -> bool {
+    let detectors = crate::config::default_detectors();
+    let env_pairs: Vec<(String, String)> = std::env::vars().collect();
+    let detection = crate::detector::evaluate_detectors(&detectors, &env_pairs);
+    detection.protected
+}
+
 fn print_all_items(items: &[CheckItem]) {
-    let categories = [
-        "Shims",
-        "Hooks",
-        "Config",
-        "Core Policy",
-        "PATH",
-        "Baseline",
-    ];
-    for cat in &categories {
-        let cat_items: Vec<_> = items.iter().filter(|i| i.category == *cat).collect();
-        if cat_items.is_empty() {
+    let sections = group_by_section(items);
+    for (section, section_items) in &sections {
+        if section_items.is_empty() {
             continue;
         }
-        println!("  {}:", cat);
-        for item in &cat_items {
+        println!("  {}:", section.heading());
+        for item in section_items {
             println!(
                 "    {:<6} {:<36} {}",
                 item.status.label(),
@@ -475,18 +526,42 @@ fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i
         })
         .collect();
 
+    let has_fail = items.iter().any(|i| i.status == CheckStatus::Fail);
+    let has_warn = items.iter().any(|i| i.status == CheckStatus::Warn);
+    let protection_status = if has_fail {
+        "fail"
+    } else if has_warn {
+        "warn"
+    } else {
+        "ok"
+    };
+
+    let sections = group_by_section(items);
+    let section_summary = |section_items: &[&CheckItem]| -> serde_json::Value {
+        let pass = section_items
+            .iter()
+            .filter(|i| i.status == CheckStatus::Ok)
+            .count();
+        serde_json::json!({ "pass": pass, "total": section_items.len() })
+    };
+
     let output = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "mode": if fix_mode { "fix" } else { "diagnose" },
+        "summary": {
+            "protection_status": protection_status,
+            "layer1": section_summary(&sections[0].1),
+            "layer2": section_summary(&sections[1].1),
+            "integrity": section_summary(&sections[2].1),
+        },
         "items": json_items,
     });
 
     println!("{}", serde_json::to_string_pretty(&output).unwrap());
 
-    // exit code based on items
-    if items.iter().any(|i| i.status == CheckStatus::Fail) {
+    if has_fail {
         Ok(1)
-    } else if items.iter().any(|i| i.status == CheckStatus::Warn) {
+    } else if has_warn {
         Ok(2)
     } else {
         Ok(0)
@@ -512,21 +587,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remediation_hint_formats_correctly() {
+    fn remediation_hint_non_ai() {
         assert_eq!(
-            remediation_hint(&Remediation::RunInstall),
+            remediation_hint(&Remediation::RunInstall, false),
             "fix: run `omamori install`"
         );
         assert_eq!(
-            remediation_hint(&Remediation::RegenerateHooks),
+            remediation_hint(&Remediation::RegenerateHooks, false),
             "fix: run `omamori install --hooks`"
         );
         assert_eq!(
-            remediation_hint(&Remediation::ChmodConfig(PathBuf::from("/tmp/config.toml"))),
+            remediation_hint(
+                &Remediation::ChmodConfig(PathBuf::from("/tmp/config.toml")),
+                false
+            ),
             "fix: run `chmod 600 /tmp/config.toml`"
         );
         assert_eq!(
-            remediation_hint(&Remediation::ManualOnly("do something".to_string())),
+            remediation_hint(&Remediation::ManualOnly("do something".to_string()), false),
+            "manual: do something"
+        );
+    }
+
+    #[test]
+    fn remediation_hint_ai_env_suppresses_literals() {
+        let generic = "fix: run omamori doctor --fix directly in your terminal (not via AI)";
+        assert_eq!(remediation_hint(&Remediation::RunInstall, true), generic);
+        assert_eq!(
+            remediation_hint(&Remediation::RegenerateHooks, true),
+            generic
+        );
+        assert_eq!(
+            remediation_hint(&Remediation::RegenerateBaseline, true),
+            generic
+        );
+        assert_eq!(
+            remediation_hint(&Remediation::ManualOnly("do something".to_string()), true),
             "manual: do something"
         );
     }
