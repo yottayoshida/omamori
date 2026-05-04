@@ -19,6 +19,7 @@ use cli::doctor::run_doctor_command;
 use cli::explain::run_explain_command;
 use cli::install::{run_install_command, run_uninstall_command};
 use cli::policy_test::run_policy_test_command;
+use cli::report::run_report_command;
 use cli::status::run_status_command;
 use engine::exec::run_exec_command;
 use engine::hook::{run_cursor_hook, run_hook_check};
@@ -84,6 +85,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("audit") => run_audit_command(args),
         Some("doctor") => run_doctor_command(args),
         Some("explain") => run_explain_command(args),
+        Some("report") => run_report_command(args),
         Some("status") => run_status_command(args),
         Some("cursor-hook") => run_cursor_hook(),
         Some("hook-check") => run_hook_check(args),

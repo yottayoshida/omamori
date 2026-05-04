@@ -237,6 +237,8 @@ omamori test [--config PATH]             # Verify policy rules
 omamori status [--refresh]               # Health check all defense layers
 omamori exec [--config PATH] -- CMD      # Run command through policy engine
 
+omamori report [--last 7d] [--json]      # Aggregate audit summary (1d–90d)
+
 omamori audit verify                     # Verify hash chain integrity (exit 0/1/2)
 omamori audit show [--last N] [--json]   # View recent audit entries (default: last 20)
 omamori audit show --all                 # View all entries

@@ -152,10 +152,48 @@ echo "exit=$?"
 
 | # | コマンド | AI-executable assertion | 人間 summary | PASS |
 |---|---------|-------------------------|--------------|------|
-| D-1 | `omamori doctor` | `exit = 0 ∧ stdout ~~ /healthy/` | 健全環境で summary 表示 | [ ] |
+| D-1 | `omamori doctor` | `exit = 0 ∧ stdout ~~ /Protection status: OK/` | 健全環境で trust dashboard 表示 | [ ] |
 | D-2 | `omamori doctor --verbose` | `exit = 0 ∧ stdout 行数 ≥ 10` | 全チェック項目表示 | [ ] |
 | D-3 | 上記 fenced block の D-3 dry-run | `exit = 2 ∧ stderr ~~ /omamori hook:/` | hook-check が block (Layer 1 + Layer 2 両判定経路) | [ ] |
 | D-4 | 上記 fenced block の D-4 dry-run | `exit = 0` | hook-check が allow | [ ] |
+| D-5 | `omamori doctor --json \| jq .summary` | `exit = 0 ∧ summary.protection_status = "ok" ∧ summary に layer1/layer2/integrity` | JSON summary block 存在確認 | [ ] |
+| D-6 | `omamori doctor --json \| jq '.items[0].category'` | category field が文字列 | JSON items[] backward compat | [ ] |
+| D-7 | `omamori doctor` 出力に `[Layer 1]` `[Layer 2]` `[Integrity]` セクション | `stdout ~~ /\[Layer 1\]/` | 4-section trust dashboard 構造 | [ ] |
+
+## Report (Rep-*)
+
+```bash
+# Rep-1: default (7d)
+omamori report
+echo "exit=$?"
+
+# Rep-2: explicit duration
+omamori report --last 30d
+echo "exit=$?"
+
+# Rep-3: JSON output
+omamori report --json | jq keys
+echo "exit=$?"
+
+# Rep-4: out-of-range duration
+omamori report --last 91d 2>&1
+echo "exit=$?"
+
+# Rep-5: invalid format
+omamori report --last 7 2>&1
+echo "exit=$?"
+```
+
+| ID | Command | Expected | Rationale | Done |
+|---|---|---|---|---|
+| Rep-1 | `omamori report` | `exit = 0 ∧ stdout ~~ /omamori report/` | default 7d report | [ ] |
+| Rep-2 | `omamori report --last 30d` | `exit = 0 ∧ stdout ~~ /last 30 days/` | explicit duration | [ ] |
+| Rep-3 | `omamori report --json \| jq keys` | `exit = 0 ∧ 7 keys (period_days, actual_window_days, total_blocks, by_layer, by_provider, chain_status, unknown_tool_fail_opens)` | SEC-R2 JSON schema | [ ] |
+| Rep-4 | `omamori report --last 91d` | `exit ≠ 0 ∧ stderr ~~ /out of range/` | SEC-R4 upper bound | [ ] |
+| Rep-5 | `omamori report --last 7` | `exit ≠ 0 ∧ stderr ~~ /invalid duration/` | no-unit rejection | [ ] |
+| Rep-6 | `omamori report --last 1d` | `exit = 0` | SEC-R4 lower bound | [ ] |
+| Rep-7 | `omamori report --json --last 7d \| jq .chain_status.status` | `"intact" or "broken" or "unavailable"` | chain_status 3-state (SEC-R8) | [ ] |
+| Rep-8 | `omamori report --json \| jq 'has("by_rule")'` | `false` | by_rule absent from JSON (SEC-R2) | [ ] |
 
 ## Audit Trail (A-*)
 
@@ -270,7 +308,7 @@ rmdir "$TEST_DIR"
 - **全 row PASS**: リリース可
 - **S-* または H-* または R-* に FAIL**: リリース不可、原因調査必須
 - **T-* に FAIL**: リリース不可、セキュリティクリティカル
-- **D-* または A-* に FAIL**: 機能 bug、重大度判断してリリース可否決定
+- **D-* または Rep-* または A-* に FAIL**: 機能 bug、重大度判断してリリース可否決定
 
 ---
 
@@ -289,6 +327,8 @@ rmdir "$TEST_DIR"
 | T-3 (PATH precedence) | `tests/cli.rs` の install path / shim ordering 確認 (直接 mapping は弱い、smoke check) |
 | D-1 / D-2 (`doctor`) | `tests/cli.rs` の doctor サブテスト |
 | D-3 / D-4 (`hook-check` dry-run) | `tests/cli.rs` の `cursor_hook_*` 系および `claude-code` provider テスト |
+| D-5 / D-6 / D-7 (`doctor --json` / trust dashboard) | `src/cli/doctor.rs` の `json_output_has_summary_and_items` + `checks_display.rs` tests |
+| Rep-* (`report`) | `src/cli/report.rs` の unit test 群 (duration parser, JSON schema, chain_status serialization) |
 | A-* (audit trail) | audit 専用 integration test (file format, HMAC chain, XDG path) |
 
 > 完全 1:1 mapping (各 acceptance row に対応する specific CI case 名) は follow-up PR (full 3D matrix 投入時) で確立予定。本 PR1 では領域単位の対応のみ示す。

@@ -24,6 +24,7 @@ pub(crate) fn usage_text() -> &'static str {
   omamori audit verify                                    # Verify hash chain integrity
   omamori audit show [--last N] [--json] [--all]          # View audit log entries
   omamori doctor [--fix] [--verbose] [--json]             # Diagnose and repair installation
+  omamori report [--last <duration>] [--json] [--verbose] # Aggregate audit summary (e.g. --last 7d)
   omamori explain [--json] [--config PATH] -- <cmd...>   # Explain what would happen to a command
   omamori status [--refresh]                              # Health check all defense layers
   omamori override disable <rule>                        # Override a core safety rule
