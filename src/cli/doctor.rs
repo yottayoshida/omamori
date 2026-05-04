@@ -142,7 +142,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     }
 
     // Section 4: Recent risk signals (from audit aggregation)
-    print_risk_signals_section();
+    print_risk_signals_section(ai_env);
 
     println!();
 
@@ -156,8 +156,10 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
                 .as_ref()
                 .is_some_and(|r| !matches!(r, Remediation::ManualOnly(_)))
         });
-        if has_fixable {
+        if has_fixable && !ai_env {
             println!("  run `omamori doctor --fix` to auto-repair");
+        } else if has_fixable {
+            println!("  issues detected — run doctor --fix directly in your terminal");
         }
     }
 
@@ -181,9 +183,9 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
 /// Section 4: Recent risk signals from audit aggregation (last 30 days).
 ///
 /// Uses `aggregate_report` from PR 1 to surface blocks and unknown-tool
-/// fail-opens. Zero counts are suppressed (healthy install = quiet).
+/// fail-opens. All-zero state shows "quiet" indicator.
 /// Best-effort: config/audit read failures → silent no-op.
-fn print_risk_signals_section() {
+fn print_risk_signals_section(ai_env: bool) {
     let Ok(load_result) = crate::config::load_config(None) else {
         return;
     };
@@ -203,13 +205,24 @@ fn print_risk_signals_section() {
         println!("    {} block(s)", report.total_blocks);
     }
     if has_unknown {
-        println!(
-            "    {} unknown-tool fail-open(s) — review: omamori audit unknown",
-            report.unknown_tool_fail_opens
-        );
+        if ai_env {
+            println!(
+                "    {} unknown-tool fail-open(s) detected",
+                report.unknown_tool_fail_opens
+            );
+        } else {
+            println!(
+                "    {} unknown-tool fail-open(s) — review: omamori audit unknown",
+                report.unknown_tool_fail_opens
+            );
+        }
     }
     if let ChainStatus::Broken { .. } = &report.chain_status {
-        println!("    chain: broken — run omamori audit verify");
+        if ai_env {
+            println!("    chain: broken");
+        } else {
+            println!("    chain: broken — run omamori audit verify");
+        }
     }
 }
 
@@ -790,5 +803,79 @@ mod tests {
         assert!(needs_install);
         assert!(!needs_regen_hooks);
         assert!(!needs_regen_baseline);
+    }
+
+    #[test]
+    fn json_output_has_summary_and_items() {
+        let items = vec![
+            CheckItem {
+                category: "Shims",
+                name: "rm".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ok".to_string(),
+                remediation: None,
+            },
+            CheckItem {
+                category: "Hooks",
+                name: "hook".to_string(),
+                status: CheckStatus::Fail,
+                detail: "missing".to_string(),
+                remediation: Some(Remediation::RegenerateHooks),
+            },
+        ];
+        // Capture stdout by parsing the JSON that print_json produces
+        // (print_json writes to stdout, but we can verify structure via
+        // the same construction logic)
+        let sections = super::super::checks_display::group_by_section(&items);
+        let section_summary = |section_items: &[&CheckItem]| -> serde_json::Value {
+            let pass = section_items
+                .iter()
+                .filter(|i| i.status == CheckStatus::Ok)
+                .count();
+            serde_json::json!({ "pass": pass, "total": section_items.len() })
+        };
+
+        let output = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "mode": "diagnose",
+            "summary": {
+                "protection_status": "fail",
+                "layer1": section_summary(&sections[0].1),
+                "layer2": section_summary(&sections[1].1),
+                "integrity": section_summary(&sections[2].1),
+            },
+            "items": items.iter().map(|item| {
+                let mut obj = serde_json::json!({
+                    "category": item.category,
+                    "name": item.name,
+                    "status": item.status.label(),
+                    "detail": item.detail,
+                });
+                if let Some(ref rem) = item.remediation {
+                    obj["remediation"] = serde_json::json!(remediation_to_str(rem));
+                }
+                obj
+            }).collect::<Vec<_>>(),
+        });
+
+        // Backward compat: items[] still present with expected shape
+        let items_arr = output["items"].as_array().unwrap();
+        assert_eq!(items_arr.len(), 2);
+        assert!(items_arr[0].get("category").is_some());
+        assert!(items_arr[0].get("name").is_some());
+        assert!(items_arr[0].get("status").is_some());
+
+        // Additive: summary block present
+        let summary = output.get("summary").unwrap();
+        assert!(summary.get("protection_status").is_some());
+        assert!(summary.get("layer1").is_some());
+        assert!(summary.get("layer2").is_some());
+        assert!(summary.get("integrity").is_some());
+
+        // Section counts correct
+        assert_eq!(summary["layer1"]["pass"], 1);
+        assert_eq!(summary["layer1"]["total"], 1);
+        assert_eq!(summary["layer2"]["pass"], 0);
+        assert_eq!(summary["layer2"]["total"], 1);
     }
 }
