@@ -809,6 +809,53 @@ mod tests {
     }
 
     #[test]
+    fn json_summary_protection_status_warn_only() {
+        let items = vec![CheckItem {
+            category: "PATH",
+            name: "shim order".to_string(),
+            status: CheckStatus::Warn,
+            detail: "after /usr/bin".to_string(),
+            remediation: Some(Remediation::ManualOnly("fix PATH".to_string())),
+        }];
+        let output = build_json_output(&items, false);
+        assert_eq!(output["summary"]["protection_status"], "warn");
+    }
+
+    #[test]
+    fn json_summary_protection_status_all_ok() {
+        let items = vec![
+            CheckItem {
+                category: "Shims",
+                name: "rm".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ok".to_string(),
+                remediation: None,
+            },
+            CheckItem {
+                category: "Hooks",
+                name: "hook".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ok".to_string(),
+                remediation: None,
+            },
+        ];
+        let output = build_json_output(&items, false);
+        assert_eq!(output["summary"]["protection_status"], "ok");
+    }
+
+    #[test]
+    fn remediation_hint_ai_env_suppresses_chmod() {
+        let generic = "fix: run omamori doctor --fix directly in your terminal (not via AI)";
+        assert_eq!(
+            remediation_hint(
+                &Remediation::ChmodConfig(PathBuf::from("/etc/omamori/config.toml")),
+                true
+            ),
+            generic
+        );
+    }
+
+    #[test]
     fn json_output_has_summary_and_items() {
         let items = vec![
             CheckItem {

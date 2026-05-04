@@ -81,6 +81,60 @@ mod tests {
     }
 
     #[test]
+    fn test_group_by_section_preserves_order() {
+        let items = vec![
+            CheckItem {
+                category: "Shims",
+                name: "cp".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ok".to_string(),
+                remediation: None,
+            },
+            CheckItem {
+                category: "Shims",
+                name: "rm".to_string(),
+                status: CheckStatus::Fail,
+                detail: "missing".to_string(),
+                remediation: None,
+            },
+            CheckItem {
+                category: "Shims",
+                name: "mv".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ok".to_string(),
+                remediation: None,
+            },
+        ];
+        let groups = group_by_section(&items);
+        let names: Vec<&str> = groups[0].1.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["cp", "rm", "mv"]);
+    }
+
+    #[test]
+    fn test_unknown_categories_land_in_integrity() {
+        let items = vec![
+            CheckItem {
+                category: "FutureCategory",
+                name: "a".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ok".to_string(),
+                remediation: None,
+            },
+            CheckItem {
+                category: "",
+                name: "b".to_string(),
+                status: CheckStatus::Ok,
+                detail: "ok".to_string(),
+                remediation: None,
+            },
+        ];
+        let groups = group_by_section(&items);
+        assert!(groups[0].1.is_empty(), "Layer1 should be empty");
+        assert!(groups[1].1.is_empty(), "Layer2 should be empty");
+        assert_eq!(groups[2].1.len(), 2, "both unknowns should land in Integrity");
+    }
+
+    #[test]
     fn test_group_by_section() {
         let items = vec![
             CheckItem {
