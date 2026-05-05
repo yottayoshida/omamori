@@ -5,15 +5,13 @@
 [![homebrew](https://img.shields.io/badge/homebrew-tap-blue)](https://github.com/yottayoshida/homebrew-tap)
 [![License](https://img.shields.io/crates/l/omamori)](LICENSE-MIT)
 
-> Safety guard for AI CLI tools. Blocks dangerous commands — and resists being disabled.
+> Deterministic semantic guard for AI CLI tools. Blocks covered destructive commands and self-disablement attempts, with tamper-evident audit trails.
 >
-> Hook check completes in **<0.1ms** — no perceivable latency.
+> Fast local checks — no model calls, no daemon, no network dependency.
 
-When AI tools like Claude Code, Codex, or Cursor run shell commands, omamori intercepts destructive operations and replaces them with safe alternatives.
+omamori is not a sandbox or a permission classifier. It is a local deterministic semantic guard for AI-triggered shell commands: it blocks covered destructive command classes before execution, blocks AI-driven self-disablement attempts, and runs alongside sandbox isolation and provider-level permission systems.
 
-Unlike other guards, omamori defends itself — AI agents cannot disable or bypass its protection ([#22](https://github.com/yottayoshida/omamori/issues/22)).
-
-**macOS only** — Terminal commands are never affected; omamori only activates when it detects an AI tool's environment variable. See [Tool Compatibility](#tool-compatibility) for supported AI tools and CI coverage.
+**macOS only** — terminal commands are passed through unless an AI tool environment is detected. See [Tool Compatibility](#tool-compatibility) for supported AI tools and coverage.
 
 ![omamori demo](demo.svg)
 
@@ -35,7 +33,21 @@ omamori doctor
 
 That's it. Works with Claude Code Auto mode — no extra config needed.
 
-> Requires omamori >= 0.9.0 for `doctor` and `explain` commands. For Cursor and Codex CLI, see [Tool Compatibility](#tool-compatibility).
+> `report` and the trust-dashboard `doctor` output require omamori >= 0.10.0.
+
+## Verifiable Claims
+
+What omamori claims, and how to verify each one:
+
+| Claim | Verified by |
+|-------|-------------|
+| Covered destructive command classes are blocked or redirected | `omamori test`, CI |
+| Supported hook deny events are written to a tamper-evident audit chain | `omamori audit verify` |
+| Installed defense layers are present and intact | `omamori doctor`, `omamori status` |
+| Hook checks are local and deterministic — no model calls, no network dependency | source, CI |
+| AI-driven self-disablement attempts are blocked in supported tool paths | acceptance test suite |
+
+Bypass classes outside this coverage scope remain possible — this is inherent to the PATH-shim and static-analysis approach. See [SECURITY.md](SECURITY.md) for the full bypass corpus and defense boundary.
 
 ## What It Blocks
 
@@ -56,25 +68,21 @@ That's it. Works with Claude Code Auto mode — no extra config needed.
 
 </details>
 
+Layer 2 hooks additionally block evasion patterns such as pipe-to-shell (`curl URL | bash`), dynamic command generation (`bash -c "$(cmd)"`), environment-variable tampering, and PATH override attempts targeting shimmed commands.
+
 All rules are customizable via TOML config. See [Configuration](#configuration) below.
 
 ## Tool Compatibility
 
-### Supported tiers
+| Tool | Status | Coverage | Notes |
+|------|--------|----------|-------|
+| Claude Code | Supported | Layer 1 + Layer 2 | PreToolUse hook installed automatically. Auto Mode compatible. |
+| Codex CLI | Supported | Layer 1 + Layer 2 | Hooks and config auto-configured during install. |
+| Cursor | Supported | Layer 1 + Layer 2 | Re-merge generated hook snippet after upgrade. |
+| Gemini CLI, Cline, others | Community | Layer 1 only | Not E2E tested. |
+| Any tool setting `AI_GUARD=1` | Fallback | Layer 1 only | Generic opt-in detection. |
 
-| Tier | Tools | Coverage |
-|------|-------|----------|
-| **Supported** | Claude Code, Codex CLI, Cursor | E2E tested. Layer 1 + Layer 2. Auto mode compatible. |
-| **Community** | Gemini CLI, Cline, others | Layer 1 only. Not E2E tested. |
-| **Fallback** | Any tool setting `AI_GUARD=1` | Layer 1 only. |
-
-> The demo image above is a Claude Code capture; the same `block` / `log-only` / `trash` behaviour applies on Codex CLI and Cursor when their env vars are detected.
-
-### Tool-specific notes
-
-- **Claude Code**: hooks applied automatically. No action needed.
-- **Codex CLI**: hooks and config auto-configured during install. Auto-sync regenerates wrappers on `brew upgrade`.
-- **Cursor**: after `brew upgrade`, re-merge the hook snippet from `~/.omamori/hooks/cursor-hooks.snippet.json` into `.cursor/hooks.json`.
+> The demo image above is a Claude Code capture; the same `block` / `log-only` / `trash` behavior applies on Codex CLI and Cursor when their env vars are detected.
 
 ### Platforms
 
@@ -102,37 +110,48 @@ Terminal → rm -rf src/
           deleted normally
 ```
 
-**Layer 1 — PATH shim**: symlinks for `rm`, `git`, `chmod`, `find`, `rsync` point to omamori. Rules apply only when an AI environment variable is detected.
+### Defense layers
 
-**Layer 2 — Hooks**: evaluates commands against the same rules as Layer 1, with three additional capabilities:
-- Recursively unwraps shell wrappers (`sudo env bash -c "..."` → extracts inner command).
-- Blocks pipe-to-shell patterns (`curl URL | bash`, `curl URL | sudo bash`, and other transparent-wrapper variants — see [SECURITY.md](SECURITY.md)).
-- Blocks dynamic command generation (`bash -c "$(cmd)"`).
+| Capability | What it does | Verified by |
+|------------|--------------|-------------|
+| **Layer 1 — PATH shim** | Intercepts destructive commands (`rm`, `git`, `chmod`, `find`, `rsync`) by name when an AI env var is detected | `omamori test`, CI |
+| **Layer 2 — Hooks** | Catches evasion patterns: shell wrappers, pipe-to-shell, dynamic generation, PATH override bypass | Hook integration tests |
+| **Self-defense** | Blocks `config disable`, `uninstall`, hook/config editing, env-var unsetting while AI-detected | Acceptance test suite |
+| **Audit chain** | HMAC-SHA256 signed, hash-chained tamper-evident JSONL log at `~/.local/share/omamori/audit.jsonl` | `omamori audit verify` |
+| **Integrity monitoring** | Verifies shims, hooks, config, core policy, PATH order. Detects subtle hook body rewrites | `omamori doctor`, `omamori status` |
+| **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, Claude Code settings.json | Hook integration tests |
+| **Auto-sync** | Detects version mismatch after `brew upgrade` and auto-regenerates hook files | Smoke test |
 
-Available for Claude Code, Cursor, and Codex CLI.
+Core policy: the 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
 
-**Audit log**: records every command decision in a tamper-evident log — if an AI agent modifies any entry, the chain breaks and tampering is detected.
-- Tamper-evident JSONL log at `~/.local/share/omamori/audit.jsonl`.
-- HMAC-SHA256 signed and hash-chained — tampering breaks the chain and is detected.
-- Per-install secret; file paths HMAC-hashed (never stored in plaintext).
-- Set `retention_days` in config to automatically prune old entries — chain integrity is preserved across pruning.
-- Logging enabled by default; retention is opt-in via config.
+**Performance**: hook check completes in well under 0.1ms in the benchmark harness — typically ~1 µs to block and ~57 µs to allow. Subprocess startup by the AI tool dominates total cost. See `benches/` and [#124](https://github.com/yottayoshida/omamori/issues/124) for methodology.
 
-**Performance**: hook check completes in **well under 0.1ms** — typically ~1 µs to block, ~57 µs to allow. Subprocess startup by the AI tool itself dominates the cost, so omamori adds no perceivable latency. Measured locally with `cargo bench`; see [#124](https://github.com/yottayoshida/omamori/issues/124) for methodology and `benches/` for reproducible harnesses.
+### Verifiability
 
-**Self-defense**: AI agents cannot `config disable`, `uninstall`, or edit `config.toml` while detected. Hooks block env var unsetting, config modification, and audit log/secret access via shell commands. This is a key differentiator from other CLI guards — omamori assumes adversarial AI behavior and defends against it.
+`doctor` groups installation checks into Layer 1, Layer 2, and Integrity, then adds recent risk signals from the audit report.
 
-**Auto mode compatible**: works seamlessly with Claude Code's [Auto mode](https://claude.com/blog/auto-mode) — safe commands proceed without prompts, dangerous commands are still hard-blocked.
+<!-- update output samples when doctor/report format changes -->
+```
+$ omamori doctor
+Protection status: OK
 
-**Auto-sync**: after `brew upgrade`, the shim detects version mismatch and auto-regenerates hook files on the next invocation.
+  [Layer 1] PATH shims 6/6
+  [Layer 2] Hook defense 4/4
+  [Integrity] Config & baseline 3/3
+  [Risk signals] Last 30 days: quiet
 
-**Core policy**: the 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is silently ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
+  run `omamori doctor --verbose` for full details
 
-**Integrity monitoring** (`omamori status`): verifies all defense layers are intact — shims, hooks, config, core policy, PATH order. Detects tampering including subtle hook edits where the version comment is preserved but the body is rewritten.
+$ omamori report --last 7d
+omamori report — last 7 days
 
-**File protection**: AI Edit/Write operations on omamori's own files (config, hooks, audit log, integrity baseline, Claude Code settings.json) are blocked. See [SECURITY.md](SECURITY.md) for the full protected file list.
+  Block events: 42
+    by layer: layer2: 42
+    by provider: claude-code: 38, codex: 4
+  Audit log: intact
+```
 
-## Real-world Effect
+## Field Notes
 
 omamori is dogfooded daily on the developer's own setup. Recent observed cases:
 
