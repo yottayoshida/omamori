@@ -128,7 +128,7 @@ echo "exit=$?"
 | T-1 | Claude Code session で `omamori uninstall` を AI agent に実行させる | `exit = 2 ∧ stderr ~~ /omamori (hook:\|protected)/` | self-uninstall block (自己防衛、`meta-pattern-uninstall-block` 経路) | [ ] |
 | T-2 | Claude Code session で AI agent に `omamori config disable rm-recursive-to-trash` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook: blocked/` | config 改変 block (`meta-pattern-config-disable-block` 経路、実機 message 例: `omamori hook: blocked — blocked attempt to modify omamori rules`) | [ ] |
 | T-3 (precedence smoke check) | raw terminal で `which rm` (PATH を変更しない素の状態で) | `which rm` 出力が `~/.omamori/shim/rm` を含む | shim が PATH 先頭にあることの baseline 確認 | [ ] |
-| T-3' (bypass attempt 検出) | Claude Code session で AI agent に `PATH=/usr/bin:$PATH rm dummy.txt` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook:/` | hook が PATH 改変付き invocation を block (env-tampering 系または PATH 改変 detection) | [ ] |
+| T-3' (bypass attempt 検出) | Claude Code session で AI agent に `PATH=/usr/bin:$PATH rm dummy.txt` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook:/` | hook が PATH 改変付き invocation を block — v0.10.1 `detect_path_shim_bypass()` で closure (#227) | [ ] |
 
 ## Doctor / Explain (D-*)
 
