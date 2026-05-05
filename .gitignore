@@ -31,3 +31,4 @@ fuzz/Cargo.lock
 investigation/
 PLAN.md
 CLAUDE.local.md
+.issue_222_body.tmp.md
