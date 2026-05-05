@@ -44,7 +44,9 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
         with:
-          toolchain: nightly
+          # Pinned: nightly-2026-05-04+ breaks cargo-fuzz 0.13.1 via rustix 0.36.5
+          # (rustc_attrs reservation). Unpin once cargo-fuzz ships a fix.
+          toolchain: nightly-2026-05-03
 
       - name: Install cargo-fuzz
         # taiki-e/install-action does not currently ship cargo-fuzz binaries,
@@ -62,7 +64,7 @@ jobs:
           else
             DURATION=30
           fi
-          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=$DURATION
+          cargo +nightly-2026-05-03 fuzz run ${{ matrix.target }} -- -max_total_time=$DURATION
 
       - name: Upload crash artifacts
         if: failure()
