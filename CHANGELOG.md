@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.1] - 2026-05-05
+
+**Summary**: PATH bypass closure + defense boundary matrix. Layer 2 hook now detects PATH-override patterns (`PATH=/usr/bin:$PATH rm`, `env PATH=/usr/bin rm`, and GNU env grammar variants) that bypass the Layer 1 shim ([#227](https://github.com/yottayoshida/omamori/issues/227)). README reframed from feature catalog to bounded-guarantee style with verifiable claims table and deterministic-guard positioning. SECURITY.md gains a Defense Boundary Matrix (caught / not caught by design / structural limit) and a known-bypass-becomes-row maintenance rule. New RELEASE.md codifies the three-tier release gate (patch / security / v1.0).
+
+### Added
+
+- **`detect_path_shim_bypass()`** in `src/engine/hook.rs` ([#227](https://github.com/yottayoshida/omamori/issues/227)). Phase 1B detection for two categories: (1) inline `PATH=` assignment followed by a `SHIM_COMMANDS` member, (2) `env` grammar variants (`env`, `env -i`, `env -u`, `env --`, `/usr/bin/env`) with `PATH=` override targeting shimmed commands. Uses `installer::SHIM_COMMANDS` as single source of truth. Returns `BlockMeta("path_shim_bypass")`.
+- **Defense Boundary Matrix** in SECURITY.md. Three-category table: Caught (13 surfaces with layer coverage), Not caught by design (2 surfaces), Not caught structural limit (5 surfaces). Each row maps attack surface → layer coverage → verification method.
+- **Known-bypass-becomes-row rule** in SECURITY.md. Every new bypass must produce a matrix row, a `hook_integration.rs` corpus entry, and a Known Limitations entry.
+- **RELEASE.md**. Three-tier release gate model: patch (CI gates), security-affecting (bypass corpus + matrix + live path), v1.0 (full live-path acceptance).
+- 17 unit tests and 8 integration test cases for PATH override detection.
+
+### Changed
+
+- **README.md** reframed as verifiable deterministic guard ([#222](https://github.com/yottayoshida/omamori/issues/222)). "Guarantees" → "Verifiable Claims" with each claim mapped to a verification command. Position statement: "deterministic semantic guard — no model calls, no daemon, no network dependency." Capability paragraphs consolidated into Defense Layers table. Tool Compatibility restructured as per-tool matrix. "Real-world Effect" → "Field Notes."
+- **ACCEPTANCE_TEST.md** T-3' updated to reference `detect_path_shim_bypass()` closure.
+- **SECURITY.md** Hook Coverage table: PATH override bypass row added. Known Limitations section A: v0.10.1 closure row added. Operator reading-path updated to include Defense Boundary Matrix.
+
+### Fixed
+
+- **PATH override shim bypass** ([#227](https://github.com/yottayoshida/omamori/issues/227)). `PATH=/usr/bin:$PATH rm dummy.txt` previously bypassed Layer 1 shim and was not detected by Layer 2 hook. Now blocked as `BlockMeta("path_shim_bypass")`. Acceptance test T-3' now PASS.
+
+### References
+
+- [#229](https://github.com/yottayoshida/omamori/pull/229) — `fix(hook): detect PATH override that bypasses shim protection`. Closes [#227](https://github.com/yottayoshida/omamori/issues/227).
+- [#231](https://github.com/yottayoshida/omamori/pull/231) — `docs(readme): reframe as verifiable deterministic guard (#222 part 1)`.
+- [#232](https://github.com/yottayoshida/omamori/pull/232) — `docs(security): add Defense Boundary Matrix (#222 part 2)`.
+- [#233](https://github.com/yottayoshida/omamori/pull/233) — `docs: add RELEASE.md + update ACCEPTANCE_TEST.md T-3'`. Closes [#222](https://github.com/yottayoshida/omamori/issues/222).
+- [#230](https://github.com/yottayoshida/omamori/pull/230) — `ci(fuzz): pin nightly to 2026-05-03`.
+
 ## [0.10.0] - 2026-05-04
 
 **Summary**: Verifiability release — `omamori report` audit aggregation subcommand ([#221](https://github.com/yottayoshida/omamori/issues/221)) and `omamori doctor` trust dashboard restructure ([#220](https://github.com/yottayoshida/omamori/issues/220)). The report subcommand surfaces block counts by layer/provider, unknown-tool fail-open counts, and hash-chain integrity status over a configurable time window (1d–90d). The doctor command is restructured from a flat checklist into a 4-section trust dashboard (Layer 1 → Layer 2 → Integrity → Recent risk signals) with a top-line `Protection status: OK / WARN / FAIL` verdict and a new `--json` summary block for programmatic consumption. Together these close the verifiability gap: users can now answer "is omamori working?" (doctor) and "what has omamori done?" (report) without reading raw audit logs.
