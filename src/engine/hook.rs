@@ -149,21 +149,19 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
         }
 
         // Category 1: inline assignment — `PATH=/xxx <shim_cmd>`
-        if token
-            .strip_prefix("PATH=")
-            .is_some()
-        {
+        if token.strip_prefix("PATH=").is_some() {
             // Find the next non-assignment token (the command)
             let mut cmd_idx = i + 1;
             while cmd_idx < tokens.len() && unwrap::is_env_assignment(&tokens[cmd_idx]) {
                 cmd_idx += 1;
             }
             if cmd_idx < tokens.len() {
-                let cmd_base = tokens[cmd_idx].rsplit('/').next().unwrap_or(&tokens[cmd_idx]);
+                let cmd_base = tokens[cmd_idx]
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&tokens[cmd_idx]);
                 if shim_cmds.contains(&cmd_base) {
-                    return Some(
-                        "blocked PATH override that bypasses shim protection",
-                    );
+                    return Some("blocked PATH override that bypasses shim protection");
                 }
             }
         }
@@ -210,9 +208,7 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
             if found_path_override && pos < tokens.len() {
                 let cmd_base = tokens[pos].rsplit('/').next().unwrap_or(&tokens[pos]);
                 if shim_cmds.contains(&cmd_base) {
-                    return Some(
-                        "blocked PATH override that bypasses shim protection",
-                    );
+                    return Some("blocked PATH override that bypasses shim protection");
                 }
             }
         }
