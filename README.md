@@ -41,7 +41,7 @@ What omamori promises, and how to verify each one:
 
 | Guarantee | Verified by |
 |-----------|-------------|
-| Covered destructive commands are blocked or redirected | `omamori test`, CI |
+| Known destructive command classes are blocked or redirected | `omamori test`, CI |
 | Tamper-evident audit trail records every decision | `omamori audit verify` |
 | All defense layers intact | `omamori doctor` |
 | No perceivable latency (<0.1ms per check) | `cargo bench` |
@@ -81,7 +81,7 @@ Layer 2 hooks additionally block **pipe-to-shell** (`curl URL | bash`), **dynami
 | **Community** | Gemini CLI, Cline, others | Layer 1 only. Not E2E tested. |
 | **Fallback** | Any tool setting `AI_GUARD=1` | Layer 1 only. |
 
-> The demo image above is a Claude Code capture; the same `block` / `log-only` / `trash` behaviour applies on Codex CLI and Cursor when their env vars are detected.
+> The demo image above is a Claude Code capture; the same `block` / `log-only` / `trash` behavior applies on Codex CLI and Cursor when their env vars are detected.
 
 ### Tool-specific notes
 
@@ -127,10 +127,11 @@ Terminal → rm -rf src/
 | **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, Claude Code settings.json | Hook integration tests |
 | **Auto-sync** | Detects version mismatch after `brew upgrade` and auto-regenerates hook files | Smoke test |
 
-Core policy: the 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is silently ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
+Core policy: the 7 built-in rules cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
 
 ### Verifiability
 
+<!-- update output samples when doctor/report format changes -->
 ```
 $ omamori doctor
 Protection status: OK
