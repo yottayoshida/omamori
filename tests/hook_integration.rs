@@ -713,6 +713,51 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "v027-proc-sub-pkexec-bash-block",
     ),
+    // 22. PATH override shim bypass (#227) — inline assignment
+    (
+        "PATH=/usr/bin:$PATH rm dummy.txt",
+        Decision::Block,
+        "path-override-inline-rm-block",
+    ),
+    (
+        "PATH=/usr/bin git status",
+        Decision::Block,
+        "path-override-inline-git-block",
+    ),
+    // 22b. PATH override shim bypass — env grammar
+    (
+        "env PATH=/usr/bin rm file",
+        Decision::Block,
+        "path-override-env-rm-block",
+    ),
+    (
+        "/usr/bin/env PATH=/usr/bin rm file",
+        Decision::Block,
+        "path-override-usr-bin-env-rm-block",
+    ),
+    (
+        "env -i PATH=/usr/bin rm file",
+        Decision::Block,
+        "path-override-env-i-rm-block",
+    ),
+    // 22c. PATH override — compound command with semicolon
+    (
+        "echo ok; PATH=/usr/bin rm file",
+        Decision::Block,
+        "path-override-compound-block",
+    ),
+    // 22d. PATH override — FP guard: non-shim command must Allow
+    (
+        "PATH=/custom/dir node script.js",
+        Decision::Allow,
+        "path-override-non-shim-allow",
+    ),
+    // 22e. PATH override — FP guard: export PATH must Allow
+    (
+        "export PATH=/usr/local/bin:$PATH",
+        Decision::Allow,
+        "path-override-export-allow",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES

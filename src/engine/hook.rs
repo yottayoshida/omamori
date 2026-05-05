@@ -137,6 +137,90 @@ fn detect_env_var_tampering(tokens: &[String]) -> Option<&'static str> {
     None
 }
 
+/// Detect PATH override + shim command bypass at the token level.
+/// Blocks: `PATH=/usr/bin:$PATH rm file`, `env PATH=/usr/bin rm file`, etc.
+/// Allows: `export PATH=...`, `PATH=/x node script.js` (node not shimmed).
+fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
+    let shim_cmds = installer::SHIM_COMMANDS;
+
+    for (i, token) in tokens.iter().enumerate() {
+        if !is_command_position(tokens, i) {
+            continue;
+        }
+
+        // Category 1: inline assignment — `PATH=/xxx <shim_cmd>`
+        if token
+            .strip_prefix("PATH=")
+            .is_some()
+        {
+            // Find the next non-assignment token (the command)
+            let mut cmd_idx = i + 1;
+            while cmd_idx < tokens.len() && unwrap::is_env_assignment(&tokens[cmd_idx]) {
+                cmd_idx += 1;
+            }
+            if cmd_idx < tokens.len() {
+                let cmd_base = tokens[cmd_idx].rsplit('/').next().unwrap_or(&tokens[cmd_idx]);
+                if shim_cmds.contains(&cmd_base) {
+                    return Some(
+                        "blocked PATH override that bypasses shim protection",
+                    );
+                }
+            }
+        }
+
+        // Category 2: env grammar — `env [opts] PATH=/xxx <shim_cmd>`
+        let base = token.rsplit('/').next().unwrap_or(token);
+        if base == "env" {
+            let mut pos = i + 1;
+            let mut found_path_override = false;
+            let mut past_options = false;
+
+            while pos < tokens.len() {
+                let t = &tokens[pos];
+
+                if !past_options {
+                    if t == "--" {
+                        past_options = true;
+                        pos += 1;
+                        continue;
+                    }
+                    // -u KEY (separate)
+                    if t == "-u" || t == "-S" || t == "-C" || t == "-P" {
+                        pos += 2;
+                        continue;
+                    }
+                    // -i, -0, -v, or combined flags like -uKEY, -CDIR
+                    if t.starts_with('-') {
+                        pos += 1;
+                        continue;
+                    }
+                }
+                // KEY=VAL — check if it's a PATH override (valid before and after --)
+                if unwrap::is_env_assignment(t) {
+                    if t.starts_with("PATH=") {
+                        found_path_override = true;
+                    }
+                    pos += 1;
+                    continue;
+                }
+                // First non-flag, non-assignment token = the command
+                break;
+            }
+
+            if found_path_override && pos < tokens.len() {
+                let cmd_base = tokens[pos].rsplit('/').next().unwrap_or(&tokens[pos]);
+                if shim_cmds.contains(&cmd_base) {
+                    return Some(
+                        "blocked PATH override that bypasses shim protection",
+                    );
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Phase 1A (meta-patterns), Phase 1B (env tampering), and the structural
 /// branch of Phase 2 (parse-error / pipe-to-shell). Returns
 /// `Err(verdict)` for any early-return case, or `Ok(invocations)` for the
@@ -166,10 +250,13 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
     //   Phase 1A has already run. Phase 2 blocks malformed commands via
     //   ParseResult::Block(ParseError) — fail-close (unwrap.rs:77).
     let normalized = unwrap::normalize_compound_operators(command);
-    if let Ok(tokens) = shell_words::split(&normalized)
-        && let Some(reason) = detect_env_var_tampering(&tokens)
-    {
-        return Err(HookCheckResult::BlockMeta(reason));
+    if let Ok(tokens) = shell_words::split(&normalized) {
+        if let Some(reason) = detect_env_var_tampering(&tokens) {
+            return Err(HookCheckResult::BlockMeta(reason));
+        }
+        if let Some(reason) = detect_path_shim_bypass(&tokens) {
+            return Err(HookCheckResult::BlockMeta(reason));
+        }
     }
 
     // Phase 2 parse: structural block (parse error / pipe-to-shell etc.)
@@ -1765,5 +1852,111 @@ mod tests {
     #[serial_test::serial]
     fn phase1b_benign_env_assignment_in_string() {
         assert_allows("echo 'CLAUDECODE=test'");
+    }
+
+    // --- BLOCK: PATH override shim bypass (#227) — all use assert_blocks_meta ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_inline_rm() {
+        assert_blocks_meta("PATH=/usr/bin:$PATH rm dummy.txt");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_inline_git() {
+        assert_blocks_meta("PATH=/usr/bin git status");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_inline_chmod() {
+        assert_blocks_meta("PATH=/opt/bin chmod 755 file");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_inline_find() {
+        assert_blocks_meta("PATH=/usr/bin find . -name foo");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_inline_rsync() {
+        assert_blocks_meta("PATH=/usr/bin rsync -a src/ dst/");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_empty_value_rm() {
+        assert_blocks_meta("PATH= rm file");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_env_rm() {
+        assert_blocks_meta("env PATH=/usr/bin rm file");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_env_i_rm() {
+        assert_blocks_meta("env -i PATH=/usr/bin rm file");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_env_u_home_path_rm() {
+        assert_blocks_meta("env -uHOME PATH=/usr/bin rm file");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_env_dashdash_rm() {
+        assert_blocks_meta("env -- PATH=/usr/bin rm file");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_usr_bin_env_rm() {
+        assert_blocks_meta("/usr/bin/env PATH=/usr/bin rm file");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_env_git() {
+        assert_blocks_meta("env PATH=/opt/git/bin git push");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_compound_tail() {
+        assert_blocks_meta("echo ok; PATH=/usr/bin rm file");
+    }
+
+    // --- ALLOW: PATH override with non-shim commands ---
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_non_shim_node() {
+        assert_allows("PATH=/custom/dir node script.js");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_non_shim_python() {
+        assert_allows("PATH=/opt/python/bin python -c 'print(1)'");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_export_path() {
+        assert_allows("export PATH=/usr/local/bin:$PATH");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn phase1b_path_override_env_non_shim() {
+        assert_allows("env PATH=/custom/dir node script.js");
     }
 }
