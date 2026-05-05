@@ -6,7 +6,7 @@ This document covers omamori's security model, threat analysis, and known limita
 
 | If you are... | Read in this order |
 |---|---|
-| **An operator** evaluating omamori for your team | [Security Model](#security-model) → [What It Protects](#what-it-protects-v090) → [Structural Limits](#structural-limits) → [Hook Coverage (Layer 2)](#hook-coverage-layer-2) → [Safe Defaults](#safe-defaults) |
+| **An operator** evaluating omamori for your team | [Security Model](#security-model) → [What It Protects](#what-it-protects-v090) → [Defense Boundary Matrix](#defense-boundary-matrix-v0101) → [Structural Limits](#structural-limits) → [Safe Defaults](#safe-defaults) |
 | **A security researcher** auditing the design | [Design Invariants](#design-invariants-v090) → [Bypass Corpus Testing](#bypass-corpus-testing-v041) → [Audit Log](#audit-log-v070) → [Integrity Monitoring](#integrity-monitoring-v050) |
 | **A contributor** preparing a PR | [AI-assisted Contribution Invariants](#ai-assisted-contribution-invariants-v093) |
 
@@ -28,6 +28,57 @@ For end-user installation and CLI usage, see [README.md](README.md). For known l
 - `find -delete` / `find --delete`
 - `rsync --delete` and 7 variants (`--del`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`, `--delete-delay`, `--remove-source-files`)
 - Custom rules defined via `config.toml`
+
+### Defense Boundary Matrix (v0.10.1+)
+
+What is caught, what is not, and why. Status values: **supported** (tested, expected to work) · **partial** (covered in some but not all tool paths) · **out of scope** (deliberate design decision) · **structural limit** (cannot be addressed by static analysis).
+
+#### Caught
+
+| Surface | Layer 1 (shim) | Layer 2 (hook) | Verified by |
+|---------|----------------|----------------|-------------|
+| Destructive recursive removal (`rm -rf`) | supported | supported | `omamori test`, CI, hook integration |
+| `git reset --hard` | supported | supported | `omamori test`, CI, hook integration |
+| `git push --force` / `git clean -f` | supported | supported | `omamori test`, CI, hook integration |
+| `chmod 777` | supported | supported | `omamori test`, CI, hook integration |
+| `find -delete` / `rsync --delete` variants | supported | supported | `omamori test`, CI, hook integration |
+| Full-path execution (`/bin/rm -rf`) | not covered | supported | Hook integration meta-pattern tests |
+| Shell wrapper evasion (`sudo env bash -c "rm -rf"`) | not covered | supported | Hook integration unwrap tests |
+| Pipe-to-shell (`curl URL \| bash` and wrapper variants) | not covered | supported | Hook integration pipe-to-shell corpus |
+| Dynamic command generation (`bash -c "$(cmd)"`) | not covered | supported (fail-close) | Hook integration |
+| PATH override bypass (`PATH=/usr/bin:$PATH rm`) | not covered | supported (v0.10.1) | Hook integration, acceptance test T-3' |
+| Env-var tampering (`unset CLAUDECODE`, `export -n`) | not covered | supported | Hook integration env-tampering corpus |
+| Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (string pattern) | Acceptance tests |
+| Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code, Codex CLI) | Hook integration file-protection tests |
+
+#### Not caught — by design
+
+| Surface | Reason | Reference |
+|---------|--------|-----------|
+| Interpreter commands (`python -c "shutil.rmtree(...)"`) | Zero real-world incidents in target tools; protocol-level enforcement (MCP) is the right layer | [#74](https://github.com/yottayoshida/omamori/issues/74) |
+| Commands outside the curated rule set | omamori guards a narrow set of known destructive patterns, not arbitrary commands | [Security Model](#security-model) |
+
+#### Not caught — structural limit
+
+| Surface | Why | Mitigation |
+|---------|-----|------------|
+| Obfuscated commands (base64, hex, variable indirection) | Static analysis cannot decode runtime-constructed commands | Sandbox isolation |
+| `bash -c "$VAR"` (variable set earlier in shell) | Requires runtime evaluation | Sandbox isolation |
+| `alias rm='/bin/rm'` | Alias overrides bypass string matching | Layer 2 hooks cover AI tool paths |
+| Heredoc / encoded payloads decoded at execution time | Static analysis boundary | Sandbox isolation |
+| `source /dev/fd/N N<&0` (fd-dup stdin alias) | Requires parsing redirection fd equivalence | Direct `source /dev/stdin` after pipe IS caught |
+
+For per-tool hook coverage (Claude Code vs Codex CLI vs Cursor), see [Hook Coverage (Layer 2)](#hook-coverage-layer-2). For the full closure history, see [Known limitations (KNOWN_LIMIT)](#known-limitations-known_limit).
+
+### Known-bypass-becomes-row rule
+
+When a new bypass surfaces, the response is not just a code fix. It is also:
+
+1. A row added to the Defense Boundary Matrix above.
+2. A corpus entry added to `tests/hook_integration.rs`.
+3. An entry in the [Known limitations](#known-limitations-known_limit) section (if closed) or Structural limits table (if not closable).
+
+This rule ensures that the boundary matrix and test corpus grow together and that bypass discovery is treated as a documentation event, not just a code event.
 
 ### v0.2.0 Security Changes
 
@@ -167,6 +218,7 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 | Process substitution (`bash <(...)`) | **Blocked** |
 | Dynamic generation (`bash -c "$(cmd)"`) | **Blocked** (fail-close) |
 | `env KEY=VAL cmd` | KEY=VAL pairs skipped; actual command evaluated |
+| PATH override bypass (`PATH=/usr/bin:$PATH rm`, `env PATH=/usr/bin rm`) | **Blocked** (v0.10.1). Inline assignment and `env` grammar variants detected via `detect_path_shim_bypass()` using `SHIM_COMMANDS` as single source of truth. See [#227](https://github.com/yottayoshida/omamori/issues/227). |
 
 ### Supported Shell List
 
@@ -324,6 +376,7 @@ These cover everything omamori does *not* protect against, separated by why. (A)
 | `curl URL \| bash -c 'source /dev/stdin'` (shell launcher reading piped payload) | v0.9.6 | Note: the v0.9.5 coarse rule already blocks any bare shell on a pipe RHS as pipe-to-shell (modulo info-only flags / positional script paths listed in the v0.9.5 row). The v0.9.6 scope 6 closure is the **launcher-internal detection** layered on top: an inner `source` or `.` (POSIX dot) builtin reading `/dev/stdin`, `/dev/fd/0`, or `/proc/self/fd/0` is recognised at the launcher boundary as a tested subset of the broader pipe-to-shell policy. The non-pipe common case `bash -c 'source /dev/stdin' < file` (explicit stdin redirect) remains Allow. `eval` / `exec` reading runtime stdin are **not yet** in the launcher-boundary closure — those remain in C below. See `tests/hook_integration.rs` corpus entry `pipe-launcher-source-stdin-block`. PR2 ([#184](https://github.com/yottayoshida/omamori/pull/184)) scope 6. |
 | `curl URL \| doas bash` / `curl URL \| pkexec bash` (privilege-escalation wrappers) | v0.9.6 | OpenBSD `doas` and polkit `pkexec` are recognised as transparent elevation wrappers; pipe-RHS `doas bash` / `pkexec bash` block. Legitimate `doas -u user <non-shell-cmd>` remains Allow (FP-pinned). See `tests/hook_integration.rs` corpus entries `pipe-wrapper-evasion-doas-block` / `pipe-wrapper-evasion-pkexec-block`. PR2 ([#184](https://github.com/yottayoshida/omamori/pull/184)) scope 7. |
 | Forward-compat fail-open on renamed tools | v0.9.6 | `HookInput::UnknownTool` no longer short-circuit-allows. `tool_input` shape (`command`/`cmd`/`file_path`/`path`/`url`) routes through the full pipeline regardless of `tool_name`; wrong-type fields (e.g. `command: 42`) fail closed. Unrecognised shapes still allow but emit `unknown_tool_fail_open` audit events and a one-line stderr hint per invocation. Refs [#182](https://github.com/yottayoshida/omamori/issues/182). |
+| `PATH=/usr/bin:$PATH rm` / `env PATH=/usr/bin rm` (PATH override shim bypass) | v0.10.1 | Phase 1B `detect_path_shim_bypass()` detects inline `PATH=` assignment and `env` grammar variants (`env`, `env -i`, `env -u`, `env --`, `/usr/bin/env`) followed by a `SHIM_COMMANDS` member. Non-shimmed commands (`PATH=/x node script.js`) remain Allow. `export PATH=...` (shell config, no command) remains Allow. See `src/engine/hook.rs::detect_path_shim_bypass`, `tests/hook_integration.rs` corpus entries `path-override-*`. Refs [#227](https://github.com/yottayoshida/omamori/issues/227). |
 | `curl URL \| env bash 2>&1` / `\| bash &>> log -s` (redirect-axis bypass on `pipe-to-shell + transparent-wrapper`) | v0.9.8 | The 2-boolean redirect classifier (`is_pure_redirect_op` / `is_concatenated_redirect`) carried in v0.9.5-v0.9.7 could not represent operand arity, so redirect operators with operand (e.g. `&>>` taking a file path) were misclassified as concatenated single-token redirects, letting downstream stdin-signal flags reach as if they were script paths. Replaced by `RedirectToken::{PureWithOperand, Concatenated, NotRedirect}` enum with explicit `token_span()` arity, used uniformly in `unwrap_transparent`, `strip_leading_noise`, and the new arity-aware skip in `classify_shell_args`. Single-digit fd prefixes (`0<`..`9>`, including `2<>file` etc.) handled via `strip_single_fd_digit` reclassification — automatically closes the `2<>` enumeration gap (V-028) surfaced during plan loop. V-027 (proc-sub + transparent wrapper) was already correct (proc-sub guard runs post-`unwrap_transparent`); v0.9.8 fills the test-gap with 9 wrappers × proc-sub regression cases. See `src/unwrap.rs::RedirectToken`, `tests/hook_integration.rs::HOOK_DECISION_CASES` (entries `redirect-axis-*-block` and `v027-proc-sub-*-block`), and `src/unwrap.rs::tests` FN-regression boundary suite. Refs [#212](https://github.com/yottayoshida/omamori/issues/212), #146 P1-1. |
 
 #### B. Out of scope by design decision
