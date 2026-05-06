@@ -69,6 +69,7 @@
 use crate::config::Config;
 use crate::engine::hook::{HookCheckResult, check_command_for_hook_with_rules};
 use crate::rules::{ActionKind, CommandInvocation, RuleConfig, match_rule};
+use crate::unwrap::{BlockReason, ParseResult, parse_command_string};
 
 use proptest::prelude::*;
 
@@ -548,4 +549,95 @@ proptest! {
             case.command_string(),
         );
     }
+
+    /// Monotonicity: ObfuscatedExpansion does NOT flip Allow → Block on the
+    /// FP regression corpus. Every command in `KNOWN_ALLOW_COMMANDS` must
+    /// remain Allow after the v0.10.2 raw-scan addition.
+    #[test]
+    fn obfuscated_expansion_monotonicity(idx in 0..KNOWN_ALLOW_COMMANDS.len()) {
+        let cmd = KNOWN_ALLOW_COMMANDS[idx];
+        let result = parse_command_string(cmd);
+        prop_assert!(
+            !matches!(result, ParseResult::Block(BlockReason::ObfuscatedExpansion)),
+            "FP regression: known-Allow command blocked as ObfuscatedExpansion:\n  cmd: {cmd}",
+        );
+    }
+
+    /// Completeness pin: generated expansion patterns at verb position all
+    /// trigger Block(ObfuscatedExpansion).
+    #[test]
+    fn obfuscated_expansion_completeness(case in arb_expansion_case()) {
+        let result = parse_command_string(&case);
+        prop_assert!(
+            matches!(result, ParseResult::Block(BlockReason::ObfuscatedExpansion)),
+            "Expansion at verb position was not blocked:\n  cmd: {case}",
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// ObfuscatedExpansion FP regression corpus (v0.10.2)
+// ----------------------------------------------------------------------
+
+/// Commands that MUST remain Allow. Drawn from the FP pin tests in
+/// `src/unwrap.rs` and `tests/hook_integration.rs`. If a future change
+/// to `raw_has_verb_obfuscation` causes any of these to flip to Block,
+/// the monotonicity property fires.
+const KNOWN_ALLOW_COMMANDS: &[&str] = &[
+    "$HOME/bin/cargo build",
+    "$EDITOR file.txt",
+    "ls -la",
+    "git status",
+    "cargo test",
+    "make -C build",
+    "RUST_LOG=debug cargo test",
+    "npm run build",
+    "python3 script.py",
+    "grep -rn pattern src/",
+    "cat /etc/hosts",
+    "echo hello world",
+    "docker run -it ubuntu",
+    "kubectl get pods",
+    "terraform plan",
+    "ssh user@host",
+    "scp file.txt user@host:/tmp/",
+    "curl -sL https://example.com",
+    "wget https://example.com/file",
+    "tar -xzf archive.tar.gz",
+    "unzip archive.zip",
+    "command -v rm",
+    "sudo rm -rf /tmp/test",
+    "env RUST_LOG=debug cargo test 2>&1 | grep FAIL",
+];
+
+// ----------------------------------------------------------------------
+// ObfuscatedExpansion completeness generator (v0.10.2)
+// ----------------------------------------------------------------------
+
+/// Generates shell expansion patterns at verb position that must all be
+/// detected by `raw_has_verb_obfuscation`. Covers ANSI-C quoting,
+/// locale quoting, parameter expansion, brace expansion, mid-word
+/// concat, and wrapper-prefixed variants.
+fn arb_expansion_case() -> impl Strategy<Value = String> {
+    let expansion_verb = prop_oneof![
+        Just("$'rm' -rf /tmp/x"),
+        Just("$\"rm\" -rf /tmp/x"),
+        Just("${IFS}rm -rf /tmp/x"),
+        Just("{rm,-rf,/tmp/x}"),
+        Just("r$'m' -rf /tmp/x"),
+        Just("r$\"m\" -rf /tmp/x"),
+        Just("r${m} -rf /tmp/x"),
+    ];
+
+    let wrapper_prefix = prop_oneof![
+        Just(""),
+        Just("sudo "),
+        Just("env "),
+        Just("timeout 5 "),
+        Just("nice "),
+        Just("command "),
+        Just("doas "),
+    ];
+
+    (wrapper_prefix, expansion_verb).prop_map(|(prefix, verb)| format!("{prefix}{verb}"))
 }
