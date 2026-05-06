@@ -50,6 +50,7 @@ What is caught, what is not, and why. Status values: **supported** (tested, expe
 | Env-var tampering (`unset CLAUDECODE`, `export -n`) | not covered | supported | Hook integration env-tampering corpus |
 | Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (string pattern) | Acceptance tests |
 | Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code, Codex CLI) | Hook integration file-protection tests |
+| Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
 
 #### Not caught — by design
 
@@ -62,7 +63,8 @@ What is caught, what is not, and why. Status values: **supported** (tested, expe
 
 | Surface | Why | Mitigation |
 |---------|-----|------------|
-| Obfuscated commands (base64, hex, variable indirection) | Static analysis cannot decode runtime-constructed commands | Sandbox isolation |
+| Obfuscated commands (base64, hex, runtime variable indirection `X=rm; $X -rf`) | Static analysis cannot decode runtime-constructed commands. Note: *static* expansion (`$'rm'`, `${IFS}rm`, brace expansion) IS caught since v0.10.2; this row covers runtime-evaluated forms only | Sandbox isolation |
+| Mid-word brace expansion at verb position (`r{m,}`) | `{` in mid-word is FP-prone (`file{.bak}`); prefix-only brace detection | Sandbox isolation |
 | `bash -c "$VAR"` (variable set earlier in shell) | Requires runtime evaluation | Sandbox isolation |
 | `alias rm='/bin/rm'` | Alias overrides bypass string matching | Layer 2 hooks cover AI tool paths |
 | Heredoc / encoded payloads decoded at execution time | Static analysis boundary | Sandbox isolation |

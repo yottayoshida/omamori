@@ -264,6 +264,12 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
             // and the forensic channel remain separated. v0.9.7 #181 C-1.
             let wrapper_kind = match &reason {
                 unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
+                unwrap::BlockReason::ObfuscatedExpansion => {
+                    // Distinct detection_layer for forensic attribution.
+                    // We encode this as a sentinel that the audit path
+                    // recognises — avoids adding a new field to BlockStructural.
+                    Some("__obfuscated_expansion__")
+                }
                 _ => None,
             };
             Err(HookCheckResult::BlockStructural {
@@ -511,6 +517,7 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
             // stays wrapper-agnostic per v0.9.5 invariant
             // (`block_reason_text_stability_across_wrappers`).
             let detection_layer = match wrapper_kind {
+                Some("__obfuscated_expansion__") => "layer2:obfuscated-expansion".to_string(),
                 Some(w) => format!("layer2:pipe-to-shell:{w}"),
                 None => "layer2:structural".to_string(),
             };
@@ -737,6 +744,7 @@ const VALID_DETECTION_LAYERS_STATIC: &[&str] = &[
     "layer2:meta-pattern",
     "layer2:rule",
     "layer2:structural",
+    "layer2:obfuscated-expansion",
 ];
 
 /// Validate that `detection_layer` value falls within the v0.9.7 taxonomy.
