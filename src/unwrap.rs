@@ -240,10 +240,10 @@ fn raw_has_verb_obfuscation(normalized: &str) -> bool {
         if seg.is_empty() {
             continue;
         }
-        if let Some(verb) = raw_extract_verb(seg) {
-            if raw_word_has_expansion(verb) {
-                return true;
-            }
+        if let Some(verb) = raw_extract_verb(seg)
+            && raw_word_has_expansion(verb)
+        {
+            return true;
         }
     }
     false
@@ -460,7 +460,10 @@ fn raw_skip_redirect(s: &str) -> Option<&str> {
 
     let mut i = 0;
     // Optional leading fd digit
-    if bytes[i].is_ascii_digit() && i + 1 < bytes.len() && (bytes[i + 1] == b'<' || bytes[i + 1] == b'>') {
+    if bytes[i].is_ascii_digit()
+        && i + 1 < bytes.len()
+        && (bytes[i + 1] == b'<' || bytes[i + 1] == b'>')
+    {
         i += 1;
     }
 
@@ -512,7 +515,8 @@ fn raw_skip_wrapper_with_flags<'a>(s: &'a str, wrapper: &str) -> &'a str {
         "sudo" => {
             // sudo flags that consume a value: -u USER, -g GROUP, -C fd, -D dir
             while !rest.is_empty() {
-                if rest.starts_with("--") && !rest.starts_with("-- ") && !rest[2..].starts_with(' ') {
+                if rest.starts_with("--") && !rest.starts_with("-- ") && !rest[2..].starts_with(' ')
+                {
                     // --long-option, skip it
                     let w = raw_next_word(rest);
                     rest = rest[w.len()..].trim_start();
@@ -524,7 +528,8 @@ fn raw_skip_wrapper_with_flags<'a>(s: &'a str, wrapper: &str) -> &'a str {
                 }
                 if rest.starts_with('-') {
                     let flag = raw_next_word(rest);
-                    let consumes_value = flag.len() == 2 && matches!(flag.as_bytes()[1], b'u' | b'g' | b'C' | b'D');
+                    let consumes_value =
+                        flag.len() == 2 && matches!(flag.as_bytes()[1], b'u' | b'g' | b'C' | b'D');
                     rest = rest[flag.len()..].trim_start();
                     if consumes_value && !rest.is_empty() {
                         let val = raw_next_word(rest);
@@ -571,7 +576,8 @@ fn raw_skip_wrapper_with_flags<'a>(s: &'a str, wrapper: &str) -> &'a str {
             // Skip flags like --signal, -s, -k, --preserve-status
             while !rest.is_empty() && rest.starts_with('-') {
                 let flag = raw_next_word(rest);
-                let consumes_value = flag == "-s" || flag == "--signal" || flag == "-k" || flag == "--kill-after";
+                let consumes_value =
+                    flag == "-s" || flag == "--signal" || flag == "-k" || flag == "--kill-after";
                 rest = rest[flag.len()..].trim_start();
                 if consumes_value && !rest.is_empty() {
                     let val = raw_next_word(rest);
