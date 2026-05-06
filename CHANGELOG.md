@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.2] - 2026-05-06
+
+**Summary**: Parser hardening — static shell expansion obfuscation detection. New `raw_has_verb_obfuscation()` scanner runs before `shell_words::split()` to catch ANSI-C quoting (`$'rm'`), locale quoting (`$"rm"`), parameter expansion (`${IFS}rm`), and brace expansion (`{rm,-rf,/}`) at verb position that the POSIX tokenizer silently strips ([#176](https://github.com/yottayoshida/omamori/issues/176)). Wrapper-aware: detects obfuscation through `sudo`, `env`, `timeout`, and all other `TRANSPARENT_WRAPPERS`. Mid-word concatenation (`r$'m'`) also caught. Redirect-axis test coverage systematized with a 3D matrix ([#219](https://github.com/yottayoshida/omamori/issues/219)). Property tests pin monotonicity (no FP regression) and completeness (all target patterns detected) ([#146](https://github.com/yottayoshida/omamori/issues/146)).
+
+### Added
+
+- **`raw_has_verb_obfuscation()`** in `src/unwrap.rs` ([#176](https://github.com/yottayoshida/omamori/issues/176)). Single-pass character scanner with quote tracking that runs on the normalized string before `shell_words::split()`. Detects `$'` (ANSI-C), `$"` (locale), `${` (parameter expansion) anywhere in the verb word, and `{` with unquoted `,` at verb-word prefix. Skips env assignments (`KEY=VAL`), redirect operators, and transparent wrapper prefixes (reusing `TRANSPARENT_WRAPPERS` as single source of truth). Returns early to `ParseResult::Block(BlockReason::ObfuscatedExpansion)`.
+- **`BlockReason::ObfuscatedExpansion`** variant. Block message: fixed string `"obfuscated command"` (no detection mechanism details, per v0.9.5 invariant). Detection layer: `"layer2:obfuscated-expansion"` for forensic attribution.
+- **`#[non_exhaustive]`** on `BlockReason` enum. Enables future variant addition without semver break.
+- **Redirect-axis 3D matrix** ([#219](https://github.com/yottayoshida/omamori/issues/219)). 35 new `redirect-3d-*` integration test cases spanning wrapper (9 TRANSPARENT_WRAPPERS + bare) × redirect-operator (`2>&1`, `>`, `>>`, `&>`, `<<<`) × compound-operator (`;`, `&&`, trailing) axes, plus 8 false-positive pins for legitimate redirect patterns.
+- **Property tests** ([#146](https://github.com/yottayoshida/omamori/issues/146)). `obfuscated_expansion_monotonicity`: 24-entry known-allow corpus stays Allow. `obfuscated_expansion_completeness`: 7 expansion verb forms × 7 wrapper prefixes all produce `Block(ObfuscatedExpansion)`.
+- 18 block + 8 FP pin unit tests for `raw_has_verb_obfuscation` in `src/unwrap.rs`.
+- 24 integration tests for ObfuscatedExpansion (4 bare block, 1 mid-word, 2 compound, 1 env-assign, 10 wrapper × obfuscation cross-product, 6 FP).
+
+### Changed
+
+- **README.md** Layer 2 evasion description updated to include static shell expansion obfuscation. Structural limitations section refined: "Obfuscated commands" now distinguishes runtime-evaluated forms (not caught) from static shell expansion at verb position (caught since v0.10.2).
+- **SECURITY.md** Defense Boundary Matrix: added "Static shell expansion obfuscation" row (Caught, Layer 2). Structural limits: refined "Obfuscated commands" to distinguish runtime vs static forms. Added "Mid-word brace expansion" as known limitation.
+
+### References
+
+- [#235](https://github.com/yottayoshida/omamori/pull/235) — `test(hook): add redirect-axis 3D matrix coverage (#219)`. Closes [#219](https://github.com/yottayoshida/omamori/issues/219).
+- [#236](https://github.com/yottayoshida/omamori/pull/236) — `feat: detect shell expansion obfuscation at verb position (#176)`. Closes [#176](https://github.com/yottayoshida/omamori/issues/176).
+- [#237](https://github.com/yottayoshida/omamori/pull/237) — `test: add ObfuscatedExpansion property tests (#146)`. Closes [#146](https://github.com/yottayoshida/omamori/issues/146).
+
 ## [0.10.1] - 2026-05-05
 
 **Summary**: PATH bypass closure + defense boundary matrix. Layer 2 hook now detects PATH-override patterns (`PATH=/usr/bin:$PATH rm`, `env PATH=/usr/bin rm`, and GNU env grammar variants) that bypass the Layer 1 shim ([#227](https://github.com/yottayoshida/omamori/issues/227)). README reframed from feature catalog to bounded-guarantee style with verifiable claims table and deterministic-guard positioning. SECURITY.md gains a Defense Boundary Matrix (caught / not caught by design / structural limit) and a known-bypass-becomes-row maintenance rule. New RELEASE.md codifies the three-tier release gate (patch / security / v1.0).
