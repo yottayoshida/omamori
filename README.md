@@ -68,7 +68,7 @@ Bypass classes outside this coverage scope remain possible — this is inherent 
 
 </details>
 
-Layer 2 hooks additionally block evasion patterns such as pipe-to-shell (`curl URL | bash`), dynamic command generation (`bash -c "$(cmd)"`), environment-variable tampering, and PATH override attempts targeting shimmed commands.
+Layer 2 hooks additionally block evasion patterns such as pipe-to-shell (`curl URL | bash`), dynamic command generation (`bash -c "$(cmd)"`), static shell expansion obfuscation (`$'rm'`, `{rm,-rf,/}`), environment-variable tampering, and PATH override attempts targeting shimmed commands.
 
 All rules are customizable via TOML config. See [Configuration](#configuration) below.
 
@@ -295,7 +295,7 @@ These are inherent to the PATH shim approach:
 - **Full-path execution** (`/bin/rm`) bypasses the shim — mitigated by Layer 2 hooks.
 - **`sudo`** changes PATH — omamori blocks when it detects elevated execution.
 - **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected. [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools.
-- **Obfuscated commands** (base64, variable indirection) — cannot be detected by static analysis.
+- **Obfuscated commands** (base64, runtime variable indirection) — runtime-evaluated forms cannot be detected by static analysis. Static shell expansion at command verb position (`$'rm'`, `{rm,-rf,/}`) is caught since v0.10.2.
 - **AI self-bypass** — `config disable` / `uninstall` are blocked; direct file editing blocked by hooks (Claude Code only).
 
 For what omamori **does not** catch — by design or by structural limit — and for the full security model and bypass corpus, see [SECURITY.md](SECURITY.md).
