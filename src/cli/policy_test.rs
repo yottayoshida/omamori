@@ -32,12 +32,17 @@ pub(crate) fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError
                 }
                 other => other.as_str().to_string(),
             };
-            let pattern = if !rule.match_all.is_empty() {
-                format!("{} {}", rule.command, rule.match_all.join(" "))
-            } else if !rule.match_any.is_empty() {
-                format!("{} {}", rule.command, rule.match_any.join("|"))
-            } else {
-                rule.command.clone()
+            let pattern = {
+                let mut parts: Vec<String> = vec![rule.command.clone()];
+                if let Some(ref sub) = rule.subcommand {
+                    parts.push(sub.clone());
+                }
+                if !rule.match_all.is_empty() {
+                    parts.push(rule.match_all.join(" "));
+                } else if !rule.match_any.is_empty() {
+                    parts.push(rule.match_any.join("|"));
+                }
+                parts.join(" ")
             };
             println!(
                 "  PASS  {:<28} {:<24} -> {}",
