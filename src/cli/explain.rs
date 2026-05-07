@@ -200,12 +200,12 @@ fn evaluate_layer1(
 
 fn evaluate_layer2(command_str: &str) -> Layer2Result {
     match check_command_for_hook(command_str) {
-        HookCheckResult::Allow => Layer2Result {
+        HookCheckResult::Allow { .. } => Layer2Result {
             blocked: false,
             phase: "allow".to_string(),
             detail: "no meta-pattern or rule match".to_string(),
         },
-        HookCheckResult::BlockMeta(reason) => Layer2Result {
+        HookCheckResult::BlockMeta { reason, .. } => Layer2Result {
             blocked: true,
             phase: "meta-pattern".to_string(),
             detail: reason.to_string(),
@@ -214,6 +214,7 @@ fn evaluate_layer2(command_str: &str) -> Layer2Result {
             rule_name,
             message,
             unwrap_chain,
+            ..
         } => {
             let detail = if let Some(chain) = unwrap_chain {
                 format!("{message} ({chain})")
@@ -229,6 +230,7 @@ fn evaluate_layer2(command_str: &str) -> Layer2Result {
         HookCheckResult::BlockStructural {
             message,
             wrapper_kind: _,
+            ..
         } => Layer2Result {
             // `wrapper_kind` is forensic-side only (audit `detection_layer`),
             // not surfaced via `omamori explain`. v0.9.7 #181 C-1.

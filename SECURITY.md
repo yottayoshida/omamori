@@ -112,6 +112,34 @@ This rule ensures that the boundary matrix and test corpus grow together and tha
 | DI-12 | Env var tampering detection is token-level, not string-level | Phase 1B `detect_env_var_tampering` uses `shell_words::split` after normalization, with `is_command_position()` to prevent false positives on quoted strings and arguments |
 | DI-13 | Phase 1A relaxation requires Phase 2 compensation (v0.10.3+) | For every verb pattern that may be relaxed in Phase 1A by the data-flag allowlist (`gh issue/pr create --body`, `git commit -m/-F`, etc.), an equivalent `omamori-*-block` builtin rule MUST exist in `default_rules()` so that real `omamori config disable` invocations remain caught by Phase 2 rule matching. Each rule uses the `subcommand` field (v0.10.3+) so `args[0]` must match exactly, preventing false positives like `omamori exec -- echo disable config`. Enforced by `scripts/check-invariants.sh` invariant `phase1a-relaxation-requires-phase2` and unit tests `default_rules_includes_omamori_self_protect_six_rules` + `omamori_self_protect_rules_skip_false_positive_data_args`. |
 
+### `hook-check --json-error` schema (v0.10.3+, PR1b)
+
+When `--json-error` is passed to `omamori hook-check`, blocked commands emit a single JSON object to **stderr** (in place of free-form text). Allow paths still emit the regular Claude Code hook response on stdout. AI agent integrations consume this for retry / approach-switch decisions.
+
+**Schema**:
+
+```json
+{
+  "blocked": true,
+  "layer": "meta-pattern" | "rule" | "layer2:structural" | "layer2:pipe-to-shell:<wrapper>" | "layer2:obfuscated-expansion",
+  "rule_id": "<rule_name or layer-specific identifier>",
+  "reason": "<human-readable message>",
+  "matched_pattern": "<protected pattern token>" | null,
+  "matched_position": { "start": <usize>, "end": <usize> } | null,
+  "hint": "run `omamori explain -- <command>` for details"
+}
+```
+
+**Field semantics**:
+
+- `blocked`: always `true` (allow path uses Claude Code hook response, not this schema)
+- `layer`: forensic layer identifier; matches the audit log `detection_layer` field
+- `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`
+- `matched_pattern`: the protected pattern token (`"config disable"`, `"omamori uninstall"`, etc.) when known; `null` for structural blocks where no specific pattern matched
+- `matched_position`: byte range `[start, end)` of the match in the original command string when known; `null` when position tracking is not available for the layer
+
+**Stability**: `blocked`, `layer`, `rule_id`, `reason`, `hint` are stable contract fields. Additional fields may be added in minor releases (e.g., `relaxed_by` for `Allow` JSON when added in PR1d). AI agents should ignore unknown keys.
+
 `guard_ai_config_modification` call sites: 9 (as of v0.9.0).
 
 ## Integrity Monitoring (v0.5.0+)
