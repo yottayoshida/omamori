@@ -121,7 +121,7 @@ When `--json-error` is passed to `omamori hook-check`, blocked commands emit a s
 ```json
 {
   "blocked": true,
-  "layer": "meta-pattern" | "rule" | "layer2:structural" | "layer2:pipe-to-shell:<wrapper>" | "layer2:obfuscated-expansion",
+  "layer": "layer2:meta-pattern" | "layer2:rule" | "layer2:structural" | "layer2:pipe-to-shell:<wrapper>" | "layer2:obfuscated-expansion",
   "rule_id": "<rule_name or layer-specific identifier>",
   "reason": "<human-readable message>",
   "matched_pattern": "<protected pattern token>" | null,
@@ -133,10 +133,14 @@ When `--json-error` is passed to `omamori hook-check`, blocked commands emit a s
 **Field semantics**:
 
 - `blocked`: always `true` (allow path uses Claude Code hook response, not this schema)
-- `layer`: forensic layer identifier; matches the audit log `detection_layer` field
+- `layer`: forensic layer identifier prefixed with `layer2:` to match the audit log `detection_layer` field exactly. Stderr JSON `layer` and audit row `detection_layer` are interchangeable for correlation
 - `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`
-- `matched_pattern`: the protected pattern token (`"config disable"`, `"omamori uninstall"`, etc.) when known; `null` for structural blocks where no specific pattern matched
+- `matched_pattern`: the protected pattern token (`"config disable"`, `"omamori uninstall"`, etc.) when known. `null` for structural blocks (no specific pattern matched) and Phase 1B token-level detections (env tampering / PATH override) where no single substring identifies the trigger
 - `matched_position`: byte range `[start, end)` of the match in the original command string when known; `null` when position tracking is not available for the layer
+
+**Trade-off — audit gap in `--json-error` mode**:
+
+When `--json-error` is active, the hook **skips audit log emission** for the blocked event. This trade-off keeps stderr a single parseable JSON object even in degraded audit environments (missing or unreadable audit secret, full disk, broken permissions) where `AuditLogger::from_config` would otherwise emit free-form warnings. AI agent integrations get a reliable contract; the cost is that `omamori audit show --action block` may miss events from `--json-error` invocations. Operators who need full audit coverage should not pass `--json-error`; the regular text-mode hook records the audit row even when it cannot print to stderr cleanly.
 
 **Stability**: `blocked`, `layer`, `rule_id`, `reason`, `hint` are stable contract fields. Additional fields may be added in minor releases (e.g., `relaxed_by` for `Allow` JSON when added in PR1d). AI agents should ignore unknown keys.
 

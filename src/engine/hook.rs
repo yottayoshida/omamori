@@ -519,14 +519,22 @@ fn run_hook_check_command(
             // an AI agent that crashes between the two writes. Append is
             // best-effort with respect to the decision (SEC-7) — failure
             // surfaces a stderr warning but the block stays.
-            audit_log_hook_block(
-                command,
-                provider,
-                None,
-                None,
-                "layer2:meta-pattern".to_string(),
-                json_error,
-            );
+            //
+            // PR1b R3 [P2]: in --json-error mode, skip audit entirely.
+            // AuditLogger::from_config can emit secret-loading warnings to
+            // stderr that we cannot fully suppress through suppress_warnings,
+            // so we trade the audit row for a clean single-JSON contract.
+            // Documented in SECURITY.md "hook-check --json-error" trade-off.
+            if !json_error {
+                audit_log_hook_block(
+                    command,
+                    provider,
+                    None,
+                    None,
+                    "layer2:meta-pattern".to_string(),
+                    false,
+                );
+            }
             if json_error {
                 emit_json_error(
                     "layer2:meta-pattern",
@@ -557,14 +565,16 @@ fn run_hook_check_command(
                 .as_deref()
                 .map(|c| format!(" ({c})"))
                 .unwrap_or_default();
-            audit_log_hook_block(
-                command,
-                provider,
-                Some(&rule_name),
-                unwrap_chain.clone(),
-                "layer2:rule".to_string(),
-                json_error,
-            );
+            if !json_error {
+                audit_log_hook_block(
+                    command,
+                    provider,
+                    Some(&rule_name),
+                    unwrap_chain.clone(),
+                    "layer2:rule".to_string(),
+                    false,
+                );
+            }
             if json_error {
                 emit_json_error(
                     "layer2:rule",
@@ -601,14 +611,16 @@ fn run_hook_check_command(
                 Some(w) => format!("layer2:pipe-to-shell:{w}"),
                 None => "layer2:structural".to_string(),
             };
-            audit_log_hook_block(
-                command,
-                provider,
-                None,
-                None,
-                detection_layer.clone(),
-                json_error,
-            );
+            if !json_error {
+                audit_log_hook_block(
+                    command,
+                    provider,
+                    None,
+                    None,
+                    detection_layer.clone(),
+                    false,
+                );
+            }
             if json_error {
                 emit_json_error(
                     &detection_layer,
