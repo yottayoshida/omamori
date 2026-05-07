@@ -114,7 +114,9 @@ This rule ensures that the boundary matrix and test corpus grow together and tha
 
 ### `hook-check --json-error` schema (v0.10.3+, PR1b)
 
-When `--json-error` is passed to `omamori hook-check`, blocked commands emit a single JSON object to **stderr** (in place of free-form text). Allow paths still emit the regular Claude Code hook response on stdout. AI agent integrations consume this for retry / approach-switch decisions.
+When `--json-error` is passed to `omamori hook-check`, **blocked shell commands** emit a single JSON object to **stderr** (in place of free-form text). Allow paths still emit the regular Claude Code hook response on stdout. AI agent integrations consume this for retry / approach-switch decisions.
+
+**Current scope**: the JSON contract applies to the **shell-command path** only (i.e. `tool_input.command` blocked by Phase 1A meta-patterns / Phase 1B token detection / Phase 2 rule match / Phase 2 structural unwrap). Other deny paths — malformed hook input, file-op deny on protected paths, unknown-tool fail-open — currently retain free-form stderr; extension to those paths is tracked as a follow-up issue. AI agents can still detect these blocks by exit code 2.
 
 **Schema**:
 

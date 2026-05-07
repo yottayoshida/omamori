@@ -522,19 +522,9 @@ fn run_hook_check_command(
             //
             // PR1b R3 [P2]: in --json-error mode, skip audit entirely.
             // AuditLogger::from_config can emit secret-loading warnings to
-            // stderr that we cannot fully suppress through suppress_warnings,
-            // so we trade the audit row for a clean single-JSON contract.
+            // stderr that we cannot fully suppress at append time, so we
+            // trade the audit row for a clean single-JSON contract.
             // Documented in SECURITY.md "hook-check --json-error" trade-off.
-            if !json_error {
-                audit_log_hook_block(
-                    command,
-                    provider,
-                    None,
-                    None,
-                    "layer2:meta-pattern".to_string(),
-                    false,
-                );
-            }
             if json_error {
                 emit_json_error(
                     "layer2:meta-pattern",
@@ -545,12 +535,19 @@ fn run_hook_check_command(
                     command,
                 );
             } else {
+                audit_log_hook_block(
+                    command,
+                    provider,
+                    None,
+                    None,
+                    "layer2:meta-pattern".to_string(),
+                );
                 eprintln!("omamori hook: blocked — {reason}");
                 if verbose {
                     eprintln!("  provider: {provider}");
                     eprintln!("  layer: meta-pattern (string-level)");
                 }
-                eprintln!("  hint: run `omamori explain -- {}` for details", command);
+                eprintln!("  hint: run `omamori explain -- {command}` for details");
             }
             Ok(2)
         }
@@ -561,20 +558,6 @@ fn run_hook_check_command(
             matched_pattern,
             matched_position,
         } => {
-            let chain_str = unwrap_chain
-                .as_deref()
-                .map(|c| format!(" ({c})"))
-                .unwrap_or_default();
-            if !json_error {
-                audit_log_hook_block(
-                    command,
-                    provider,
-                    Some(&rule_name),
-                    unwrap_chain.clone(),
-                    "layer2:rule".to_string(),
-                    false,
-                );
-            }
             if json_error {
                 emit_json_error(
                     "layer2:rule",
@@ -585,6 +568,17 @@ fn run_hook_check_command(
                     command,
                 );
             } else {
+                audit_log_hook_block(
+                    command,
+                    provider,
+                    Some(&rule_name),
+                    unwrap_chain.clone(),
+                    "layer2:rule".to_string(),
+                );
+                let chain_str = unwrap_chain
+                    .as_deref()
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default();
                 eprintln!("omamori hook: blocked — {message}{chain_str}");
                 if verbose {
                     eprintln!("  provider: {provider}");
@@ -611,16 +605,6 @@ fn run_hook_check_command(
                 Some(w) => format!("layer2:pipe-to-shell:{w}"),
                 None => "layer2:structural".to_string(),
             };
-            if !json_error {
-                audit_log_hook_block(
-                    command,
-                    provider,
-                    None,
-                    None,
-                    detection_layer.clone(),
-                    false,
-                );
-            }
             if json_error {
                 emit_json_error(
                     &detection_layer,
@@ -631,6 +615,7 @@ fn run_hook_check_command(
                     command,
                 );
             } else {
+                audit_log_hook_block(command, provider, None, None, detection_layer);
                 eprintln!("{message}");
                 if verbose {
                     eprintln!("  provider: {provider}");
@@ -887,7 +872,6 @@ fn audit_log_hook_block(
     rule_name: Option<&str>,
     unwrap_chain: Option<String>,
     detection_layer_value: String,
-    suppress_warnings: bool,
 ) {
     debug_assert!(
         is_valid_detection_layer(&detection_layer_value),
@@ -897,16 +881,11 @@ fn audit_log_hook_block(
     let load_result = match load_config(None) {
         Ok(r) => r,
         Err(e) => {
-            // PR1b R1 [P2]: in --json-error mode, suppress free-form stderr
-            // warnings so consumers receive a single JSON object on stderr.
-            // Audit gaps are still recorded by absence of the chain entry.
-            if !suppress_warnings {
-                eprintln!(
-                    "omamori warning: could not record Layer 2 hook deny event for {command:?} \
-                     — config load failed: {e}. The 'omamori audit show --action block' surface \
-                     is incomplete for this event."
-                );
-            }
+            eprintln!(
+                "omamori warning: could not record Layer 2 hook deny event for {command:?} \
+                 — config load failed: {e}. The 'omamori audit show --action block' surface \
+                 is incomplete for this event."
+            );
             return;
         }
     };
@@ -937,9 +916,7 @@ fn audit_log_hook_block(
     // produced by `format_unwrap_chain`, wrapped in a 1-element vec.
     event.unwrap_chain = unwrap_chain.map(|c| vec![c]);
 
-    if let Err(e) = logger.append(event)
-        && !suppress_warnings
-    {
+    if let Err(e) = logger.append(event) {
         eprintln!(
             "omamori warning: failed to record Layer 2 hook deny event for {command:?}: {e}. \
              The 'omamori audit show --action block' surface is incomplete for this event."
@@ -1310,20 +1287,17 @@ fn emit_json_error(
     matched_position: Option<&Range<usize>>,
     command: &str,
 ) {
-    let position = matched_position.map(|r| {
-        serde_json::json!({
-            "start": r.start,
-            "end": r.end,
-        })
-    });
     let payload = serde_json::json!({
         "blocked": true,
         "layer": layer,
         "rule_id": rule_id,
         "reason": reason,
         "matched_pattern": matched_pattern,
-        "matched_position": position,
-        "hint": format!("run `omamori explain -- {}` for details", command),
+        "matched_position": matched_position.map(|r| serde_json::json!({
+            "start": r.start,
+            "end": r.end,
+        })),
+        "hint": format!("run `omamori explain -- {command}` for details"),
     });
     eprintln!(
         "{}",
@@ -1474,14 +1448,12 @@ mod tests {
         let pattern = got_pattern.expect("matched_pattern must be populated");
         assert!(
             pattern.contains("uninstall"),
-            "matched_pattern should be the protected token (e.g. 'omamori uninstall'), got {:?}",
-            pattern
+            "matched_pattern should be the protected token (e.g. 'omamori uninstall'), got {pattern:?}"
         );
         let position = got_position.expect("matched_position must be populated");
         assert!(
             position.end > position.start,
-            "matched_position must have non-empty range, got {:?}",
-            position
+            "matched_position must have non-empty range, got {position:?}"
         );
     }
 
