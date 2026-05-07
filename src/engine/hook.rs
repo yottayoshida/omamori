@@ -276,16 +276,18 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
     let normalized = unwrap::normalize_compound_operators(command);
     if let Ok(tokens) = shell_words::split(&normalized) {
         if let Some(reason) = detect_env_var_tampering(&tokens) {
+            // Phase 1B: token-level detection has no single substring "pattern" —
+            // matched_pattern is None per schema (Codex review PR1b R2 [P2]).
             return Err(HookCheckResult::BlockMeta {
                 reason,
-                matched_pattern: Some(reason),
+                matched_pattern: None,
                 matched_position: None,
             });
         }
         if let Some(reason) = detect_path_shim_bypass(&tokens) {
             return Err(HookCheckResult::BlockMeta {
                 reason,
-                matched_pattern: Some(reason),
+                matched_pattern: None,
                 matched_position: None,
             });
         }
@@ -527,7 +529,7 @@ fn run_hook_check_command(
             );
             if json_error {
                 emit_json_error(
-                    "meta-pattern",
+                    "layer2:meta-pattern",
                     reason,
                     reason,
                     matched_pattern,
@@ -565,7 +567,7 @@ fn run_hook_check_command(
             );
             if json_error {
                 emit_json_error(
-                    "rule",
+                    "layer2:rule",
                     &rule_name,
                     &message,
                     matched_pattern,
@@ -923,7 +925,9 @@ fn audit_log_hook_block(
     // produced by `format_unwrap_chain`, wrapped in a 1-element vec.
     event.unwrap_chain = unwrap_chain.map(|c| vec![c]);
 
-    if let Err(e) = logger.append(event) {
+    if let Err(e) = logger.append(event)
+        && !suppress_warnings
+    {
         eprintln!(
             "omamori warning: failed to record Layer 2 hook deny event for {command:?}: {e}. \
              The 'omamori audit show --action block' surface is incomplete for this event."
