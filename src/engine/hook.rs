@@ -5,6 +5,7 @@
 //! See threat model T8 (DREAD 9.0): fail-close fallback in check_command_for_hook.
 
 use std::ffi::OsString;
+use std::ops::Range;
 
 use crate::AppError;
 use crate::config::{self, ConfigLoadResult, load_config};
@@ -24,16 +25,34 @@ use crate::unwrap;
 /// comparison. Not re-exported — downstream callers must invoke the AI-
 /// tool hook entry point (`omamori hook-check`) instead, so phase
 /// short-circuits and rule loading both run.
+#[allow(dead_code)] // PR1b: metadata fields populated in PR1c; values currently None
 pub(crate) enum HookCheckResult {
     /// Command is allowed.
-    Allow,
+    ///
+    /// `relaxed_by` identifies which heuristic permitted the command when the
+    /// allow path was reached via a relaxation (e.g. data-flag allowlist in
+    /// PR1d). `None` means the command was allowed by the default policy
+    /// (no protected pattern matched). Used by audit log to tag relaxed
+    /// decisions for forensic review (DI-13 / Gap 1).
+    Allow { relaxed_by: Option<&'static str> },
     /// Command is blocked by a meta-pattern (string-level).
-    BlockMeta(&'static str),
+    ///
+    /// `matched_pattern` carries the protected pattern token (`"config disable"`,
+    /// `"omamori uninstall"`, etc.) for acceptance test assertions and
+    /// structured error output. `matched_position` is the byte range of
+    /// the match in the original command string when known.
+    BlockMeta {
+        reason: &'static str,
+        matched_pattern: Option<&'static str>,
+        matched_position: Option<Range<usize>>,
+    },
     /// Command is blocked by the unwrap stack (token-level rule match).
     BlockRule {
         rule_name: String,
         message: String,
         unwrap_chain: Option<String>,
+        matched_pattern: Option<&'static str>,
+        matched_position: Option<Range<usize>>,
     },
     /// Command is blocked by the unwrap stack (structural block: pipe-to-shell, etc.).
     ///
@@ -49,6 +68,8 @@ pub(crate) enum HookCheckResult {
     BlockStructural {
         message: String,
         wrapper_kind: Option<&'static str>,
+        matched_pattern: Option<&'static str>,
+        matched_position: Option<Range<usize>>,
     },
 }
 
@@ -227,10 +248,17 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 /// `load_config(None)` when Phase 1A/1B/structural short-circuits the
 /// verdict.
 fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckResult> {
-    // Phase 1A: String-level meta-patterns (path/config/uninstall)
+    // Phase 1A: String-level meta-patterns (path/config/uninstall).
+    // matched_pattern carries the actual `pattern` token (e.g. "config disable"),
+    // not the human-readable `reason`. Reason has its own `reason` / `rule_id`
+    // fields in the JSON schema. Codex review (PR1b R1) [P2].
     for (pattern, reason) in installer::blocked_string_patterns() {
-        if command.contains(pattern) {
-            return Err(HookCheckResult::BlockMeta(reason));
+        if let Some(start) = command.find(pattern) {
+            return Err(HookCheckResult::BlockMeta {
+                reason,
+                matched_pattern: Some(pattern),
+                matched_position: Some(start..start + pattern.len()),
+            });
         }
     }
 
@@ -248,10 +276,20 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
     let normalized = unwrap::normalize_compound_operators(command);
     if let Ok(tokens) = shell_words::split(&normalized) {
         if let Some(reason) = detect_env_var_tampering(&tokens) {
-            return Err(HookCheckResult::BlockMeta(reason));
+            // Phase 1B: token-level detection has no single substring "pattern" —
+            // matched_pattern is None per schema (Codex review PR1b R2 [P2]).
+            return Err(HookCheckResult::BlockMeta {
+                reason,
+                matched_pattern: None,
+                matched_position: None,
+            });
         }
         if let Some(reason) = detect_path_shim_bypass(&tokens) {
-            return Err(HookCheckResult::BlockMeta(reason));
+            return Err(HookCheckResult::BlockMeta {
+                reason,
+                matched_pattern: None,
+                matched_position: None,
+            });
         }
     }
 
@@ -275,6 +313,8 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
             Err(HookCheckResult::BlockStructural {
                 message: format!("omamori hook: blocked — {}", reason.message()),
                 wrapper_kind,
+                matched_pattern: None,
+                matched_position: None,
             })
         }
         unwrap::ParseResult::Commands(invocations) => Ok(invocations),
@@ -299,10 +339,12 @@ fn match_invocations_against_rules(
                 rule_name: rule.name.clone(),
                 message: msg,
                 unwrap_chain: chain_desc,
+                matched_pattern: None,
+                matched_position: None,
             };
         }
     }
-    HookCheckResult::Allow
+    HookCheckResult::Allow { relaxed_by: None }
 }
 
 /// Three-phase hook check, evaluating against rules loaded from on-disk
@@ -387,6 +429,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
 
     let provider = parse_provider_flag(args);
     let verbose = std::env::var("OMAMORI_VERBOSE").is_ok();
+    let json_error = parse_json_error_flag(args);
 
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -423,7 +466,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
         HookInput::UnknownTool {
             tool_name,
             tool_input,
-        } => run_hook_check_unknown_tool(&tool_name, &tool_input, &provider, verbose),
+        } => run_hook_check_unknown_tool(&tool_name, &tool_input, &provider, verbose, json_error),
         HookInput::FileOp { tool, path } => {
             if let Some(reason) = is_protected_file_path(&path) {
                 eprintln!("omamori hook: blocked {tool} to protected file — {reason}");
@@ -449,67 +492,108 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                 print_hook_check_allow_response("omamori: empty command");
                 return Ok(0);
             }
-            run_hook_check_command(&command, &provider, verbose)
+            run_hook_check_command(&command, &provider, verbose, json_error)
         }
     }
 }
 
 /// Evaluate a shell command through the two-phase hook check pipeline.
-fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Result<i32, AppError> {
+fn run_hook_check_command(
+    command: &str,
+    provider: &str,
+    verbose: bool,
+    json_error: bool,
+) -> Result<i32, AppError> {
     match check_command_for_hook(command) {
-        HookCheckResult::Allow => {
+        HookCheckResult::Allow { .. } => {
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
         }
-        HookCheckResult::BlockMeta(reason) => {
+        HookCheckResult::BlockMeta {
+            reason,
+            matched_pattern,
+            matched_position,
+        } => {
             // Append BEFORE printing stderr so the audit chain reflects the
             // deny narrative even if the user's terminal is being scraped by
             // an AI agent that crashes between the two writes. Append is
             // best-effort with respect to the decision (SEC-7) — failure
             // surfaces a stderr warning but the block stays.
-            audit_log_hook_block(
-                command,
-                provider,
-                None,
-                None,
-                "layer2:meta-pattern".to_string(),
-            );
-            eprintln!("omamori hook: blocked — {reason}");
-            if verbose {
-                eprintln!("  provider: {provider}");
-                eprintln!("  layer: meta-pattern (string-level)");
+            //
+            // PR1b R3 [P2]: in --json-error mode, skip audit entirely.
+            // AuditLogger::from_config can emit secret-loading warnings to
+            // stderr that we cannot fully suppress at append time, so we
+            // trade the audit row for a clean single-JSON contract.
+            // Documented in SECURITY.md "hook-check --json-error" trade-off.
+            if json_error {
+                emit_json_error(
+                    "layer2:meta-pattern",
+                    reason,
+                    reason,
+                    matched_pattern,
+                    matched_position.as_ref(),
+                    command,
+                );
+            } else {
+                audit_log_hook_block(
+                    command,
+                    provider,
+                    None,
+                    None,
+                    "layer2:meta-pattern".to_string(),
+                );
+                eprintln!("omamori hook: blocked — {reason}");
+                if verbose {
+                    eprintln!("  provider: {provider}");
+                    eprintln!("  layer: meta-pattern (string-level)");
+                }
+                eprintln!("  hint: run `omamori explain -- {command}` for details");
             }
-            eprintln!("  hint: run `omamori explain -- {}` for details", command);
             Ok(2)
         }
         HookCheckResult::BlockRule {
             rule_name,
             message,
             unwrap_chain,
+            matched_pattern,
+            matched_position,
         } => {
-            let chain_str = unwrap_chain
-                .as_deref()
-                .map(|c| format!(" ({c})"))
-                .unwrap_or_default();
-            audit_log_hook_block(
-                command,
-                provider,
-                Some(&rule_name),
-                unwrap_chain.clone(),
-                "layer2:rule".to_string(),
-            );
-            eprintln!("omamori hook: blocked — {message}{chain_str}");
-            if verbose {
-                eprintln!("  provider: {provider}");
-                eprintln!("  rule: {rule_name}");
-                eprintln!("  layer: unwrap-stack (token-level)");
+            if json_error {
+                emit_json_error(
+                    "layer2:rule",
+                    &rule_name,
+                    &message,
+                    matched_pattern,
+                    matched_position.as_ref(),
+                    command,
+                );
+            } else {
+                audit_log_hook_block(
+                    command,
+                    provider,
+                    Some(&rule_name),
+                    unwrap_chain.clone(),
+                    "layer2:rule".to_string(),
+                );
+                let chain_str = unwrap_chain
+                    .as_deref()
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default();
+                eprintln!("omamori hook: blocked — {message}{chain_str}");
+                if verbose {
+                    eprintln!("  provider: {provider}");
+                    eprintln!("  rule: {rule_name}");
+                    eprintln!("  layer: unwrap-stack (token-level)");
+                }
+                eprintln!("  hint: run `omamori explain -- {command}` for details");
             }
-            eprintln!("  hint: run `omamori explain -- {command}` for details");
             Ok(2)
         }
         HookCheckResult::BlockStructural {
             message,
             wrapper_kind,
+            matched_pattern,
+            matched_position,
         } => {
             // `wrapper_kind` flows into the audit `detection_layer` field as
             // `"layer2:pipe-to-shell:{wrapper}"` for forensic attribution but
@@ -521,13 +605,24 @@ fn run_hook_check_command(command: &str, provider: &str, verbose: bool) -> Resul
                 Some(w) => format!("layer2:pipe-to-shell:{w}"),
                 None => "layer2:structural".to_string(),
             };
-            audit_log_hook_block(command, provider, None, None, detection_layer);
-            eprintln!("{message}");
-            if verbose {
-                eprintln!("  provider: {provider}");
-                eprintln!("  layer: unwrap-stack (structural)");
+            if json_error {
+                emit_json_error(
+                    &detection_layer,
+                    "structural",
+                    &message,
+                    matched_pattern,
+                    matched_position.as_ref(),
+                    command,
+                );
+            } else {
+                audit_log_hook_block(command, provider, None, None, detection_layer);
+                eprintln!("{message}");
+                if verbose {
+                    eprintln!("  provider: {provider}");
+                    eprintln!("  layer: unwrap-stack (structural)");
+                }
+                eprintln!("  hint: run `omamori explain -- {command}` for details");
             }
-            eprintln!("  hint: run `omamori explain -- {command}` for details");
             Ok(2)
         }
     }
@@ -565,6 +660,7 @@ fn run_hook_check_unknown_tool(
     tool_input: &serde_json::Value,
     provider: &str,
     verbose: bool,
+    json_error: bool,
 ) -> Result<i32, AppError> {
     match classify_input_shape(tool_input) {
         // Shell-shape and file-op-shape *should* have been resolved at
@@ -576,7 +672,7 @@ fn run_hook_check_unknown_tool(
                 print_hook_check_allow_response("omamori: empty command");
                 return Ok(0);
             }
-            run_hook_check_command(cmd, provider, verbose)
+            run_hook_check_command(cmd, provider, verbose, json_error)
         }
         InputShape::FileOp(path) => {
             if let Some(reason) = is_protected_file_path(path) {
@@ -861,10 +957,10 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
     }
 
     match check_command_for_hook(&command) {
-        HookCheckResult::Allow => {
+        HookCheckResult::Allow { .. } => {
             print_cursor_response(true, "allow", None, None);
         }
-        HookCheckResult::BlockMeta(reason) => {
+        HookCheckResult::BlockMeta { reason, .. } => {
             eprintln!("omamori cursor-hook: BLOCKED ({reason})");
             print_cursor_response(
                 false,
@@ -895,6 +991,7 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
         HookCheckResult::BlockStructural {
             message,
             wrapper_kind: _,
+            ..
         } => {
             // `wrapper_kind` is forensic-side only and stays out of the
             // user-facing cursor response for the same v0.9.5 reason as the
@@ -1173,6 +1270,42 @@ fn parse_provider_flag(args: &[OsString]) -> String {
     "unknown".to_string()
 }
 
+/// `--json-error` flag (PR1b, v0.10.3+): when present, hook-check emits
+/// a structured JSON object to stderr on block instead of free-form text.
+/// AI agent integrations consume this for retry / approach-switch decisions.
+fn parse_json_error_flag(args: &[OsString]) -> bool {
+    args.iter().any(|a| a.to_str() == Some("--json-error"))
+}
+
+/// Emit a structured JSON error to stderr for `--json-error` mode.
+/// Schema is documented in SECURITY.md "hook-check --json-error schema".
+fn emit_json_error(
+    layer: &str,
+    rule_id: &str,
+    reason: &str,
+    matched_pattern: Option<&str>,
+    matched_position: Option<&Range<usize>>,
+    command: &str,
+) {
+    let payload = serde_json::json!({
+        "blocked": true,
+        "layer": layer,
+        "rule_id": rule_id,
+        "reason": reason,
+        "matched_pattern": matched_pattern,
+        "matched_position": matched_position.map(|r| serde_json::json!({
+            "start": r.start,
+            "end": r.end,
+        })),
+        "hint": format!("run `omamori explain -- {command}` for details"),
+    });
+    eprintln!(
+        "{}",
+        serde_json::to_string(&payload)
+            .unwrap_or_else(|_| r#"{"blocked":true,"reason":"omamori: fallback"}"#.to_string())
+    );
+}
+
 fn print_hook_check_allow_response(reason: &str) {
     let response = serde_json::json!({
         "hookSpecificOutput": {
@@ -1281,13 +1414,47 @@ mod tests {
                     "expected rm-related rule, got: {rule_name}"
                 );
             }
-            HookCheckResult::BlockMeta(_) | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow => {
+            HookCheckResult::BlockMeta { .. } | HookCheckResult::BlockStructural { .. } => {}
+            HookCheckResult::Allow { .. } => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: rm -rf / was ALLOWED — fail-close fallback is broken");
             }
         }
         restore_config(old_xdg, old_home, dir);
+    }
+
+    /// PR1b (DI-13 / #239 follow-up): BlockMeta must populate `matched_pattern`
+    /// with the protected pattern token (NOT the human-readable reason — those
+    /// have separate fields) so acceptance tests can assert on structured
+    /// metadata instead of brittle stderr substrings.
+    /// Codex review (PR1b R1) [P2] enforced this contract.
+    #[test]
+    #[serial_test::serial]
+    fn block_meta_populates_matched_pattern_metadata() {
+        let (old_xdg, old_home, dir) = isolate_config();
+        let result = check_command_for_hook("omamori uninstall");
+        let (got_pattern, got_position) = match result {
+            HookCheckResult::BlockMeta {
+                matched_pattern,
+                matched_position,
+                ..
+            } => (matched_pattern, matched_position),
+            _ => {
+                restore_config(old_xdg, old_home, dir);
+                panic!("expected BlockMeta for `omamori uninstall`");
+            }
+        };
+        restore_config(old_xdg, old_home, dir);
+        let pattern = got_pattern.expect("matched_pattern must be populated");
+        assert!(
+            pattern.contains("uninstall"),
+            "matched_pattern should be the protected token (e.g. 'omamori uninstall'), got {pattern:?}"
+        );
+        let position = got_position.expect("matched_position must be populated");
+        assert!(
+            position.end > position.start,
+            "matched_position must have non-empty range, got {position:?}"
+        );
     }
 
     #[test]
@@ -1296,18 +1463,18 @@ mod tests {
         let (old_xdg, old_home, dir) = isolate_config();
 
         match check_command_for_hook("ls /tmp") {
-            HookCheckResult::Allow => {}
+            HookCheckResult::Allow { .. } => {}
             other => {
                 restore_config(old_xdg, old_home, dir);
                 panic!(
                     "expected Allow for 'ls /tmp', got: {}",
                     match other {
-                        HookCheckResult::BlockMeta(r) => format!("BlockMeta({r})"),
+                        HookCheckResult::BlockMeta { reason: r, .. } => format!("BlockMeta({r})"),
                         HookCheckResult::BlockRule { rule_name, .. } =>
                             format!("BlockRule({rule_name})"),
                         HookCheckResult::BlockStructural { message: r, .. } =>
                             format!("BlockStructural({r})"),
-                        HookCheckResult::Allow => unreachable!(),
+                        HookCheckResult::Allow { .. } => unreachable!(),
                     }
                 );
             }
@@ -1613,9 +1780,9 @@ mod tests {
         let (old_xdg, old_home, dir) = isolate_config();
 
         match check_command_for_hook("unset CLAUDECODE") {
-            HookCheckResult::BlockMeta(_) => {}
+            HookCheckResult::BlockMeta { .. } => {}
             HookCheckResult::BlockRule { .. } | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow => {
+            HookCheckResult::Allow { .. } => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: 'unset CLAUDECODE' was ALLOWED — meta-pattern is broken");
             }
@@ -1629,7 +1796,7 @@ mod tests {
         let (old_xdg, old_home, dir) = isolate_config();
 
         match check_command_for_hook("echo hello world") {
-            HookCheckResult::Allow => {}
+            HookCheckResult::Allow { .. } => {}
             _ => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("'echo hello world' should be allowed");
@@ -1650,8 +1817,8 @@ mod tests {
     fn assert_blocks_meta(command: &str) {
         let (old_xdg, old_home, dir) = isolate_config();
         match check_command_for_hook(command) {
-            HookCheckResult::BlockMeta(_) => {}
-            HookCheckResult::Allow => {
+            HookCheckResult::BlockMeta { .. } => {}
+            HookCheckResult::Allow { .. } => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: {command:?} was ALLOWED — should be BlockMeta");
             }
@@ -1675,17 +1842,17 @@ mod tests {
     fn assert_allows(command: &str) {
         let (old_xdg, old_home, dir) = isolate_config();
         match check_command_for_hook(command) {
-            HookCheckResult::Allow => {}
+            HookCheckResult::Allow { .. } => {}
             other => {
                 let desc = match other {
-                    HookCheckResult::BlockMeta(r) => format!("BlockMeta({r})"),
+                    HookCheckResult::BlockMeta { reason: r, .. } => format!("BlockMeta({r})"),
                     HookCheckResult::BlockRule { rule_name, .. } => {
                         format!("BlockRule({rule_name})")
                     }
                     HookCheckResult::BlockStructural { message: r, .. } => {
                         format!("BlockStructural({r})")
                     }
-                    HookCheckResult::Allow => unreachable!(),
+                    HookCheckResult::Allow { .. } => unreachable!(),
                 };
                 restore_config(old_xdg, old_home, dir);
                 panic!("expected Allow for {command:?}, got: {desc}");
