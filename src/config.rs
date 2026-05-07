@@ -512,10 +512,68 @@ pub fn default_rules() -> Vec<RuleConfig> {
             Some("omamori blocked rsync with destructive flags".to_string()),
         )
         .with_builtin(true),
+        // omamori self-modification protection (v0.10.3, DI-13).
+        // Phase 2 backstop for verb patterns moved out of Phase 1A `command.contains`
+        // by the data-flag allowlist. Without these, relaxing Phase 1A would let
+        // raw `omamori config disable` / `omamori uninstall` etc. through.
+        RuleConfig::new(
+            "omamori-config-modify-block",
+            "omamori",
+            ActionKind::Block,
+            vec!["config".to_string()],
+            vec!["disable".to_string(), "enable".to_string()],
+            Some("omamori blocked self-modification of rules".to_string()),
+        )
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-uninstall-block",
+            "omamori",
+            ActionKind::Block,
+            vec!["uninstall".to_string()],
+            Vec::new(),
+            Some("omamori blocked uninstall via AI".to_string()),
+        )
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-init-force-block",
+            "omamori",
+            ActionKind::Block,
+            vec!["init".to_string()],
+            vec!["--force".to_string()],
+            Some("omamori blocked init --force via AI".to_string()),
+        )
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-override-block",
+            "omamori",
+            ActionKind::Block,
+            vec!["override".to_string()],
+            Vec::new(),
+            Some("omamori blocked override via AI".to_string()),
+        )
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-doctor-fix-block",
+            "omamori",
+            ActionKind::Block,
+            vec!["doctor".to_string()],
+            vec!["--fix".to_string()],
+            Some("omamori blocked doctor --fix via AI".to_string()),
+        )
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-explain-block",
+            "omamori",
+            ActionKind::Block,
+            vec!["explain".to_string()],
+            Vec::new(),
+            Some("omamori blocked explain via AI (oracle attack prevention)".to_string()),
+        )
+        .with_builtin(true),
     ]
 }
 
-/// Names of the 7 core (built-in) safety rules.
+/// Names of the 13 core (built-in) safety rules: 7 generic + 6 omamori-* (DI-13).
 pub fn core_rule_names() -> Vec<&'static str> {
     vec![
         "rm-recursive-to-trash",
@@ -525,6 +583,12 @@ pub fn core_rule_names() -> Vec<&'static str> {
         "chmod-777-block",
         "find-delete-block",
         "rsync-delete-block",
+        "omamori-config-modify-block",
+        "omamori-uninstall-block",
+        "omamori-init-force-block",
+        "omamori-override-block",
+        "omamori-doctor-fix-block",
+        "omamori-explain-block",
     ]
 }
 
@@ -1038,6 +1102,91 @@ mod tests {
                 rule.enabled,
                 "rule {} should be enabled by default",
                 rule.name
+            );
+        }
+    }
+
+    /// DI-13: omamori self-protect rules must exist in `default_rules()`.
+    /// PR1c will relax Phase 1A verb-pattern substring match for `omamori`
+    /// subcommands; without these Phase 2 builtin rules a real `omamori
+    /// config disable` invocation would not be caught.
+    #[test]
+    fn default_rules_includes_omamori_self_protect_six_rules() {
+        let rules = default_rules();
+        let required: &[&str] = &[
+            "omamori-config-modify-block",
+            "omamori-uninstall-block",
+            "omamori-init-force-block",
+            "omamori-override-block",
+            "omamori-doctor-fix-block",
+            "omamori-explain-block",
+        ];
+        for name in required {
+            let rule = rules
+                .iter()
+                .find(|r| r.name == *name)
+                .unwrap_or_else(|| panic!("default_rules() must include {}", name));
+            assert_eq!(
+                rule.command, "omamori",
+                "{} must target program 'omamori'",
+                name
+            );
+            assert!(
+                matches!(rule.action, ActionKind::Block),
+                "{} must use Block action",
+                name
+            );
+            assert!(rule.is_builtin, "{} must be marked as builtin", name);
+            assert!(rule.enabled, "{} must be enabled by default", name);
+        }
+    }
+
+    /// Verify each `omamori-*-block` rule actually matches its target invocation
+    /// via `match_rule`, independently of Phase 1A `command.contains`.
+    #[test]
+    fn omamori_self_protect_rules_match_via_phase2() {
+        use crate::rules::{CommandInvocation, match_rule};
+        let rules = default_rules();
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "omamori",
+                &["config", "disable", "rm-recursive-to-trash"],
+                "omamori-config-modify-block",
+            ),
+            (
+                "omamori",
+                &["config", "enable", "git-reset-block"],
+                "omamori-config-modify-block",
+            ),
+            ("omamori", &["uninstall"], "omamori-uninstall-block"),
+            ("omamori", &["init", "--force"], "omamori-init-force-block"),
+            ("omamori", &["override"], "omamori-override-block"),
+            ("omamori", &["doctor", "--fix"], "omamori-doctor-fix-block"),
+            (
+                "omamori",
+                &["explain", "rm", "-rf", "/"],
+                "omamori-explain-block",
+            ),
+        ];
+        for (program, args, expected) in cases {
+            let inv = CommandInvocation::new(
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            );
+            let matched = match_rule(&rules, &inv);
+            assert!(
+                matched.is_some(),
+                "command `{} {:?}` should match a rule",
+                program,
+                args
+            );
+            assert_eq!(
+                matched.unwrap().name,
+                *expected,
+                "command `{} {:?}` should match `{}`",
+                program,
+                args,
+                expected
             );
         }
     }

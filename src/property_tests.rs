@@ -427,6 +427,12 @@ fn wrapper_kinds_cover_transparent_wrappers_sot() {
 /// built-in rule (Block / Trash / MoveTo) without updating both the
 /// generator branch in [`arb_destructive_core`] and this constant fires
 /// here, before any property test runs.
+///
+/// Excludes `command == "omamori"` rules (DI-13 Phase 2 backstop, v0.10.3+):
+/// these protect omamori's own subcommands from AI-driven self-modification
+/// and are not destructive shell commands. The proptest generator does not
+/// emit `omamori uninstall` / `omamori config disable` etc., so coverage
+/// expectation excludes them by design.
 #[test]
 fn coverage_matches_default_rules_destructive_set() {
     let config = Config::default();
@@ -437,7 +443,7 @@ fn coverage_matches_default_rules_destructive_set() {
             matches!(
                 r.action,
                 ActionKind::Block | ActionKind::Trash | ActionKind::MoveTo
-            )
+            ) && r.command != "omamori"
         })
         .map(|r| r.name.as_str())
         .collect();

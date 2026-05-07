@@ -337,6 +337,37 @@ else
     fail=1
 fi
 
+# ---------- Invariant: phase1a-relaxation-requires-phase2 (DI-13, v0.10.3+) ----------
+# Phase 2 backstop for verb patterns that may be relaxed in Phase 1A by the
+# data-flag allowlist (v0.10.3+, #240). These 6 builtin rules MUST exist in
+# `default_rules()` so that a real `omamori config disable` invocation is
+# caught even if `command.contains` is bypassed by token-level position-aware
+# Phase 1A.
+#
+# Naming: identified by name rather than number so future re-orderings do
+# not break SECURITY.md cross-references.
+di13_fail=0
+required_omamori_rules=(
+    "omamori-config-modify-block"
+    "omamori-uninstall-block"
+    "omamori-init-force-block"
+    "omamori-override-block"
+    "omamori-doctor-fix-block"
+    "omamori-explain-block"
+)
+cf=src/config.rs
+for rule in "${required_omamori_rules[@]}"; do
+    if ! grep -qF "\"$rule\"" "$cf"; then
+        echo "FAIL [invariant phase1a-relaxation-requires-phase2/DI-13]: $cf must define \"$rule\""
+        di13_fail=1
+    fi
+done
+if [ "$di13_fail" -eq 0 ]; then
+    echo "phase1a-relaxation-requires-phase2 OK: omamori-* builtin rules intact (DI-13)"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"

@@ -51,6 +51,7 @@ What is caught, what is not, and why. Status values: **supported** (tested, expe
 | Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (string pattern) | Acceptance tests |
 | Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code, Codex CLI) | Hook integration file-protection tests |
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
+| Self-modification commands in command context (`omamori config disable/enable`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`) | supported (env guard) | supported (Phase 1A string pattern + Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
 
 #### Not caught — by design
 
@@ -109,6 +110,7 @@ This rule ensures that the boundary matrix and test corpus grow together and tha
 | DI-10 | `doctor --fix` repair order: install → hooks → chmod → baseline (last) | Baseline must reflect the post-repair state, not the pre-repair state |
 | DI-11 | Command separators `\n`, `\r`, `&` are normalized before tokenization | `normalize_compound_operators` treats unquoted newlines as `;` and space-separates `&` (excluding `&>`, `>&`, `2>&1` redirects) |
 | DI-12 | Env var tampering detection is token-level, not string-level | Phase 1B `detect_env_var_tampering` uses `shell_words::split` after normalization, with `is_command_position()` to prevent false positives on quoted strings and arguments |
+| DI-13 | Phase 1A relaxation requires Phase 2 compensation (v0.10.3+) | For every verb pattern that may be relaxed in Phase 1A by the data-flag allowlist (`gh issue/pr create --body`, `git commit -m/-F`, etc.), an equivalent `omamori-*-block` builtin rule MUST exist in `default_rules()` so that real `omamori config disable` invocations remain caught by Phase 2 rule matching. Enforced by `scripts/check-invariants.sh` invariant `phase1a-relaxation-requires-phase2` and unit test `default_rules_includes_omamori_self_protect_six_rules`. |
 
 `guard_ai_config_modification` call sites: 9 (as of v0.9.0).
 
