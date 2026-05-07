@@ -868,6 +868,7 @@ mod tests {
             message: None,
             enabled: true,
             destination: None,
+            subcommand: None,
             is_builtin: false,
         };
         let outcome = ActionOutcome::Blocked {
@@ -910,6 +911,7 @@ mod tests {
             message: Some("blocked push --force".to_string()),
             enabled: true,
             destination: None,
+            subcommand: None,
             is_builtin: false,
         };
         let outcome = ActionOutcome::Blocked {

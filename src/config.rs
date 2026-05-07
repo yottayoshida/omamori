@@ -74,6 +74,11 @@ struct UserRule {
     match_all: Option<Vec<String>>,
     match_any: Option<Vec<String>>,
     message: Option<String>,
+    /// Optional subcommand position constraint (DI-13, v0.10.3+).
+    /// Only honored on user-defined rules (not on overrides of built-ins;
+    /// changing built-in subcommand via override would weaken DI-13).
+    #[serde(default)]
+    subcommand: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +210,9 @@ fn merge_rules(
                     }
                     if let Some(dest) = &ur.destination {
                         rule.destination = Some(dest.clone());
+                    }
+                    if let Some(sub) = &ur.subcommand {
+                        rule.subcommand = Some(sub.clone());
                     }
                     merged.push(rule);
                 }
@@ -512,10 +520,77 @@ pub fn default_rules() -> Vec<RuleConfig> {
             Some("omamori blocked rsync with destructive flags".to_string()),
         )
         .with_builtin(true),
+        // omamori self-modification protection (v0.10.3, DI-13).
+        // Phase 2 backstop for verb patterns moved out of Phase 1A `command.contains`
+        // by the data-flag allowlist. Without these, relaxing Phase 1A would let
+        // raw `omamori config disable` / `omamori uninstall` etc. through.
+        //
+        // Each rule uses `with_subcommand(...)` so args[0] must match exactly,
+        // preventing false positives like `omamori exec -- echo disable config`.
+        RuleConfig::new(
+            "omamori-config-modify-block",
+            "omamori",
+            ActionKind::Block,
+            Vec::new(),
+            vec!["disable".to_string(), "enable".to_string()],
+            Some("omamori blocked self-modification of rules".to_string()),
+        )
+        .with_subcommand("config")
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-uninstall-block",
+            "omamori",
+            ActionKind::Block,
+            Vec::new(),
+            Vec::new(),
+            Some("omamori blocked uninstall via AI".to_string()),
+        )
+        .with_subcommand("uninstall")
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-init-force-block",
+            "omamori",
+            ActionKind::Block,
+            Vec::new(),
+            vec!["--force".to_string()],
+            Some("omamori blocked init --force via AI".to_string()),
+        )
+        .with_subcommand("init")
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-override-block",
+            "omamori",
+            ActionKind::Block,
+            Vec::new(),
+            Vec::new(),
+            Some("omamori blocked override via AI".to_string()),
+        )
+        .with_subcommand("override")
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-doctor-fix-block",
+            "omamori",
+            ActionKind::Block,
+            Vec::new(),
+            vec!["--fix".to_string()],
+            Some("omamori blocked doctor --fix via AI".to_string()),
+        )
+        .with_subcommand("doctor")
+        .with_builtin(true),
+        RuleConfig::new(
+            "omamori-explain-block",
+            "omamori",
+            ActionKind::Block,
+            Vec::new(),
+            Vec::new(),
+            Some("omamori blocked explain via AI (oracle attack prevention)".to_string()),
+        )
+        .with_subcommand("explain")
+        .with_builtin(true),
     ]
 }
 
-/// Names of the 7 core (built-in) safety rules.
+/// Names of the 13 core (built-in) safety rules: 7 generic + 6 omamori-* (DI-13).
 pub fn core_rule_names() -> Vec<&'static str> {
     vec![
         "rm-recursive-to-trash",
@@ -525,6 +600,12 @@ pub fn core_rule_names() -> Vec<&'static str> {
         "chmod-777-block",
         "find-delete-block",
         "rsync-delete-block",
+        "omamori-config-modify-block",
+        "omamori-uninstall-block",
+        "omamori-init-force-block",
+        "omamori-override-block",
+        "omamori-doctor-fix-block",
+        "omamori-explain-block",
     ]
 }
 
@@ -726,6 +807,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -756,6 +838,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut overrides = HashMap::new();
         overrides.insert("git-push-force-block".to_string(), false);
@@ -780,6 +863,7 @@ mod tests {
             match_all: None,
             match_any: Some(vec!["-rf".to_string()]),
             message: Some("custom".to_string()),
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -801,6 +885,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -825,6 +910,7 @@ mod tests {
                 match_all: None,
                 match_any: None,
                 message: None,
+                subcommand: None,
             },
             UserRule {
                 name: "git-push-force-block".to_string(),
@@ -835,6 +921,7 @@ mod tests {
                 match_all: None,
                 match_any: None,
                 message: None,
+                subcommand: None,
             },
         ];
         let mut warnings = Vec::new();
@@ -873,6 +960,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -902,6 +990,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -924,6 +1013,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: Some("my custom message".to_string()),
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -1040,6 +1130,157 @@ mod tests {
                 rule.name
             );
         }
+    }
+
+    /// DI-13: omamori self-protect rules must exist in `default_rules()`.
+    /// PR1c will relax Phase 1A verb-pattern substring match for `omamori`
+    /// subcommands; without these Phase 2 builtin rules a real `omamori
+    /// config disable` invocation would not be caught.
+    #[test]
+    fn default_rules_includes_omamori_self_protect_six_rules() {
+        let rules = default_rules();
+        let required: &[&str] = &[
+            "omamori-config-modify-block",
+            "omamori-uninstall-block",
+            "omamori-init-force-block",
+            "omamori-override-block",
+            "omamori-doctor-fix-block",
+            "omamori-explain-block",
+        ];
+        for name in required {
+            let rule = rules
+                .iter()
+                .find(|r| r.name == *name)
+                .unwrap_or_else(|| panic!("default_rules() must include {}", name));
+            assert_eq!(
+                rule.command, "omamori",
+                "{} must target program 'omamori'",
+                name
+            );
+            assert!(
+                matches!(rule.action, ActionKind::Block),
+                "{} must use Block action",
+                name
+            );
+            assert!(rule.is_builtin, "{} must be marked as builtin", name);
+            assert!(rule.enabled, "{} must be enabled by default", name);
+        }
+    }
+
+    /// Verify each `omamori-*-block` rule actually matches its target invocation
+    /// via `match_rule`, independently of Phase 1A `command.contains`.
+    #[test]
+    fn omamori_self_protect_rules_match_via_phase2() {
+        use crate::rules::{CommandInvocation, match_rule};
+        let rules = default_rules();
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "omamori",
+                &["config", "disable", "rm-recursive-to-trash"],
+                "omamori-config-modify-block",
+            ),
+            (
+                "omamori",
+                &["config", "enable", "git-reset-block"],
+                "omamori-config-modify-block",
+            ),
+            ("omamori", &["uninstall"], "omamori-uninstall-block"),
+            ("omamori", &["init", "--force"], "omamori-init-force-block"),
+            ("omamori", &["override"], "omamori-override-block"),
+            ("omamori", &["doctor", "--fix"], "omamori-doctor-fix-block"),
+            (
+                "omamori",
+                &["explain", "rm", "-rf", "/"],
+                "omamori-explain-block",
+            ),
+        ];
+        for (program, args, expected) in cases {
+            let inv = CommandInvocation::new(
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            );
+            let matched = match_rule(&rules, &inv);
+            assert!(
+                matched.is_some(),
+                "command `{} {:?}` should match a rule",
+                program,
+                args
+            );
+            assert_eq!(
+                matched.unwrap().name,
+                *expected,
+                "command `{} {:?}` should match `{}`",
+                program,
+                args,
+                expected
+            );
+        }
+    }
+
+    /// DI-13 false-positive regression guard. The `omamori-*-block` rules use
+    /// `subcommand` constraint so that arguments at non-subcommand positions
+    /// containing protected words do not trigger a false block. Without
+    /// `subcommand`, `match_any` would match any argument anywhere.
+    /// Codex review (PR1a R1) flagged this as a P2 regression risk.
+    #[test]
+    fn omamori_self_protect_rules_skip_false_positive_data_args() {
+        use crate::rules::{CommandInvocation, match_rule};
+        let rules = default_rules();
+        // Each command has args[0] != target subcommand, but contains protected
+        // words at non-subcommand positions. Should NOT match any omamori-* rule.
+        let benign_cases: &[(&str, &[&str])] = &[
+            ("omamori", &["exec", "--", "echo", "disable", "config"]),
+            ("omamori", &["report", "--by_rule", "uninstall"]),
+            ("omamori", &["audit", "show", "--filter", "override"]),
+            ("omamori", &["status", "--note", "explain something"]),
+            ("omamori", &["init"]), // no --force, must not match init-force-block
+            ("omamori", &["doctor"]), // no --fix, must not match doctor-fix-block
+        ];
+        for (program, args) in benign_cases {
+            let inv = CommandInvocation::new(
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            );
+            let matched = match_rule(&rules, &inv);
+            if let Some(m) = matched {
+                assert!(
+                    !m.name.starts_with("omamori-"),
+                    "benign command `{} {:?}` must not match self-protect rule `{}`",
+                    program,
+                    args,
+                    m.name
+                );
+            }
+        }
+    }
+
+    /// Codex review (PR1a R2) [P2]: user-defined rules in TOML must honor the
+    /// `subcommand` field. Earlier `UserRule` was missing this field, silently
+    /// dropping it for custom rules. This test pins that user rules can declare
+    /// `subcommand` and have it propagate into the resolved Config.
+    #[test]
+    fn user_rule_with_subcommand_field_is_honored() {
+        let toml_str = r#"
+[[rules]]
+name = "my-custom-block"
+command = "mytool"
+action = "block"
+subcommand = "danger"
+match_any = ["--really"]
+"#;
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        let rule = config
+            .rules
+            .iter()
+            .find(|r| r.name == "my-custom-block")
+            .expect("user-defined rule should be merged");
+        assert_eq!(
+            rule.subcommand.as_deref(),
+            Some("danger"),
+            "subcommand field on user rule must be propagated"
+        );
     }
 
     #[test]
