@@ -248,13 +248,16 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 /// `load_config(None)` when Phase 1A/1B/structural short-circuits the
 /// verdict.
 fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckResult> {
-    // Phase 1A: String-level meta-patterns (path/config/uninstall)
+    // Phase 1A: String-level meta-patterns (path/config/uninstall).
+    // matched_pattern carries the actual `pattern` token (e.g. "config disable"),
+    // not the human-readable `reason`. Reason has its own `reason` / `rule_id`
+    // fields in the JSON schema. Codex review (PR1b R1) [P2].
     for (pattern, reason) in installer::blocked_string_patterns() {
-        if command.contains(pattern) {
+        if let Some(start) = command.find(pattern) {
             return Err(HookCheckResult::BlockMeta {
                 reason,
-                matched_pattern: Some(reason),
-                matched_position: None,
+                matched_pattern: Some(pattern),
+                matched_position: Some(start..start + pattern.len()),
             });
         }
     }
@@ -520,6 +523,7 @@ fn run_hook_check_command(
                 None,
                 None,
                 "layer2:meta-pattern".to_string(),
+                json_error,
             );
             if json_error {
                 emit_json_error(
@@ -557,6 +561,7 @@ fn run_hook_check_command(
                 Some(&rule_name),
                 unwrap_chain.clone(),
                 "layer2:rule".to_string(),
+                json_error,
             );
             if json_error {
                 emit_json_error(
@@ -594,7 +599,14 @@ fn run_hook_check_command(
                 Some(w) => format!("layer2:pipe-to-shell:{w}"),
                 None => "layer2:structural".to_string(),
             };
-            audit_log_hook_block(command, provider, None, None, detection_layer.clone());
+            audit_log_hook_block(
+                command,
+                provider,
+                None,
+                None,
+                detection_layer.clone(),
+                json_error,
+            );
             if json_error {
                 emit_json_error(
                     &detection_layer,
@@ -861,6 +873,7 @@ fn audit_log_hook_block(
     rule_name: Option<&str>,
     unwrap_chain: Option<String>,
     detection_layer_value: String,
+    suppress_warnings: bool,
 ) {
     debug_assert!(
         is_valid_detection_layer(&detection_layer_value),
@@ -870,11 +883,16 @@ fn audit_log_hook_block(
     let load_result = match load_config(None) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
-                "omamori warning: could not record Layer 2 hook deny event for {command:?} \
-                 — config load failed: {e}. The 'omamori audit show --action block' surface \
-                 is incomplete for this event."
-            );
+            // PR1b R1 [P2]: in --json-error mode, suppress free-form stderr
+            // warnings so consumers receive a single JSON object on stderr.
+            // Audit gaps are still recorded by absence of the chain entry.
+            if !suppress_warnings {
+                eprintln!(
+                    "omamori warning: could not record Layer 2 hook deny event for {command:?} \
+                     — config load failed: {e}. The 'omamori audit show --action block' surface \
+                     is incomplete for this event."
+                );
+            }
             return;
         }
     };
@@ -1416,33 +1434,38 @@ mod tests {
     }
 
     /// PR1b (DI-13 / #239 follow-up): BlockMeta must populate `matched_pattern`
-    /// with the protected pattern token so acceptance test assertions can
-    /// reference structured metadata instead of brittle stderr substrings.
+    /// with the protected pattern token (NOT the human-readable reason — those
+    /// have separate fields) so acceptance tests can assert on structured
+    /// metadata instead of brittle stderr substrings.
+    /// Codex review (PR1b R1) [P2] enforced this contract.
     #[test]
     #[serial_test::serial]
     fn block_meta_populates_matched_pattern_metadata() {
         let (old_xdg, old_home, dir) = isolate_config();
         let result = check_command_for_hook("omamori uninstall");
-        let (got_pattern, got_reason) = match result {
+        let (got_pattern, got_position) = match result {
             HookCheckResult::BlockMeta {
-                reason,
                 matched_pattern,
+                matched_position,
                 ..
-            } => (matched_pattern, reason),
+            } => (matched_pattern, matched_position),
             _ => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("expected BlockMeta for `omamori uninstall`");
             }
         };
         restore_config(old_xdg, old_home, dir);
+        let pattern = got_pattern.expect("matched_pattern must be populated");
         assert!(
-            got_pattern.is_some(),
-            "BlockMeta must populate matched_pattern (got None)"
+            pattern.contains("uninstall"),
+            "matched_pattern should be the protected token (e.g. 'omamori uninstall'), got {:?}",
+            pattern
         );
-        assert_eq!(
-            got_pattern,
-            Some(got_reason),
-            "matched_pattern should equal reason for Phase 1A meta-pattern blocks"
+        let position = got_position.expect("matched_position must be populated");
+        assert!(
+            position.end > position.start,
+            "matched_position must have non-empty range, got {:?}",
+            position
         );
     }
 
