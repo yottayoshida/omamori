@@ -2007,15 +2007,20 @@ fn hook_check_json_error_blockrule_shape() {
     let json = parse_json_error_stderr(&stderr);
     assert_eq!(json["blocked"], serde_json::Value::Bool(true));
     assert_eq!(json["layer"], "layer2:rule");
-    let rule_id = json["rule_id"].as_str().expect("rule_id must be a string");
-    assert!(
-        !rule_id.is_empty(),
-        "rule_id must be non-empty for BlockRule"
+    // Mutation guard (Codex Phase 6-B R2): rule_id must be exact, not just
+    // non-empty. A swap of rule_id <-> message would otherwise pass.
+    assert_eq!(
+        json["rule_id"], "rm-recursive-to-trash",
+        "rule_id must be the exact rule name (not message)"
     );
     // PR1b: matched_pattern/position not yet populated for BlockRule.
     assert!(
         json["matched_pattern"].is_null(),
         "PR1b: BlockRule matched_pattern is null until PR1c"
+    );
+    assert!(
+        json["matched_position"].is_null(),
+        "PR1b: BlockRule matched_position is null until PR1c"
     );
 }
 
@@ -2030,14 +2035,23 @@ fn hook_check_json_error_blockstructural_shape() {
     assert!(stdout.is_empty());
     let json = parse_json_error_stderr(&stderr);
     assert_eq!(json["blocked"], serde_json::Value::Bool(true));
-    let layer = json["layer"].as_str().expect("layer must be a string");
-    assert!(
-        layer.starts_with("layer2:"),
-        "BlockStructural layer must start with layer2: (got {layer})"
+    // Mutation guard (Codex Phase 6-B R2): layer must be exact, not just
+    // prefixed with layer2:. A swap to layer2:meta-pattern would otherwise pass.
+    assert_eq!(
+        json["layer"], "layer2:pipe-to-shell:env",
+        "BlockStructural layer must encode the wrapper kind exactly"
     );
     assert_eq!(
         json["rule_id"], "structural",
         "BlockStructural rule_id is the constant 'structural'"
+    );
+    assert!(
+        json["matched_pattern"].is_null(),
+        "BlockStructural matched_pattern is null per schema"
+    );
+    assert!(
+        json["matched_position"].is_null(),
+        "BlockStructural matched_position is null per schema"
     );
 }
 
