@@ -197,10 +197,10 @@ fn rule_matches(rule: &RuleConfig, invocation: &CommandInvocation) -> bool {
     // DI-13: subcommand position constraint. When `Some`, args[0] must match exactly.
     // This prevents `omamori exec -- echo disable config` from matching a generic
     // `match_any=["disable"]` rule by ensuring the verb is at the subcommand position.
-    if let Some(ref sub) = rule.subcommand {
-        if invocation.args.first().map(String::as_str) != Some(sub.as_str()) {
-            return false;
-        }
+    if let Some(ref sub) = rule.subcommand
+        && invocation.args.first().map(String::as_str) != Some(sub.as_str())
+    {
+        return false;
     }
 
     let expanded = expand_short_flags(&invocation.args);
