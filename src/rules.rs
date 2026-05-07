@@ -90,7 +90,14 @@ pub struct RuleConfig {
     pub enabled: bool,
     #[serde(default)]
     pub destination: Option<String>,
-    /// True for the 7 built-in core safety rules. Cannot be injected via config.toml.
+    /// Optional subcommand position constraint (v0.10.3+, DI-13).
+    /// When `Some(s)`, the rule matches only when `args[0] == s`.
+    /// Prevents false positives like `omamori exec -- echo disable config`
+    /// matching a generic `match_any=["disable"]` builtin rule.
+    /// Used by the 6 `omamori-*-block` self-protection rules.
+    #[serde(default)]
+    pub subcommand: Option<String>,
+    /// True for the 13 built-in core safety rules. Cannot be injected via config.toml.
     #[serde(skip)]
     pub is_builtin: bool,
 }
@@ -113,6 +120,7 @@ impl RuleConfig {
             message,
             enabled: true,
             destination: None,
+            subcommand: None,
             is_builtin: false,
         }
     }
@@ -124,6 +132,11 @@ impl RuleConfig {
 
     pub fn with_destination(mut self, destination: String) -> Self {
         self.destination = Some(destination);
+        self
+    }
+
+    pub fn with_subcommand(mut self, subcommand: &str) -> Self {
+        self.subcommand = Some(subcommand.to_string());
         self
     }
 
@@ -179,6 +192,15 @@ pub(crate) fn expand_short_flags(args: &[String]) -> Vec<String> {
 fn rule_matches(rule: &RuleConfig, invocation: &CommandInvocation) -> bool {
     if rule.command != invocation.program {
         return false;
+    }
+
+    // DI-13: subcommand position constraint. When `Some`, args[0] must match exactly.
+    // This prevents `omamori exec -- echo disable config` from matching a generic
+    // `match_any=["disable"]` rule by ensuring the verb is at the subcommand position.
+    if let Some(ref sub) = rule.subcommand {
+        if invocation.args.first().map(String::as_str) != Some(sub.as_str()) {
+            return false;
+        }
     }
 
     let expanded = expand_short_flags(&invocation.args);

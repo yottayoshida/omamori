@@ -100,12 +100,15 @@ message = "omamori blocked rsync with destructive flags"
 # Phase 2 backstop for verb patterns moved out of Phase 1A `command.contains`
 # by the data-flag allowlist. Without these, relaxing Phase 1A would let raw
 # `omamori config disable` / `omamori uninstall` etc. through.
+#
+# Each rule uses `subcommand` so args[0] must match exactly, preventing
+# false positives like `omamori exec -- echo disable config`.
 
 [[rules]]
 name = "omamori-config-modify-block"
 command = "omamori"
 action = "block"
-match_all = ["config"]
+subcommand = "config"
 match_any = ["disable", "enable"]
 message = "omamori blocked self-modification of rules"
 
@@ -113,14 +116,14 @@ message = "omamori blocked self-modification of rules"
 name = "omamori-uninstall-block"
 command = "omamori"
 action = "block"
-match_all = ["uninstall"]
+subcommand = "uninstall"
 message = "omamori blocked uninstall via AI"
 
 [[rules]]
 name = "omamori-init-force-block"
 command = "omamori"
 action = "block"
-match_all = ["init"]
+subcommand = "init"
 match_any = ["--force"]
 message = "omamori blocked init --force via AI"
 
@@ -128,14 +131,14 @@ message = "omamori blocked init --force via AI"
 name = "omamori-override-block"
 command = "omamori"
 action = "block"
-match_all = ["override"]
+subcommand = "override"
 message = "omamori blocked override via AI"
 
 [[rules]]
 name = "omamori-doctor-fix-block"
 command = "omamori"
 action = "block"
-match_all = ["doctor"]
+subcommand = "doctor"
 match_any = ["--fix"]
 message = "omamori blocked doctor --fix via AI"
 
@@ -143,7 +146,7 @@ message = "omamori blocked doctor --fix via AI"
 name = "omamori-explain-block"
 command = "omamori"
 action = "block"
-match_all = ["explain"]
+subcommand = "explain"
 message = "omamori blocked explain via AI (oracle attack prevention)"
 
 # --- Example: move-to action (new in v0.2) ---

@@ -516,59 +516,68 @@ pub fn default_rules() -> Vec<RuleConfig> {
         // Phase 2 backstop for verb patterns moved out of Phase 1A `command.contains`
         // by the data-flag allowlist. Without these, relaxing Phase 1A would let
         // raw `omamori config disable` / `omamori uninstall` etc. through.
+        //
+        // Each rule uses `with_subcommand(...)` so args[0] must match exactly,
+        // preventing false positives like `omamori exec -- echo disable config`.
         RuleConfig::new(
             "omamori-config-modify-block",
             "omamori",
             ActionKind::Block,
-            vec!["config".to_string()],
+            Vec::new(),
             vec!["disable".to_string(), "enable".to_string()],
             Some("omamori blocked self-modification of rules".to_string()),
         )
+        .with_subcommand("config")
         .with_builtin(true),
         RuleConfig::new(
             "omamori-uninstall-block",
             "omamori",
             ActionKind::Block,
-            vec!["uninstall".to_string()],
+            Vec::new(),
             Vec::new(),
             Some("omamori blocked uninstall via AI".to_string()),
         )
+        .with_subcommand("uninstall")
         .with_builtin(true),
         RuleConfig::new(
             "omamori-init-force-block",
             "omamori",
             ActionKind::Block,
-            vec!["init".to_string()],
+            Vec::new(),
             vec!["--force".to_string()],
             Some("omamori blocked init --force via AI".to_string()),
         )
+        .with_subcommand("init")
         .with_builtin(true),
         RuleConfig::new(
             "omamori-override-block",
             "omamori",
             ActionKind::Block,
-            vec!["override".to_string()],
+            Vec::new(),
             Vec::new(),
             Some("omamori blocked override via AI".to_string()),
         )
+        .with_subcommand("override")
         .with_builtin(true),
         RuleConfig::new(
             "omamori-doctor-fix-block",
             "omamori",
             ActionKind::Block,
-            vec!["doctor".to_string()],
+            Vec::new(),
             vec!["--fix".to_string()],
             Some("omamori blocked doctor --fix via AI".to_string()),
         )
+        .with_subcommand("doctor")
         .with_builtin(true),
         RuleConfig::new(
             "omamori-explain-block",
             "omamori",
             ActionKind::Block,
-            vec!["explain".to_string()],
+            Vec::new(),
             Vec::new(),
             Some("omamori blocked explain via AI (oracle attack prevention)".to_string()),
         )
+        .with_subcommand("explain")
         .with_builtin(true),
     ]
 }
@@ -1188,6 +1197,43 @@ mod tests {
                 args,
                 expected
             );
+        }
+    }
+
+    /// DI-13 false-positive regression guard. The `omamori-*-block` rules use
+    /// `subcommand` constraint so that arguments at non-subcommand positions
+    /// containing protected words do not trigger a false block. Without
+    /// `subcommand`, `match_any` would match any argument anywhere.
+    /// Codex review (PR1a) flagged this as a P2 regression risk.
+    #[test]
+    fn omamori_self_protect_rules_skip_false_positive_data_args() {
+        use crate::rules::{CommandInvocation, match_rule};
+        let rules = default_rules();
+        // Each command has args[0] != target subcommand, but contains protected
+        // words at non-subcommand positions. Should NOT match any omamori-* rule.
+        let benign_cases: &[(&str, &[&str])] = &[
+            ("omamori", &["exec", "--", "echo", "disable", "config"]),
+            ("omamori", &["report", "--by_rule", "uninstall"]),
+            ("omamori", &["audit", "show", "--filter", "override"]),
+            ("omamori", &["status", "--note", "explain something"]),
+            ("omamori", &["init"]), // no --force, must not match init-force-block
+            ("omamori", &["doctor"]), // no --fix, must not match doctor-fix-block
+        ];
+        for (program, args) in benign_cases {
+            let inv = CommandInvocation::new(
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            );
+            let matched = match_rule(&rules, &inv);
+            if let Some(m) = matched {
+                assert!(
+                    !m.name.starts_with("omamori-"),
+                    "benign command `{} {:?}` must not match self-protect rule `{}`",
+                    program,
+                    args,
+                    m.name
+                );
+            }
         }
     }
 
