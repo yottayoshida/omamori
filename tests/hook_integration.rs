@@ -1115,6 +1115,125 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Allow,
         "obfuscated-fp-command-v-allow",
     ),
+    // ----------------------------------------------------------------------
+    // PR1c (v0.10.3): false-positive ALLOW — verb pattern in data context.
+    // Phase 1A verb-based moved to token-level position-aware detection,
+    // so quoted body / data flag arguments containing protected verbs
+    // (e.g. `gh issue create --body "config disable bug"`) MUST allow.
+    // shell_words::split packs quoted bodies into a single token, so
+    // is_command_position rejects them — verb pattern detector skips.
+    // ----------------------------------------------------------------------
+    (
+        "gh issue create --body \"config disable bug は v0.10.3 で fix\"",
+        Decision::Allow,
+        "fp-data-context-config-disable-allow",
+    ),
+    (
+        "gh issue create --body \"omamori uninstall を試した話\"",
+        Decision::Allow,
+        "fp-data-context-uninstall-allow",
+    ),
+    (
+        "gh pr create --body \"omamori init --force is dangerous\"",
+        Decision::Allow,
+        "fp-data-context-init-force-allow",
+    ),
+    (
+        "gh pr create --body \"omamori override 経由の bypass を防ぐ\"",
+        Decision::Allow,
+        "fp-data-context-override-allow",
+    ),
+    (
+        "git commit -m \"fix: config disable race condition\"",
+        Decision::Allow,
+        "fp-data-context-git-commit-disable-allow",
+    ),
+    (
+        "git commit -m \"refactor: omamori doctor --fix path\"",
+        Decision::Allow,
+        "fp-data-context-doctor-fix-allow",
+    ),
+    (
+        "git commit -m \"docs: omamori explain output schema\"",
+        Decision::Allow,
+        "fp-data-context-explain-allow",
+    ),
+    (
+        "echo 'config disable foo'",
+        Decision::Allow,
+        "fp-quoted-config-disable-allow",
+    ),
+    (
+        "printf 'omamori uninstall'",
+        Decision::Allow,
+        "fp-quoted-uninstall-allow",
+    ),
+    (
+        "echo \"omamori init --force\"",
+        Decision::Allow,
+        "fp-quoted-init-force-allow",
+    ),
+    (
+        "omamori exec -- echo disable config",
+        Decision::Allow,
+        "fp-exec-passthrough-disable-allow",
+    ),
+    (
+        "omamori exec -- echo uninstall override",
+        Decision::Allow,
+        "fp-exec-passthrough-uninstall-allow",
+    ),
+    // ----------------------------------------------------------------------
+    // PR1c (v0.10.3): false-negative regression guard — verb pattern at
+    // command position MUST still BLOCK. These are the same verbs as the
+    // fp_* cases above but in the raw command position.
+    // ----------------------------------------------------------------------
+    (
+        "omamori uninstall",
+        Decision::Block,
+        "fn-raw-uninstall-block",
+    ),
+    (
+        "echo ok && omamori uninstall",
+        Decision::Block,
+        "fn-compound-uninstall-block",
+    ),
+    (
+        "config disable rm-recursive",
+        Decision::Block,
+        "fn-raw-config-disable-block",
+    ),
+    (
+        "config enable git-reset-block",
+        Decision::Block,
+        "fn-raw-config-enable-block",
+    ),
+    (
+        "omamori init --force",
+        Decision::Block,
+        "fn-raw-init-force-block",
+    ),
+    (
+        "omamori init somerule --force",
+        Decision::Block,
+        "fn-init-with-arg-then-force-block",
+    ),
+    ("omamori override", Decision::Block, "fn-raw-override-block"),
+    (
+        "omamori doctor --fix",
+        Decision::Block,
+        "fn-raw-doctor-fix-block",
+    ),
+    (
+        "omamori explain rm-recursive",
+        Decision::Block,
+        "fn-raw-explain-block",
+    ),
+    (
+        "FOO=1 omamori uninstall",
+        Decision::Block,
+        "fn-env-prefix-uninstall-block",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES

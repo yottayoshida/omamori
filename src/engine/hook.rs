@@ -95,6 +95,69 @@ fn is_command_position(tokens: &[String], idx: usize) -> bool {
     true // walked all the way to start
 }
 
+/// Detect verb-based meta-patterns at command position (Phase 1A, PR1c, v0.10.3+).
+///
+/// Mirrors `detect_env_var_tampering` lattice (Phase 1B): operates on
+/// `shell_words::split` token slice, checks `is_command_position`, then
+/// matches n-token verb patterns from `META_PATTERNS_VERB`. Patterns whose
+/// last token is a flag (e.g. `"omamori init --force"`) match when the
+/// verb prefix is at command position AND the flag appears anywhere in
+/// subsequent tokens (per shapes.md T3/T5: flag scan to end-of-args).
+///
+/// Returns `(pattern_str, reason)` of the matched pattern, or `None`.
+fn detect_verb_at_command_position(tokens: &[String]) -> Option<(&'static str, &'static str)> {
+    for i in 0..tokens.len() {
+        if !is_command_position(tokens, i) {
+            continue;
+        }
+        let window = &tokens[i..];
+        for &(pattern, reason) in installer::META_PATTERNS_VERB {
+            if matches_verb_pattern_at(window, pattern) {
+                return Some((pattern, reason));
+            }
+        }
+    }
+    None
+}
+
+/// Match a verb pattern (e.g. `"config disable"`, `"omamori init --force"`)
+/// against a token slice starting at command position.
+///
+/// - Plain verb pattern (no trailing flag): all pattern tokens must match
+///   consecutive positions at `tokens[0..]`.
+/// - Verb-prefix + flag pattern: verb prefix must match consecutive
+///   positions at `tokens[0..]`, and the trailing flag (`--force`, `--fix`)
+///   may appear anywhere in `tokens[verb_prefix.len()..]` (end-of-args scan).
+fn matches_verb_pattern_at(tokens: &[String], pattern: &str) -> bool {
+    let pattern_tokens: Vec<&str> = pattern.split_whitespace().collect();
+    if pattern_tokens.is_empty() || tokens.len() < pattern_tokens.len() {
+        return false;
+    }
+
+    let last_is_flag = pattern_tokens.last().is_some_and(|t| t.starts_with('-'));
+
+    if last_is_flag && pattern_tokens.len() >= 3 {
+        // Verb prefix = pattern_tokens[..len-1], must match exactly at start.
+        let verb_prefix_len = pattern_tokens.len() - 1;
+        let flag = pattern_tokens[verb_prefix_len];
+        let prefix_match = pattern_tokens[..verb_prefix_len]
+            .iter()
+            .zip(tokens.iter())
+            .all(|(p, t)| *p == t.as_str());
+        if !prefix_match {
+            return false;
+        }
+        // Scan tokens after the verb prefix for the flag.
+        return tokens[verb_prefix_len..].iter().any(|t| t == flag);
+    }
+
+    // Plain n-token verb match (no trailing flag).
+    pattern_tokens
+        .iter()
+        .zip(tokens.iter())
+        .all(|(p, t)| *p == t.as_str())
+}
+
 /// Detect env var tampering at the token level.
 /// Only flags commands in command position to avoid false positives
 /// on quoted strings and arguments (e.g., printf 'unset CLAUDECODE').
@@ -248,11 +311,11 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 /// `load_config(None)` when Phase 1A/1B/structural short-circuits the
 /// verdict.
 fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckResult> {
-    // Phase 1A: String-level meta-patterns (path/config/uninstall).
-    // matched_pattern carries the actual `pattern` token (e.g. "config disable"),
+    // Phase 1A path-based: substring match preserved (INV-path-preserve, PR1c).
+    // matched_pattern carries the actual `pattern` token (e.g. ".claude/settings.json"),
     // not the human-readable `reason`. Reason has its own `reason` / `rule_id`
     // fields in the JSON schema. Codex review (PR1b R1) [P2].
-    for (pattern, reason) in installer::blocked_string_patterns() {
+    for &(pattern, reason) in installer::META_PATTERNS_PATH {
         if let Some(start) = command.find(pattern) {
             return Err(HookCheckResult::BlockMeta {
                 reason,
@@ -262,19 +325,32 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
         }
     }
 
-    // Phase 1B: Token-level env var tampering detection.
+    // Phase 1A verb-based + Phase 1B: token-level position-aware (PR1c, v0.10.3+).
     // normalize_compound_operators splits ;, &&, ||, |, &, \n into separate tokens,
     // then shell_words::split normalizes whitespace + parses quotes.
     // This ensures "echo ok;unset CLAUDECODE" is correctly tokenized as
     // ["echo", "ok", ";", "unset", "CLAUDECODE"] — without normalize,
     // shell_words would produce ["echo", "ok;unset", "CLAUDECODE"].
-    // is_command_position() ensures only segment-initial verbs are flagged.
+    // is_command_position() ensures only segment-initial verbs are flagged
+    // (data-context patterns like `gh issue create --body "config disable bug"`
+    // are skipped because the quoted body is packed into a single token).
     //
     // DEFENSE BOUNDARY on shell_words::split failure:
-    //   Phase 1A has already run. Phase 2 blocks malformed commands via
-    //   ParseResult::Block(ParseError) — fail-close (unwrap.rs:77).
+    //   Phase 1A path-based has already run. Phase 2 blocks malformed
+    //   commands via ParseResult::Block(ParseError) — fail-close (INV-fail-close).
     let normalized = unwrap::normalize_compound_operators(command);
     if let Ok(tokens) = shell_words::split(&normalized) {
+        // Phase 1A verb-based (PR1c): n-token verb pattern at command position.
+        // matched_position is None because `tokens` is the post-normalize slice
+        // and original byte offsets are not preserved across quote/escape
+        // unwrapping (acceptable per BlockMeta schema).
+        if let Some((pattern, reason)) = detect_verb_at_command_position(&tokens) {
+            return Err(HookCheckResult::BlockMeta {
+                reason,
+                matched_pattern: Some(pattern),
+                matched_position: None,
+            });
+        }
         if let Some(reason) = detect_env_var_tampering(&tokens) {
             // Phase 1B: token-level detection has no single substring "pattern" —
             // matched_pattern is None per schema (Codex review PR1b R2 [P2]).
@@ -1428,6 +1504,14 @@ mod tests {
     /// have separate fields) so acceptance tests can assert on structured
     /// metadata instead of brittle stderr substrings.
     /// Codex review (PR1b R1) [P2] enforced this contract.
+    ///
+    /// PR1c moved verb-based patterns to token-level position-aware detection
+    /// (`detect_verb_at_command_position`), so `omamori uninstall` now hits the
+    /// verb-based path with `matched_position = None` (no original byte offset
+    /// in post-`shell_words::split` slice). Path-based patterns still populate
+    /// position (covered by hook_check_json_error_blockmeta_exact_metadata
+    /// in tests/cli.rs). This test asserts the verb-path contract: pattern
+    /// populated, position None.
     #[test]
     #[serial_test::serial]
     fn block_meta_populates_matched_pattern_metadata() {
@@ -1446,14 +1530,13 @@ mod tests {
         };
         restore_config(old_xdg, old_home, dir);
         let pattern = got_pattern.expect("matched_pattern must be populated");
-        assert!(
-            pattern.contains("uninstall"),
-            "matched_pattern should be the protected token (e.g. 'omamori uninstall'), got {pattern:?}"
+        assert_eq!(
+            pattern, "omamori uninstall",
+            "matched_pattern must be the exact verb pattern token"
         );
-        let position = got_position.expect("matched_position must be populated");
         assert!(
-            position.end > position.start,
-            "matched_position must have non-empty range, got {position:?}"
+            got_position.is_none(),
+            "PR1c: verb-based patterns have matched_position = None (token-level detection), got {got_position:?}"
         );
     }
 
