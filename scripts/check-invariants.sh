@@ -340,12 +340,15 @@ fi
 # ---------- Invariant: phase1a-relaxation-requires-phase2 (DI-13, v0.10.3+) ----------
 # Phase 2 backstop for verb patterns that may be relaxed in Phase 1A by the
 # data-flag allowlist (v0.10.3+, #240). These 6 builtin rules MUST exist in
-# `default_rules()` so that a real `omamori config disable` invocation is
-# caught even if `command.contains` is bypassed by token-level position-aware
-# Phase 1A.
+# `default_rules()` so that a real self-modification invocation is caught
+# even if Phase 1A is relaxed by the data-flag allowlist.
 #
 # Naming: identified by name rather than number so future re-orderings do
 # not break SECURITY.md cross-references.
+#
+# The check narrows grep to the `default_rules()` body — Codex review (PR1a)
+# noted the original wide-scope grep would pass even if a rule was deleted
+# from default_rules() but kept in tests or core_rule_names() (false OK).
 di13_fail=0
 required_omamori_rules=(
     "omamori-config-modify-block"
@@ -356,14 +359,19 @@ required_omamori_rules=(
     "omamori-explain-block"
 )
 cf=src/config.rs
+default_rules_body=$(awk '
+    /^pub fn default_rules\(\)/ { inside=1 }
+    inside { print }
+    inside && /^}/ { exit }
+' "$cf")
 for rule in "${required_omamori_rules[@]}"; do
-    if ! grep -qF "\"$rule\"" "$cf"; then
-        echo "FAIL [invariant phase1a-relaxation-requires-phase2/DI-13]: $cf must define \"$rule\""
+    if ! printf '%s\n' "$default_rules_body" | grep -qF "\"$rule\""; then
+        echo "FAIL [invariant phase1a-relaxation-requires-phase2/DI-13]: default_rules() must define \"$rule\""
         di13_fail=1
     fi
 done
 if [ "$di13_fail" -eq 0 ]; then
-    echo "phase1a-relaxation-requires-phase2 OK: omamori-* builtin rules intact (DI-13)"
+    echo "phase1a-relaxation-requires-phase2 OK: omamori-* builtin rules intact in default_rules() (DI-13)"
 else
     fail=1
 fi

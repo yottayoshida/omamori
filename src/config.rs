@@ -74,6 +74,11 @@ struct UserRule {
     match_all: Option<Vec<String>>,
     match_any: Option<Vec<String>>,
     message: Option<String>,
+    /// Optional subcommand position constraint (DI-13, v0.10.3+).
+    /// Only honored on user-defined rules (not on overrides of built-ins;
+    /// changing built-in subcommand via override would weaken DI-13).
+    #[serde(default)]
+    subcommand: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +210,9 @@ fn merge_rules(
                     }
                     if let Some(dest) = &ur.destination {
                         rule.destination = Some(dest.clone());
+                    }
+                    if let Some(sub) = &ur.subcommand {
+                        rule.subcommand = Some(sub.clone());
                     }
                     merged.push(rule);
                 }
@@ -799,6 +807,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -829,6 +838,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut overrides = HashMap::new();
         overrides.insert("git-push-force-block".to_string(), false);
@@ -853,6 +863,7 @@ mod tests {
             match_all: None,
             match_any: Some(vec!["-rf".to_string()]),
             message: Some("custom".to_string()),
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -874,6 +885,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -898,6 +910,7 @@ mod tests {
                 match_all: None,
                 match_any: None,
                 message: None,
+                subcommand: None,
             },
             UserRule {
                 name: "git-push-force-block".to_string(),
@@ -908,6 +921,7 @@ mod tests {
                 match_all: None,
                 match_any: None,
                 message: None,
+                subcommand: None,
             },
         ];
         let mut warnings = Vec::new();
@@ -946,6 +960,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -975,6 +990,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: None,
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -997,6 +1013,7 @@ mod tests {
             match_all: None,
             match_any: None,
             message: Some("my custom message".to_string()),
+            subcommand: None,
         }];
         let mut warnings = Vec::new();
         let merged = merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
@@ -1204,7 +1221,7 @@ mod tests {
     /// `subcommand` constraint so that arguments at non-subcommand positions
     /// containing protected words do not trigger a false block. Without
     /// `subcommand`, `match_any` would match any argument anywhere.
-    /// Codex review (PR1a) flagged this as a P2 regression risk.
+    /// Codex review (PR1a R1) flagged this as a P2 regression risk.
     #[test]
     fn omamori_self_protect_rules_skip_false_positive_data_args() {
         use crate::rules::{CommandInvocation, match_rule};
@@ -1235,6 +1252,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Codex review (PR1a R2) [P2]: user-defined rules in TOML must honor the
+    /// `subcommand` field. Earlier `UserRule` was missing this field, silently
+    /// dropping it for custom rules. This test pins that user rules can declare
+    /// `subcommand` and have it propagate into the resolved Config.
+    #[test]
+    fn user_rule_with_subcommand_field_is_honored() {
+        let toml_str = r#"
+[[rules]]
+name = "my-custom-block"
+command = "mytool"
+action = "block"
+subcommand = "danger"
+match_any = ["--really"]
+"#;
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        let rule = config
+            .rules
+            .iter()
+            .find(|r| r.name == "my-custom-block")
+            .expect("user-defined rule should be merged");
+        assert_eq!(
+            rule.subcommand.as_deref(),
+            Some("danger"),
+            "subcommand field on user rule must be propagated"
+        );
     }
 
     #[test]
