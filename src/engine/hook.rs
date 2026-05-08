@@ -73,6 +73,88 @@ pub(crate) enum HookCheckResult {
     },
 }
 
+/// Strip the contents of single- and double-quoted regions from a shell
+/// command, leaving an unquoted residual safe for substring backstop
+/// matching. Outside quotes, characters are preserved verbatim (including
+/// `\<x>` escape sequences). Codex review (PR1c R3) [P1] backstop closure.
+///
+/// Used by `check_pre_phase_2` after token-level verb detection: when the
+/// position-aware path misses (e.g. `xargs -I{} omamori uninstall {}`,
+/// `find . -exec omamori uninstall {} \;`), the residual still contains
+/// the protected verb at a non-quoted position so substring contains
+/// catches it. Quoted bodies (gh issue body / git commit message) are
+/// stripped, so the FP-relief invariant is preserved.
+fn strip_quoted_data(command: &str) -> String {
+    let mut result = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            // chars inside single-quote are skipped (data context)
+        } else if in_double {
+            if c == '\\' {
+                // skip escape sequence (\<x>)
+                chars.next();
+            } else if c == '"' {
+                in_double = false;
+            }
+            // chars inside double-quote are skipped
+        } else if c == '\'' {
+            in_single = true;
+        } else if c == '"' {
+            in_double = true;
+        } else if c == '\\' {
+            // outside quote: preserve backslash + next char as-is
+            result.push(c);
+            if let Some(&next) = chars.peek() {
+                result.push(next);
+                chars.next();
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Extract the payload of an `env -S 'string'` invocation at command
+/// position, if any. `env -S` splits the payload into argv and execs it,
+/// so a quoted payload containing a protected verb pattern is executable
+/// data — NOT a quoted body to be stripped. `strip_quoted_data` would
+/// otherwise erase it. Codex review (PR1c R3) [P1].
+fn env_dash_s_payload(tokens: &[String]) -> Option<&str> {
+    for (i, t) in tokens.iter().enumerate() {
+        if t == "env" && is_command_position(tokens, i) {
+            let mut j = i + 1;
+            while j < tokens.len() {
+                let arg = &tokens[j];
+                if arg == "-S"
+                    && let Some(payload) = tokens.get(j + 1)
+                {
+                    return Some(payload.as_str());
+                }
+                if let Some(suffix) = arg.strip_prefix("-S")
+                    && !suffix.is_empty()
+                {
+                    return Some(suffix);
+                }
+                // env's option zone: -<flag> or KEY=VAL keeps scanning
+                if arg.starts_with('-') || arg.contains('=') {
+                    j += 1;
+                    continue;
+                }
+                // First positional: end of env's options
+                break;
+            }
+        }
+    }
+    None
+}
+
 /// Check if token at `idx` is in command position (start of a segment).
 /// Command position = index 0, immediately after an operator token,
 /// or after a run of KEY=VAL assignment prefixes (e.g., FOO=1 unset VAR).
@@ -404,6 +486,36 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
             return Err(HookCheckResult::BlockMeta {
                 reason,
                 matched_pattern: None,
+                matched_position: None,
+            });
+        }
+        // Phase 1A verb backstop: env -S payload contains executable verbs
+        // (a single quoted token that env will split + exec). Codex PR1c R3 [P1].
+        if let Some(payload) = env_dash_s_payload(&tokens) {
+            for &(pattern, reason) in installer::META_PATTERNS_VERB {
+                if payload.contains(pattern) {
+                    return Err(HookCheckResult::BlockMeta {
+                        reason,
+                        matched_pattern: Some(pattern),
+                        matched_position: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // Phase 1A verb backstop (Codex PR1c R3 [P1]): residual quote-stripped
+    // substring match catches verb patterns invoked via wrapper grammars
+    // not modeled by detect_verb_at_command_position (`xargs -I{}`,
+    // `find -exec ... {} \;`, parallel, sh -c without -c-as-shell-launcher,
+    // etc.). Quoted bodies are stripped so the FP-relief invariant for
+    // gh issue body / git commit message is preserved.
+    let residual = strip_quoted_data(command);
+    for &(pattern, reason) in installer::META_PATTERNS_VERB {
+        if residual.contains(pattern) {
+            return Err(HookCheckResult::BlockMeta {
+                reason,
+                matched_pattern: Some(pattern),
                 matched_position: None,
             });
         }

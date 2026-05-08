@@ -1284,6 +1284,43 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "fn-chained-wrappers-uninstall-block",
     ),
+    // PR1c R3 [P1] regression guards: backstop residual quote-strip +
+    // env -S payload must catch verbs missed by token-level detector.
+    (
+        "xargs -I{} omamori uninstall {}",
+        Decision::Block,
+        "fn-xargs-flag-i-uninstall-block",
+    ),
+    (
+        "xargs -L 1 omamori uninstall",
+        Decision::Block,
+        "fn-xargs-flag-l-uninstall-block",
+    ),
+    (
+        "xargs -n 1 -P 4 omamori uninstall",
+        Decision::Block,
+        "fn-xargs-flag-n-p-uninstall-block",
+    ),
+    (
+        "env -S 'omamori uninstall'",
+        Decision::Block,
+        "fn-env-dash-s-uninstall-block",
+    ),
+    (
+        "env -S'omamori uninstall'",
+        Decision::Block,
+        "fn-env-dash-s-combined-uninstall-block",
+    ),
+    (
+        "find . -exec omamori uninstall {} \\;",
+        Decision::Block,
+        "fn-find-exec-uninstall-block",
+    ),
+    (
+        "parallel omamori uninstall ::: a b c",
+        Decision::Block,
+        "fn-parallel-uninstall-block",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
