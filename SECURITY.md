@@ -243,7 +243,17 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 
 2. **Phase 2 — Unwrap Stack** (token-level): Tokenizes the command, strips shell wrappers, extracts inner commands from shell launchers, and evaluates each extracted command against the same rules as Layer 1.
 
-**Broad match by design**: Meta-patterns use `command.contains(pattern)` substring matching. This means `ls ~/.local/share/omamori` is blocked alongside `rm -rf ~/.local/share/omamori`. Read-only commands on protected paths are intentionally blocked to prevent reconnaissance that could aid targeted attacks. Affected patterns include `audit.jsonl`, `audit-secret`, `.integrity.json`, `.local/share/omamori`, `omamori/config.toml`, and `.codex/hooks.json`.
+**Broad match by design** (path-based, retained in v0.10.3+): Path-based meta-patterns (`audit.jsonl`, `audit-secret`, `.integrity.json`, `.local/share/omamori`, `omamori/config.toml`, `.codex/hooks.json`, `/bin/rm`, `.claude/settings.json`, `.codex/config.toml`, etc., 18 entries in `META_PATTERNS_PATH`) use `command.contains(pattern)` substring match. `ls ~/.local/share/omamori` is blocked alongside `rm -rf ~/.local/share/omamori`. Read-only commands on protected paths are intentionally blocked to prevent reconnaissance that could aid targeted attacks. This is the T3 (heredoc redirect to protected path) defense.
+
+**Token-level + backstop** (verb-based, v0.10.3+ PR1c): Verb-based meta-patterns (`config disable/enable`, `omamori uninstall`, `omamori init --force`, `omamori override`, `omamori doctor --fix`, `omamori explain`, 7 entries in `META_PATTERNS_VERB`) moved from `command.contains` to a layered detector: (1) token-level position-aware matching (`detect_verb_at_command_position` mirroring the `is_command_position` lattice from Phase 1B, with execution-wrapper transparency for `xargs`/`time`/`nohup`/`sudo`/`env`/etc.), (2) `env -S` payload inspection (`env_dash_s_payload`), (3) residual quote-strip backstop (`strip_quoted_data` preserves `$(...)` and backticks inside double quotes since they remain executable). This relieves false-positives like `gh issue create --body "config disable bug fixed"` (#240) while preserving block on raw / wrapper / executable-quoted invocations.
+
+**v0.10.2 → v0.10.3 PR1c coverage narrow** (documented, intentional): the substring match in v0.10.2 incidentally caught a small set of vectors that fall outside omamori's declared scope. PR1c's `strip_quoted_data` no longer reaches inside passive quoted bodies, so these vectors are now allowed. They are consistent with already-documented scope-outs:
+
+- `tcsh -c 'omamori uninstall'` / `su -c 'omamori uninstall'` — non-default shell launchers (omamori officially supports `bash`/`sh`/`zsh`/`dash`/`ksh`, see [Supported Shell List](#supported-shell-list))
+- `awk "/foo/ { system(\"omamori uninstall\") }"` / `perl -e 'system("omamori uninstall")'` — interpreter family commands, [decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74)
+- `alias x='omamori uninstall'; x` — alias dynamic dispatch, statically unanalysable
+
+These were never within the declared protection surface; they happened to be caught by the broad substring match. v0.10.3 explicitly returns to the documented scope. Operators relying on the incidental v0.10.2 coverage should track #74 (interpreter family) for shell_launcher list expansion discussion.
 
 | Capability | Detection |
 |-----------|-----------|

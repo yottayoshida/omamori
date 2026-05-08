@@ -1348,6 +1348,24 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "fn-sudo-env-s-uninstall-block",
     ),
+    // PR1c R5 follow-up: pin "out-of-scope allow" vectors so a future patch
+    // does not accidentally re-enable v0.10.2 incidental coverage.
+    // Documented in SECURITY.md §"v0.10.2 -> v0.10.3 PR1c coverage narrow".
+    (
+        "perl -e 'system(\"omamori uninstall\")'",
+        Decision::Allow,
+        "interpreter-out-of-scope-perl-allow",
+    ),
+    (
+        "tcsh -c 'omamori uninstall'",
+        Decision::Allow,
+        "non-default-shell-launcher-tcsh-allow",
+    ),
+    (
+        "su -c 'omamori uninstall'",
+        Decision::Allow,
+        "non-default-shell-launcher-su-allow",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
