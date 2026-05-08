@@ -37,7 +37,7 @@ The format is based on Keep a Changelog.
 - AI agent retry count for issue body / commit message style commands: 3-5 retries → 0 (one-shot allow).
 - Self-hosting workaround patterns for omamori own development: 11 documented patterns → ≤2 (only path-based mentions remain).
 - Block message label count (text mode): 1 chunk → 5 with verbose (rule_id / matched / context / hint / bypass).
-- ACCEPTANCE_TEST.md full re-run wall clock: ~31 min → ~22-25 min after PR2 schema improvements (env preface / precondition / path columns).
+- ACCEPTANCE_TEST.md precision: S-1/S-2 stderr regex aligned to the actual prefix set emitted by the binary (`omamori (hook:|blocked|failed to move)` — Layer 2 hook + rule-message/sudo escalation + Trash-failure fail-close), so EPERM trash-failure messages match. Rep-3 jq form rewritten to `(keys | length == 7) and (has("by_rule") | not)` which works on jq 1.6/1.7 (the legacy `[..., ...] | all` form errored with `Cannot check whether array has a string key`). S-3' precondition is now explicit (raw terminal only — AI session is blocked by `omamori-config-modify-block`). D-1/D-2 require an installed-shim env, not isolated sandbox. New `AI-data-flag-*` rows pin #240 effect via `hook-check` dry-run (data-context ALLOW + inner-substitution BLOCK + audit `relaxed` tag emission). Acceptance preconditions now require local-installing the release-candidate binary + `omamori install --force` + Claude session restart, since AI-data-flag-* execution self-blocks under v0.10.2 hooks.
 
 ### Known limitations
 
