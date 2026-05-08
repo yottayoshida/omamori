@@ -376,6 +376,62 @@ else
     fail=1
 fi
 
+# ---------- Invariant: data-context-recognition-via-strip (DI-14, v0.10.3+) ----------
+# PR1c introduced `strip_quoted_data` as the data-context recognition primitive
+# replacing the original PR1d data-flag allowlist design. The function MUST
+# exist in `src/engine/hook.rs` so the residual quote-strip backstop and the
+# verb-detection FP-relief invariant both remain functional. Removing it would
+# silently re-introduce the v0.10.2-style false positives (#240).
+hk=src/engine/hook.rs
+di14_fail=0
+if ! grep -qE 'fn strip_quoted_data\(' "$hk"; then
+    echo "FAIL [invariant data-context-recognition-via-strip/DI-14]: $hk must define 'fn strip_quoted_data('"
+    di14_fail=1
+fi
+if [ "$di14_fail" -eq 0 ]; then
+    echo "data-context-recognition-via-strip OK: strip_quoted_data intact (DI-14)"
+else
+    fail=1
+fi
+
+# ---------- Invariant: data-context-substitution-preserved (DI-15, v0.10.3+) ----------
+# Inside double quotes, `$(...)` and backticks are EXECUTABLE — the shell still
+# runs them. `strip_quoted_data` MUST preserve substitution boundaries so the
+# residual backstop can still match protected verbs inside `echo "$(omamori
+# uninstall)"`. Codex review (PR1c R4) [P1] established this as a security
+# invariant after a regression that erased $(...).
+di15_fail=0
+if ! grep -qE 'subst_depth' "$hk"; then
+    echo "FAIL [invariant data-context-substitution-preserved/DI-15]: $hk must track subst_depth in strip_quoted_data"
+    di15_fail=1
+fi
+if [ "$di15_fail" -eq 0 ]; then
+    echo "data-context-substitution-preserved OK: subst_depth tracked (DI-15)"
+else
+    fail=1
+fi
+
+# ---------- Invariant: data-flag-allow-emits-audit-with-relaxed-tag (DI-16, v0.10.3+) ----------
+# Allow paths that the residual quote-strip backstop relied on (i.e.
+# `relaxed_by` was Some) MUST emit an audit event tagged
+# `layer2:relaxed:<source>` so `omamori audit show --relaxed` can surface them
+# for forensic review. Without this, FP regressions in the data-context
+# heuristic become silently undetectable.
+di16_fail=0
+if ! grep -qE 'fn audit_log_hook_allow_relaxed\(' "$hk"; then
+    echo "FAIL [invariant data-flag-allow-emits-audit-with-relaxed-tag/DI-16]: $hk must define 'fn audit_log_hook_allow_relaxed('"
+    di16_fail=1
+fi
+if ! grep -qE 'layer2:relaxed:' "$hk"; then
+    echo "FAIL [invariant data-flag-allow-emits-audit-with-relaxed-tag/DI-16]: $hk must use detection_layer 'layer2:relaxed:<source>'"
+    di16_fail=1
+fi
+if [ "$di16_fail" -eq 0 ]; then
+    echo "data-flag-allow-emits-audit-with-relaxed-tag OK: audit_log_hook_allow_relaxed intact (DI-16)"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"

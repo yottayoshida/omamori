@@ -60,6 +60,12 @@ pub struct ShowOptions {
     /// events the hook layer records when a tool drifts past
     /// shape-based routing.
     pub action: Option<String>,
+    /// PR1d (v0.10.3+, #240): when true, only entries whose
+    /// `detection_layer` starts with `"layer2:relaxed:"` are shown.
+    /// Used by `omamori audit show --relaxed` to forensically review
+    /// commands that the data-context residual backstop allowed
+    /// (DI-16 audit-relaxed-tag invariant).
+    pub relaxed_only: bool,
 }
 
 pub struct AuditSummary {
@@ -265,6 +271,18 @@ pub fn show_entries(
         // would let `--action allow` match the `unknown_tool_fail_open`
         // result label and confuse users.
         if opts.action.as_ref().is_some_and(|f| event.action != *f) {
+            continue;
+        }
+        // PR1d (v0.10.3+, #240): only entries whose `detection_layer`
+        // starts with `"layer2:relaxed:"` (DI-16). Surface for
+        // forensically reviewing which commands the data-context
+        // residual backstop allowed.
+        if opts.relaxed_only
+            && !event
+                .detection_layer
+                .as_ref()
+                .is_some_and(|s| s.starts_with("layer2:relaxed:"))
+        {
             continue;
         }
 
