@@ -4,6 +4,58 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.3] - 2026-05-08
+
+**Summary**: Self-block relief for AI workflows ([#240](https://github.com/yottayoshida/omamori/issues/240)). Verb-based meta-pattern detection moves from `command.contains` substring matching to token-level position-aware lattice (mirroring Phase 1B). Path-based 18 entries retain substring match for T3 defense. The data-context residual quote-strip backstop catches verbs invoked via wrapper grammars (`xargs`, `find -exec`, `env -S`, double-quoted `$(...)`, etc.) without re-introducing FP on quoted bodies. Self-modification verbs gain Phase 2 builtin rules (`omamori-*-block`) as defense-in-depth, with `subcommand` position constraint preventing false positives like `omamori exec -- echo disable config`. ACCEPTANCE_TEST.md doc inaccuracies fixed in [#239](https://github.com/yottayoshida/omamori/issues/239) (PR2).
+
+### Added
+
+- **`META_PATTERNS_VERB` (7 entries) + `META_PATTERNS_PATH` (18 entries)** split with `MetaPatternKind` enum (`VerbAtCommandPosition` / `ProtectedPathSubstring`). Legacy `blocked_string_patterns()` returns the concatenation for backward compat.
+- **`detect_verb_at_command_position`** (Phase 1A token-level detector) + `matches_verb_pattern_at` (n-token match with end-of-segment flag scan) + `is_verb_executable_position` (segment head OR after execution wrapper, recursively for chained wrappers like `time nohup verb`).
+- **`EXECUTION_WRAPPERS`**: `xargs`, `time`, `nohup`, `nice`, `timeout`, `env`, `sudo`, `doas`, `pkexec`, `command`, `exec`. Treated as transparent for self-protect verb detection.
+- **`strip_quoted_data`** (data-context recognition primitive, DI-14): single-quote complete strip, double-quote passive strip with `$(...)` and backtick preservation (DI-15). Used by the residual quote-strip backstop.
+- **`env_dash_s_payload`** (env -S payload extraction): basename match for path-qualified `/usr/bin/env`, recursive wrapper position so `sudo env -S 'verb'` is caught.
+- **6 builtin rules to `default_rules()`** ([PR1a](https://github.com/yottayoshida/omamori/pull/241)): `omamori-config-modify-block`, `omamori-uninstall-block`, `omamori-init-force-block`, `omamori-override-block`, `omamori-doctor-fix-block`, `omamori-explain-block`. Each uses the new `RuleConfig.subcommand` field for position-exact matching. `core_rule_names()` expanded from 7 to 13.
+- **`HookCheckResult` struct variant refactor** ([PR1b](https://github.com/yottayoshida/omamori/pull/242)): `matched_pattern: Option<&'static str>`, `matched_position: Option<Range<usize>>`, `relaxed_by: Option<&'static str>` fields enable structured acceptance test assertions instead of brittle stderr substring matching (#239 root cause).
+- **`hook-check --json-error` flag** ([PR1b](https://github.com/yottayoshida/omamori/pull/242)): emits a single JSON object on stderr for blocked shell commands. Schema documented in `SECURITY.md`. AI agent integrations parse this for retry / approach-switch decisions.
+- **`omamori audit show --relaxed` flag**: surfaces Allow events tagged `layer2:relaxed:<source>` so the data-context heuristic's coverage is forensically reviewable.
+- **`audit_log_hook_allow_relaxed`**: tags Allow paths that the residual quote-strip backstop relied on (DI-16) so FP regression is detectable.
+- **3 proptest properties** in `src/property_tests.rs`: `prop_trigger_inside_quoted_body_arg_is_allowed`, `prop_trigger_in_raw_command_position_is_blocked`, `prop_subshell_inner_verb_blocked`. New CI `proptest-deep` job runs at `PROPTEST_CASES=2048` (ubuntu-latest).
+- **HOOK_DECISION_CASES additions**: 60+ table-driven cases (fp_data-context, fn_raw-position, fp_flag-after-separator, fn_wrapper, fn_xargs-flag, fn_env-dash-s, fn_find-parallel, fn_double-quote-subst, fn_path-qualified-env, out-of-scope-allow).
+- **`tests/cli.rs` hook_check_json_error contract tests** (6 cases): path BlockMeta exact metadata, verb BlockMeta null position, Phase 1B null metadata, BlockRule shape, BlockStructural exact wrapper layer, single-object stderr guard.
+- **DI-13 / DI-14 / DI-15 / DI-16** invariants in `scripts/check-invariants.sh` (name-managed, not number-collision-prone): `phase1a-relaxation-requires-phase2`, `data-context-recognition-via-strip`, `data-context-substitution-preserved`, `data-flag-allow-emits-audit-with-relaxed-tag`.
+- **block message bypass hint** (text mode): block stderr now includes `bypass:` line suggesting `--body-file <path>` when the protected token is in a data-context argument.
+- `usage_text()` documents `--json-error` flag.
+
+### Fixed
+
+- **#240 false positives in data context**: `gh issue create --body "config disable bug"`, `git commit -m "test omamori uninstall flow"`, `gh pr create --body "omamori init --force is dangerous"`, etc. now allow. The `feedback_omamori_self_block_workarounds.md` 11 known patterns are largely resolved by token-level verb detection + residual quote-strip backstop.
+
+### UX impact
+
+- AI agent stderr parse target lines (block path): 2-4 lines text → 1 line JSON in `--json-error` mode.
+- AI agent retry count for issue body / commit message style commands: 3-5 retries → 0 (one-shot allow).
+- Self-hosting workaround patterns for omamori own development: 11 documented patterns → ≤2 (only path-based mentions remain).
+- Block message label count (text mode): 1 chunk → 5 with verbose (rule_id / matched / context / hint / bypass).
+- ACCEPTANCE_TEST.md full re-run wall clock: ~31 min → ~22-25 min after PR2 schema improvements (env preface / precondition / path columns).
+
+### Known limitations
+
+- **`--break-glass` flag not yet implemented**: if a new false-positive pattern surfaces post-v0.10.3, recovery path is `omamori uninstall` → wait for patch release → `omamori install`. A proper `--break-glass` with audit emission and rate-limit is planned for v0.11.x.
+- **Path-based 18 entries retain substring match**: `gh issue create --body "see ~/.claude/settings.json"` is still BLOCKED by design (T3 heredoc redirect to protected path defense). Use `--body-file <path>` as a one-off bypass. A structural revision scoping path patterns to writeable surface only is planned for v0.11.x.
+- **v0.10.2 → v0.10.3 incidental coverage narrow**: 5 vectors that v0.10.2's broad substring match incidentally caught are now allowed. All consistent with previously-declared scope-outs (non-default shells `tcsh`/`su`, interpreter family `awk`/`perl` per [#74](https://github.com/yottayoshida/omamori/issues/74), alias dynamic dispatch). Documented in `SECURITY.md` "Broad match by design" section.
+- **`--json-error` JSON contract scope**: applies to the shell-command path only. Other deny paths (malformed hook input, file-op deny, unknown-tool fail-open) retain free-form stderr; extension is a follow-up.
+- **`--json-error` mode skips audit emission**: the trade-off keeps stderr a single parseable JSON object even in degraded audit environments. Operators needing full audit coverage should not pass `--json-error`.
+- **Word-boundary FP**: `echo omamori uninstaller` is still blocked by the residual backstop (uninstaller has `omamori uninstall` prefix). Pre-existing in v0.10.2, not introduced by v0.10.3.
+
+### Notes on this release
+
+This release delivers an immediate-relief fix for verb triggers in data context (covers ~11 known self-block patterns documented in `feedback_omamori_self_block_workarounds.md`).
+
+The two-stage strategy is intentional: v0.10.3 = immediate verb relief + Phase 2 builtin defense-in-depth + audit forensic surface. v0.11.x = structural revision (path patterns scoped to writeable surface, `--break-glass` flag, `omamori init` onboarding, `--json-error` extension to non-block paths). The split keeps the v0.10.3 PR series merge-able in clean increments without scope creep.
+
+PR series merged: [PR1a #241](https://github.com/yottayoshida/omamori/pull/241) (Phase 2 builtin rules), [PR1b #242](https://github.com/yottayoshida/omamori/pull/242) (Decision struct + `--json-error`), [PR1c #243](https://github.com/yottayoshida/omamori/pull/243) (token-level verb detection), PR1d (this, audit relaxed tag + invariants + UX), PR2 (#239 acceptance test doc fix).
+
 ## [0.10.2] - 2026-05-06
 
 **Summary**: Parser hardening — static shell expansion obfuscation detection. New `raw_has_verb_obfuscation()` scanner runs before `shell_words::split()` to catch ANSI-C quoting (`$'rm'`), locale quoting (`$"rm"`), parameter expansion (`${IFS}rm`), and brace expansion (`{rm,-rf,/}`) at verb position that the POSIX tokenizer silently strips ([#176](https://github.com/yottayoshida/omamori/issues/176)). Wrapper-aware: detects obfuscation through `sudo`, `env`, `timeout`, and all other `TRANSPARENT_WRAPPERS`. Mid-word concatenation (`r$'m'`) also caught. Redirect-axis test coverage systematized with a 3D matrix ([#219](https://github.com/yottayoshida/omamori/issues/219)). Property tests pin monotonicity (no FP regression) and completeness (all target patterns detected) ([#146](https://github.com/yottayoshida/omamori/issues/146)).

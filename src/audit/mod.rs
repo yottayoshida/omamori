@@ -1250,6 +1250,7 @@ mod tests {
             provider: None,
             json: false,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1287,6 +1288,7 @@ mod tests {
             provider: None,
             json: false,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1308,6 +1310,7 @@ mod tests {
             provider: None,
             json: true,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1349,6 +1352,7 @@ mod tests {
             provider: None,
             json: false,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1389,6 +1393,7 @@ mod tests {
             provider: None,
             json: false,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1416,6 +1421,7 @@ mod tests {
             provider: None,
             json: false,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -1878,6 +1884,7 @@ mod tests {
             provider: None,
             json: false,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
@@ -2047,6 +2054,7 @@ mod tests {
             provider: None,
             json: false,
             action: None,
+            relaxed_only: false,
         };
         let mut buf = Vec::new();
         let err = show_entries(&config, &opts, &mut buf).unwrap_err();

@@ -89,6 +89,7 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
         provider: None,
         json: false,
         action: None,
+        relaxed_only: false,
     };
 
     let mut index = 3usize;
@@ -140,6 +141,10 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
                 opts.json = true;
                 index += 1;
             }
+            "--relaxed" => {
+                opts.relaxed_only = true;
+                index += 1;
+            }
             other => {
                 return Err(AppError::Usage(format!(
                     "unknown show flag: {other}\n\n{}",
@@ -178,6 +183,7 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
         provider: None,
         json: false,
         action: Some("unknown_tool_fail_open".to_string()),
+        relaxed_only: false,
     };
 
     let mut index = 3usize;
@@ -269,6 +275,7 @@ fn audit_usage() -> &'static str {
   omamori audit show --rule <name>               Filter by rule (substring match)
   omamori audit show --provider <name>           Filter by provider
   omamori audit show --action <name>             Filter by action (exact match)
+  omamori audit show --relaxed                   Filter to data-context relaxed allows (PR1d, #240)
   omamori audit unknown [--last N] [--json]      Show forward-compat fail-opens for unknown tools (#182)
   omamori audit key rotate                       Rotate HMAC signing key"
 }

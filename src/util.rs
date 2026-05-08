@@ -29,7 +29,7 @@ pub(crate) fn usage_text() -> &'static str {
   omamori status [--refresh]                              # Health check all defense layers
   omamori override disable <rule>                        # Override a core safety rule
   omamori override enable <rule>                         # Restore a core safety rule
-  omamori hook-check [--provider NAME]                   # Hook detection engine (stdin → exit code)
+  omamori hook-check [--provider NAME] [--json-error]    # Hook detection engine (stdin → exit code)
   omamori cursor-hook                                   # Cursor beforeShellExecution handler
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori

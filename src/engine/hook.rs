@@ -480,7 +480,13 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 /// share this prefix so the production wrapper does not pay
 /// `load_config(None)` when Phase 1A/1B/structural short-circuits the
 /// verdict.
-fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckResult> {
+/// Phase 1A pre-check return: `(invocations, relaxed_by)` on Ok-pass-through.
+/// `relaxed_by` is `Some("data-context")` when `strip_quoted_data` removed
+/// content from the original command, indicating the verb backstop relied
+/// on residual stripping. Used by Allow-path audit tagging (DI-16, PR1d Gap 1).
+type PrePhase2Ok = (Vec<CommandInvocation>, Option<&'static str>);
+
+fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
     // Phase 1A path-based: substring match preserved (INV-path-preserve, PR1c).
     // matched_pattern carries the actual `pattern` token (e.g. ".claude/settings.json"),
     // not the human-readable `reason`. Reason has its own `reason` / `rule_id`
@@ -593,16 +599,31 @@ fn check_pre_phase_2(command: &str) -> Result<Vec<CommandInvocation>, HookCheckR
                 matched_position: None,
             })
         }
-        unwrap::ParseResult::Commands(invocations) => Ok(invocations),
+        unwrap::ParseResult::Commands(invocations) => {
+            // PR1d Gap 1: tag Allow path with the relaxation source so audit
+            // log can flag "this command was allowed because the residual
+            // backstop saw nothing after data-context stripping". Future
+            // forensic surface for FP regression analysis. Equality check
+            // costs O(n) but only on the Phase 2 entry path (path-based
+            // already short-circuited).
+            let relaxed_by: Option<&'static str> = if residual != command {
+                Some("data-context")
+            } else {
+                None
+            };
+            Ok((invocations, relaxed_by))
+        }
     }
 }
 
 /// Apply Phase 2 rule matching against an explicit rule slice. Returns the
-/// first matching rule's `BlockRule` verdict, or `Allow`.
+/// first matching rule's `BlockRule` verdict, or `Allow` (with `relaxed_by`
+/// passed through from `check_pre_phase_2` for audit log forensic tagging).
 fn match_invocations_against_rules(
     command: &str,
     invocations: &[CommandInvocation],
     rules: &[crate::rules::RuleConfig],
+    relaxed_by: Option<&'static str>,
 ) -> HookCheckResult {
     for inv in invocations {
         if let Some(rule) = match_rule(rules, inv) {
@@ -620,7 +641,7 @@ fn match_invocations_against_rules(
             };
         }
     }
-    HookCheckResult::Allow { relaxed_by: None }
+    HookCheckResult::Allow { relaxed_by }
 }
 
 /// Three-phase hook check, evaluating against rules loaded from on-disk
@@ -637,8 +658,8 @@ fn match_invocations_against_rules(
 /// SECURITY (T8): The `Config::default()` fallback on `load_config` failure
 /// is intentional fail-safe behavior, not fail-open.
 pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
-    let invocations = match check_pre_phase_2(command) {
-        Ok(invs) => invs,
+    let (invocations, relaxed_by) = match check_pre_phase_2(command) {
+        Ok(pair) => pair,
         Err(verdict) => return verdict,
     };
     // Phase 2 reached — load on-disk config now (fail-safe fallback per T8).
@@ -646,7 +667,7 @@ pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
         config: config::Config::default(),
         warnings: vec![],
     });
-    match_invocations_against_rules(command, &invocations, &load_result.config.rules)
+    match_invocations_against_rules(command, &invocations, &load_result.config.rules, relaxed_by)
 }
 
 /// Three-phase hook check, evaluating Phase 2 rule matching against an
@@ -670,11 +691,11 @@ pub(crate) fn check_command_for_hook_with_rules(
     command: &str,
     rules: &[crate::rules::RuleConfig],
 ) -> HookCheckResult {
-    let invocations = match check_pre_phase_2(command) {
-        Ok(invs) => invs,
+    let (invocations, relaxed_by) = match check_pre_phase_2(command) {
+        Ok(pair) => pair,
         Err(verdict) => return verdict,
     };
-    match_invocations_against_rules(command, &invocations, rules)
+    match_invocations_against_rules(command, &invocations, rules, relaxed_by)
 }
 
 /// Format the unwrap chain for display: "rm -rf / (via bash -c)"
@@ -781,7 +802,17 @@ fn run_hook_check_command(
     json_error: bool,
 ) -> Result<i32, AppError> {
     match check_command_for_hook(command) {
-        HookCheckResult::Allow { .. } => {
+        HookCheckResult::Allow { relaxed_by } => {
+            // PR1d (#240, DI-16): when the allow path was reached only
+            // because the residual quote-strip backstop saw nothing,
+            // record an audit event tagged `layer2:relaxed:<source>` for
+            // forensic review via `omamori audit show --relaxed`. Standard
+            // allow paths (no relaxation) stay quiet to avoid log noise.
+            if let Some(source) = relaxed_by
+                && !json_error
+            {
+                audit_log_hook_allow_relaxed(command, provider, source);
+            }
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
         }
@@ -822,8 +853,14 @@ fn run_hook_check_command(
                 if verbose {
                     eprintln!("  provider: {provider}");
                     eprintln!("  layer: meta-pattern (string-level)");
+                    if let Some(p) = matched_pattern {
+                        eprintln!("  matched: {p:?}");
+                    }
                 }
                 eprintln!("  hint: run `omamori explain -- {command}` for details");
+                eprintln!(
+                    "  bypass: if the protected token is inside data context (e.g. `gh issue create --body`), use --body-file <path> for one-off"
+                );
             }
             Ok(2)
         }
@@ -1142,6 +1179,30 @@ fn is_valid_detection_layer(s: &str) -> bool {
 /// MUST NOT flip the block decision (SEC-7). On failure, the caller has
 /// already chosen to block — we only surface a stderr warning so the user
 /// knows the audit chain has a gap for this event. v0.9.7 #181 B-1.
+/// PR1d (#240, DI-16): record an Allow path that the residual quote-strip
+/// backstop relied on. Tags the event with `detection_layer =
+/// "layer2:relaxed:<source>"` so `omamori audit show --relaxed` can
+/// surface them for forensic review of the data-context heuristic.
+/// Best-effort: failure does not flip the decision.
+fn audit_log_hook_allow_relaxed(command: &str, provider: &str, source: &str) {
+    let load_result = match load_config(None) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let logger = match crate::audit::AuditLogger::from_config(&load_result.config.audit) {
+        Some(l) => l,
+        None => return,
+    };
+    let invocation = CommandInvocation::new(command.to_string(), Vec::new());
+    let detectors = vec![provider.to_string()];
+    let outcome = crate::actions::ActionOutcome::PassedThrough { exit_code: 0 };
+    let mut event = logger.create_event(&invocation, None, &detectors, &outcome);
+    event.action = "allow".to_string();
+    event.result = "allow".to_string();
+    event.detection_layer = Some(format!("layer2:relaxed:{source}"));
+    let _ = logger.append(event);
+}
+
 fn audit_log_hook_block(
     command: &str,
     provider: &str,
@@ -2412,5 +2473,51 @@ mod tests {
     #[serial_test::serial]
     fn phase1b_path_override_env_non_shim() {
         assert_allows("env PATH=/custom/dir node script.js");
+    }
+
+    /// PR1d (v0.10.3+, NFR): p99 hook check latency under 12ms.
+    ///
+    /// Catches gross regressions in the verb-detection lattice, residual
+    /// quote-strip backstop, env -S extraction, and Phase 2 rule matching.
+    /// Per-platform variance is high; this is a soft guard, not a hard
+    /// performance contract. CI runs on a known-slow shared runner so the
+    /// budget is generous; local Apple Silicon p99 typically ~ 1ms.
+    #[test]
+    #[serial_test::serial]
+    fn p99_hook_check_latency_under_budget() {
+        const SAMPLES: usize = 500;
+        const P99_BUDGET_MICROS: u128 = 12_000;
+
+        let representative_commands: &[&str] = &[
+            "ls -la /tmp",
+            "rm dummy.txt",
+            "git status",
+            "echo hello world",
+            "gh issue create --body \"bug fixed\"",
+            "git commit -m \"refactor done\"",
+            "find . -name '*.rs' -exec grep TODO {} +",
+            "cargo test --lib",
+            "echo ok && unset CLAUDECODE",
+            "xargs -I{} echo {} ::: a b c",
+        ];
+
+        let (old_xdg, old_home, dir) = isolate_config();
+        let mut durations: Vec<u128> = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES {
+            let cmd = representative_commands[i % representative_commands.len()];
+            let start = std::time::Instant::now();
+            let _ = check_command_for_hook(cmd);
+            durations.push(start.elapsed().as_micros());
+        }
+        restore_config(old_xdg, old_home, dir);
+
+        durations.sort_unstable();
+        let p99 = durations[(SAMPLES * 99) / 100];
+        assert!(
+            p99 < P99_BUDGET_MICROS,
+            "p99 hook check latency {}µs exceeds budget {}µs (PR1d NFR)",
+            p99,
+            P99_BUDGET_MICROS
+        );
     }
 }
