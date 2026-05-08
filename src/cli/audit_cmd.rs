@@ -141,6 +141,10 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
                 opts.json = true;
                 index += 1;
             }
+            "--relaxed" => {
+                opts.relaxed_only = true;
+                index += 1;
+            }
             other => {
                 return Err(AppError::Usage(format!(
                     "unknown show flag: {other}\n\n{}",
