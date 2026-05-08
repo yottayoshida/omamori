@@ -135,6 +135,8 @@ echo "exit=$?"
 > ⚠️ AI env で `omamori explain` は oracle-attack-prevention で **self-block される** (DI-8 仕様)。AI agent path では D-3/D-4 を `omamori hook-check --provider claude-code` の dry-run で代替する (block は `exit = 2`、allow は `exit = 0`、stdout は契約上空または JSON、stderr に block reason)。
 >
 > verdict 本体を確認したい場合は **human-only fallback**: 別 shell session で `unset CLAUDECODE` 後に `omamori explain -- <cmd>` (テスト後 `export CLAUDECODE=1` で必ず復帰)。本 acceptance test の AI path には含めない。
+>
+> ⚠️ **D-1 / D-2 は実 env 前提**: installed omamori binary、PATH に shim 配置済 (`which rm` が `~/.omamori/shim/rm` を返す)、`~/.local/share/omamori/audit.jsonl` 存在の env で実行。isolated sandbox (新規 install 直後、shim 未配置) では `Protection status: OK` が出ない。
 
 D-3 / D-4 の hook-check JSON dry-run (Fenced Block #2):
 
@@ -152,8 +154,8 @@ echo "exit=$?"
 
 | # | コマンド | AI-executable assertion | 人間 summary | PASS |
 |---|---------|-------------------------|--------------|------|
-| D-1 | `omamori doctor` | `exit = 0 ∧ stdout ~~ /Protection status: OK/` | 健全環境で trust dashboard 表示。**実 env (installed omamori、PATH に shim あり、`~/.local/share/omamori/audit.jsonl` 存在) で実行**。isolated env (新規 install 直後、shim 未配置) では `Protection status: OK` が出ない可能性あり | [ ] |
-| D-2 | `omamori doctor --verbose` | `exit = 0 ∧ stdout 行数 ≥ 10` | 全チェック項目表示。**D-1 と同じ実 env requirement**。`--verbose` で `[Layer 1]` `[Layer 2]` `[Integrity]` 各 section と sub-checks (検出 PATH / shim hash / hook payload など) が展開される | [ ] |
+| D-1 | `omamori doctor` | `exit = 0 ∧ stdout ~~ /Protection status: OK/` | 健全環境で trust dashboard 表示 (env 要件は section 直上の callout 参照) | [ ] |
+| D-2 | `omamori doctor --verbose` | `exit = 0 ∧ stdout 行数 ≥ 10` | 全チェック項目表示。`--verbose` で `[Layer 1]` `[Layer 2]` `[Integrity]` 各 section と sub-checks (検出 PATH / shim hash / hook payload など) が展開される | [ ] |
 | D-3 | 上記 fenced block の D-3 dry-run | `exit = 2 ∧ stderr ~~ /omamori hook:/` | hook-check が block (Layer 1 + Layer 2 両判定経路) | [ ] |
 | D-4 | 上記 fenced block の D-4 dry-run | `exit = 0` | hook-check が allow | [ ] |
 | D-5 | `omamori doctor --json \| jq .summary` | `exit = 0 ∧ summary.protection_status = "ok" ∧ summary に layer1/layer2/integrity` | JSON summary block 存在確認 | [ ] |
@@ -282,6 +284,8 @@ echo "exit=$?"
 
 ## v0.10.3 #240 effect (AI-data-flag-*) — data-context relaxation
 
+> 用語: `DI-1x` = design invariant 番号 (`scripts/check-invariants.sh` で機械検証)、`PR1c` / `PR1d` = v0.10.3 PR 系列、`T7 oracle` = oracle-attack-prevention 防御 (詳細は `SECURITY.md`)、`relaxed:data-context` = audit log の `detection_layer` field tag で `strip_quoted_data` residual backstop で ALLOW した event を意味する。release ごとの追加 row は `CHANGELOG.md` `[0.10.3]` section に対応。
+>
 > 実行: Claude Code session または下記 fenced block の `hook-check` JSON dry-run。本 section は v0.10.3 (#240) で導入された data-context recognition (`strip_quoted_data` residual backstop + `subst_depth` substitution preservation + `EXECUTION_WRAPPERS` recursive wrapper position) の AI-invocation-path coverage を pin する。data 文脈の verb trigger は ALLOW、内側 substitution は BLOCK、ALLOW path は audit log に `detection_layer = "layer2:relaxed:<source>"` で記録される。
 
 ### Fenced Block #4 — AI-data-flag-* hook-check dry-run
