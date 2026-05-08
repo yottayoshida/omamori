@@ -1321,6 +1321,33 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "fn-parallel-uninstall-block",
     ),
+    // PR1c R4 [P1] regression guards: double-quoted $(...) is executable,
+    // path-qualified / wrapped env -S still triggers the payload check.
+    (
+        "echo \"$(omamori uninstall)\"",
+        Decision::Block,
+        "fn-double-quote-cmd-subst-uninstall-block",
+    ),
+    (
+        "echo \"prefix $(omamori uninstall) suffix\"",
+        Decision::Block,
+        "fn-double-quote-cmd-subst-embedded-block",
+    ),
+    (
+        "echo \"`omamori uninstall`\"",
+        Decision::Block,
+        "fn-double-quote-backtick-uninstall-block",
+    ),
+    (
+        "/usr/bin/env -S 'omamori uninstall'",
+        Decision::Block,
+        "fn-path-qualified-env-s-uninstall-block",
+    ),
+    (
+        "sudo env -S 'omamori uninstall'",
+        Decision::Block,
+        "fn-sudo-env-s-uninstall-block",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES

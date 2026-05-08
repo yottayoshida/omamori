@@ -73,36 +73,77 @@ pub(crate) enum HookCheckResult {
     },
 }
 
-/// Strip the contents of single- and double-quoted regions from a shell
-/// command, leaving an unquoted residual safe for substring backstop
-/// matching. Outside quotes, characters are preserved verbatim (including
-/// `\<x>` escape sequences). Codex review (PR1c R3) [P1] backstop closure.
+/// Strip the contents of quoted regions from a shell command, leaving an
+/// unquoted residual safe for substring backstop matching. Codex review
+/// (PR1c R3 / R4) [P1] backstop closure.
+///
+/// Strip semantics match shell evaluation rules:
+/// - **Single quotes** strip the entire contents (literal in shell, no
+///   expansion).
+/// - **Double quotes** strip *passive* contents but PRESERVE active
+///   substitutions: `$(...)` command substitution and `` `...` `` backticks
+///   are kept because the shell still executes them. `$VAR` is dropped
+///   (variable references, not executable substitutions).
+/// - Outside quotes, characters are preserved verbatim (including `\<x>`
+///   escape sequences).
 ///
 /// Used by `check_pre_phase_2` after token-level verb detection: when the
 /// position-aware path misses (e.g. `xargs -I{} omamori uninstall {}`,
-/// `find . -exec omamori uninstall {} \;`), the residual still contains
-/// the protected verb at a non-quoted position so substring contains
-/// catches it. Quoted bodies (gh issue body / git commit message) are
-/// stripped, so the FP-relief invariant is preserved.
+/// `echo "$(omamori uninstall)"`), the residual still contains the
+/// protected verb so substring contains catches it. Passive quoted
+/// bodies (gh issue body / git commit message) are stripped, preserving
+/// the FP-relief invariant.
 fn strip_quoted_data(command: &str) -> String {
     let mut result = String::with_capacity(command.len());
     let mut chars = command.chars().peekable();
     let mut in_single = false;
     let mut in_double = false;
+    let mut subst_depth: i32 = 0;
     while let Some(c) = chars.next() {
         if in_single {
             if c == '\'' {
                 in_single = false;
             }
-            // chars inside single-quote are skipped (data context)
+            // single-quote contents are literal, skip
         } else if in_double {
-            if c == '\\' {
-                // skip escape sequence (\<x>)
+            if subst_depth > 0 {
+                // Inside $(...) inside double quote: preserve everything
+                // (executable substitution).
+                result.push(c);
+                if c == '(' {
+                    subst_depth += 1;
+                } else if c == ')' {
+                    subst_depth -= 1;
+                }
+            } else if c == '$' {
+                // Possible $(...) or ${...} or $VAR. Only $(...) is
+                // preserved (executable). $VAR / ${VAR} are dropped.
+                if chars.peek() == Some(&'(') {
+                    result.push(c);
+                    result.push('(');
+                    chars.next();
+                    subst_depth = 1;
+                }
+                // else: $VAR or ${...}, drop the $ and continue stripping
+            } else if c == '`' {
+                // Backtick command substitution: preserve through next `
+                // (simplified: nested backticks not supported, but rare
+                // in practice and the substring match still triggers if
+                // a verb appears anywhere in the unbalanced sequence).
+                result.push(c);
+                for bc in chars.by_ref() {
+                    result.push(bc);
+                    if bc == '`' {
+                        break;
+                    }
+                }
+            } else if c == '\\' {
+                // Skip escape sequence inside double quote
                 chars.next();
             } else if c == '"' {
                 in_double = false;
             }
-            // chars inside double-quote are skipped
+            // else: passive char inside double quote, skip
         } else if c == '\'' {
             in_single = true;
         } else if c == '"' {
@@ -125,10 +166,17 @@ fn strip_quoted_data(command: &str) -> String {
 /// position, if any. `env -S` splits the payload into argv and execs it,
 /// so a quoted payload containing a protected verb pattern is executable
 /// data — NOT a quoted body to be stripped. `strip_quoted_data` would
-/// otherwise erase it. Codex review (PR1c R3) [P1].
+/// otherwise erase it. Codex review (PR1c R3 / R4) [P1].
+///
+/// Recognises `env` invoked through path-qualified forms
+/// (`/usr/bin/env`, `/bin/env`) and through transparent execution wrappers
+/// (`sudo env`, `nohup env`, etc., via `is_verb_executable_position`).
+/// Per R4: basename comparison + executable-position recursion.
 fn env_dash_s_payload(tokens: &[String]) -> Option<&str> {
     for (i, t) in tokens.iter().enumerate() {
-        if t == "env" && is_command_position(tokens, i) {
+        // basename match: env, /usr/bin/env, /bin/env, busybox/env, etc.
+        let basename = t.rsplit('/').next().unwrap_or(t.as_str());
+        if basename == "env" && is_verb_executable_position(tokens, i) {
             let mut j = i + 1;
             while j < tokens.len() {
                 let arg = &tokens[j];
