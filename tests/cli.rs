@@ -1930,14 +1930,14 @@ fn parse_json_error_stderr(stderr: &str) -> serde_json::Value {
     parsed
 }
 
-/// Phase 1A meta-pattern (verb-based via subcommand) emits structured JSON
-/// with the actual matched_pattern token and a non-empty byte range.
+/// Phase 1A meta-pattern (path-based) emits structured JSON with the actual
+/// matched_pattern token and a non-empty byte range covering it. Path-based
+/// patterns retain `command.contains` substring match (INV-path-preserve)
+/// so byte offset is recoverable.
 #[test]
-fn hook_check_json_error_blockmeta_exact_metadata() {
-    // The protected pattern is the literal substring "omamori uninstall"
-    // (registered in installer::blocked_string_patterns). Use a benign-looking
-    // command that contains this substring to trigger Phase 1A.
-    let cmd = "echo ok && omamori uninstall";
+fn hook_check_json_error_blockmeta_path_exact_metadata() {
+    // `.claude/settings.json` is a path-based META_PATTERNS_PATH entry.
+    let cmd = "vim ~/.claude/settings.json";
     let (stdout, stderr, exit_code) = run_hook_check_json_error(&pretooluse_bash_json(cmd));
     assert_eq!(exit_code, 2, "block must yield exit 2");
     assert!(stdout.is_empty(), "stdout must be empty in block path");
@@ -1949,10 +1949,10 @@ fn hook_check_json_error_blockmeta_exact_metadata() {
     );
     let pattern = json["matched_pattern"]
         .as_str()
-        .expect("matched_pattern must be a string for Phase 1A");
+        .expect("matched_pattern must be a string for path-based Phase 1A");
     assert_eq!(
-        pattern, "omamori uninstall",
-        "matched_pattern must be the protected token (not the reason)"
+        pattern, ".claude/settings.json",
+        "matched_pattern must be the protected token"
     );
     let position = &json["matched_position"];
     let start = position["start"].as_u64().expect("start must be present");
@@ -1967,6 +1967,32 @@ fn hook_check_json_error_blockmeta_exact_metadata() {
     assert_eq!(
         slice, pattern,
         "command[matched_position] must equal matched_pattern (mutation guard)"
+    );
+}
+
+/// Phase 1A meta-pattern (verb-based, PR1c token-level) emits the verb
+/// pattern token but null `matched_position` because token-level detection
+/// in `detect_verb_at_command_position` operates on the post-`shell_words::split`
+/// slice and cannot recover original byte offsets.
+#[test]
+fn hook_check_json_error_blockmeta_verb_exact_metadata() {
+    let cmd = "echo ok && omamori uninstall";
+    let (stdout, stderr, exit_code) = run_hook_check_json_error(&pretooluse_bash_json(cmd));
+    assert_eq!(exit_code, 2, "block must yield exit 2");
+    assert!(stdout.is_empty(), "stdout must be empty in block path");
+    let json = parse_json_error_stderr(&stderr);
+    assert_eq!(json["blocked"], serde_json::Value::Bool(true));
+    assert_eq!(json["layer"], "layer2:meta-pattern");
+    let pattern = json["matched_pattern"]
+        .as_str()
+        .expect("matched_pattern must be a string for verb-based Phase 1A");
+    assert_eq!(
+        pattern, "omamori uninstall",
+        "matched_pattern must be the exact verb pattern token"
+    );
+    assert!(
+        json["matched_position"].is_null(),
+        "PR1c: verb-based patterns have matched_position = null (token-level)"
     );
 }
 

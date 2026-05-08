@@ -55,6 +55,23 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
       - run: cargo test --locked
 
+  # Deep proptest job (PR1c, v0.10.3+). Runs the v0.10.3 token-level
+  # position-aware properties at PROPTEST_CASES=2048 to amplify mutation /
+  # adversarial-input coverage beyond the default 256 cases used in the
+  # main `test` job. Ubuntu-only — the property strategies are
+  # platform-independent so a second OS leg adds no signal, only cost.
+  proptest-deep:
+    name: Proptest deep (PROPTEST_CASES=2048)
+    runs-on: ubuntu-latest
+    needs: action-pin-check
+    continue-on-error: false
+    env:
+      PROPTEST_CASES: "2048"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - run: cargo test --locked --lib property_tests::prop_ -- --nocapture
+
   # Compile-check the criterion bench harnesses on the same macOS+Ubuntu
   # matrix as `test`. This catches API drift between the lib crate and
   # the bench harnesses (`omamori::unwrap::parse_command_string`,
