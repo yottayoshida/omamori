@@ -127,8 +127,14 @@ fn detect_verb_at_command_position(tokens: &[String]) -> Option<(&'static str, &
 ///   consecutive positions at `tokens[0..]`.
 /// - Verb-prefix + flag pattern: verb prefix must match consecutive
 ///   positions at `tokens[0..]`, and the trailing flag (`--force`, `--fix`)
-///   may appear anywhere in `tokens[verb_prefix.len()..]` (end-of-args scan).
+///   may appear anywhere in `tokens[verb_prefix.len()..]` UNTIL the next
+///   shell segment separator (`&&`, `||`, `;`, `|`, `&`). Stopping at the
+///   separator prevents false-positives like `omamori init safe && echo --force`
+///   where `--force` belongs to the second command segment.
+///   Codex review (PR1c R1) [P2].
 fn matches_verb_pattern_at(tokens: &[String], pattern: &str) -> bool {
+    const SEGMENT_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "&"];
+
     let pattern_tokens: Vec<&str> = pattern.split_whitespace().collect();
     if pattern_tokens.is_empty() || tokens.len() < pattern_tokens.len() {
         return false;
@@ -147,8 +153,13 @@ fn matches_verb_pattern_at(tokens: &[String], pattern: &str) -> bool {
         if !prefix_match {
             return false;
         }
-        // Scan tokens after the verb prefix for the flag.
-        return tokens[verb_prefix_len..].iter().any(|t| t == flag);
+        // Scan tokens after the verb prefix for the flag, stopping at the
+        // next shell segment separator so flags in later commands do not
+        // attribute to this verb.
+        return tokens[verb_prefix_len..]
+            .iter()
+            .take_while(|t| !SEGMENT_SEPARATORS.contains(&t.as_str()))
+            .any(|t| t == flag);
     }
 
     // Plain n-token verb match (no trailing flag).

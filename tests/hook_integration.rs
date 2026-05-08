@@ -1234,6 +1234,23 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "fn-env-prefix-uninstall-block",
     ),
+    // PR1c R1 [P2] regression guard: flag scan must stop at segment separator
+    // so a flag in a LATER command does not attribute to an earlier verb.
+    (
+        "omamori init safe && echo --force",
+        Decision::Allow,
+        "fp-flag-after-separator-allow",
+    ),
+    (
+        "omamori init safe; echo --force",
+        Decision::Allow,
+        "fp-flag-after-semicolon-allow",
+    ),
+    (
+        "omamori doctor && grep --fix logfile",
+        Decision::Allow,
+        "fp-flag-after-and-grep-allow",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
