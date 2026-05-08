@@ -1251,6 +1251,39 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Allow,
         "fp-flag-after-and-grep-allow",
     ),
+    // PR1c R2 [P1] regression guard: execution wrappers (xargs/time/nohup/
+    // sudo/env/etc.) MUST be transparent for self-protect verb detection
+    // so `xargs omamori uninstall` does not silently bypass Phase 1A.
+    (
+        "xargs omamori uninstall",
+        Decision::Block,
+        "fn-xargs-uninstall-block",
+    ),
+    (
+        "echo /tmp/base | xargs omamori uninstall --base-dir",
+        Decision::Block,
+        "fn-pipe-xargs-uninstall-block",
+    ),
+    (
+        "time omamori uninstall",
+        Decision::Block,
+        "fn-time-uninstall-block",
+    ),
+    (
+        "nohup omamori init --force",
+        Decision::Block,
+        "fn-nohup-init-force-block",
+    ),
+    (
+        "sudo omamori config disable rm-recursive",
+        Decision::Block,
+        "fn-sudo-config-disable-block",
+    ),
+    (
+        "time nohup omamori uninstall",
+        Decision::Block,
+        "fn-chained-wrappers-uninstall-block",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES

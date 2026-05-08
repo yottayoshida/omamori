@@ -95,19 +95,48 @@ fn is_command_position(tokens: &[String], idx: usize) -> bool {
     true // walked all the way to start
 }
 
+/// Execution wrappers that pass their argv to another program. When such a
+/// wrapper is at command position, the directly-following position is also
+/// treated as an executable context for self-protect verb detection.
+/// Without this, `xargs omamori uninstall` would skip Phase 1A and reach
+/// Phase 2 as program=xargs, where no `omamori-*-block` rule matches.
+/// Codex review (PR1c R2) [P1] regression closure.
+const EXECUTION_WRAPPERS: &[&str] = &[
+    "xargs", "time", "nohup", "nice", "timeout", "env", "sudo", "doas", "pkexec", "command", "exec",
+];
+
+/// Like `is_command_position`, but additionally recognises positions
+/// immediately following an `EXECUTION_WRAPPERS` token (recursively, so
+/// `time nohup omamori uninstall` is also covered).
+fn is_verb_executable_position(tokens: &[String], idx: usize) -> bool {
+    if is_command_position(tokens, idx) {
+        return true;
+    }
+    if idx == 0 {
+        return false;
+    }
+    let prev = tokens[idx - 1].as_str();
+    if EXECUTION_WRAPPERS.contains(&prev) {
+        return is_verb_executable_position(tokens, idx - 1);
+    }
+    false
+}
+
 /// Detect verb-based meta-patterns at command position (Phase 1A, PR1c, v0.10.3+).
 ///
 /// Mirrors `detect_env_var_tampering` lattice (Phase 1B): operates on
-/// `shell_words::split` token slice, checks `is_command_position`, then
-/// matches n-token verb patterns from `META_PATTERNS_VERB`. Patterns whose
-/// last token is a flag (e.g. `"omamori init --force"`) match when the
-/// verb prefix is at command position AND the flag appears anywhere in
-/// subsequent tokens (per shapes.md T3/T5: flag scan to end-of-args).
+/// `shell_words::split` token slice, checks `is_verb_executable_position`
+/// (segment head OR after an execution wrapper like `xargs`/`time`/`sudo`),
+/// then matches n-token verb patterns from `META_PATTERNS_VERB`. Patterns
+/// whose last token is a flag (e.g. `"omamori init --force"`) match when
+/// the verb prefix is at executable position AND the flag appears anywhere
+/// in subsequent tokens until the next segment separator
+/// (per shapes.md T3/T5 + Codex PR1c R1 [P2]).
 ///
 /// Returns `(pattern_str, reason)` of the matched pattern, or `None`.
 fn detect_verb_at_command_position(tokens: &[String]) -> Option<(&'static str, &'static str)> {
     for i in 0..tokens.len() {
-        if !is_command_position(tokens, i) {
+        if !is_verb_executable_position(tokens, i) {
             continue;
         }
         let window = &tokens[i..];
