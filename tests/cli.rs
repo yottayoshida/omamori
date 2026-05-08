@@ -644,6 +644,35 @@ fn audit_key_rotate_blocked_in_ai_session() {
     );
 }
 
+// `omamori audit show --relaxed` parser reachability (PR1d, DI-16 closure).
+// Pins the gap between symbol-existence (DI-16 grep) and end-to-end CLI wiring.
+#[test]
+fn audit_show_relaxed_flag_reaches_parser() {
+    let dir = unique_dir("audit-show-relaxed");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["audit", "show", "--relaxed"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env("XDG_DATA_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("unknown show flag"),
+        "--relaxed must reach the parser arm, got stderr: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "audit show --relaxed should exit 0 on empty log, got stderr: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn config_disable_core_rule_rejected() {
     let dir = unique_dir("guard-core-reject");
