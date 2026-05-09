@@ -261,9 +261,7 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
         unwrap::ParseResult::Block(reason) => {
             let wrapper_kind = match &reason {
                 unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
-                unwrap::BlockReason::ObfuscatedExpansion => {
-                    Some("__obfuscated_expansion__")
-                }
+                unwrap::BlockReason::ObfuscatedExpansion => Some("__obfuscated_expansion__"),
                 _ => None,
             };
             Err(HookCheckResult::BlockStructural {
@@ -273,9 +271,7 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
                 matched_position: None,
             })
         }
-        unwrap::ParseResult::Commands(invocations) => {
-            Ok(invocations)
-        }
+        unwrap::ParseResult::Commands(invocations) => Ok(invocations),
     }
 }
 
