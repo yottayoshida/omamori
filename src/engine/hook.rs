@@ -246,8 +246,181 @@ fn is_verb_executable_position(tokens: &[String], idx: usize) -> bool {
         return false;
     }
     let prev = tokens[idx - 1].as_str();
-    if EXECUTION_WRAPPERS.contains(&prev) {
+    let prev_base = prev.rsplit('/').next().unwrap_or(prev);
+    if EXECUTION_WRAPPERS.contains(&prev_base) {
         return is_verb_executable_position(tokens, idx - 1);
+    }
+    // Wrappers with flags: `env -i cmd`, `sudo -u root cmd`
+    if prev.starts_with('-') {
+        return is_after_wrapper_with_flags(tokens, idx);
+    }
+    false
+}
+
+/// Check if a redirect operator is a write redirect (output direction).
+///
+/// Write: `>`, `>>`, `>|`, `&>`, `&>>`, `>&`, `n>`, `n>>` (output).
+/// Read:  `<`, `<<`, `<<<`, `<<-`, `<>`, `n<` (input).
+/// `>&` is included: `>&file` is a write redirect to a file (same as `&>`).
+/// `>&2` is fd duplication but won't match a protected path pattern.
+fn is_write_redirect_op(op: &str) -> bool {
+    let core = op.trim_start_matches(|c: char| c.is_ascii_digit());
+    if core.is_empty() {
+        return false;
+    }
+    matches!(core, ">" | ">>" | ">|" | "&>" | "&>>" | ">&")
+}
+
+/// Check if a concatenated redirect token starts with a write redirect prefix.
+fn is_write_redirect_concatenated(token: &str) -> bool {
+    let core = token.trim_start_matches(|c: char| c.is_ascii_digit());
+    if core.is_empty() {
+        return false;
+    }
+    core.starts_with(">>")
+        || core.starts_with(">|")
+        || core.starts_with("&>>")
+        || core.starts_with("&>")
+        || core.starts_with(">&")
+        || core.starts_with('>')
+}
+
+/// Check if a token is a write verb from `installer::WRITE_VERBS`.
+fn is_write_verb(token: &str) -> bool {
+    let basename = token.rsplit('/').next().unwrap_or(token);
+    installer::WRITE_VERBS.contains(&basename)
+}
+
+/// Check if `tokens[idx]` is preceded by an execution wrapper with optional
+/// flags (e.g. `env -i bash`, `sudo -u root bash`). Walks backwards past
+/// flag tokens (starting with `-`) looking for a wrapper at exec position.
+fn is_after_wrapper_with_flags(tokens: &[String], idx: usize) -> bool {
+    if idx == 0 {
+        return false;
+    }
+    let mut j = idx - 1;
+    loop {
+        let t = tokens[j].as_str();
+        if t.starts_with('-') {
+            if j == 0 {
+                return false;
+            }
+            j -= 1;
+            continue;
+        }
+        let basename = t.rsplit('/').next().unwrap_or(t);
+        return EXECUTION_WRAPPERS.contains(&basename)
+            && is_verb_executable_position(tokens, j);
+    }
+}
+
+/// Extract the payload of a `shell -c 'string'` invocation at executable
+/// position. Recognises all `SHELL_NAMES` (bash, sh, zsh, dash, ksh) via
+/// basename match, transparent through execution wrappers (sudo, env, etc.)
+/// including wrapper flags (`env -i bash -c`, `sudo -u root bash -c`).
+/// Also handles combined shell flags (`bash -lc "cmd"`).
+fn shell_dash_c_payload(tokens: &[String]) -> Option<&str> {
+    for (i, t) in tokens.iter().enumerate() {
+        let basename = t.rsplit('/').next().unwrap_or(t.as_str());
+        if unwrap::SHELL_NAMES.contains(&basename)
+            && is_verb_executable_position(tokens, i)
+        {
+            let mut j = i + 1;
+            while j < tokens.len() {
+                let arg = &tokens[j];
+                if arg == "-c" {
+                    if let Some(payload) = tokens.get(j + 1) {
+                        return Some(payload.as_str());
+                    }
+                    return None;
+                }
+                // Combined flag ending with `c` (e.g. -lc, -ec, -xc)
+                if arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg.len() > 2
+                    && arg.ends_with('c')
+                {
+                    if let Some(payload) = tokens.get(j + 1) {
+                        return Some(payload.as_str());
+                    }
+                    return None;
+                }
+                if arg.starts_with('-') {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
+const SEGMENT_SEPARATORS: &[&str] = &[";", "&&", "||", "|", "&"];
+
+/// Check if a protected path pattern appears in write surface within the
+/// given token slice.
+///
+/// Write surface = write redirect target (`>`, `>>`, `>|`, `&>`, `&>>`, `>&`)
+/// or argument to a `WRITE_VERB` at executable position (bounded to current
+/// command segment). Input redirects (`<`, `<<`, `<<<`) and redirect operands
+/// in general are excluded from WRITE_VERB scanning (caught separately by
+/// the redirect checks).
+fn is_path_in_write_surface(tokens: &[String], pattern: &str) -> bool {
+    for (i, token) in tokens.iter().enumerate() {
+        // Check 1: write redirect operand (separate operator token before this one).
+        // Use is_write_redirect_op directly — it handles arbitrary-digit fd
+        // prefixes via trim_start_matches, covering multi-digit fds (10>&)
+        // that RedirectToken::classify misses.
+        if token.contains(pattern) && i > 0 {
+            let prev = &tokens[i - 1];
+            if is_write_redirect_op(prev) {
+                return true;
+            }
+        }
+        // Check 2: concatenated write redirect (operator + operand fused).
+        // Same rationale: is_write_redirect_concatenated handles multi-digit fds.
+        if token.contains(pattern) && is_write_redirect_concatenated(token) {
+            return true;
+        }
+        // Check 3: WRITE_VERB at exec position — scan args within segment,
+        // skipping redirect operators and their operands
+        if is_write_verb(token) && is_verb_executable_position(tokens, i) {
+            let mut skip_next = false;
+            for t in &tokens[i + 1..] {
+                if SEGMENT_SEPARATORS.contains(&t.as_str()) {
+                    break;
+                }
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                let kind = unwrap::RedirectToken::classify(t);
+                if kind == unwrap::RedirectToken::PureWithOperand {
+                    skip_next = true;
+                    continue;
+                }
+                if kind == unwrap::RedirectToken::Concatenated {
+                    continue;
+                }
+                if t.contains(pattern) {
+                    return true;
+                }
+            }
+        }
+        // Check 4: dd of=<pattern> — require dd at exec position in same segment.
+        // Walk backwards from of= and stop at any segment separator.
+        if token.starts_with("of=") && token[3..].contains(pattern) {
+            for (k, t) in tokens[..i].iter().enumerate().rev() {
+                let b = t.rsplit('/').next().unwrap_or(t.as_str());
+                if SEGMENT_SEPARATORS.contains(&b) {
+                    break;
+                }
+                if b == "dd" && is_verb_executable_position(tokens, k) {
+                    return true;
+                }
+            }
+        }
     }
     false
 }
@@ -487,11 +660,13 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 type PrePhase2Ok = (Vec<CommandInvocation>, Option<&'static str>);
 
 fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
-    // Phase 1A path-based: substring match preserved (INV-path-preserve, PR1c).
-    // matched_pattern carries the actual `pattern` token (e.g. ".claude/settings.json"),
-    // not the human-readable `reason`. Reason has its own `reason` / `rule_id`
-    // fields in the JSON schema. Codex review (PR1b R1) [P2].
-    for &(pattern, reason) in installer::META_PATTERNS_PATH {
+    // 0. Compute residual once (shared with Tier 1/2 and verb backstop).
+    let residual = strip_quoted_data(command);
+
+    // --- Phase 1A: 3-tier path meta-pattern detection (#248, v0.10.4+) ---
+
+    // Tier 3 TOKEN: raw unconditional match (INV-sensitive-raw, DREAD 9.2).
+    for &(pattern, reason) in installer::META_PATTERNS_PATH_TOKEN {
         if let Some(start) = command.find(pattern) {
             return Err(HookCheckResult::BlockMeta {
                 reason,
@@ -501,51 +676,107 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
         }
     }
 
-    // Phase 1A verb-based + Phase 1B: token-level position-aware (PR1c, v0.10.3+).
-    // normalize_compound_operators splits ;, &&, ||, |, &, \n into separate tokens,
-    // then shell_words::split normalizes whitespace + parses quotes.
-    // This ensures "echo ok;unset CLAUDECODE" is correctly tokenized as
-    // ["echo", "ok", ";", "unset", "CLAUDECODE"] — without normalize,
-    // shell_words would produce ["echo", "ok;unset", "CLAUDECODE"].
-    // is_command_position() ensures only segment-initial verbs are flagged
-    // (data-context patterns like `gh issue create --body "config disable bug"`
-    // are skipped because the quoted body is packed into a single token).
-    //
-    // DEFENSE BOUNDARY on shell_words::split failure:
-    //   Phase 1A path-based has already run. Phase 2 blocks malformed
-    //   commands via ParseResult::Block(ParseError) — fail-close (INV-fail-close).
+    // Tier 1 EXEC: raw substring match (unchanged from v0.10.3).
+    // EXEC patterns include boundary characters (space, dquote, tab, squote)
+    // that interact with strip_quoted_data, so raw match is required.
+    // These patterns are not the source of FPs — FP relief targets Tier 2 FILE.
+    for &(pattern, reason) in installer::META_PATTERNS_PATH_EXEC {
+        if let Some(start) = command.find(pattern) {
+            return Err(HookCheckResult::BlockMeta {
+                reason,
+                matched_pattern: Some(pattern),
+                matched_position: Some(start..start + pattern.len()),
+            });
+        }
+    }
+
+    // Tokenize (shared with Tier 2, verb detection, and Phase 1B below).
     let normalized = unwrap::normalize_compound_operators(command);
-    if let Ok(tokens) = shell_words::split(&normalized) {
-        // Phase 1A verb-based (PR1c): n-token verb pattern at command position.
-        // matched_position is None because `tokens` is the post-normalize slice
-        // and original byte offsets are not preserved across quote/escape
-        // unwrapping (acceptable per BlockMeta schema).
-        if let Some((pattern, reason)) = detect_verb_at_command_position(&tokens) {
+    let tokens_result = shell_words::split(&normalized);
+
+    // Tier 2 FILE: write-surface check only (#248).
+    // Read/data mentions are allowed; only redirect targets and WRITE_VERB
+    // arguments are blocked.
+    for &(pattern, reason) in installer::META_PATTERNS_PATH_FILE {
+        let raw_pos = command.find(pattern);
+        if raw_pos.is_none() {
+            continue;
+        }
+        let pos_range = || raw_pos.map(|s| s..s + pattern.len());
+
+        // Shell launcher payload (bash -c "tee path") — recursive write-surface.
+        if let Ok(ref tokens) = tokens_result {
+            if let Some(payload) = shell_dash_c_payload(tokens) {
+                if payload.contains(pattern) {
+                    let p_norm = unwrap::normalize_compound_operators(payload);
+                    if let Ok(p_tokens) = shell_words::split(&p_norm) {
+                        if is_path_in_write_surface(&p_tokens, pattern) {
+                            return Err(HookCheckResult::BlockMeta {
+                                reason,
+                                matched_pattern: Some(pattern),
+                                matched_position: pos_range(),
+                            });
+                        }
+                    } else {
+                        return Err(HookCheckResult::BlockMeta {
+                            reason,
+                            matched_pattern: Some(pattern),
+                            matched_position: pos_range(),
+                        });
+                    }
+                }
+            }
+        }
+        // Quoted data filter: if pattern only appears inside passive quotes,
+        // it is data — not a write target.
+        if !residual.contains(pattern) {
+            continue;
+        }
+        // Write-surface check on the outer command tokens.
+        if let Ok(ref tokens) = tokens_result {
+            if is_path_in_write_surface(tokens, pattern) {
+                return Err(HookCheckResult::BlockMeta {
+                    reason,
+                    matched_pattern: Some(pattern),
+                    matched_position: pos_range(),
+                });
+            }
+        } else {
+            // Tokenization failed + path in residual → fail-close (INV-fail-close).
+            return Err(HookCheckResult::BlockMeta {
+                reason,
+                matched_pattern: Some(pattern),
+                matched_position: pos_range(),
+            });
+        }
+        // No positive write evidence → allow this pattern (blocklist-writes).
+    }
+
+    // --- Phase 1A verb-based + Phase 1B (unchanged, reuse tokens_result) ---
+
+    if let Ok(ref tokens) = tokens_result {
+        if let Some((pattern, reason)) = detect_verb_at_command_position(tokens) {
             return Err(HookCheckResult::BlockMeta {
                 reason,
                 matched_pattern: Some(pattern),
                 matched_position: None,
             });
         }
-        if let Some(reason) = detect_env_var_tampering(&tokens) {
-            // Phase 1B: token-level detection has no single substring "pattern" —
-            // matched_pattern is None per schema (Codex review PR1b R2 [P2]).
+        if let Some(reason) = detect_env_var_tampering(tokens) {
             return Err(HookCheckResult::BlockMeta {
                 reason,
                 matched_pattern: None,
                 matched_position: None,
             });
         }
-        if let Some(reason) = detect_path_shim_bypass(&tokens) {
+        if let Some(reason) = detect_path_shim_bypass(tokens) {
             return Err(HookCheckResult::BlockMeta {
                 reason,
                 matched_pattern: None,
                 matched_position: None,
             });
         }
-        // Phase 1A verb backstop: env -S payload contains executable verbs
-        // (a single quoted token that env will split + exec). Codex PR1c R3 [P1].
-        if let Some(payload) = env_dash_s_payload(&tokens) {
+        if let Some(payload) = env_dash_s_payload(tokens) {
             for &(pattern, reason) in installer::META_PATTERNS_VERB {
                 if payload.contains(pattern) {
                     return Err(HookCheckResult::BlockMeta {
@@ -558,13 +789,7 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
         }
     }
 
-    // Phase 1A verb backstop (Codex PR1c R3 [P1]): residual quote-stripped
-    // substring match catches verb patterns invoked via wrapper grammars
-    // not modeled by detect_verb_at_command_position (`xargs -I{}`,
-    // `find -exec ... {} \;`, parallel, sh -c without -c-as-shell-launcher,
-    // etc.). Quoted bodies are stripped so the FP-relief invariant for
-    // gh issue body / git commit message is preserved.
-    let residual = strip_quoted_data(command);
+    // Phase 1A verb backstop (reuse pre-computed residual).
     for &(pattern, reason) in installer::META_PATTERNS_VERB {
         if residual.contains(pattern) {
             return Err(HookCheckResult::BlockMeta {
@@ -578,16 +803,9 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
     // Phase 2 parse: structural block (parse error / pipe-to-shell etc.)
     match unwrap::parse_command_string(command) {
         unwrap::ParseResult::Block(reason) => {
-            // Carry the wrapper basename through to the audit log via
-            // `wrapper_kind`. `message` stays wrapper-agnostic (block-reason
-            // text is the v0.9.5 fixed string) so the AI-iteration channel
-            // and the forensic channel remain separated. v0.9.7 #181 C-1.
             let wrapper_kind = match &reason {
                 unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
                 unwrap::BlockReason::ObfuscatedExpansion => {
-                    // Distinct detection_layer for forensic attribution.
-                    // We encode this as a sentinel that the audit path
-                    // recognises — avoids adding a new field to BlockStructural.
                     Some("__obfuscated_expansion__")
                 }
                 _ => None,
@@ -600,12 +818,6 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
             })
         }
         unwrap::ParseResult::Commands(invocations) => {
-            // PR1d Gap 1: tag Allow path with the relaxation source so audit
-            // log can flag "this command was allowed because the residual
-            // backstop saw nothing after data-context stripping". Future
-            // forensic surface for FP regression analysis. Equality check
-            // costs O(n) but only on the Phase 2 entry path (path-based
-            // already short-circuited).
             let relaxed_by: Option<&'static str> = if residual != command {
                 Some("data-context")
             } else {

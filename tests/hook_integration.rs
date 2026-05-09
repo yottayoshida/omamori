@@ -1366,16 +1366,188 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Allow,
         "non-default-shell-launcher-su-allow",
     ),
+    // =========================================================================
+    // v0.10.4: Write-surface scoping (#248) — Tier 2 FILE patterns block ONLY
+    // when the path is in write context (redirect target / WRITE_VERB arg).
+    // Read/data mentions are allowed, fixing FP on `cat`, `grep`, `gh --body`.
+    // =========================================================================
+    // ws-1. FP relief: `cat` reading a protected path is not a write
+    (
+        "cat ~/.claude/settings.json",
+        Decision::Allow,
+        "ws-file-read-cat-allow",
+    ),
+    // ws-2. FP relief: `grep` reading a protected path
+    (
+        "grep pattern ~/.claude/settings.json",
+        Decision::Allow,
+        "ws-file-read-grep-allow",
+    ),
+    // ws-3. FP relief: input redirect (`<`) is read, not write surface
+    (
+        "sort < ~/.claude/settings.json",
+        Decision::Allow,
+        "ws-file-input-redirect-allow",
+    ),
+    // ws-4. FP relief: path in passive quoted data (gh issue body)
+    (
+        "gh issue create --body \"see ~/.claude/settings.json\"",
+        Decision::Allow,
+        "ws-file-quoted-data-allow",
+    ),
+    // ws-5. FP relief: shell launcher with read-only command in payload
+    (
+        "bash -c \"cat ~/.claude/settings.json\"",
+        Decision::Allow,
+        "ws-file-launcher-read-allow",
+    ),
+    // ws-6. FP relief: audit.jsonl in read context
+    (
+        "cat audit.jsonl",
+        Decision::Allow,
+        "ws-file-read-audit-allow",
+    ),
+    // ws-7. Write-surface block: output redirect target
+    (
+        "echo x > ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-redirect-block",
+    ),
+    // ws-8. Write-surface block: WRITE_VERB (tee)
+    (
+        "tee ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-verb-tee-block",
+    ),
+    // ws-9. Write-surface block: WRITE_VERB (cp) — known conservative FP
+    //       when protected path is the source (not dest); per-verb arg
+    //       mapping deferred to v0.10.5+
+    (
+        "cp bad.json ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-verb-cp-block",
+    ),
+    // ws-10. Write-surface block: new WRITE_VERB (sed)
+    (
+        "sed -i 's/./' ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-verb-sed-block",
+    ),
+    // ws-11. Write-surface block: shell launcher with WRITE_VERB in payload
+    (
+        "bash -c \"tee ~/.claude/settings.json\"",
+        Decision::Block,
+        "ws-file-launcher-write-verb-block",
+    ),
+    // ws-12. Write-surface block: shell launcher with write redirect in payload
+    (
+        "bash -c \"echo x > ~/.claude/settings.json\"",
+        Decision::Block,
+        "ws-file-launcher-write-redirect-block",
+    ),
+    // ws-13. Write-surface block: append redirect to audit log
+    (
+        "echo x >> audit.jsonl",
+        Decision::Block,
+        "ws-file-write-append-block",
+    ),
+    // ws-14. Write-surface block: dd of= syntax targeting protected path
+    (
+        "dd if=/dev/zero of=audit.jsonl bs=1 count=0",
+        Decision::Block,
+        "ws-file-write-dd-of-block",
+    ),
+    // ws-15. Tier 3 TOKEN isolation: `codex_hooks` in read context still blocks
+    (
+        "cat codex_hooks",
+        Decision::Block,
+        "ws-token-codex-hooks-read-block",
+    ),
+    // ws-16. Tier 3 TOKEN isolation: `audit-secret` in quoted data still blocks
+    (
+        "echo \"audit-secret value\"",
+        Decision::Block,
+        "ws-token-audit-secret-quoted-block",
+    ),
+    // ws-17. Codex R1 fix: segment boundary — WRITE_VERB in earlier segment
+    //        must not reach into later read-only segment
+    (
+        "touch /tmp/x; cat ~/.claude/settings.json",
+        Decision::Allow,
+        "ws-file-segment-boundary-allow",
+    ),
+    // ws-18. Codex R1 fix: input redirect operand after WRITE_VERB is read
+    (
+        "tee < ~/.claude/settings.json",
+        Decision::Allow,
+        "ws-file-write-verb-input-redirect-allow",
+    ),
+    // ws-19. Codex R1 fix: shell launcher with combined flag -lc
+    (
+        "bash -lc \"tee ~/.claude/settings.json\"",
+        Decision::Block,
+        "ws-file-launcher-combined-flag-block",
+    ),
+    // ws-20. Codex R1 fix: wrapper flags (env -i) before shell launcher
+    (
+        "env -i bash -c \"tee ~/.claude/settings.json\"",
+        Decision::Block,
+        "ws-file-launcher-wrapper-flags-block",
+    ),
+    // ws-21. Codex R1 fix: >& redirect to protected path
+    (
+        "echo x >& ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-redirect-dup-block",
+    ),
+    // ws-22. Codex R2 fix: multi-digit fd redirect bypass
+    (
+        "echo x 10>& ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-redirect-multifd-block",
+    ),
+    // ws-23. Codex R2 fix: dd of= segment crossing FP
+    (
+        "dd if=/dev/null of=/tmp/out; cat of=audit.jsonl",
+        Decision::Allow,
+        "ws-file-segment-dd-cross-allow",
+    ),
+    // ws-24. dd of= within same segment still blocks
+    (
+        "dd if=/dev/null of=audit.jsonl",
+        Decision::Block,
+        "ws-file-write-dd-same-segment-block",
+    ),
+    // ws-25. 6-B: concatenated write redirect (no space after >)
+    (
+        "echo x >~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-concat-redirect-block",
+    ),
+    // ws-26. 6-B: &> redirect operator
+    (
+        "echo x &>audit.jsonl",
+        Decision::Block,
+        "ws-file-write-ampersand-redirect-block",
+    ),
+    // ws-27. 6-B: absolute path WRITE_VERB
+    (
+        "/usr/bin/tee ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-verb-abspath-block",
+    ),
+    // ws-28. 6-B: wrapper + direct WRITE_VERB (not shell launcher)
+    (
+        "env -i tee ~/.claude/settings.json",
+        Decision::Block,
+        "ws-file-write-verb-wrapper-block",
+    ),
 ];
 
-/// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
-/// entries. Catches category-selective drop that the global ≥18 floor in
-/// `corpus_includes_meta_pattern_coverage` misses (e.g. deleting all 8
-/// `15a` rm boundary fixtures and adding 8 new fixtures elsewhere keeps
-/// the total ≥ 18 but silently drops rm coverage). Sum is 23 — the full
-/// HEAD count including the PR #187 DI-9 additions.
-///
-/// Each prefix anchors with a trailing `-` to prevent accidental
+/// Per-category minimum floors for HOOK_DECISION_CASES entries. Catches
+/// category-selective drop that global floors would miss. Meta-pattern
+/// sum is 23 (PR #187 DI-9 included); ws-* sum is 28 (#248 write-surface
+/// scoping + Codex R1/R2/6-B fix pins). Each prefix anchors with a trailing `-` to prevent accidental
 /// sub-prefix matching: `meta-pattern-bin-rm-` does NOT match
 /// `meta-pattern-bin-rmdir-` because the next char after `rm` is `-` vs
 /// `d`. PR #187 item 1 / PR #186 R5 P3 B2.
@@ -1392,6 +1564,18 @@ const META_PATTERN_CATEGORY_FLOORS: &[(&str, usize)] = &[
     ("meta-pattern-rmdir-", 1),         // 15d FP guard
     ("meta-pattern-bin-rmdir-", 1),     // 15d FP guard
     ("meta-pattern-usr-bin-rmdir-", 1), // 15d FP guard
+    // v0.10.4 write-surface scoping (#248)
+    ("ws-file-read-", 3),              // FP relief: cat, grep, audit read
+    ("ws-file-input-", 1),             // FP relief: input redirect
+    ("ws-file-quoted-", 1),            // FP relief: path in quoted data
+    ("ws-file-launcher-read-", 1),     // FP relief: shell launcher read
+    ("ws-file-launcher-write-", 2),    // write block: launcher write verb + redirect
+    ("ws-file-launcher-combined-", 1), // Codex R1: -lc combined flag
+    ("ws-file-launcher-wrapper-", 1),  // Codex R1: env -i wrapper flags
+    ("ws-file-write-", 12),            // write block: redirect, concat, dup, multifd, &>, append, verb×5, dd
+    ("ws-file-segment-", 2),           // Codex R1/R2: segment boundary FP fixes
+    ("ws-file-write-verb-input-", 1),  // Codex R1: input redirect after WRITE_VERB
+    ("ws-token-", 2),                  // Tier 3 TOKEN isolation
 ];
 
 /// Cross-OS invariant: the same bash input must yield the same Decision on
@@ -1475,11 +1659,20 @@ fn corpus_includes_meta_pattern_coverage() {
             .count();
         assert!(
             count >= *floor,
-            "meta-pattern category '{prefix}*' must have ≥{floor} entries; got {count}. \
-             Category-selective deletion would silently drop this surface coverage even \
-             when the global ≥18 floor still passes."
+            "category '{prefix}*' must have ≥{floor} entries; got {count}. \
+             Category-selective deletion would silently drop this surface coverage."
         );
     }
+
+    // v0.10.4 write-surface scoping (#248): 21 fixtures (9 Allow + 12 Block)
+    let ws_count = HOOK_DECISION_CASES
+        .iter()
+        .filter(|(_, _, cat)| cat.starts_with("ws-"))
+        .count();
+    assert!(
+        ws_count >= 21,
+        "write-surface corpus (#248) must have ≥21 entries; got {ws_count}."
+    );
 }
 
 /// Pin the Block exit code contract at exactly 2. The `cross_os_invariant`

@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.4] - 2026-05-09
+
+**Summary**: Write-surface scoping for path-based meta-patterns ([#248](https://github.com/yottayoshida/omamori/issues/248)). The former 18-entry `META_PATTERNS_PATH` is split into a 3-tier classification (EXEC / FILE / TOKEN), where Tier 2 FILE patterns (8 protected file paths) are blocked only when the path appears in write context — a write-redirect target (`>`, `>>`, `>|`, `&>`, `&>>`) or a `WRITE_VERB` argument. Read/data mentions are now allowed, resolving the remaining false positives from v0.10.3 known limitations (e.g. `cat ~/.claude/settings.json`, `grep pattern settings.json`, `gh issue create --body "see settings.json"`).
+
+### Added
+
+- **3-tier path pattern classification**: `META_PATTERNS_PATH_EXEC` (8 `/bin/rm` boundary variants, raw substring), `META_PATTERNS_PATH_FILE` (8 protected file paths, write-surface only), `META_PATTERNS_PATH_TOKEN` (2 sensitive tokens `codex_hooks`/`audit-secret`, raw unconditional). Legacy `blocked_string_patterns()` returns the concatenation for backward compat.
+- **`is_path_in_write_surface`**: detects whether a protected path is a write-redirect operand (output redirects only — input redirects `<`/`<<`/`<<<`/`<>` excluded), a `WRITE_VERB` argument, or a `dd of=` target.
+- **`shell_dash_c_payload`**: extracts `-c` argument from shell launchers (`bash`/`sh`/`zsh`/`dash`/`ksh`), applies write-surface detection recursively to payload. `bash -c "cat path"` allows; `bash -c "tee path"` blocks.
+- **`is_write_redirect_op` / `is_write_redirect_concatenated`**: discriminates write redirects (`>`, `>>`, `>|`, `&>`, `&>>`) from read redirects (`<`, `<<`, `<<<`, `<>`). The existing `RedirectToken::classify` treats all redirects uniformly; these helpers add write/read discrimination.
+- **`WRITE_VERBS` expanded** from 9 to 16: added `sed`, `truncate`, `patch`, `ln`, `touch`, `chmod`, `chown`. Removed `#[allow(dead_code)]`.
+- **14 new HOOK_DECISION_CASES**: 6 FP-relief Allow cases (`cat`, `grep`, `sort <`, `bash -c "cat"`, quoted data, audit read) + 8 write-surface Block cases (redirect, append, tee, cp, sed, `bash -c` write verb/redirect, `dd of=`). Per-category floors added to `META_PATTERN_CATEGORY_FLOORS`.
+
+### Fixed
+
+- **#248 false positives on read/data context**: `cat ~/.claude/settings.json`, `grep pattern ~/.claude/settings.json`, `sort < ~/.claude/settings.json`, `gh issue create --body "see settings.json"`, `bash -c "cat settings.json"` now allow. This resolves the v0.10.3 known limitation "Path-based 18 entries retain substring match".
+
+### Security
+
+- **Reconnaissance trade-off documented**: allowing read access to protected paths exposes configuration content. Acceptable because config format is open-source, Edit/Write tool gates independently prevent modification, and FP cost significantly degrades AI workflows.
+- **INV-fail-close**: tokenization failure with a protected path present in the residual triggers Block (not Allow).
+- **INV-path-raw-first**: raw `command.contains` check before `strip_quoted_data` prevents `bash -c "tee path"` bypass.
+- **INV-sensitive-raw**: Tier 3 TOKEN patterns (`codex_hooks`, `audit-secret`) retain unconditional raw match (DREAD 9.2).
+
+### Known limitations
+
+- **Known conservative FP**: `cp ~/.claude/settings.json /tmp/backup` blocks because `cp` is a `WRITE_VERB` and per-verb source/destination argument mapping is deferred to a future release.
+- **`eval "tee path"` bypass**: `eval` is not in `SHELL_NAMES` and does not receive shell launcher payload extraction. Consistent with #74 precedent (interpreter family out of scope).
+- **Variable indirection (`$VAR`)**: static analysis cannot resolve runtime variable values. Fundamental limitation documented in SECURITY.md.
+
 ## [0.10.3] - 2026-05-08
 
 **Summary**: Self-block relief for AI workflows ([#240](https://github.com/yottayoshida/omamori/issues/240)). Verb-based meta-pattern detection moves from `command.contains` substring matching to token-level position-aware lattice (mirroring Phase 1B). Path-based 18 entries retain substring match for T3 defense. The data-context residual quote-strip backstop catches verbs invoked via wrapper grammars (`xargs`, `find -exec`, `env -S`, double-quoted `$(...)`, etc.) without re-introducing FP on quoted bodies. Self-modification verbs gain Phase 2 builtin rules (`omamori-*-block`) as defense-in-depth, with `subcommand` position constraint preventing false positives like `omamori exec -- echo disable config`. ACCEPTANCE_TEST.md doc inaccuracies fixed in [#239](https://github.com/yottayoshida/omamori/issues/239) (PR2).
@@ -42,7 +72,7 @@ The format is based on Keep a Changelog.
 ### Known limitations
 
 - **`--break-glass` flag not yet implemented**: if a new false-positive pattern surfaces post-v0.10.3, recovery path is `omamori uninstall` → wait for patch release → `omamori install`. A proper `--break-glass` with audit emission and rate-limit is planned for v0.11.x.
-- **Path-based 18 entries retain substring match**: `gh issue create --body "see ~/.claude/settings.json"` is still BLOCKED by design (T3 heredoc redirect to protected path defense). Use `--body-file <path>` as a one-off bypass. A structural revision scoping path patterns to writeable surface only is planned for v0.11.x.
+- **Path-based 18 entries retain substring match**: `gh issue create --body "see ~/.claude/settings.json"` is still BLOCKED by design (T3 heredoc redirect to protected path defense). Use `--body-file <path>` as a one-off bypass. **Resolved in v0.10.4** (#248): path patterns split into 3 tiers, FILE tier scoped to write-surface only.
 - **v0.10.2 → v0.10.3 incidental coverage narrow**: 5 vectors that v0.10.2's broad substring match incidentally caught are now allowed. All consistent with previously-declared scope-outs (non-default shells `tcsh`/`su`, interpreter family `awk`/`perl` per [#74](https://github.com/yottayoshida/omamori/issues/74), alias dynamic dispatch). Documented in `SECURITY.md` "Broad match by design" section.
 - **`--json-error` JSON contract scope**: applies to the shell-command path only. Other deny paths (malformed hook input, file-op deny, unknown-tool fail-open) retain free-form stderr; extension is a follow-up.
 - **`--json-error` mode skips audit emission**: the trade-off keeps stderr a single parseable JSON object even in degraded audit environments. Operators needing full audit coverage should not pass `--json-error`.

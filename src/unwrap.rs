@@ -15,7 +15,7 @@ const MAX_SEGMENTS: usize = 20;
 
 // --- Shells recognized by basename ---
 
-const SHELL_NAMES: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
+pub(crate) const SHELL_NAMES: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 
 // --- Transparent wrappers (single source of truth) ---
 //

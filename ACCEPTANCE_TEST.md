@@ -337,6 +337,69 @@ echo "exit=$?"
 
 ---
 
+## v0.10.4 #248 effect (ws-*) — write-surface scoping for path patterns
+
+> 用語: `Tier 2 FILE` = 8 protected file path patterns (`.claude/settings.json`, `.integrity.json`, `.codex/hooks.json`, etc.)。v0.10.3 までは unconditional substring match で block していたものを、write context (write redirect target / WRITE_VERB argument) でのみ block に変更。`WRITE_VERBS` = `tee`, `vim`, `vi`, `nano`, `emacs`, `cp`, `mv`, `dd`, `install`, `sed`, `truncate`, `patch`, `ln`, `touch`, `chmod`, `chown` (16 total)。
+>
+> 実行: Claude Code session または下記 fenced block の `hook-check` JSON dry-run。
+
+### Fenced Block #5 — ws-* hook-check dry-run
+
+```bash
+# ws-1: cat reading a protected path → ALLOW (read context, no write surface)
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"cat ~/.claude/settings.json"}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+
+# ws-2: grep reading a protected path → ALLOW
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"grep pattern ~/.claude/settings.json"}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+
+# ws-3: input redirect (read, not write) → ALLOW
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"sort < ~/.claude/settings.json"}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+
+# ws-4: path in quoted data → ALLOW
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh issue create --body \"see ~/.claude/settings.json\""}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+
+# ws-5: shell launcher with read command → ALLOW
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"bash -c \"cat ~/.claude/settings.json\""}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+
+# ws-6: write redirect → BLOCK
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"echo x > ~/.claude/settings.json"}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+
+# ws-7: WRITE_VERB (tee) → BLOCK
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"tee ~/.claude/settings.json"}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+
+# ws-8: shell launcher with WRITE_VERB → BLOCK
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"bash -c \"tee ~/.claude/settings.json\""}}' \
+  | omamori hook-check --provider claude-code
+echo "exit=$?"
+```
+
+| # | コマンド | AI-executable assertion | 人間 summary | PASS |
+|---|---------|-------------------------|--------------|------|
+| ws-1 | Fenced Block #5 の ws-1 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | `cat` は read 操作。Tier 2 FILE pattern は write surface に無いので ALLOW。v0.10.3 では false-positive BLOCK (#248 closure) | [ ] |
+| ws-2 | Fenced Block #5 の ws-2 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | `grep` は read 操作。write surface に無いので ALLOW | [ ] |
+| ws-3 | Fenced Block #5 の ws-3 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | input redirect `<` は read。write redirect (`>`) と区別され ALLOW | [ ] |
+| ws-4 | Fenced Block #5 の ws-4 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | path は `--body` 内の passive quoted data。strip_quoted_data で除去され ALLOW | [ ] |
+| ws-5 | Fenced Block #5 の ws-5 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | shell launcher payload に `cat` (read)。payload の write-surface 検査で write evidence なし → ALLOW | [ ] |
+| ws-6 | Fenced Block #5 の ws-6 dry-run | `exit = 2 ∧ stderr ~~ /omamori hook:/` | `>` は write redirect。path が write-redirect target なので BLOCK | [ ] |
+| ws-7 | Fenced Block #5 の ws-7 dry-run | `exit = 2 ∧ stderr ~~ /omamori hook:/` | `tee` は WRITE_VERB。path が WRITE_VERB argument なので BLOCK | [ ] |
+| ws-8 | Fenced Block #5 の ws-8 dry-run | `exit = 2 ∧ stderr ~~ /omamori hook:/` | shell launcher payload に `tee` (WRITE_VERB)。payload の write-surface 検査で BLOCK | [ ] |
+
+---
+
 ## Recovery (destructive row 実行後の回復)
 
 | 実行 row | 期待 (block 成立) | block 失敗時の対応 |

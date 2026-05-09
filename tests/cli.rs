@@ -1965,7 +1965,7 @@ fn parse_json_error_stderr(stderr: &str) -> serde_json::Value {
 /// so byte offset is recoverable.
 #[test]
 fn hook_check_json_error_blockmeta_path_exact_metadata() {
-    // `.claude/settings.json` is a path-based META_PATTERNS_PATH entry.
+    // `.claude/settings.json` is a Tier 2 FILE (META_PATTERNS_PATH_FILE) entry.
     let cmd = "vim ~/.claude/settings.json";
     let (stdout, stderr, exit_code) = run_hook_check_json_error(&pretooluse_bash_json(cmd));
     assert_eq!(exit_code, 2, "block must yield exit 2");

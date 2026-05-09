@@ -246,7 +246,19 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 
 2. **Phase 2 — Unwrap Stack** (token-level): Tokenizes the command, strips shell wrappers, extracts inner commands from shell launchers, and evaluates each extracted command against the same rules as Layer 1.
 
-**Broad match by design** (path-based, retained in v0.10.3+): Path-based meta-patterns (`audit.jsonl`, `audit-secret`, `.integrity.json`, `.local/share/omamori`, `omamori/config.toml`, `.codex/hooks.json`, `/bin/rm`, `.claude/settings.json`, `.codex/config.toml`, etc., 18 entries in `META_PATTERNS_PATH`) use `command.contains(pattern)` substring match. `ls ~/.local/share/omamori` is blocked alongside `rm -rf ~/.local/share/omamori`. Read-only commands on protected paths are intentionally blocked to prevent reconnaissance that could aid targeted attacks. This is the T3 (heredoc redirect to protected path) defense.
+**3-tier path pattern classification** (v0.10.4+, #248): The former 18-entry `META_PATTERNS_PATH` is split into three tiers with different detection strategies:
+
+| Tier | Name | Count | Detection | Examples |
+|------|------|-------|-----------|----------|
+| 1 — EXEC | Exec-bypass paths | 8 | Raw `command.contains` substring | `/bin/rm `, `/usr/bin/rm"` (4 boundary variants × 2 paths) |
+| 2 — FILE | Protected file paths | 8 | **Write-surface only**: blocked when path is a write-redirect target (`>`, `>>`, `>|`, `&>`, `&>>`) or a `WRITE_VERB` argument | `.claude/settings.json`, `.integrity.json`, `.codex/hooks.json`, `audit.jsonl`, etc. |
+| 3 — TOKEN | Sensitive tokens | 2 | Raw `command.contains` substring (unconditional) | `codex_hooks`, `audit-secret` |
+
+**Tier 2 write-surface detection** (v0.10.4+): `cat ~/.claude/settings.json`, `grep pattern ~/.claude/settings.json`, and `gh issue create --body "see settings.json"` are now **allowed** — the path appears in read or data context, not write context. Write operations (`echo x > ~/.claude/settings.json`, `tee ~/.claude/settings.json`, `sed -i 's/./' ~/.claude/settings.json`) remain **blocked**. Shell launcher payloads (`bash -c "..."`) are recursively inspected: `bash -c "cat path"` allows, `bash -c "tee path"` blocks. Input redirects (`<`, `<<`, `<<<`, `<>`) are classified as read, not write. `WRITE_VERBS`: `tee`, `vim`, `vi`, `nano`, `emacs`, `cp`, `mv`, `dd`, `install`, `sed`, `truncate`, `patch`, `ln`, `touch`, `chmod`, `chown` (16 total). Known conservative FP: `cp protected_path /tmp/backup` blocks because per-verb source/dest argument mapping is deferred. Tokenization failure with a path present in the residual triggers fail-close (INV-fail-close).
+
+**Reconnaissance trade-off** (v0.10.4): allowing read access to protected paths (e.g. `cat ~/.claude/settings.json`) exposes configuration content. This is an acceptable trade-off because: (1) omamori's config format is open-source and documented, (2) Claude Code's Edit/Write tool gates independently prevent modification through the tool-use path, (3) the false-positive cost of blocking all read operations significantly degrades AI development workflows (11 known self-block patterns in v0.10.2). Tier 1 EXEC and Tier 3 TOKEN retain unconditional raw substring match.
+
+**Broad match retained** (Tier 1 EXEC + Tier 3 TOKEN): `/bin/rm` boundary patterns and sensitive tokens (`codex_hooks`, `audit-secret`) remain unconditional raw substring match. These patterns do not cause false positives in normal workflows and protect high-severity attack surfaces (DREAD 8.8+ for exec bypass, 9.2 for codex_hooks tampering).
 
 **Token-level + backstop** (verb-based, v0.10.3+ PR1c): Verb-based meta-patterns (`config disable/enable`, `omamori uninstall`, `omamori init --force`, `omamori override`, `omamori doctor --fix`, `omamori explain`, 7 entries in `META_PATTERNS_VERB`) moved from `command.contains` to a layered detector: (1) token-level position-aware matching (`detect_verb_at_command_position` mirroring the `is_command_position` lattice from Phase 1B, with execution-wrapper transparency for `xargs`/`time`/`nohup`/`sudo`/`env`/etc.), (2) `env -S` payload inspection (`env_dash_s_payload`), (3) residual quote-strip backstop (`strip_quoted_data` preserves `$(...)` and backticks inside double quotes since they remain executable). This relieves false-positives like `gh issue create --body "config disable bug fixed"` (#240) while preserving block on raw / wrapper / executable-quoted invocations.
 
@@ -732,22 +744,21 @@ Entries written before v0.7.0 lack chain fields. When `append()` encounters a le
 
 ## Known Operational Caveats
 
-### Layer 2 meta-pattern false-positives on developer workflows (v0.9.7+)
+### Layer 2 meta-pattern false-positives on developer workflows (v0.9.7–v0.10.3)
 
-Layer 2 meta-pattern matching uses substring inclusion (`command.contains(pattern)`) on the full Bash command string. This is correct for the protection guarantee — `unset CLAUDECODE` anywhere in a command must block, including inside `echo`. The same broadness produces false-positive blocks on developer workflows that *describe* protected configuration without modifying it. Reproducible cases observed during omamori's own development:
+> **Resolved in v0.10.4.** The 3-tier path pattern classification (see [Path pattern classification](#path-pattern-classification) above) scopes FILE-tier patterns to write surface only, eliminating the false-positive classes listed below. TOKEN-tier and EXEC-tier patterns retain unconditional matching.
 
-- `git commit -m '...'` where the commit message body mentions paths like `~/.claude/settings.json`, `.integrity.json`, `audit.jsonl`, or `audit-secret` (release-note prose, threat-model documentation, this very file)
-- `grep` / `rg` invocations that pass these strings as search arguments
-- AI-assisted code-review prompts that surface protected-path words densely in a single Bash invocation (e.g. quoting threat-model excerpts inline)
+In v0.9.7–v0.10.3, Layer 2 meta-pattern matching used substring inclusion (`command.contains(pattern)`) on the full Bash command string for all path patterns. This produced false-positive blocks on developer workflows that *described* protected configuration without modifying it:
 
-These blocks are correct under the v0.9.7 design: the meta-pattern cannot tell *describing* from *modifying* without a full shell parse, and conservatively blocks both. Workarounds for legitimate developer workflows:
+- `git commit -m '...'` where the commit message body mentions paths like `~/.claude/settings.json`
+- `grep` / `rg` / `cat` invocations that pass protected paths as read-only arguments
+- AI-assisted code-review prompts that quote protected-path words in a single Bash invocation
 
-1. Pass commit messages via file: `git commit -F /tmp/msg.txt` keeps the trigger words off the command line.
-2. Split contiguous strings on the Bash command line: e.g. `A=audit B=.jsonl; rg "$A$B"` — the meta-pattern matches the *literal* command string, not its expanded form.
-3. Use AI-tool file-edit interfaces (Read / Edit / Write) instead of Bash for reading or modifying file content; those routes go through `is_protected_file_path`, which is path-aware and does not false-positive on incidental substring mentions in unrelated files.
-4. Use the Codex MCP channel (`mcp__codex__codex`, `mcp__codex__review`) for AI review prompts that necessarily quote protected paths; the MCP transport bypasses the Bash PreToolUse hook entirely.
+Starting with v0.10.4, FILE-tier patterns (`.claude/settings.json`, `.integrity.json`, `audit.jsonl`, etc.) block only when the path appears in a write context: as a write redirect target (`>`, `>>`, `>|`, `&>`, `&>>`, `>&`) or as an argument to a WRITE_VERB (`tee`, `cp`, `mv`, `sed`, etc.). Read-only mentions (`cat`, `grep`, quoted data in `--body` arguments) pass through.
 
-This is a known trade-off, not a bug. Loosening the meta-pattern toward syntactic precision (e.g. tokenizing every Bash command before substring matching) would weaken the protection against obfuscated access to `audit-secret` / `.integrity.json` and is therefore not on the roadmap. The trade-off is documented here so operators reading omamori's own commit history understand that an occasional false-positive block during development is *evidence the layer is working*, not a regression to investigate.
+TOKEN-tier patterns (`codex_hooks`, `audit-secret`) remain unconditional raw substring matches — these tokens are dangerous in any context, and loosening them would weaken the protection against obfuscated access.
+
+**Remaining workaround need**: TOKEN-tier patterns still require the v0.9.7 workarounds (split contiguous strings, pass via file, use Read/Edit tools) when the literal token appears in a Bash command for legitimate reasons.
 
 ### Test-suite pollution of contributor `~/.claude/settings.json` (v0.9.7)
 

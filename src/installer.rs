@@ -468,9 +468,11 @@ pub(crate) const PROTECTED_ENV_VARS: &[&str] = &[
 /// position-aware detection (`detect_verb_at_command_position` in `hook.rs`)
 /// to avoid false-positives like `gh issue create --body "config disable bug"`.
 ///
-/// `ProtectedPathSubstring` patterns retain `command.contains` substring
-/// match to defend against threats T3 (heredoc redirect to protected path)
-/// where the path mention itself is dangerous regardless of context.
+/// `ProtectedPathSubstring` covers three tiers of path/token patterns (v0.10.4+):
+/// - **EXEC** (Tier 1): `/bin/rm` variants — raw substring match on residual
+/// - **FILE** (Tier 2): protected file paths — write-surface scoped
+///   (block only on write redirect target or WRITE_VERB argument)
+/// - **TOKEN** (Tier 3): `codex_hooks`, `audit-secret` — raw unconditional match
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetaPatternKind {
     VerbAtCommandPosition,
@@ -513,19 +515,13 @@ pub const META_PATTERNS_VERB: &[(&str, &str)] = &[
     ),
 ];
 
-/// Path-based meta-patterns (PR1c, v0.10.3+).
+/// Tier 1 EXEC: direct path execution bypassing PATH shim (#248, v0.10.4+).
 ///
-/// Each entry is `(pattern_substring, reason)`. Substring match is PRESERVED
-/// (not token-position-aware) to defend against threat T3 — heredoc redirect
-/// to protected path. Path mention itself is dangerous regardless of context
-/// because shell parsing can promote any path-shaped substring to a redirect
-/// target via `>`/`>>`/`tee` etc. (INV-path-preserve).
-///
-/// PR1d's data-flag allowlist will exempt path mentions inside `gh issue
-/// create --body` etc. via separate logic; the substring match itself stays.
-pub const META_PATTERNS_PATH: &[(&str, &str)] = &[
-    // Direct path execution bypassing PATH shim — match various shell token
-    // boundaries: space, double-quote, tab, single-quote
+/// Raw substring match (unchanged from v0.10.3). These patterns include
+/// boundary characters (space, dquote, tab, squote) that interact with
+/// `strip_quoted_data`, so raw match is required. EXEC patterns are not
+/// the source of false positives — FP relief targets Tier 2 FILE only.
+pub const META_PATTERNS_PATH_EXEC: &[(&str, &str)] = &[
     ("/bin/rm ", "blocked direct rm path that bypasses PATH shim"),
     (
         "/bin/rm\"",
@@ -552,67 +548,79 @@ pub const META_PATTERNS_PATH: &[(&str, &str)] = &[
         "/usr/bin/rm'",
         "blocked direct rm path that bypasses PATH shim",
     ),
-    // Claude Code hook registration protection (#110 T3)
+];
+
+/// Tier 2 FILE: protected file paths (#248, v0.10.4+).
+///
+/// Blocked only in write context: redirect target (`>`, `>>`, `>|`, `&>`,
+/// `&>>`) or WRITE_VERB argument. Read/data mentions (e.g. `cat path`,
+/// `grep pattern path`, `gh issue create --body "see path"`) are allowed.
+/// INV-redirect-primary: redirect targeting a protected path is always
+/// treated as write surface.
+pub const META_PATTERNS_PATH_FILE: &[(&str, &str)] = &[
     (
         ".claude/settings.json",
-        "blocked attempt to edit Claude Code settings (contains hook config)",
+        "blocked attempt to write to Claude Code settings (contains hook config)",
     ),
-    // Integrity baseline protection
     (
         ".integrity.json",
-        "blocked attempt to edit integrity baseline",
+        "blocked attempt to write to integrity baseline",
     ),
-    // Codex CLI hook protection (#66, T2/T3)
     (
         ".codex/hooks.json",
-        "blocked attempt to edit Codex hooks config",
+        "blocked attempt to write to Codex hooks config",
     ),
-    (".codex/config.toml", "blocked attempt to edit Codex config"),
+    (
+        ".codex/config.toml",
+        "blocked attempt to write to Codex config",
+    ),
     (
         "config.toml.bak",
-        "blocked attempt to use Codex config backup",
+        "blocked attempt to write to Codex config backup",
     ),
+    ("audit.jsonl", "blocked attempt to write to audit log"),
+    (
+        "omamori/config.toml",
+        "blocked attempt to write to omamori config",
+    ),
+    (
+        ".local/share/omamori",
+        "blocked attempt to write to omamori data directory",
+    ),
+];
+
+/// Tier 3 TOKEN: sensitive feature-flag tokens (#248, v0.10.4+).
+///
+/// Raw unconditional substring match — any mention is blocked regardless of
+/// context. These tokens control security-critical feature flags whose mere
+/// presence in a command is suspicious (INV-sensitive-raw, DREAD 9.2).
+pub const META_PATTERNS_PATH_TOKEN: &[(&str, &str)] = &[
     (
         "codex_hooks",
         "blocked attempt to modify Codex hooks feature flag",
     ),
-    // Audit log protection (#29)
-    ("audit.jsonl", "blocked attempt to modify audit log"),
     ("audit-secret", "blocked attempt to access audit secret"),
-    // Config protection for retention settings (#29)
-    (
-        "omamori/config.toml",
-        "blocked attempt to edit omamori config",
-    ),
-    // Data directory protection (#29)
-    (
-        ".local/share/omamori",
-        "blocked attempt to modify omamori data directory",
-    ),
 ];
 
-/// Write-target verbs (PR1c SoT, v0.10.3+).
+/// Write-target verbs used by Tier 2 FILE write-surface detection (#248, v0.10.4+).
 ///
-/// Reserved for future v0.11 D-case refactor: scoping path-substring matches
-/// to commands that actually write to a path (`tee`, `vim`, `cat >`, etc.)
-/// rather than every mention. **Currently unused by the Phase 1A detector**;
-/// path patterns retain unconditional substring match in v0.10.3 per
-/// INV-path-preserve. SoT only — populating this list does NOT change PR1c
-/// behavior.
-#[allow(dead_code)]
+/// A command containing a WRITE_VERB at executable position with a protected
+/// path in its arguments is classified as write surface and blocked.
 pub const WRITE_VERBS: &[&str] = &[
-    "tee", "vim", "vi", "nano", "emacs", "cp", "mv", "dd", "install",
+    "tee", "vim", "vi", "nano", "emacs", "cp", "mv", "dd", "install", "sed", "truncate", "patch",
+    "ln", "touch", "chmod", "chown",
 ];
 
-/// Legacy combined meta-pattern list (Phase 1A, all 25 entries).
+/// Combined meta-pattern list (all 25 entries).
 ///
-/// Returns 18 path-based + 7 verb-based entries concatenated. Kept for
-/// backward compatibility with internal call sites and `scripts/check-invariants.sh`
-/// substring greps. New code should use [`META_PATTERNS_PATH`] and
-/// [`META_PATTERNS_VERB`] directly to dispatch via [`MetaPatternKind`].
+/// Returns all path-based (EXEC + FILE + TOKEN) + verb-based entries
+/// concatenated. Used by `scripts/check-invariants.sh` and internal call
+/// sites that need the full pattern set.
 pub fn blocked_string_patterns() -> Vec<(&'static str, &'static str)> {
-    META_PATTERNS_PATH
+    META_PATTERNS_PATH_EXEC
         .iter()
+        .chain(META_PATTERNS_PATH_FILE.iter())
+        .chain(META_PATTERNS_PATH_TOKEN.iter())
         .chain(META_PATTERNS_VERB.iter())
         .copied()
         .collect()
