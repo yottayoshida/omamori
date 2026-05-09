@@ -111,40 +111,6 @@ else
         echo "FAIL [invariant #6e]: $hi must not gate tests on target_os"
         hi_fail=1
     fi
-    # #6f (PR #187 item 3): pin existence of the floor test itself. PR4 (#146
-    # scope 4) introduced `corpus_includes_meta_pattern_coverage` to encode
-    # the "silent pattern drop must fail the suite" guarantee, but the floor
-    # function is itself subject to silent drop — a contributor who deletes
-    # the function body passes CI quietly. Pin the function name here so
-    # physical removal fails CI before reaching review.
-    if ! grep -qF 'fn corpus_includes_meta_pattern_coverage' "$hi"; then
-        echo "FAIL [invariant #6f]: PR #146 scope 4 floor test 'fn corpus_includes_meta_pattern_coverage' must be retained — it pins the silent-drop guarantee and is itself subject to silent drop"
-        hi_fail=1
-    fi
-    # #6g (PR #187 item 3): pin the global meta-pattern floor at >= 18.
-    # The exact range allows the head count to drift to 23 (PR #187 added
-    # 2 DI-9 entries for total 23) without re-flagging this invariant on
-    # every legitimate corpus growth. Floor below 18 means tactical drift
-    # has eaten the safety margin and this should fail CI.
-    if ! grep -qE 'meta_pattern_count >= *(18|19|20|21|22|23)' "$hi"; then
-        echo "FAIL [invariant #6g]: meta-pattern global floor 'meta_pattern_count >= 18..23' must be present"
-        hi_fail=1
-    fi
-    # #6h (PR #187 Codex R1 P1): pin the per-category floor map itself.
-    # #6f and #6g pin only the global floor; without #6h, a future commit
-    # could delete `META_PATTERN_CATEGORY_FLOORS` and its iteration, leaving
-    # the global ≥18 floor as the only guard. That re-opens the
-    # category-selective drop attack PR #187 item 1 was designed to close.
-    # Pin both the const declaration and the iteration site so neither half
-    # of the per-category guard can be silently removed.
-    if ! grep -qF 'const META_PATTERN_CATEGORY_FLOORS' "$hi"; then
-        echo "FAIL [invariant #6h]: PR #187 item 1 per-category floor map 'const META_PATTERN_CATEGORY_FLOORS' must be retained"
-        hi_fail=1
-    fi
-    if ! grep -qF 'for (prefix, floor) in META_PATTERN_CATEGORY_FLOORS' "$hi"; then
-        echo "FAIL [invariant #6h]: per-category floor iteration 'for (prefix, floor) in META_PATTERN_CATEGORY_FLOORS' must be retained"
-        hi_fail=1
-    fi
 fi
 if [ "$hi_fail" -eq 0 ]; then
     echo "#6 OK: hook integration suite has required structure"
@@ -376,61 +342,18 @@ else
     fail=1
 fi
 
-# ---------- Invariant: data-context-recognition-via-strip (DI-14, v0.10.3+) ----------
-# PR1c introduced `strip_quoted_data` as the data-context recognition primitive
-# replacing the original PR1d data-flag allowlist design. The function MUST
-# exist in `src/engine/hook.rs` so the residual quote-strip backstop and the
-# verb-detection FP-relief invariant both remain functional. Removing it would
-# silently re-introduce the v0.10.2-style false positives (#240).
-hk=src/engine/hook.rs
-di14_fail=0
-if ! grep -qE 'fn strip_quoted_data\(' "$hk"; then
-    echo "FAIL [invariant data-context-recognition-via-strip/DI-14]: $hk must define 'fn strip_quoted_data('"
-    di14_fail=1
-fi
-if [ "$di14_fail" -eq 0 ]; then
-    echo "data-context-recognition-via-strip OK: strip_quoted_data intact (DI-14)"
-else
-    fail=1
-fi
+# ---------- DI-14 RETIRED (v0.10.4) ----------
+# strip_quoted_data removed: meta-pattern infrastructure deleted.
+# FP relief achieved by removing 25 meta-patterns entirely.
+echo "DI-14 RETIRED (v0.10.4): strip_quoted_data removed with meta-pattern infrastructure"
 
-# ---------- Invariant: data-context-substitution-preserved (DI-15, v0.10.3+) ----------
-# Inside double quotes, `$(...)` and backticks are EXECUTABLE — the shell still
-# runs them. `strip_quoted_data` MUST preserve substitution boundaries so the
-# residual backstop can still match protected verbs inside `echo "$(omamori
-# uninstall)"`. Codex review (PR1c R4) [P1] established this as a security
-# invariant after a regression that erased $(...).
-di15_fail=0
-if ! grep -qE 'subst_depth' "$hk"; then
-    echo "FAIL [invariant data-context-substitution-preserved/DI-15]: $hk must track subst_depth in strip_quoted_data"
-    di15_fail=1
-fi
-if [ "$di15_fail" -eq 0 ]; then
-    echo "data-context-substitution-preserved OK: subst_depth tracked (DI-15)"
-else
-    fail=1
-fi
+# ---------- DI-15 RETIRED (v0.10.4) ----------
+# subst_depth tracking removed with strip_quoted_data.
+echo "DI-15 RETIRED (v0.10.4): subst_depth removed with strip_quoted_data"
 
-# ---------- Invariant: data-flag-allow-emits-audit-with-relaxed-tag (DI-16, v0.10.3+) ----------
-# Allow paths that the residual quote-strip backstop relied on (i.e.
-# `relaxed_by` was Some) MUST emit an audit event tagged
-# `layer2:relaxed:<source>` so `omamori audit show --relaxed` can surface them
-# for forensic review. Without this, FP regressions in the data-context
-# heuristic become silently undetectable.
-di16_fail=0
-if ! grep -qE 'fn audit_log_hook_allow_relaxed\(' "$hk"; then
-    echo "FAIL [invariant data-flag-allow-emits-audit-with-relaxed-tag/DI-16]: $hk must define 'fn audit_log_hook_allow_relaxed('"
-    di16_fail=1
-fi
-if ! grep -qE 'layer2:relaxed:' "$hk"; then
-    echo "FAIL [invariant data-flag-allow-emits-audit-with-relaxed-tag/DI-16]: $hk must use detection_layer 'layer2:relaxed:<source>'"
-    di16_fail=1
-fi
-if [ "$di16_fail" -eq 0 ]; then
-    echo "data-flag-allow-emits-audit-with-relaxed-tag OK: audit_log_hook_allow_relaxed intact (DI-16)"
-else
-    fail=1
-fi
+# ---------- DI-16 RETIRED (v0.10.4) ----------
+# audit_log_hook_allow_relaxed and layer2:relaxed: removed with relaxed_by infrastructure.
+echo "DI-16 RETIRED (v0.10.4): relaxed_by audit path removed with meta-pattern infrastructure"
 
 if [ "$fail" -ne 0 ]; then
     echo

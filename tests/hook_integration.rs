@@ -407,188 +407,65 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "arg-reorder-long-flag-order-block",
     ),
-    // 15. PR4 scope 4: meta-pattern (`blocked_string_patterns`) behavioral
-    //     coverage. Previously asserted at the array-shape level in
-    //     `src/installer.rs` (`meta_patterns_cover_*`), now pinned at the
-    //     hook-check CLI boundary so the test survives a pattern-list
-    //     refactor and only fails if the attack surface actually re-opens.
-    //
-    // 15a. Direct-path rm bypassing PATH shim — full boundary coverage.
-    //      The deleted `meta_patterns_cover_rm_path_boundaries` test
-    //      pinned 2 paths × 4 token boundaries (space, double-quote, tab,
-    //      single-quote) = 8 asserts. Phase 1A runs `command.contains`
-    //      against the raw pre-quote-stripped command string, so each
-    //      boundary is an independent attack surface — `/bin/rm"` and
-    //      `/bin/rm\t` are distinct pattern entries that a refactor
-    //      could drop individually.
-    //      All cases DELIBERATELY non-recursive (`rm /tmp/x`, no `-rf`)
-    //      so the Block decision must come from the Phase 1A meta-pattern
-    //      layer, not from the Phase 2 rule `rm-recursive-to-trash`.
-    //      Codex Review PR #186 R1 (space-boundary), R2 (both paths),
-    //      R3 (non-space boundaries). Case #2 `/bin/rm -rf /tmp/x`
-    //      remains for historical coverage but is double-covered; this
-    //      group is the meta-layer guarantee.
-    // 15a.i space boundary.
-    (
-        "/bin/rm /tmp/x",
-        Decision::Block,
-        "meta-pattern-bin-rm-space-boundary-block",
-    ),
-    (
-        "/usr/bin/rm /tmp/x",
-        Decision::Block,
-        "meta-pattern-usr-bin-rm-space-boundary-block",
-    ),
-    // 15a.ii double-quote boundary — raw command `"/bin/rm" /tmp/x`.
-    //        After shell_words strips quotes tokens are fine, but the
-    //        Phase 1A contains-check sees the raw form with the trailing
-    //        quote char right after the path.
-    (
-        "\"/bin/rm\" /tmp/x",
-        Decision::Block,
-        "meta-pattern-bin-rm-dquote-boundary-block",
-    ),
-    (
-        "\"/usr/bin/rm\" /tmp/x",
-        Decision::Block,
-        "meta-pattern-usr-bin-rm-dquote-boundary-block",
-    ),
-    // 15a.iii tab boundary — direct path followed by TAB instead of space.
-    (
-        "/bin/rm\t/tmp/x",
-        Decision::Block,
-        "meta-pattern-bin-rm-tab-boundary-block",
-    ),
-    (
-        "/usr/bin/rm\t/tmp/x",
-        Decision::Block,
-        "meta-pattern-usr-bin-rm-tab-boundary-block",
-    ),
-    // 15a.iv single-quote boundary — raw command `'/bin/rm' /tmp/x`.
-    (
-        "'/bin/rm' /tmp/x",
-        Decision::Block,
-        "meta-pattern-bin-rm-squote-boundary-block",
-    ),
-    (
-        "'/usr/bin/rm' /tmp/x",
-        Decision::Block,
-        "meta-pattern-usr-bin-rm-squote-boundary-block",
-    ),
-    // 15b. omamori self-mutation attempts: subcommands that tamper with
-    //      omamori's own config / install state must be blocked.
+    // 15. Phase 2 builtin rule self-protection (omamori-*-block rules).
+    //     These commands are blocked by Phase 2 rule matching, not meta-patterns.
     (
         "omamori config disable some-rule",
         Decision::Block,
-        "meta-pattern-config-disable-block",
+        "phase2-self-protect-config-disable-block",
     ),
     (
         "omamori config enable some-rule",
         Decision::Block,
-        "meta-pattern-config-enable-block",
+        "phase2-self-protect-config-enable-block",
     ),
     (
         "omamori uninstall",
         Decision::Block,
-        "meta-pattern-uninstall-block",
+        "phase2-self-protect-uninstall-block",
     ),
     (
         "omamori init --force",
         Decision::Block,
-        "meta-pattern-init-force-block",
+        "phase2-self-protect-init-force-block",
     ),
     (
         "omamori override",
         Decision::Block,
-        "meta-pattern-override-block",
+        "phase2-self-protect-override-block",
     ),
-    // 15b-DI9. DI-9 behavioral pins for `omamori doctor --fix` and
-    //          `omamori explain` `blocked_string_patterns()` entries
-    //          (declared inside `blocked_string_patterns()` in
-    //          `src/installer.rs`; line numbers omitted because they drift).
-    //          Inherited gap
-    //          from the deleted `meta_patterns_cover_config_modification`
-    //          unit test — neither PR4 nor the rest of HOOK_DECISION_CASES
-    //          carried behavioral coverage for these two patterns. PR4's
-    //          thesis applies universally: every `blocked_string_patterns()`
-    //          entry should have at least one behavioral fixture somewhere.
-    //          PR #187 item 2 / PR #186 R5 P3 B3.
     (
         "omamori doctor --fix",
         Decision::Block,
-        "meta-pattern-doctor-fix-block",
+        "phase2-self-protect-doctor-fix-block",
     ),
     (
         "omamori explain some-rule",
         Decision::Block,
-        "meta-pattern-explain-block",
+        "phase2-self-protect-explain-block",
     ),
-    // 15c. Codex CLI hook / config protection (#66 T2/T3).
+    // 15-fp. FP relief pins: commands that mentioned protected paths in
+    //        data context were previously false-positive blocked by
+    //        meta-pattern substring match. Now allowed.
     (
-        "echo payload > ~/.codex/hooks.json",
-        Decision::Block,
-        "meta-pattern-codex-hooks-json-block",
-    ),
-    (
-        "echo payload > ~/.codex/config.toml",
-        Decision::Block,
-        "meta-pattern-codex-config-toml-block",
-    ),
-    (
-        "cp config.toml config.toml.bak",
-        Decision::Block,
-        "meta-pattern-codex-config-toml-bak-block",
-    ),
-    (
-        "sed -i 's/codex_hooks = true/codex_hooks = false/' ~/.codex/config.toml",
-        Decision::Block,
-        "meta-pattern-codex-hooks-flag-block",
-    ),
-    // 15c-iso. Isolation entry for the `codex_hooks` meta-pattern: the
-    //          fixture above matches BOTH `.codex/config.toml` AND
-    //          `codex_hooks` substrings, so if `codex_hooks` is dropped from
-    //          `blocked_string_patterns()` the prior entry still Blocks via
-    //          `.codex/config.toml`. This fixture uses a staging path that
-    //          does not contain `.codex/config.toml`, `.codex/hooks.json`,
-    //          or `config.toml.bak`, so only the `codex_hooks` pattern can
-    //          trigger the Block. Same isolation regime as 15a-15b; PR #186
-    //          proxy review P1.
-    //
-    //          NOTE: if the `codex_hooks` pattern is ever refactored to a
-    //          stricter form (e.g. `codex_hooks ` trailing-space, or a word
-    //          boundary requirement), the sed-command fixture below must be
-    //          rechecked — it currently happens to include `codex_hooks `
-    //          with a trailing space inside the sed expression, but that
-    //          incidental match should not be relied on when the pattern
-    //          tightens. PR #186 proxy R5.
-    (
-        "sed -i 's/codex_hooks = true/codex_hooks = false/' /tmp/staged.toml",
-        Decision::Block,
-        "meta-pattern-codex-hooks-standalone-block",
-    ),
-    // 15d. FP guard: `rmdir` must NOT be caught by the `/bin/rm ` / `/bin/rm\t`
-    //      / etc. boundary patterns. Previously asserted structurally by
-    //      `meta_patterns_do_not_false_positive_on_rmdir` (pattern array never
-    //      contains `/bin/rmdir`), which also caught the "someone copy-pastes
-    //      a typo'd `/bin/rmdir ` into the block list" class. The bare
-    //      `rmdir /tmp/x` form does not share any substring prefix with the
-    //      /bin/rm* patterns, so direct-path rmdir pins are required to cover
-    //      the typo-injection surface the old test guarded against. PR #186
-    //      proxy review P2.
-    (
-        "rmdir /tmp/x",
+        "cat ~/.claude/settings.json",
         Decision::Allow,
-        "meta-pattern-rmdir-bare-fp-guard-allow",
+        "fp-relief-cat-settings-allow",
     ),
     (
-        "/bin/rmdir /tmp/x",
+        "grep pattern ~/.claude/settings.json",
         Decision::Allow,
-        "meta-pattern-bin-rmdir-fp-guard-allow",
+        "fp-relief-grep-settings-allow",
     ),
     (
-        "/usr/bin/rmdir /tmp/x",
+        "git commit -m \"codex_hooks discussion\"",
         Decision::Allow,
-        "meta-pattern-usr-bin-rmdir-fp-guard-allow",
+        "fp-relief-codex-hooks-data-allow",
+    ),
+    (
+        "gh issue create --body \"see .claude/settings.json\"",
+        Decision::Allow,
+        "fp-relief-gh-issue-settings-allow",
     ),
     // =========================================================================
     // v0.9.8 PR2: redirect-axis closure (#212) — RedirectToken enum +
@@ -1200,13 +1077,13 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
     ),
     (
         "config disable rm-recursive",
-        Decision::Block,
-        "fn-raw-config-disable-block",
+        Decision::Allow,
+        "fp-relief-bare-config-disable-allow",
     ),
     (
         "config enable git-reset-block",
-        Decision::Block,
-        "fn-raw-config-enable-block",
+        Decision::Allow,
+        "fp-relief-bare-config-enable-allow",
     ),
     (
         "omamori init --force",
@@ -1251,24 +1128,8 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Allow,
         "fp-flag-after-and-grep-allow",
     ),
-    // PR1c R2 [P1] regression guard: execution wrappers (xargs/time/nohup/
-    // sudo/env/etc.) MUST be transparent for self-protect verb detection
-    // so `xargs omamori uninstall` does not silently bypass Phase 1A.
-    (
-        "xargs omamori uninstall",
-        Decision::Block,
-        "fn-xargs-uninstall-block",
-    ),
-    (
-        "echo /tmp/base | xargs omamori uninstall --base-dir",
-        Decision::Block,
-        "fn-pipe-xargs-uninstall-block",
-    ),
-    (
-        "time omamori uninstall",
-        Decision::Block,
-        "fn-time-uninstall-block",
-    ),
+    // v0.10.4: TRANSPARENT_WRAPPERS (nohup/sudo/etc.) still unwrap to
+    // expose the inner omamori command to Phase 2 builtin rules.
     (
         "nohup omamori init --force",
         Decision::Block,
@@ -1279,74 +1140,90 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "fn-sudo-config-disable-block",
     ),
+    // v0.10.4: non-TRANSPARENT wrappers (xargs/time/find/parallel) and
+    // data-context vectors (echo "$(...)") were caught by the deleted
+    // meta-pattern infrastructure. Now Allow at Layer 2; still blocked
+    // at Layer 0 (binary env guard) when the inner omamori invocation
+    // actually executes.
+    (
+        "xargs omamori uninstall",
+        Decision::Allow,
+        "scope-narrow-xargs-allow",
+    ),
+    (
+        "echo /tmp/base | xargs omamori uninstall --base-dir",
+        Decision::Allow,
+        "scope-narrow-pipe-xargs-allow",
+    ),
+    (
+        "time omamori uninstall",
+        Decision::Allow,
+        "scope-narrow-time-allow",
+    ),
     (
         "time nohup omamori uninstall",
-        Decision::Block,
-        "fn-chained-wrappers-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-time-nohup-allow",
     ),
-    // PR1c R3 [P1] regression guards: backstop residual quote-strip +
-    // env -S payload must catch verbs missed by token-level detector.
     (
         "xargs -I{} omamori uninstall {}",
-        Decision::Block,
-        "fn-xargs-flag-i-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-xargs-flag-i-allow",
     ),
     (
         "xargs -L 1 omamori uninstall",
-        Decision::Block,
-        "fn-xargs-flag-l-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-xargs-flag-l-allow",
     ),
     (
         "xargs -n 1 -P 4 omamori uninstall",
-        Decision::Block,
-        "fn-xargs-flag-n-p-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-xargs-flag-n-p-allow",
     ),
     (
         "env -S 'omamori uninstall'",
-        Decision::Block,
-        "fn-env-dash-s-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-env-dash-s-allow",
     ),
     (
         "env -S'omamori uninstall'",
-        Decision::Block,
-        "fn-env-dash-s-combined-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-env-dash-s-combined-allow",
     ),
     (
         "find . -exec omamori uninstall {} \\;",
-        Decision::Block,
-        "fn-find-exec-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-find-exec-allow",
     ),
     (
         "parallel omamori uninstall ::: a b c",
-        Decision::Block,
-        "fn-parallel-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-parallel-allow",
     ),
-    // PR1c R4 [P1] regression guards: double-quoted $(...) is executable,
-    // path-qualified / wrapped env -S still triggers the payload check.
     (
         "echo \"$(omamori uninstall)\"",
-        Decision::Block,
-        "fn-double-quote-cmd-subst-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-cmd-subst-allow",
     ),
     (
         "echo \"prefix $(omamori uninstall) suffix\"",
-        Decision::Block,
-        "fn-double-quote-cmd-subst-embedded-block",
+        Decision::Allow,
+        "scope-narrow-cmd-subst-embedded-allow",
     ),
     (
         "echo \"`omamori uninstall`\"",
-        Decision::Block,
-        "fn-double-quote-backtick-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-backtick-allow",
     ),
     (
         "/usr/bin/env -S 'omamori uninstall'",
-        Decision::Block,
-        "fn-path-qualified-env-s-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-path-env-s-allow",
     ),
     (
         "sudo env -S 'omamori uninstall'",
-        Decision::Block,
-        "fn-sudo-env-s-uninstall-block",
+        Decision::Allow,
+        "scope-narrow-sudo-env-s-allow",
     ),
     // PR1c R5 follow-up: pin "out-of-scope allow" vectors so a future patch
     // does not accidentally re-enable v0.10.2 incidental coverage.
@@ -1370,30 +1247,6 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
 /// entries. Catches category-selective drop that the global ≥18 floor in
-/// `corpus_includes_meta_pattern_coverage` misses (e.g. deleting all 8
-/// `15a` rm boundary fixtures and adding 8 new fixtures elsewhere keeps
-/// the total ≥ 18 but silently drops rm coverage). Sum is 23 — the full
-/// HEAD count including the PR #187 DI-9 additions.
-///
-/// Each prefix anchors with a trailing `-` to prevent accidental
-/// sub-prefix matching: `meta-pattern-bin-rm-` does NOT match
-/// `meta-pattern-bin-rmdir-` because the next char after `rm` is `-` vs
-/// `d`. PR #187 item 1 / PR #186 R5 P3 B2.
-const META_PATTERN_CATEGORY_FLOORS: &[(&str, usize)] = &[
-    ("meta-pattern-bin-rm-", 4),        // 15a (bin side, 4 boundary types)
-    ("meta-pattern-usr-bin-rm-", 4),    // 15a (usr/bin side, 4 boundary types)
-    ("meta-pattern-config-", 2),        // 15b (config disable / enable)
-    ("meta-pattern-init-force-", 1),    // 15b
-    ("meta-pattern-uninstall-", 1),     // 15b
-    ("meta-pattern-override-", 1),      // 15b
-    ("meta-pattern-doctor-fix-", 1),    // 15b-DI9 (PR #187 item 2)
-    ("meta-pattern-explain-", 1),       // 15b-DI9 (PR #187 item 2)
-    ("meta-pattern-codex-", 5),         // 15c (4 keywords) + 15c-iso standalone
-    ("meta-pattern-rmdir-", 1),         // 15d FP guard
-    ("meta-pattern-bin-rmdir-", 1),     // 15d FP guard
-    ("meta-pattern-usr-bin-rmdir-", 1), // 15d FP guard
-];
-
 /// Cross-OS invariant: the same bash input must yield the same Decision on
 /// every supported OS. Runs the entire corpus in one temp env to keep install
 /// cost at one-per-test.
@@ -1428,58 +1281,6 @@ fn corpus_includes_both_decisions() {
         .any(|(_, d, _)| *d == Decision::Block);
     assert!(has_allow, "corpus must include at least one Allow case");
     assert!(has_block, "corpus must include at least one Block case");
-}
-
-/// Pin the minimum size of the `meta-pattern-*` sub-corpus introduced by PR4
-/// (#146 scope 4). `corpus_includes_both_decisions` only guarantees one
-/// Allow + one Block exist anywhere in HOOK_DECISION_CASES, so a refactor
-/// that silently drops the 15a-15d entries (10+ fixtures) would still pass
-/// because unrelated entries keep both Decisions alive. This test pins the
-/// category floor directly — the thesis of PR4 is that "silent pattern
-/// drop" must fail the suite, so the corpus that encodes that guarantee
-/// must itself be guarded from silent drop. PR #186 proxy review P2.
-#[test]
-fn corpus_includes_meta_pattern_coverage() {
-    let meta_pattern_count = HOOK_DECISION_CASES
-        .iter()
-        .filter(|(_, _, cat)| cat.starts_with("meta-pattern-"))
-        .count();
-    // Floor rationale: the 4 deleted installer unit tests mapped to
-    //   - rm_path_boundaries: 2 paths × 4 boundaries = 8 fixtures
-    //   - config_modification: 5 keywords (incl. override)         = 5 fixtures
-    //   - codex_protection:   4 original keywords                   = 4 fixtures
-    //                         + 1 isolation fixture for codex_hooks = 5 fixtures
-    //   - do_not_false_positive_on_rmdir: bare + 2 direct paths     = 3 fixtures
-    // → 8 + 5 + 5 + 3 = 21 behavioral fixtures from PR #146 scope 4.
-    // PR #187 item 2 added 2 DI-9 fixtures (doctor --fix, explain) for a
-    // HEAD total of 23. Floor stays at 18 to allow tactical drift while
-    // still catching wholesale category-level deletion. Per-category
-    // selective drop (e.g. deleting all 15a rm-boundary fixtures and
-    // adding 8 unrelated new ones) is caught by `META_PATTERN_CATEGORY_FLOORS`
-    // below. PR #186 R5 proxy corrected the prior 20/18 arithmetic.
-    assert!(
-        meta_pattern_count >= 18,
-        "meta-pattern corpus (#146 scope 4) must have ≥18 entries; got {meta_pattern_count}. \
-         If you are intentionally removing entries, verify the attack/FP surfaces still \
-         have isolated behavioral coverage and update this floor."
-    );
-
-    // Per-category floor map: catches category-selective drop that the
-    // global ≥18 floor would miss (the same total can be hit by deleting
-    // an entire category and replacing it with unrelated new fixtures).
-    // PR #187 item 1 / PR #186 R5 P3 B2.
-    for (prefix, floor) in META_PATTERN_CATEGORY_FLOORS {
-        let count = HOOK_DECISION_CASES
-            .iter()
-            .filter(|(_, _, cat)| cat.starts_with(prefix))
-            .count();
-        assert!(
-            count >= *floor,
-            "meta-pattern category '{prefix}*' must have ≥{floor} entries; got {count}. \
-             Category-selective deletion would silently drop this surface coverage even \
-             when the global ≥18 floor still passes."
-        );
-    }
 }
 
 /// Pin the Block exit code contract at exactly 2. The `cross_os_invariant`
@@ -1881,13 +1682,13 @@ fn audit_path_for(base: &Path) -> PathBuf {
     base.join(".local/share/omamori/audit.jsonl")
 }
 
-/// V-014: BlockMeta path (string-level meta-pattern) appends an audit event
-/// with `detection_layer="layer2:meta-pattern"`. Trigger: `omamori uninstall`
-/// is in `blocked_string_patterns()` and routes through Phase 1A (BlockMeta).
+/// V-014: BlockMeta path (Phase 1B env-var tampering) appends an audit event
+/// with `detection_layer="layer2:meta-pattern"`. Trigger: `unset CLAUDECODE`
+/// is caught by `detect_env_var_tampering` (Phase 1B).
 #[test]
 fn hook_deny_blockmeta_creates_audit_entry() {
     let (base, hook_path, shim_dir) = setup_hook_env("v014-blockmeta");
-    let json = pretooluse_bash_json("omamori uninstall");
+    let json = pretooluse_bash_json("unset CLAUDECODE");
     let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
 
     assert_eq!(

@@ -195,15 +195,15 @@ fn evaluate_layer1(
 }
 
 // ---------------------------------------------------------------------------
-// Layer 2: hook evaluation (meta-pattern + unwrap stack)
+// Layer 2: hook evaluation (Phase 1B detectors + Phase 2 rules + unwrap stack)
 // ---------------------------------------------------------------------------
 
 fn evaluate_layer2(command_str: &str) -> Layer2Result {
     match check_command_for_hook(command_str) {
-        HookCheckResult::Allow { .. } => Layer2Result {
+        HookCheckResult::Allow => Layer2Result {
             blocked: false,
             phase: "allow".to_string(),
-            detail: "no meta-pattern or rule match".to_string(),
+            detail: "no Phase 1B or rule match".to_string(),
         },
         HookCheckResult::BlockMeta { reason, .. } => Layer2Result {
             blocked: true,
@@ -337,22 +337,20 @@ mod tests {
     }
 
     #[test]
-    fn layer2_meta_pattern_blocks() {
+    fn layer2_phase1b_env_tampering_blocks() {
         let result = evaluate_layer2("unset CLAUDECODE");
         assert!(result.blocked);
         assert_eq!(result.phase, "meta-pattern");
     }
 
     #[test]
-    fn layer2_blocked_command_pattern_explain() {
-        // "omamori explain" should be caught by blocked_string_patterns after DI-9
-        // This test will pass after we add the pattern to installer.rs
+    fn layer2_phase2_rule_blocks_explain() {
         let result = evaluate_layer2("omamori explain -- rm -rf /");
         assert!(result.blocked);
     }
 
     #[test]
-    fn layer2_blocked_command_pattern_doctor_fix() {
+    fn layer2_phase2_rule_blocks_doctor_fix() {
         let result = evaluate_layer2("omamori doctor --fix");
         assert!(result.blocked);
     }
