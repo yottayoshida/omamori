@@ -27,14 +27,8 @@ use crate::unwrap;
 /// short-circuits and rule loading both run.
 #[allow(dead_code)] // PR1b: metadata fields populated in PR1c; values currently None
 pub(crate) enum HookCheckResult {
-    /// Command is allowed.
-    ///
-    /// `relaxed_by` identifies which heuristic permitted the command when the
-    /// allow path was reached via a relaxation (e.g. data-flag allowlist in
-    /// PR1d). `None` means the command was allowed by the default policy
-    /// (no protected pattern matched). Used by audit log to tag relaxed
-    /// decisions for forensic review (DI-13 / Gap 1).
-    Allow { relaxed_by: Option<&'static str> },
+    /// Command is allowed — no protected pattern matched.
+    Allow,
     /// Command is blocked by a meta-pattern (string-level).
     ///
     /// `matched_pattern` carries the protected pattern token (`"config disable"`,
@@ -73,136 +67,6 @@ pub(crate) enum HookCheckResult {
     },
 }
 
-/// Strip the contents of quoted regions from a shell command, leaving an
-/// unquoted residual safe for substring backstop matching. Codex review
-/// (PR1c R3 / R4) [P1] backstop closure.
-///
-/// Strip semantics match shell evaluation rules:
-/// - **Single quotes** strip the entire contents (literal in shell, no
-///   expansion).
-/// - **Double quotes** strip *passive* contents but PRESERVE active
-///   substitutions: `$(...)` command substitution and `` `...` `` backticks
-///   are kept because the shell still executes them. `$VAR` is dropped
-///   (variable references, not executable substitutions).
-/// - Outside quotes, characters are preserved verbatim (including `\<x>`
-///   escape sequences).
-///
-/// Used by `check_pre_phase_2` after token-level verb detection: when the
-/// position-aware path misses (e.g. `xargs -I{} omamori uninstall {}`,
-/// `echo "$(omamori uninstall)"`), the residual still contains the
-/// protected verb so substring contains catches it. Passive quoted
-/// bodies (gh issue body / git commit message) are stripped, preserving
-/// the FP-relief invariant.
-fn strip_quoted_data(command: &str) -> String {
-    let mut result = String::with_capacity(command.len());
-    let mut chars = command.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut subst_depth: i32 = 0;
-    while let Some(c) = chars.next() {
-        if in_single {
-            if c == '\'' {
-                in_single = false;
-            }
-            // single-quote contents are literal, skip
-        } else if in_double {
-            if subst_depth > 0 {
-                // Inside $(...) inside double quote: preserve everything
-                // (executable substitution).
-                result.push(c);
-                if c == '(' {
-                    subst_depth += 1;
-                } else if c == ')' {
-                    subst_depth -= 1;
-                }
-            } else if c == '$' {
-                // Possible $(...) or ${...} or $VAR. Only $(...) is
-                // preserved (executable). $VAR / ${VAR} are dropped.
-                if chars.peek() == Some(&'(') {
-                    result.push(c);
-                    result.push('(');
-                    chars.next();
-                    subst_depth = 1;
-                }
-                // else: $VAR or ${...}, drop the $ and continue stripping
-            } else if c == '`' {
-                // Backtick command substitution: preserve through next `
-                // (simplified: nested backticks not supported, but rare
-                // in practice and the substring match still triggers if
-                // a verb appears anywhere in the unbalanced sequence).
-                result.push(c);
-                for bc in chars.by_ref() {
-                    result.push(bc);
-                    if bc == '`' {
-                        break;
-                    }
-                }
-            } else if c == '\\' {
-                // Skip escape sequence inside double quote
-                chars.next();
-            } else if c == '"' {
-                in_double = false;
-            }
-            // else: passive char inside double quote, skip
-        } else if c == '\'' {
-            in_single = true;
-        } else if c == '"' {
-            in_double = true;
-        } else if c == '\\' {
-            // outside quote: preserve backslash + next char as-is
-            result.push(c);
-            if let Some(&next) = chars.peek() {
-                result.push(next);
-                chars.next();
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
-/// Extract the payload of an `env -S 'string'` invocation at command
-/// position, if any. `env -S` splits the payload into argv and execs it,
-/// so a quoted payload containing a protected verb pattern is executable
-/// data — NOT a quoted body to be stripped. `strip_quoted_data` would
-/// otherwise erase it. Codex review (PR1c R3 / R4) [P1].
-///
-/// Recognises `env` invoked through path-qualified forms
-/// (`/usr/bin/env`, `/bin/env`) and through transparent execution wrappers
-/// (`sudo env`, `nohup env`, etc., via `is_verb_executable_position`).
-/// Per R4: basename comparison + executable-position recursion.
-fn env_dash_s_payload(tokens: &[String]) -> Option<&str> {
-    for (i, t) in tokens.iter().enumerate() {
-        // basename match: env, /usr/bin/env, /bin/env, busybox/env, etc.
-        let basename = t.rsplit('/').next().unwrap_or(t.as_str());
-        if basename == "env" && is_verb_executable_position(tokens, i) {
-            let mut j = i + 1;
-            while j < tokens.len() {
-                let arg = &tokens[j];
-                if arg == "-S"
-                    && let Some(payload) = tokens.get(j + 1)
-                {
-                    return Some(payload.as_str());
-                }
-                if let Some(suffix) = arg.strip_prefix("-S")
-                    && !suffix.is_empty()
-                {
-                    return Some(suffix);
-                }
-                // env's option zone: -<flag> or KEY=VAL keeps scanning
-                if arg.starts_with('-') || arg.contains('=') {
-                    j += 1;
-                    continue;
-                }
-                // First positional: end of env's options
-                break;
-            }
-        }
-    }
-    None
-}
-
 /// Check if token at `idx` is in command position (start of a segment).
 /// Command position = index 0, immediately after an operator token,
 /// or after a run of KEY=VAL assignment prefixes (e.g., FOO=1 unset VAR).
@@ -223,109 +87,6 @@ fn is_command_position(tokens: &[String], idx: usize) -> bool {
         return false;
     }
     true // walked all the way to start
-}
-
-/// Execution wrappers that pass their argv to another program. When such a
-/// wrapper is at command position, the directly-following position is also
-/// treated as an executable context for self-protect verb detection.
-/// Without this, `xargs omamori uninstall` would skip Phase 1A and reach
-/// Phase 2 as program=xargs, where no `omamori-*-block` rule matches.
-/// Codex review (PR1c R2) [P1] regression closure.
-const EXECUTION_WRAPPERS: &[&str] = &[
-    "xargs", "time", "nohup", "nice", "timeout", "env", "sudo", "doas", "pkexec", "command", "exec",
-];
-
-/// Like `is_command_position`, but additionally recognises positions
-/// immediately following an `EXECUTION_WRAPPERS` token (recursively, so
-/// `time nohup omamori uninstall` is also covered).
-fn is_verb_executable_position(tokens: &[String], idx: usize) -> bool {
-    if is_command_position(tokens, idx) {
-        return true;
-    }
-    if idx == 0 {
-        return false;
-    }
-    let prev = tokens[idx - 1].as_str();
-    if EXECUTION_WRAPPERS.contains(&prev) {
-        return is_verb_executable_position(tokens, idx - 1);
-    }
-    false
-}
-
-/// Detect verb-based meta-patterns at command position (Phase 1A, PR1c, v0.10.3+).
-///
-/// Mirrors `detect_env_var_tampering` lattice (Phase 1B): operates on
-/// `shell_words::split` token slice, checks `is_verb_executable_position`
-/// (segment head OR after an execution wrapper like `xargs`/`time`/`sudo`),
-/// then matches n-token verb patterns from `META_PATTERNS_VERB`. Patterns
-/// whose last token is a flag (e.g. `"omamori init --force"`) match when
-/// the verb prefix is at executable position AND the flag appears anywhere
-/// in subsequent tokens until the next segment separator
-/// (per shapes.md T3/T5 + Codex PR1c R1 [P2]).
-///
-/// Returns `(pattern_str, reason)` of the matched pattern, or `None`.
-fn detect_verb_at_command_position(tokens: &[String]) -> Option<(&'static str, &'static str)> {
-    for i in 0..tokens.len() {
-        if !is_verb_executable_position(tokens, i) {
-            continue;
-        }
-        let window = &tokens[i..];
-        for &(pattern, reason) in installer::META_PATTERNS_VERB {
-            if matches_verb_pattern_at(window, pattern) {
-                return Some((pattern, reason));
-            }
-        }
-    }
-    None
-}
-
-/// Match a verb pattern (e.g. `"config disable"`, `"omamori init --force"`)
-/// against a token slice starting at command position.
-///
-/// - Plain verb pattern (no trailing flag): all pattern tokens must match
-///   consecutive positions at `tokens[0..]`.
-/// - Verb-prefix + flag pattern: verb prefix must match consecutive
-///   positions at `tokens[0..]`, and the trailing flag (`--force`, `--fix`)
-///   may appear anywhere in `tokens[verb_prefix.len()..]` UNTIL the next
-///   shell segment separator (`&&`, `||`, `;`, `|`, `&`). Stopping at the
-///   separator prevents false-positives like `omamori init safe && echo --force`
-///   where `--force` belongs to the second command segment.
-///   Codex review (PR1c R1) [P2].
-fn matches_verb_pattern_at(tokens: &[String], pattern: &str) -> bool {
-    const SEGMENT_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "&"];
-
-    let pattern_tokens: Vec<&str> = pattern.split_whitespace().collect();
-    if pattern_tokens.is_empty() || tokens.len() < pattern_tokens.len() {
-        return false;
-    }
-
-    let last_is_flag = pattern_tokens.last().is_some_and(|t| t.starts_with('-'));
-
-    if last_is_flag && pattern_tokens.len() >= 3 {
-        // Verb prefix = pattern_tokens[..len-1], must match exactly at start.
-        let verb_prefix_len = pattern_tokens.len() - 1;
-        let flag = pattern_tokens[verb_prefix_len];
-        let prefix_match = pattern_tokens[..verb_prefix_len]
-            .iter()
-            .zip(tokens.iter())
-            .all(|(p, t)| *p == t.as_str());
-        if !prefix_match {
-            return false;
-        }
-        // Scan tokens after the verb prefix for the flag, stopping at the
-        // next shell segment separator so flags in later commands do not
-        // attribute to this verb.
-        return tokens[verb_prefix_len..]
-            .iter()
-            .take_while(|t| !SEGMENT_SEPARATORS.contains(&t.as_str()))
-            .any(|t| t == flag);
-    }
-
-    // Plain n-token verb match (no trailing flag).
-    pattern_tokens
-        .iter()
-        .zip(tokens.iter())
-        .all(|(p, t)| *p == t.as_str())
 }
 
 /// Detect env var tampering at the token level.
@@ -471,65 +232,16 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
     None
 }
 
-/// Phase 1A (meta-patterns), Phase 1B (env tampering), and the structural
-/// branch of Phase 2 (parse-error / pipe-to-shell). Returns
-/// `Err(verdict)` for any early-return case, or `Ok(invocations)` for the
-/// caller to apply rule matching against a chosen rule slice.
-///
-/// Both `check_command_for_hook` and `check_command_for_hook_with_rules`
-/// share this prefix so the production wrapper does not pay
-/// `load_config(None)` when Phase 1A/1B/structural short-circuits the
-/// verdict.
-/// Phase 1A pre-check return: `(invocations, relaxed_by)` on Ok-pass-through.
-/// `relaxed_by` is `Some("data-context")` when `strip_quoted_data` removed
-/// content from the original command, indicating the verb backstop relied
-/// on residual stripping. Used by Allow-path audit tagging (DI-16, PR1d Gap 1).
-type PrePhase2Ok = (Vec<CommandInvocation>, Option<&'static str>);
+/// Phase 1B (env tampering, PATH shim bypass) and the structural branch of
+/// Phase 2 (parse-error / pipe-to-shell). Returns `Err(verdict)` for any
+/// early-return case, or `Ok(invocations)` for the caller to apply rule
+/// matching against a chosen rule slice.
+type PrePhase2Ok = Vec<CommandInvocation>;
 
 fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
-    // Phase 1A path-based: substring match preserved (INV-path-preserve, PR1c).
-    // matched_pattern carries the actual `pattern` token (e.g. ".claude/settings.json"),
-    // not the human-readable `reason`. Reason has its own `reason` / `rule_id`
-    // fields in the JSON schema. Codex review (PR1b R1) [P2].
-    for &(pattern, reason) in installer::META_PATTERNS_PATH {
-        if let Some(start) = command.find(pattern) {
-            return Err(HookCheckResult::BlockMeta {
-                reason,
-                matched_pattern: Some(pattern),
-                matched_position: Some(start..start + pattern.len()),
-            });
-        }
-    }
-
-    // Phase 1A verb-based + Phase 1B: token-level position-aware (PR1c, v0.10.3+).
-    // normalize_compound_operators splits ;, &&, ||, |, &, \n into separate tokens,
-    // then shell_words::split normalizes whitespace + parses quotes.
-    // This ensures "echo ok;unset CLAUDECODE" is correctly tokenized as
-    // ["echo", "ok", ";", "unset", "CLAUDECODE"] — without normalize,
-    // shell_words would produce ["echo", "ok;unset", "CLAUDECODE"].
-    // is_command_position() ensures only segment-initial verbs are flagged
-    // (data-context patterns like `gh issue create --body "config disable bug"`
-    // are skipped because the quoted body is packed into a single token).
-    //
-    // DEFENSE BOUNDARY on shell_words::split failure:
-    //   Phase 1A path-based has already run. Phase 2 blocks malformed
-    //   commands via ParseResult::Block(ParseError) — fail-close (INV-fail-close).
     let normalized = unwrap::normalize_compound_operators(command);
     if let Ok(tokens) = shell_words::split(&normalized) {
-        // Phase 1A verb-based (PR1c): n-token verb pattern at command position.
-        // matched_position is None because `tokens` is the post-normalize slice
-        // and original byte offsets are not preserved across quote/escape
-        // unwrapping (acceptable per BlockMeta schema).
-        if let Some((pattern, reason)) = detect_verb_at_command_position(&tokens) {
-            return Err(HookCheckResult::BlockMeta {
-                reason,
-                matched_pattern: Some(pattern),
-                matched_position: None,
-            });
-        }
         if let Some(reason) = detect_env_var_tampering(&tokens) {
-            // Phase 1B: token-level detection has no single substring "pattern" —
-            // matched_pattern is None per schema (Codex review PR1b R2 [P2]).
             return Err(HookCheckResult::BlockMeta {
                 reason,
                 matched_pattern: None,
@@ -543,51 +255,13 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
                 matched_position: None,
             });
         }
-        // Phase 1A verb backstop: env -S payload contains executable verbs
-        // (a single quoted token that env will split + exec). Codex PR1c R3 [P1].
-        if let Some(payload) = env_dash_s_payload(&tokens) {
-            for &(pattern, reason) in installer::META_PATTERNS_VERB {
-                if payload.contains(pattern) {
-                    return Err(HookCheckResult::BlockMeta {
-                        reason,
-                        matched_pattern: Some(pattern),
-                        matched_position: None,
-                    });
-                }
-            }
-        }
     }
 
-    // Phase 1A verb backstop (Codex PR1c R3 [P1]): residual quote-stripped
-    // substring match catches verb patterns invoked via wrapper grammars
-    // not modeled by detect_verb_at_command_position (`xargs -I{}`,
-    // `find -exec ... {} \;`, parallel, sh -c without -c-as-shell-launcher,
-    // etc.). Quoted bodies are stripped so the FP-relief invariant for
-    // gh issue body / git commit message is preserved.
-    let residual = strip_quoted_data(command);
-    for &(pattern, reason) in installer::META_PATTERNS_VERB {
-        if residual.contains(pattern) {
-            return Err(HookCheckResult::BlockMeta {
-                reason,
-                matched_pattern: Some(pattern),
-                matched_position: None,
-            });
-        }
-    }
-
-    // Phase 2 parse: structural block (parse error / pipe-to-shell etc.)
     match unwrap::parse_command_string(command) {
         unwrap::ParseResult::Block(reason) => {
-            // Carry the wrapper basename through to the audit log via
-            // `wrapper_kind`. `message` stays wrapper-agnostic (block-reason
-            // text is the v0.9.5 fixed string) so the AI-iteration channel
-            // and the forensic channel remain separated. v0.9.7 #181 C-1.
             let wrapper_kind = match &reason {
                 unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
                 unwrap::BlockReason::ObfuscatedExpansion => {
-                    // Distinct detection_layer for forensic attribution.
-                    // We encode this as a sentinel that the audit path
-                    // recognises — avoids adding a new field to BlockStructural.
                     Some("__obfuscated_expansion__")
                 }
                 _ => None,
@@ -600,30 +274,17 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
             })
         }
         unwrap::ParseResult::Commands(invocations) => {
-            // PR1d Gap 1: tag Allow path with the relaxation source so audit
-            // log can flag "this command was allowed because the residual
-            // backstop saw nothing after data-context stripping". Future
-            // forensic surface for FP regression analysis. Equality check
-            // costs O(n) but only on the Phase 2 entry path (path-based
-            // already short-circuited).
-            let relaxed_by: Option<&'static str> = if residual != command {
-                Some("data-context")
-            } else {
-                None
-            };
-            Ok((invocations, relaxed_by))
+            Ok(invocations)
         }
     }
 }
 
 /// Apply Phase 2 rule matching against an explicit rule slice. Returns the
-/// first matching rule's `BlockRule` verdict, or `Allow` (with `relaxed_by`
-/// passed through from `check_pre_phase_2` for audit log forensic tagging).
+/// first matching rule's `BlockRule` verdict, or `Allow`.
 fn match_invocations_against_rules(
     command: &str,
     invocations: &[CommandInvocation],
     rules: &[crate::rules::RuleConfig],
-    relaxed_by: Option<&'static str>,
 ) -> HookCheckResult {
     for inv in invocations {
         if let Some(rule) = match_rule(rules, inv) {
@@ -641,25 +302,24 @@ fn match_invocations_against_rules(
             };
         }
     }
-    HookCheckResult::Allow { relaxed_by }
+    HookCheckResult::Allow
 }
 
-/// Three-phase hook check, evaluating against rules loaded from on-disk
+/// Two-phase hook check, evaluating against rules loaded from on-disk
 /// config with a `Config::default()` fail-safe fallback.
 ///
-/// Phase 1A: String-level meta-patterns (path/config/uninstall)
-/// Phase 1B: Token-level env var tampering detection (whitespace-resilient)
+/// Phase 1B: Token-level env var tampering / PATH override bypass detection
 /// Phase 2: Token-level unwrap stack → rule matching
 ///
 /// `load_config(None)` runs lazily — only when Phase 2 actually reaches
-/// the rule-matching arm. Phase 1A/1B/structural short-circuits pay zero
+/// the rule-matching arm. Phase 1B/structural short-circuits pay zero
 /// disk I/O.
 ///
 /// SECURITY (T8): The `Config::default()` fallback on `load_config` failure
 /// is intentional fail-safe behavior, not fail-open.
 pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
-    let (invocations, relaxed_by) = match check_pre_phase_2(command) {
-        Ok(pair) => pair,
+    let invocations = match check_pre_phase_2(command) {
+        Ok(inv) => inv,
         Err(verdict) => return verdict,
     };
     // Phase 2 reached — load on-disk config now (fail-safe fallback per T8).
@@ -667,7 +327,7 @@ pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
         config: config::Config::default(),
         warnings: vec![],
     });
-    match_invocations_against_rules(command, &invocations, &load_result.config.rules, relaxed_by)
+    match_invocations_against_rules(command, &invocations, &load_result.config.rules)
 }
 
 /// Three-phase hook check, evaluating Phase 2 rule matching against an
@@ -691,11 +351,11 @@ pub(crate) fn check_command_for_hook_with_rules(
     command: &str,
     rules: &[crate::rules::RuleConfig],
 ) -> HookCheckResult {
-    let (invocations, relaxed_by) = match check_pre_phase_2(command) {
-        Ok(pair) => pair,
+    let invocations = match check_pre_phase_2(command) {
+        Ok(inv) => inv,
         Err(verdict) => return verdict,
     };
-    match_invocations_against_rules(command, &invocations, rules, relaxed_by)
+    match_invocations_against_rules(command, &invocations, rules)
 }
 
 /// Format the unwrap chain for display: "rm -rf / (via bash -c)"
@@ -802,17 +462,7 @@ fn run_hook_check_command(
     json_error: bool,
 ) -> Result<i32, AppError> {
     match check_command_for_hook(command) {
-        HookCheckResult::Allow { relaxed_by } => {
-            // PR1d (#240, DI-16): when the allow path was reached only
-            // because the residual quote-strip backstop saw nothing,
-            // record an audit event tagged `layer2:relaxed:<source>` for
-            // forensic review via `omamori audit show --relaxed`. Standard
-            // allow paths (no relaxation) stay quiet to avoid log noise.
-            if let Some(source) = relaxed_by
-                && !json_error
-            {
-                audit_log_hook_allow_relaxed(command, provider, source);
-            }
+        HookCheckResult::Allow => {
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
         }
@@ -1179,30 +829,6 @@ fn is_valid_detection_layer(s: &str) -> bool {
 /// MUST NOT flip the block decision (SEC-7). On failure, the caller has
 /// already chosen to block — we only surface a stderr warning so the user
 /// knows the audit chain has a gap for this event. v0.9.7 #181 B-1.
-/// PR1d (#240, DI-16): record an Allow path that the residual quote-strip
-/// backstop relied on. Tags the event with `detection_layer =
-/// "layer2:relaxed:<source>"` so `omamori audit show --relaxed` can
-/// surface them for forensic review of the data-context heuristic.
-/// Best-effort: failure does not flip the decision.
-fn audit_log_hook_allow_relaxed(command: &str, provider: &str, source: &str) {
-    let load_result = match load_config(None) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let logger = match crate::audit::AuditLogger::from_config(&load_result.config.audit) {
-        Some(l) => l,
-        None => return,
-    };
-    let invocation = CommandInvocation::new(command.to_string(), Vec::new());
-    let detectors = vec![provider.to_string()];
-    let outcome = crate::actions::ActionOutcome::PassedThrough { exit_code: 0 };
-    let mut event = logger.create_event(&invocation, None, &detectors, &outcome);
-    event.action = "allow".to_string();
-    event.result = "allow".to_string();
-    event.detection_layer = Some(format!("layer2:relaxed:{source}"));
-    let _ = logger.append(event);
-}
-
 fn audit_log_hook_block(
     command: &str,
     provider: &str,
@@ -1294,7 +920,7 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
     }
 
     match check_command_for_hook(&command) {
-        HookCheckResult::Allow { .. } => {
+        HookCheckResult::Allow => {
             print_cursor_response(true, "allow", None, None);
         }
         HookCheckResult::BlockMeta { reason, .. } => {
@@ -1752,7 +1378,7 @@ mod tests {
                 );
             }
             HookCheckResult::BlockMeta { .. } | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow { .. } => {
+            HookCheckResult::Allow => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: rm -rf / was ALLOWED — fail-close fallback is broken");
             }
@@ -1760,24 +1386,15 @@ mod tests {
         restore_config(old_xdg, old_home, dir);
     }
 
-    /// PR1b (DI-13 / #239 follow-up): BlockMeta must populate `matched_pattern`
-    /// with the protected pattern token (NOT the human-readable reason — those
-    /// have separate fields) so acceptance tests can assert on structured
-    /// metadata instead of brittle stderr substrings.
-    /// Codex review (PR1b R1) [P2] enforced this contract.
-    ///
-    /// PR1c moved verb-based patterns to token-level position-aware detection
-    /// (`detect_verb_at_command_position`), so `omamori uninstall` now hits the
-    /// verb-based path with `matched_position = None` (no original byte offset
-    /// in post-`shell_words::split` slice). Path-based patterns still populate
-    /// position (covered by hook_check_json_error_blockmeta_exact_metadata
-    /// in tests/cli.rs). This test asserts the verb-path contract: pattern
-    /// populated, position None.
+    /// Phase 1B BlockMeta (env-var tampering, PATH override bypass) sets
+    /// both `matched_pattern` and `matched_position` to `None` — these
+    /// detectors operate at the token level without a single pattern string
+    /// or byte offset to report.
     #[test]
     #[serial_test::serial]
-    fn block_meta_populates_matched_pattern_metadata() {
+    fn block_meta_phase1b_has_null_metadata() {
         let (old_xdg, old_home, dir) = isolate_config();
-        let result = check_command_for_hook("omamori uninstall");
+        let result = check_command_for_hook("unset CLAUDECODE");
         let (got_pattern, got_position) = match result {
             HookCheckResult::BlockMeta {
                 matched_pattern,
@@ -1786,18 +1403,17 @@ mod tests {
             } => (matched_pattern, matched_position),
             _ => {
                 restore_config(old_xdg, old_home, dir);
-                panic!("expected BlockMeta for `omamori uninstall`");
+                panic!("expected BlockMeta for `unset CLAUDECODE`");
             }
         };
         restore_config(old_xdg, old_home, dir);
-        let pattern = got_pattern.expect("matched_pattern must be populated");
-        assert_eq!(
-            pattern, "omamori uninstall",
-            "matched_pattern must be the exact verb pattern token"
+        assert!(
+            got_pattern.is_none(),
+            "Phase 1B BlockMeta: matched_pattern must be None"
         );
         assert!(
             got_position.is_none(),
-            "PR1c: verb-based patterns have matched_position = None (token-level detection), got {got_position:?}"
+            "Phase 1B BlockMeta: matched_position must be None"
         );
     }
 
@@ -1807,7 +1423,7 @@ mod tests {
         let (old_xdg, old_home, dir) = isolate_config();
 
         match check_command_for_hook("ls /tmp") {
-            HookCheckResult::Allow { .. } => {}
+            HookCheckResult::Allow => {}
             other => {
                 restore_config(old_xdg, old_home, dir);
                 panic!(
@@ -1818,7 +1434,7 @@ mod tests {
                             format!("BlockRule({rule_name})"),
                         HookCheckResult::BlockStructural { message: r, .. } =>
                             format!("BlockStructural({r})"),
-                        HookCheckResult::Allow { .. } => unreachable!(),
+                        HookCheckResult::Allow => unreachable!(),
                     }
                 );
             }
@@ -2126,7 +1742,7 @@ mod tests {
         match check_command_for_hook("unset CLAUDECODE") {
             HookCheckResult::BlockMeta { .. } => {}
             HookCheckResult::BlockRule { .. } | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow { .. } => {
+            HookCheckResult::Allow => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: 'unset CLAUDECODE' was ALLOWED — meta-pattern is broken");
             }
@@ -2140,7 +1756,7 @@ mod tests {
         let (old_xdg, old_home, dir) = isolate_config();
 
         match check_command_for_hook("echo hello world") {
-            HookCheckResult::Allow { .. } => {}
+            HookCheckResult::Allow => {}
             _ => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("'echo hello world' should be allowed");
@@ -2162,7 +1778,7 @@ mod tests {
         let (old_xdg, old_home, dir) = isolate_config();
         match check_command_for_hook(command) {
             HookCheckResult::BlockMeta { .. } => {}
-            HookCheckResult::Allow { .. } => {
+            HookCheckResult::Allow => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: {command:?} was ALLOWED — should be BlockMeta");
             }
@@ -2186,7 +1802,7 @@ mod tests {
     fn assert_allows(command: &str) {
         let (old_xdg, old_home, dir) = isolate_config();
         match check_command_for_hook(command) {
-            HookCheckResult::Allow { .. } => {}
+            HookCheckResult::Allow => {}
             other => {
                 let desc = match other {
                     HookCheckResult::BlockMeta { reason: r, .. } => format!("BlockMeta({r})"),
@@ -2196,7 +1812,7 @@ mod tests {
                     HookCheckResult::BlockStructural { message: r, .. } => {
                         format!("BlockStructural({r})")
                     }
-                    HookCheckResult::Allow { .. } => unreachable!(),
+                    HookCheckResult::Allow => unreachable!(),
                 };
                 restore_config(old_xdg, old_home, dir);
                 panic!("expected Allow for {command:?}, got: {desc}");

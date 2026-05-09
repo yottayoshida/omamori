@@ -648,37 +648,9 @@ fn arb_expansion_case() -> impl Strategy<Value = String> {
     (wrapper_prefix, expansion_verb).prop_map(|(prefix, verb)| format!("{prefix}{verb}"))
 }
 
-// ----------------------------------------------------------------------
-// PR1c (v0.10.3): Phase 1A verb-based token-level position-aware proptest
-// ----------------------------------------------------------------------
-//
-// Three properties pin the thesis invariant:
-//   1. Verb pattern inside quoted data context (gh issue body, git commit
-//      message, etc.) is ALLOWED — quoted body is packed into a single
-//      shell_words token, so detect_verb_at_command_position rejects it
-//      via is_command_position guard. This is the FP-relief invariant.
-//   2. Verb pattern at raw command position is BLOCKED — direct invocation
-//      must trigger BlockMeta.
-//   3. Verb pattern inside subshell (`bash -c '...'`) is BLOCKED — Phase 2
-//      unwrap stack + PR1a builtin omamori-*-block rules provide
-//      defense-in-depth even when Phase 1A path-only would miss.
-
-const VERB_PATTERNS_FOR_PROPTEST: &[&str] = &[
-    "config disable",
-    "config enable",
-    "omamori uninstall",
-    "omamori init --force",
-    "omamori override",
-    "omamori doctor --fix",
-    "omamori explain",
-];
-
-/// Subshell-form patterns: must include the `omamori` program because
-/// PR1a builtin rules (`omamori-*-block`) target `program == "omamori"`,
-/// and `bash -c 'config disable'` (without `omamori` prefix) is intentionally
-/// out of scope (program=config has no Phase 2 builtin rule). The omamori
-/// prefix ensures Phase 2 unwrap → internal program == "omamori" → builtin
-/// rule match defense-in-depth.
+/// Subshell-form patterns for Phase 2 builtin rule defense-in-depth testing.
+/// Must include the `omamori` program because builtin rules
+/// (`omamori-*-block`) target `program == "omamori"`.
 const OMAMORI_SUBSHELL_PATTERNS: &[&str] = &[
     "omamori uninstall",
     "omamori init --force",
@@ -689,60 +661,12 @@ const OMAMORI_SUBSHELL_PATTERNS: &[&str] = &[
     "omamori config enable bar",
 ];
 
-const DATA_FLAG_HOSTS: &[&str] = &[
-    "gh issue create --body",
-    "gh pr create --body",
-    "git commit -m",
-];
-
-fn arb_verb_pattern() -> impl Strategy<Value = &'static str> {
-    prop::sample::select(VERB_PATTERNS_FOR_PROPTEST)
-}
-
 fn arb_omamori_subshell_pattern() -> impl Strategy<Value = &'static str> {
     prop::sample::select(OMAMORI_SUBSHELL_PATTERNS)
 }
 
-fn arb_data_flag_host() -> impl Strategy<Value = &'static str> {
-    prop::sample::select(DATA_FLAG_HOSTS)
-}
-
 proptest! {
-    /// Property 1 (PR1c FP-relief invariant): verb pattern inside a quoted
-    /// data argument MUST be ALLOWED. Tests `is_command_position` guard
-    /// rejecting quoted bodies that contain protected verbs.
-    #[test]
-    fn prop_trigger_inside_quoted_body_arg_is_allowed(
-        host in arb_data_flag_host(),
-        pattern in arb_verb_pattern(),
-        prefix in "[a-zA-Z ]{0,32}",
-        suffix in "[a-zA-Z ]{0,32}",
-    ) {
-        let cmd = format!(r#"{host} "{prefix}{pattern}{suffix}""#);
-        let config = Config::default();
-        let blocked = layer2_blocks(&cmd, &config.rules);
-        prop_assert!(
-            !blocked,
-            "verb pattern inside quoted data argument must be ALLOWED: {cmd}"
-        );
-    }
-
-    /// Property 2 (PR1c correctness invariant): verb pattern at raw command
-    /// position MUST be BLOCKED. Each META_PATTERNS_VERB entry triggers
-    /// BlockMeta when invoked directly.
-    #[test]
-    fn prop_trigger_in_raw_command_position_is_blocked(
-        pattern in arb_verb_pattern(),
-    ) {
-        let config = Config::default();
-        let blocked = layer2_blocks(pattern, &config.rules);
-        prop_assert!(
-            blocked,
-            "verb pattern at raw command position must be BLOCKED: {pattern}"
-        );
-    }
-
-    /// Property 3 (defense-in-depth invariant): omamori subcommand inside a
+    /// Phase 2 defense-in-depth: omamori subcommand inside a
     /// `<shell> -c '...'` subshell MUST be BLOCKED via Phase 2 unwrap stack
     /// + PR1a builtin omamori-*-block rules. `config disable` without the
     /// `omamori` prefix is out of scope (program=config has no Phase 2

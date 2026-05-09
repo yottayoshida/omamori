@@ -14,7 +14,7 @@ omamori の shim/hook は AI 環境検知時のみ発火する (`CLAUDECODE` 等
 |---|---|---|---|
 | Layer 1 (S-*) | **raw terminal** で実コマンド (shim 経由) | `CLAUDECODE=1` | Claude Code 安全層が omamori shim より先に block するケースがあり、shim 単独動作の検証は raw terminal で |
 | Layer 2 (H-*) | **Claude Code session** または **`hook-check` JSON dry-run** | `CLAUDECODE=1` (Claude session は継承) | hook 発火条件は AI env 検知。raw terminal では `hook-check --provider claude-code` で等価判定 |
-| Tamper (T-*) | row 別 (T-1 = Claude session の hook、T-2 = Claude session で `omamori config disable` 実行、T-3 = raw terminal smoke check、T-3' = Claude session の bypass attempt) | `CLAUDECODE=1` | T-2 の旧式 (raw shell redirect、または hook-check Edit JSON dry-run) は **omamori meta-pattern hook 自身が block する** (raw shell redirect は実破壊、hook-check JSON 文字列内の `tool_name:"Edit"` + config 改変 pattern が meta-pattern catch される) — `meta-pattern-config-disable-block` で動作確認 |
+| Tamper (T-*) | row 別 (T-1 = Claude session の hook、T-2 = Claude session で `omamori config disable` 実行、T-3 = raw terminal smoke check、T-3' = Claude session の bypass attempt) | `CLAUDECODE=1` | T-2 の旧式 (raw shell redirect、または hook-check Edit JSON dry-run) は **omamori Phase 2 builtin rule hook 自身が block する** (raw shell redirect は実破壊、hook-check JSON 文字列内の `tool_name:"Edit"` + config 改変 pattern が PROTECTED_FILE_PATTERNS で catch される) — `phase2-self-protect-config-disable-block` で動作確認 |
 | Doctor (D-*) | row 別 (D-1/D-2 = どちらも、D-3/D-4 = `hook-check` JSON dry-run) | `CLAUDECODE=1` | `omamori explain` は AI env で oracle-attack-prevention で self-block されるため、AI agent path では `hook-check` で代替 |
 | Audit (A-*) | どちらでも可 | `CLAUDECODE=1` | 監査ログは全 path で記録 |
 
@@ -90,7 +90,7 @@ block 系の stable substring: `omamori hook:` (Layer 2) / `omamori blocked` (ru
 | S-1 | `rm -rf /` | `exit != 0 ∧ stderr ~~ /omamori (hook:\|blocked\|failed to move)/` | `/` 全削除 → block | [ ] |
 | S-2 | `rm -r -f /etc/fstab` | `exit != 0 ∧ stderr ~~ /omamori (hook:\|blocked\|failed to move)/` | 引数分割形でも検出。`/etc/fstab` は EPERM 経路で stderr prefix が `omamori failed to move ... refused to run` になる (補足: `/etc/fstab` の EPERM fail-close 経路は本セクション末尾の補足参照) | [ ] |
 | S-3 (default config) | `git reset --hard` | `exit = 0 ∧ stderr ~~ /stash/` | default rule = `stash-then-exec` (stash 自動作成成功で reset を通す) | [ ] |
-| S-3' (block-mode config) | **raw terminal で `omamori config enable git-reset-block` (precondition、AI session では PR1a の `omamori-config-modify-block` で BLOCK されるため AI agent から打てない)、その後に `git reset --hard`** | `exit != 0 ∧ stderr ~~ /omamori/` | `git-reset-block` rule 有効化時のみ block 動作。precondition の `config enable` は raw terminal セットアップ専用 (AI env 自体が hook で block する `meta-pattern-config-modify` 経路)。テスト後 raw terminal で `omamori config disable git-reset-block` で復帰 | [ ] |
+| S-3' (block-mode config) | **raw terminal で `omamori config enable git-reset-block` (precondition、AI session では PR1a の `omamori-config-modify-block` で BLOCK されるため AI agent から打てない)、その後に `git reset --hard`** | `exit != 0 ∧ stderr ~~ /omamori/` | `git-reset-block` rule 有効化時のみ block 動作。precondition の `config enable` は raw terminal セットアップ専用 (AI env 自体が hook で block する Phase 2 builtin rule `omamori-config-modify-block` 経路)。テスト後 raw terminal で `omamori config disable git-reset-block` で復帰 | [ ] |
 | S-4 | `git push --force` | `exit != 0 ∧ stderr ~~ /omamori/` | force push block | [ ] |
 | S-5 | `git clean -fd` | `exit != 0 ∧ stderr ~~ /omamori/` | clean block | [ ] |
 | S-6 | `chmod 777 /` | `exit != 0 ∧ stderr ~~ /omamori/` | `/` permission 全公開 → block | [ ] |
@@ -130,14 +130,14 @@ echo "exit=$?"
 
 > 実行: row 別。**T-2 は raw shell redirect および hook-check Edit JSON dry-run の両方を使わない**:
 > - raw shell redirect (`printf 'x' > ~/.omamori/config.toml`) は shim を経由せず **実破壊する** ため禁止
-> - hook-check Edit JSON dry-run は **omamori 自身の meta-pattern hook が JSON 文字列内の `tool_name:"Edit"` + config 改変 pattern を catch して block する** ため AI agent からは実行不能
+> - hook-check Edit JSON dry-run は **omamori 自身の PROTECTED_FILE_PATTERNS が JSON 文字列内の config 改変 pattern を catch して block する** ため AI agent からは実行不能
 >
-> 代替として `omamori config disable <rule>` を Claude session で AI agent に実行させる。これは `meta-pattern-config-disable-block` で hook が block する直接の path。
+> 代替として `omamori config disable <rule>` を Claude session で AI agent に実行させる。これは Phase 2 builtin rule `omamori-config-modify-block` で hook が block する直接の path。
 
 | # | コマンド / 実 path | AI-executable assertion | 人間 summary | PASS |
 |---|------------------|-------------------------|--------------|------|
-| T-1 | Claude Code session で `omamori uninstall` を AI agent に実行させる | `exit = 2 ∧ stderr ~~ /omamori (hook:\|protected)/` | self-uninstall block (自己防衛、`meta-pattern-uninstall-block` 経路) | [ ] |
-| T-2 | Claude Code session で AI agent に `omamori config disable rm-recursive-to-trash` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook: blocked/` | config 改変 block (`meta-pattern-config-disable-block` 経路、実機 message 例: `omamori hook: blocked — blocked attempt to modify omamori rules`) | [ ] |
+| T-1 | Claude Code session で `omamori uninstall` を AI agent に実行させる | `exit = 2 ∧ stderr ~~ /omamori (hook:\|protected)/` | self-uninstall block (自己防衛、Phase 2 builtin rule `omamori-uninstall-block` 経路) | [ ] |
+| T-2 | Claude Code session で AI agent に `omamori config disable rm-recursive-to-trash` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook: blocked/` | config 改変 block (Phase 2 builtin rule `omamori-config-modify-block` 経路、実機 message 例: `omamori hook: blocked — blocked attempt to modify omamori rules`) | [ ] |
 | T-3 (precedence smoke check) | raw terminal で `which rm` (PATH を変更しない素の状態で) | `which rm` 出力が `~/.omamori/shim/rm` を含む | shim が PATH 先頭にあることの baseline 確認 | [ ] |
 | T-3' (bypass attempt 検出) | Claude Code session で AI agent に `PATH=/usr/bin:$PATH rm dummy.txt` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook:/` | hook が PATH 改変付き invocation を block — v0.10.1 `detect_path_shim_bypass()` で closure (#227) | [ ] |
 
@@ -231,7 +231,7 @@ omamori audit show --rule rm-recursive-to-trash --last 5
 | # | コマンド | AI-executable assertion | 人間 summary | PASS |
 |---|---------|-------------------------|--------------|------|
 | A-1 | (S-1 後) `omamori audit show --rule rm-recursive-to-trash --last 5` | `exit = 0 ∧ stdout に S-1 由来 entry: rule_id="rm-recursive-to-trash" ∧ result が block 系` | S-1 由来 audit row が直近 5 件に存在 | [ ] |
-| A-2 | `omamori audit show --last 1` (AI agent からも実行可、CLI 経由で audit log 存在を確認) | `exit = 0 ∧ stdout が non-empty (column header `TIMESTAMP` を含むか、`--json` ならば `{"timestamp":...,"seq":...}` JSON entry)` | 監査ログ存在 (XDG Base Directory 準拠の `~/.local/share/omamori/audit.jsonl`、ただし AI agent からは file system 直叩きで block される — `meta-pattern-audit-log-protect` 経路。CLI 経由の `audit show` で代替) | [ ] |
+| A-2 | `omamori audit show --last 1` (AI agent からも実行可、CLI 経由で audit log 存在を確認) | `exit = 0 ∧ stdout が non-empty (column header `TIMESTAMP` を含むか、`--json` ならば `{"timestamp":...,"seq":...}` JSON entry)` | 監査ログ存在 (XDG Base Directory 準拠の `~/.local/share/omamori/audit.jsonl`、ただし AI agent からは file system 直叩きで block される — `PROTECTED_FILE_PATTERNS` 経路。CLI 経由の `audit show` で代替) | [ ] |
 
 > A-1 補足: `--action block` フィルタは catch しない (`audit/mod.rs` で `action` 列はルールの **意図** = `Trash`、実際の outcome = block は `result` 列)。
 
@@ -293,47 +293,38 @@ echo "exit=$?"
 
 ---
 
-## v0.10.3 #240 effect (AI-data-flag-*) — data-context relaxation
+## v0.10.4 FP relief (AI-data-flag-*) — meta-pattern removal
 
-> 用語: `DI-1x` = design invariant 番号 (`scripts/check-invariants.sh` で機械検証)、`PR1c` / `PR1d` = v0.10.3 PR 系列、`T7 oracle` = oracle-attack-prevention 防御 (詳細は `SECURITY.md`)、`relaxed:data-context` = audit log の `detection_layer` field tag で `strip_quoted_data` residual backstop で ALLOW した event を意味する。release ごとの追加 row は `CHANGELOG.md` `[0.10.3]` section に対応。
->
-> 実行: Claude Code session または下記 fenced block の `hook-check` JSON dry-run。本 section は v0.10.3 (#240) で導入された data-context recognition (`strip_quoted_data` residual backstop + `subst_depth` substitution preservation + `EXECUTION_WRAPPERS` recursive wrapper position) の AI-invocation-path coverage を pin する。data 文脈の verb trigger は ALLOW、内側 substitution は BLOCK、ALLOW path は audit log に `detection_layer = "layer2:relaxed:<source>"` で記録される。
+> v0.10.3 で導入した data-context infrastructure (`strip_quoted_data`, `subst_depth`, `EXECUTION_WRAPPERS`) は v0.10.4 で meta-pattern 全削除に伴い除去。Phase 2 builtin rules はコマンド先頭の `program` フィールドで判定するため、引数内の trigger word は構造的に誤検出しない。本 section は FP relief が維持されていることを pin する。
 
 ### Fenced Block #4 — AI-data-flag-* hook-check dry-run
 
 ```bash
-# AI-data-flag-1: gh issue --body 内の verb trigger は data 文脈で ALLOW
+# AI-data-flag-1: gh issue --body 内の verb trigger は ALLOW (program=gh, Phase 2 rule なし)
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh issue create --title \"x\" --body \"config disable rm-recursive-to-trash\""}}' \
   | omamori hook-check --provider claude-code
 echo "exit=$?"
 
-# AI-data-flag-2: --body 内の inner $(...) は再帰検査で BLOCK
+# AI-data-flag-2: --body 内の inner $(...) も ALLOW (program=gh, Phase 2 rule なし)
+# v0.10.3 では subst_depth で BLOCK していたが、meta-pattern 削除により Phase 2 は program=gh で判定。
+# inner substitution の omamori invocation は Layer 0 (binary env guard) でカバー。
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"gh issue create --body \"$(omamori uninstall)\""}}' \
   | omamori hook-check --provider claude-code
 echo "exit=$?"
 
-# AI-data-flag-3: git commit -m 内の trigger も data 文脈で ALLOW
+# AI-data-flag-3: git commit -m 内の trigger も ALLOW (program=git, Phase 2 rule なし for this subcommand)
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git commit -m \"fix: prevent omamori uninstall regression\""}}' \
   | omamori hook-check --provider claude-code
-echo "exit=$?"
-
-# AI-data-flag-4 (table view): ALLOW した event が audit log に relaxed tag 付きで記録されている
-omamori audit show --relaxed --last 5
-echo "exit=$?"
-
-# AI-data-flag-4 (JSON view): detection_layer="layer2:relaxed:data-context" を fact 確認
-omamori audit show --relaxed --json --last 5 | jq -r '.detection_layer' | head -3
 echo "exit=$?"
 ```
 
 | # | コマンド | AI-executable assertion | 人間 summary | PASS |
 |---|---------|-------------------------|--------------|------|
-| AI-data-flag-1 | Fenced Block #4 の AI-data-flag-1 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | `gh issue --body` 内の `config disable` 文字列は data 文脈として ALLOW (PR1c `strip_quoted_data` residual backstop)。v0.10.2 までは false-positive BLOCK だった (#240 closure) | [ ] |
-| AI-data-flag-2 | Fenced Block #4 の AI-data-flag-2 dry-run | `exit = 2 ∧ stderr ~~ /omamori hook:/` | `--body "$(omamori uninstall)"` の inner substitution は `subst_depth` preservation で再帰検査され BLOCK (T7 oracle 防御、DI-15)。security regression 不在を pin | [ ] |
-| AI-data-flag-3 | Fenced Block #4 の AI-data-flag-3 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | `git commit -m` 内の `omamori uninstall` 文字列も data 文脈として ALLOW。dev workflow regression なし | [ ] |
-| AI-data-flag-4 | (AI-data-flag-1/-3 後) `omamori audit show --relaxed --json --last 5 \| jq -r '.detection_layer'` | `exit = 0 ∧ stdout に "layer2:relaxed:data-context" 行が 1 件以上` | DI-16: data-flag ALLOW path は audit log に relaxed tag 付きで記録され、`audit show --relaxed` で forensic 可視化可能 | [ ] |
+| AI-data-flag-1 | Fenced Block #4 の AI-data-flag-1 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | `gh issue --body` 内の `config disable` 文字列は ALLOW。Phase 2 は `program=gh` で判定、trigger word は引数のため無視 | [ ] |
+| AI-data-flag-2 | Fenced Block #4 の AI-data-flag-2 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | `--body "$(omamori uninstall)"` も ALLOW。v0.10.3 では BLOCK だったが、meta-pattern 削除により Phase 2 は `program=gh` で判定。inner substitution の `omamori` 実行は Layer 0 (binary env guard) でカバー | [ ] |
+| AI-data-flag-3 | Fenced Block #4 の AI-data-flag-3 dry-run | `exit = 0 ∧ stdout JSON ~~ /"permissionDecision":"allow"/` | `git commit -m` 内の `omamori uninstall` 文字列も ALLOW。dev workflow FP なし | [ ] |
 
-> ⚠️ AI-data-flag-2 は **inner substitution が BLOCK されること** が成功条件。relaxation が緩過ぎて adversarial path も通ってしまうと security regression なので、本 row は negative test (拒否成立で PASS) として扱う。
+> ⚠️ AI-data-flag-2 は v0.10.3 では BLOCK (negative test) だったが、v0.10.4 で ALLOW に変更。inner `$(omamori uninstall)` の実際の実行は Layer 0 (binary env guard: `guard_ai_config_modification()`) がブロックする。Layer 2 hook は shell expansion 前の文字列を見るため、`$(...)` 内の実行を阻止する仕組みではない。
 
 ---
 
@@ -376,11 +367,11 @@ rmdir "$TEST_DIR"
 | Acceptance row | 対応 CI 領域 |
 |---|---|
 | S-* (Layer 1 shim) | `src/engine/shim.rs` の unit test 群 (block / failed / passed-through outcome) |
-| H-1 (`rm -rf /tmp/test`) | hook 経由の rm-recursive 系 (action rule `rm-recursive-to-trash`)、`HOOK_DECISION_CASES` 内の direct-path 系 (`meta-pattern-bin-rm-*-block`) と互換 |
+| H-1 (`rm -rf /tmp/test`) | hook 経由の rm-recursive 系 (action rule `rm-recursive-to-trash`)、`HOOK_DECISION_CASES` 内の direct-path 系 (`phase2-self-protect-*`) と互換 |
 | H-2 / H-3 (shell launcher unwrap) | `src/unwrap.rs` 内の `process_segment` テスト群 (`bash -c`、`sh -c`) |
 | H-5 / H-6 (pipe-to-shell wrapper) | `HOOK_DECISION_CASES` の pipe-wrapper 系 (検索: `pipe-wrapper-evasion-*` / wrapper variant 系) |
-| T-1 (`omamori uninstall`) | `HOOK_DECISION_CASES`: `meta-pattern-uninstall-block` |
-| T-2 (config 保護 file-op) | `HOOK_DECISION_CASES`: `meta-pattern-config-disable-block` 等 + protected file rule unit test |
+| T-1 (`omamori uninstall`) | `HOOK_DECISION_CASES`: `phase2-self-protect-uninstall-block` |
+| T-2 (config 保護 file-op) | `HOOK_DECISION_CASES`: `phase2-self-protect-config-disable-block` 等 + protected file rule unit test |
 | T-3 (PATH precedence) | `tests/cli.rs` の install path / shim ordering 確認 (直接 mapping は弱い、smoke check) |
 | D-1 / D-2 (`doctor`) | `tests/cli.rs` の doctor サブテスト |
 | D-3 / D-4 (`hook-check` dry-run) | `tests/cli.rs` の `cursor_hook_*` 系および `claude-code` provider テスト |

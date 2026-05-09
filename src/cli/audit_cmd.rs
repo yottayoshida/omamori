@@ -275,7 +275,7 @@ fn audit_usage() -> &'static str {
   omamori audit show --rule <name>               Filter by rule (substring match)
   omamori audit show --provider <name>           Filter by provider
   omamori audit show --action <name>             Filter by action (exact match)
-  omamori audit show --relaxed                   Filter to data-context relaxed allows (PR1d, #240)
+  omamori audit show --relaxed                   Filter to relaxed allows (legacy data-context flag; pre-v0.10.4 logs only)
   omamori audit unknown [--last N] [--json]      Show forward-compat fail-opens for unknown tools (#182)
   omamori audit key rotate                       Rotate HMAC signing key"
 }

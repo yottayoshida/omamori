@@ -1070,9 +1070,9 @@ fn hook_check_allow_returns_permission_decision_json() {
     );
 }
 
-/// V-004, V-005: BLOCK (meta-pattern) — stdout empty, exit code 2
+/// V-004, V-005: BLOCK (rm -rf via Phase 2 rule) — stdout empty, exit code 2
 #[test]
-fn hook_check_block_meta_has_empty_stdout_and_exit_2() {
+fn hook_check_block_rm_rf_has_empty_stdout_and_exit_2() {
     let (stdout, stderr, exit_code) =
         run_hook_check(&pretooluse_bash_json("/bin/rm -rf /tmp/test"));
     assert_eq!(exit_code, 2, "BLOCK must exit with code 2");
@@ -1505,23 +1505,13 @@ fn hook_check_edit_symlinked_parent_blocked() {
     let _ = std::fs::remove_dir_all(&poc_dir);
 }
 
-/// #110 S2: export -n meta-pattern blocks unexport of detector env vars.
+/// #110 S2: Phase 1B env var tampering blocks unexport of detector env vars.
 #[test]
 fn hook_check_blocks_export_n_claudecode() {
     let (_, stderr, exit_code) =
         run_hook_check(&pretooluse_bash_json("export -n CLAUDECODE && echo hi"));
     assert_eq!(exit_code, 2);
     assert!(stderr.contains("unexport"));
-}
-
-/// #110 T3: Bash command editing settings.json is blocked by meta-pattern.
-#[test]
-fn hook_check_blocks_bash_settings_json_edit() {
-    let (_, stderr, exit_code) = run_hook_check(&pretooluse_bash_json(
-        "sed -i '' 's/omamori//' ~/.claude/settings.json",
-    ));
-    assert_eq!(exit_code, 2);
-    assert!(stderr.contains("Claude Code settings"));
 }
 
 /// #111: VERBOSE mode includes raw input in stderr for malformed input.
@@ -1547,31 +1537,6 @@ fn hook_check_malformed_verbose_shows_raw_input() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     assert_eq!(output.status.code(), Some(2));
     assert!(stderr.contains("raw input"), "verbose must show raw input");
-}
-
-// ---------------------------------------------------------------------------
-// hook-check meta-pattern tests (pre-existing)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn hook_check_blocks_integrity_json() {
-    // Verify meta-patterns block .integrity.json editing
-    // (previously checked in hook script, now delegated to hook-check via meta-patterns)
-    let patterns = omamori::installer::blocked_string_patterns();
-    assert!(
-        patterns.iter().any(|(p, _)| p.contains(".integrity.json")),
-        "meta-patterns should block .integrity.json editing"
-    );
-}
-
-#[test]
-fn blocked_patterns_include_integrity_json() {
-    let patterns = omamori::installer::blocked_string_patterns();
-    let has_integrity = patterns.iter().any(|(p, _)| p.contains(".integrity.json"));
-    assert!(
-        has_integrity,
-        "blocked_string_patterns should include .integrity.json"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,14 +1584,6 @@ fn codex_hook_check_block_rm_rf() {
     );
 }
 
-/// V-001 (Codex): meta-pattern block (direct path bypass)
-#[test]
-fn codex_hook_check_block_meta_pattern() {
-    let (_, stderr, exit_code) = run_hook_check(&codex_pretooluse_json("/bin/rm -rf /important"));
-    assert_eq!(exit_code, 2);
-    assert!(stderr.contains("blocked"));
-}
-
 /// V-008: tool_name other than Bash still extracts command
 #[test]
 fn codex_hook_check_non_bash_tool_name() {
@@ -1661,26 +1618,6 @@ fn codex_hook_check_provider_flag() {
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(0));
-}
-
-/// Codex meta-pattern: block editing .codex/hooks.json
-#[test]
-fn codex_hook_check_blocks_hooks_json_edit() {
-    let (_, stderr, exit_code) = run_hook_check(&codex_pretooluse_json(
-        "sed -i '' 's/omamori/true/' ~/.codex/hooks.json",
-    ));
-    assert_eq!(exit_code, 2);
-    assert!(stderr.contains("blocked"));
-}
-
-/// Codex meta-pattern: block editing .codex/config.toml
-#[test]
-fn codex_hook_check_blocks_config_toml_edit() {
-    let (_, stderr, exit_code) = run_hook_check(&codex_pretooluse_json(
-        "echo 'codex_hooks = false' > ~/.codex/config.toml",
-    ));
-    assert_eq!(exit_code, 2);
-    assert!(stderr.contains("blocked"));
 }
 
 // =========================================================================
@@ -1957,72 +1894,6 @@ fn parse_json_error_stderr(stderr: &str) -> serde_json::Value {
         panic!("stderr must be a single parseable JSON object (got {trimmed:?}): {e}")
     });
     parsed
-}
-
-/// Phase 1A meta-pattern (path-based) emits structured JSON with the actual
-/// matched_pattern token and a non-empty byte range covering it. Path-based
-/// patterns retain `command.contains` substring match (INV-path-preserve)
-/// so byte offset is recoverable.
-#[test]
-fn hook_check_json_error_blockmeta_path_exact_metadata() {
-    // `.claude/settings.json` is a path-based META_PATTERNS_PATH entry.
-    let cmd = "vim ~/.claude/settings.json";
-    let (stdout, stderr, exit_code) = run_hook_check_json_error(&pretooluse_bash_json(cmd));
-    assert_eq!(exit_code, 2, "block must yield exit 2");
-    assert!(stdout.is_empty(), "stdout must be empty in block path");
-    let json = parse_json_error_stderr(&stderr);
-    assert_eq!(json["blocked"], serde_json::Value::Bool(true));
-    assert_eq!(
-        json["layer"], "layer2:meta-pattern",
-        "layer must match audit detection_layer taxonomy"
-    );
-    let pattern = json["matched_pattern"]
-        .as_str()
-        .expect("matched_pattern must be a string for path-based Phase 1A");
-    assert_eq!(
-        pattern, ".claude/settings.json",
-        "matched_pattern must be the protected token"
-    );
-    let position = &json["matched_position"];
-    let start = position["start"].as_u64().expect("start must be present");
-    let end = position["end"].as_u64().expect("end must be present");
-    assert!(end > start, "matched_position must be non-empty");
-    assert_eq!(
-        (end - start) as usize,
-        pattern.len(),
-        "matched_position range must equal pattern length"
-    );
-    let slice = &cmd[start as usize..end as usize];
-    assert_eq!(
-        slice, pattern,
-        "command[matched_position] must equal matched_pattern (mutation guard)"
-    );
-}
-
-/// Phase 1A meta-pattern (verb-based, PR1c token-level) emits the verb
-/// pattern token but null `matched_position` because token-level detection
-/// in `detect_verb_at_command_position` operates on the post-`shell_words::split`
-/// slice and cannot recover original byte offsets.
-#[test]
-fn hook_check_json_error_blockmeta_verb_exact_metadata() {
-    let cmd = "echo ok && omamori uninstall";
-    let (stdout, stderr, exit_code) = run_hook_check_json_error(&pretooluse_bash_json(cmd));
-    assert_eq!(exit_code, 2, "block must yield exit 2");
-    assert!(stdout.is_empty(), "stdout must be empty in block path");
-    let json = parse_json_error_stderr(&stderr);
-    assert_eq!(json["blocked"], serde_json::Value::Bool(true));
-    assert_eq!(json["layer"], "layer2:meta-pattern");
-    let pattern = json["matched_pattern"]
-        .as_str()
-        .expect("matched_pattern must be a string for verb-based Phase 1A");
-    assert_eq!(
-        pattern, "omamori uninstall",
-        "matched_pattern must be the exact verb pattern token"
-    );
-    assert!(
-        json["matched_position"].is_null(),
-        "PR1c: verb-based patterns have matched_position = null (token-level)"
-    );
 }
 
 /// Phase 1B token-level detection (env tampering) emits null matched_pattern

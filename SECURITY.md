@@ -42,16 +42,16 @@ What is caught, what is not, and why. Status values: **supported** (tested, expe
 | `git push --force` / `git clean -f` | supported | supported | `omamori test`, CI, hook integration |
 | `chmod 777` | supported | supported | `omamori test`, CI, hook integration |
 | `find -delete` / `rsync --delete` variants | supported | supported | `omamori test`, CI, hook integration |
-| Full-path execution (`/bin/rm -rf`) | not covered | supported | Hook integration meta-pattern tests |
+| Full-path execution (`/bin/rm -rf`) | not covered | supported | Hook integration Phase 2 rule tests |
 | Shell wrapper evasion (`sudo env bash -c "rm -rf"`) | not covered | supported | Hook integration unwrap tests |
 | Pipe-to-shell (`curl URL \| bash` and wrapper variants) | not covered | supported | Hook integration pipe-to-shell corpus |
 | Dynamic command generation (`bash -c "$(cmd)"`) | not covered | supported (fail-close) | Hook integration |
 | PATH override bypass (`PATH=/usr/bin:$PATH rm`) | not covered | supported (v0.10.1) | Hook integration, acceptance test T-3' |
 | Env-var tampering (`unset CLAUDECODE`, `export -n`) | not covered | supported | Hook integration env-tampering corpus |
-| Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (string pattern) | Acceptance tests |
+| Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (Phase 2 builtin rules) | Acceptance tests |
 | Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code, Codex CLI) | Hook integration file-protection tests |
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
-| Self-modification commands in command context (`omamori config disable/enable`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`) | supported (env guard) | supported (Phase 1A string pattern + Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
+| Self-modification commands in command context (`omamori config disable/enable`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`) | supported (env guard) | supported (Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
 
 #### Not caught — by design
 
@@ -106,20 +106,20 @@ This rule ensures that the boundary matrix and test corpus grow together and tha
 |----|-----------|-------------|
 | DI-7 | `doctor --fix` is blocked in AI environments | `guard_ai_config_modification("doctor --fix")` — prevents baseline normalization to hide tampering |
 | DI-8 | `explain` is blocked in AI environments | `guard_ai_config_modification("explain")` — prevents oracle attacks (probing which commands are blocked) |
-| DI-9 | `doctor --fix` and `explain` in `blocked_string_patterns` | Defense-in-depth: Layer 2 hooks also block these commands via string matching |
+| DI-9 | *(Retired in v0.10.4)* | Was: `doctor --fix` and `explain` in `blocked_string_patterns` (meta-pattern defense-in-depth). Protection now provided by Phase 2 builtin rules `omamori-doctor-fix-block` and `omamori-explain-block` (DI-13) |
 | DI-10 | `doctor --fix` repair order: install → hooks → chmod → baseline (last) | Baseline must reflect the post-repair state, not the pre-repair state |
 | DI-11 | Command separators `\n`, `\r`, `&` are normalized before tokenization | `normalize_compound_operators` treats unquoted newlines as `;` and space-separates `&` (excluding `&>`, `>&`, `2>&1` redirects) |
 | DI-12 | Env var tampering detection is token-level, not string-level | Phase 1B `detect_env_var_tampering` uses `shell_words::split` after normalization, with `is_command_position()` to prevent false positives on quoted strings and arguments |
-| DI-13 | Phase 1A relaxation requires Phase 2 compensation (v0.10.3+) | For every verb pattern that may be relaxed in Phase 1A by the data-flag allowlist (`gh issue/pr create --body`, `git commit -m/-F`, etc.), an equivalent `omamori-*-block` builtin rule MUST exist in `default_rules()` so that real `omamori config disable` invocations remain caught by Phase 2 rule matching. Each rule uses the `subcommand` field (v0.10.3+) so `args[0]` must match exactly, preventing false positives like `omamori exec -- echo disable config`. Enforced by `scripts/check-invariants.sh` invariant `phase1a-relaxation-requires-phase2` and unit tests `default_rules_includes_omamori_self_protect_six_rules` + `omamori_self_protect_rules_skip_false_positive_data_args`. |
-| DI-14 | Data-context recognition via strip (v0.10.3+) | `strip_quoted_data` in `src/engine/hook.rs` is the data-context recognition primitive. It removes single-quoted regions (literal) and passive double-quoted regions while preserving execution-active substitutions (`$(...)` and backticks). The residual is fed to a substring backstop that catches verbs invoked through wrapper grammars not modeled by `detect_verb_at_command_position` (`xargs -I{}`, `find -exec`, parallel, etc.). Removing this primitive silently re-introduces the v0.10.2 false-positive class (#240). Enforced by `scripts/check-invariants.sh` invariant `data-context-recognition-via-strip`. |
-| DI-15 | Data-context substitution preserved (v0.10.3+) | Inside double quotes, `$(...)` and backticks are EXECUTABLE — the shell still runs them. `strip_quoted_data` MUST track substitution depth (`subst_depth`) so the residual still contains the protected verb in `echo "$(omamori uninstall)"` form. Established as a security invariant after Codex review (PR1c R4) [P1] caught a regression that erased `$(...)`. Enforced by `scripts/check-invariants.sh` invariant `data-context-substitution-preserved`. |
-| DI-16 | Data-flag allow emits audit with relaxed tag (v0.10.3+) | When the Allow path is reached only because the residual quote-strip backstop saw nothing (`relaxed_by` is `Some`), the hook MUST emit an audit event tagged `detection_layer = "layer2:relaxed:<source>"`. This makes the data-context heuristic's coverage forensically reviewable via `omamori audit show --relaxed`. Without this, FP regressions in the heuristic become silently undetectable. Enforced by `scripts/check-invariants.sh` invariant `data-flag-allow-emits-audit-with-relaxed-tag`. |
+| DI-13 | Phase 2 builtin rules cover self-modification verbs (v0.10.3+, updated v0.10.4) | Six `omamori-*-block` builtin rules in `default_rules()` block self-modification commands (`config disable/enable`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`) via Phase 2 token-level rule matching. Each rule uses the `subcommand` field so `args[0]` must match exactly, preventing false positives like `omamori exec -- echo disable config`. Prior to v0.10.4 these served as defense-in-depth alongside Phase 1A meta-patterns; since v0.10.4 they are the primary Layer 2 defense for self-modification verbs. Enforced by unit tests `default_rules_includes_omamori_self_protect_six_rules` + `omamori_self_protect_rules_skip_false_positive_data_args`. |
+| DI-14 | *(Retired in v0.10.4)* | Was: data-context recognition via `strip_quoted_data` (v0.10.3). Removed with meta-pattern infrastructure — Phase 2 builtin rules use token-level matching that inherently distinguishes command context from data arguments via the `subcommand` field. |
+| DI-15 | *(Retired in v0.10.4)* | Was: data-context substitution preservation via `subst_depth` tracking (v0.10.3). Removed with `strip_quoted_data` — no longer needed since meta-pattern substring matching is gone. |
+| DI-16 | *(Retired in v0.10.4)* | Was: data-flag allow emits audit with `layer2:relaxed:*` tag (v0.10.3). Removed with the data-context heuristic — `relaxed_by` field is always `None`. |
 
 ### `hook-check --json-error` schema (v0.10.3+, PR1b)
 
 When `--json-error` is passed to `omamori hook-check`, **blocked shell commands** emit a single JSON object to **stderr** (in place of free-form text). Allow paths still emit the regular Claude Code hook response on stdout. AI agent integrations consume this for retry / approach-switch decisions.
 
-**Current scope**: the JSON contract applies to the **shell-command path** only (i.e. `tool_input.command` blocked by Phase 1A meta-patterns / Phase 1B token detection / Phase 2 rule match / Phase 2 structural unwrap). Other deny paths — malformed hook input, file-op deny on protected paths, unknown-tool fail-open — currently retain free-form stderr; extension to those paths is tracked as a follow-up issue. AI agents can still detect these blocks by exit code 2.
+**Current scope**: the JSON contract applies to the **shell-command path** only (i.e. `tool_input.command` blocked by Phase 1B token detection / Phase 2 rule match / Phase 2 structural unwrap). Other deny paths — malformed hook input, file-op deny on protected paths, unknown-tool fail-open — currently retain free-form stderr; extension to those paths is tracked as a follow-up issue. AI agents can still detect these blocks by exit code 2.
 
 **Schema**:
 
@@ -147,7 +147,7 @@ When `--json-error` is passed to `omamori hook-check`, **blocked shell commands*
 
 When `--json-error` is active, the hook **skips audit log emission** for the blocked event. This trade-off keeps stderr a single parseable JSON object even in degraded audit environments (missing or unreadable audit secret, full disk, broken permissions) where `AuditLogger::from_config` would otherwise emit free-form warnings. AI agent integrations get a reliable contract; the cost is that `omamori audit show --action block` may miss events from `--json-error` invocations. Operators who need full audit coverage should not pass `--json-error`; the regular text-mode hook records the audit row even when it cannot print to stderr cleanly.
 
-**Stability**: `blocked`, `layer`, `rule_id`, `reason`, `hint` are stable contract fields. Additional fields may be added in minor releases (e.g., `relaxed_by` for `Allow` JSON when added in PR1d). AI agents should ignore unknown keys.
+**Stability**: `blocked`, `layer`, `rule_id`, `reason`, `hint` are stable contract fields. Additional fields may be added in minor releases. AI agents should ignore unknown keys.
 
 `guard_ai_config_modification` call sites: 9 (as of v0.9.0).
 
@@ -184,7 +184,7 @@ Canary checks point-in-time state. Tampering between checks is not detected unti
 | Attack | Protection |
 |--------|-----------|
 | AI edits `.integrity.json` (Claude Code Edit/Write) | Hook block pattern: `".integrity.json"` |
-| AI edits `.integrity.json` (Cursor Bash) | `blocked_command_patterns()` match |
+| AI edits `.integrity.json` (Cursor Bash) | `PROTECTED_FILE_PATTERNS` match |
 | AI deletes `.integrity.json` | Canary detects missing file; auto-regenerates on next shim invocation |
 | AI tampers baseline to match tampered state | Implementation-derived hook hash ignores baseline for hook verification |
 
@@ -242,21 +242,11 @@ This is intentional: each detector's expected value is sourced from the actual t
 
 Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (`src/unwrap.rs`). The hook pipeline runs in two phases:
 
-1. **Phase 1 — Meta-patterns** (string-level): Catches tamper attempts (env var unset, config editing, `/bin/rm` direct paths, `.integrity.json` editing). These are intentionally broad — `unset CLAUDECODE` appearing anywhere in a command is blocked, including inside `echo`.
+1. **Phase 1B — Token-level detectors**: `detect_env_var_tampering` (blocks `unset CLAUDECODE`, `export -n`, `env -u` on protected env vars) and `detect_path_shim_bypass` (blocks `PATH=/usr/bin:$PATH rm` and `env PATH=...` variants targeting shimmed commands). These run after `shell_words::split` for position-aware detection.
 
-2. **Phase 2 — Unwrap Stack** (token-level): Tokenizes the command, strips shell wrappers, extracts inner commands from shell launchers, and evaluates each extracted command against the same rules as Layer 1.
+2. **Phase 2 — Unwrap Stack** (token-level): Tokenizes the command, strips shell wrappers, extracts inner commands from shell launchers, and evaluates each extracted command against the configured rules. Six builtin `omamori-*-block` rules protect against self-modification commands.
 
-**Broad match by design** (path-based, retained in v0.10.3+): Path-based meta-patterns (`audit.jsonl`, `audit-secret`, `.integrity.json`, `.local/share/omamori`, `omamori/config.toml`, `.codex/hooks.json`, `/bin/rm`, `.claude/settings.json`, `.codex/config.toml`, etc., 18 entries in `META_PATTERNS_PATH`) use `command.contains(pattern)` substring match. `ls ~/.local/share/omamori` is blocked alongside `rm -rf ~/.local/share/omamori`. Read-only commands on protected paths are intentionally blocked to prevent reconnaissance that could aid targeted attacks. This is the T3 (heredoc redirect to protected path) defense.
-
-**Token-level + backstop** (verb-based, v0.10.3+ PR1c): Verb-based meta-patterns (`config disable/enable`, `omamori uninstall`, `omamori init --force`, `omamori override`, `omamori doctor --fix`, `omamori explain`, 7 entries in `META_PATTERNS_VERB`) moved from `command.contains` to a layered detector: (1) token-level position-aware matching (`detect_verb_at_command_position` mirroring the `is_command_position` lattice from Phase 1B, with execution-wrapper transparency for `xargs`/`time`/`nohup`/`sudo`/`env`/etc.), (2) `env -S` payload inspection (`env_dash_s_payload`), (3) residual quote-strip backstop (`strip_quoted_data` preserves `$(...)` and backticks inside double quotes since they remain executable). This relieves false-positives like `gh issue create --body "config disable bug fixed"` (#240) while preserving block on raw / wrapper / executable-quoted invocations.
-
-**v0.10.2 → v0.10.3 PR1c coverage narrow** (documented, intentional): the substring match in v0.10.2 incidentally caught a small set of vectors that fall outside omamori's declared scope. PR1c's `strip_quoted_data` no longer reaches inside passive quoted bodies, so these vectors are now allowed. They are consistent with already-documented scope-outs:
-
-- `tcsh -c 'omamori uninstall'` / `su -c 'omamori uninstall'` — non-default shell launchers (omamori officially supports `bash`/`sh`/`zsh`/`dash`/`ksh`, see [Supported Shell List](#supported-shell-list))
-- `awk "/foo/ { system(\"omamori uninstall\") }"` / `perl -e 'system("omamori uninstall")'` — interpreter family commands, [decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74)
-- `alias x='omamori uninstall'; x` — alias dynamic dispatch, statically unanalysable
-
-These were never within the declared protection surface; they happened to be caught by the broad substring match. v0.10.3 explicitly returns to the documented scope. Operators relying on the incidental v0.10.2 coverage should track #74 (interpreter family) for shell_launcher list expansion discussion.
+**v0.10.4 meta-pattern removal**: Prior to v0.10.4, a Phase 1A substring-matching layer (`META_PATTERNS_PATH` with 18 entries and `META_PATTERNS_VERB` with 7 entries) ran before Phase 1B. This layer was removed in v0.10.4 because it caused 5-12 false-positive blocks per day on legitimate developer workflows (`grep` on config paths, commit messages mentioning protected files, etc.) and was bypassable via script file indirection. All protection previously provided by meta-patterns is now covered by Phase 1B token-level detectors (env var tampering, PATH override bypass), Phase 2 builtin rules (`omamori-*-block` for self-modification verbs), and `PROTECTED_FILE_PATTERNS` (Edit/Write tool gate). The `detection_layer` value `"layer2:meta-pattern"` is retained in the taxonomy for Phase 1B BlockMeta verdicts.
 
 | Capability | Detection |
 |-----------|-----------|
@@ -306,7 +296,7 @@ Pre-v0.9.7, Layer 2 hook deny verdicts (`BlockMeta` / `BlockRule` / `BlockStruct
 
 | Verdict | `detection_layer` value |
 |---------|------------------------|
-| `BlockMeta` (string-level meta-pattern, env-tampering) | `"layer2:meta-pattern"` |
+| `BlockMeta` (Phase 1B token-level: env-var tampering, PATH override bypass) | `"layer2:meta-pattern"` |
 | `BlockRule` (token-level rule match) | `"layer2:rule"` (with `rule_id` carrying the matched rule name) |
 | `BlockStructural` with transparent wrapper | `"layer2:pipe-to-shell:{wrapper}"` (e.g. `"layer2:pipe-to-shell:env"`, `"layer2:pipe-to-shell:sudo"`; wrapper basename comes from `unwrap::TRANSPARENT_WRAPPERS`) |
 | `BlockStructural` without wrapper (parse error / depth / dynamic generation / process substitution / bare-shell pipe RHS) | `"layer2:structural"` |
@@ -327,7 +317,7 @@ Layer 2 deny audit append is **best-effort with respect to the hook decision** b
 
 CHAIN_VERSION stays at `1`. The new `detection_layer` values follow the precedent set by v0.9.6's `"shape-routing"` value (PR6): they are added to the existing string field with no schema break, and parsers that do not recognise the new values must treat them as opaque. SIEM pipelines that filter on `detection_layer == "layer1"` only will silently exclude the new Layer 2 deny events; pipelines that want full Layer 2 coverage should match `detection_layer` values starting with `"layer2:"`.
 
-`is_valid_detection_layer` (in `src/engine/hook.rs`) validates against a fixed taxonomy — static prefixes (`"layer1"`, `"shape-routing"`, `"layer2:meta-pattern"`, `"layer2:rule"`, `"layer2:structural"`) plus the `"layer2:pipe-to-shell:"` prefix paired with a wrapper basename from `unwrap::TRANSPARENT_WRAPPERS`. Adding a new transparent wrapper to that constant automatically becomes a valid detection_layer extension; adding a new top-level layer category requires an explicit constant update.
+`is_valid_detection_layer` (in `src/engine/hook.rs`) validates against a fixed taxonomy — static prefixes (`"layer1"`, `"shape-routing"`, `"layer2:meta-pattern"`, `"layer2:rule"`, `"layer2:structural"`) plus the `"layer2:pipe-to-shell:"` prefix paired with a wrapper basename from `unwrap::TRANSPARENT_WRAPPERS`. The `"layer2:meta-pattern"` value is retained for Phase 1B BlockMeta verdicts (env-var tampering, PATH override bypass). Adding a new transparent wrapper to that constant automatically becomes a valid detection_layer extension; adding a new top-level layer category requires an explicit constant update.
 
 #### What is *not* covered
 
@@ -338,7 +328,7 @@ CHAIN_VERSION stays at `1`. The new `detection_layer` values follow the preceden
 
 AI tool platforms ship new tools and rename existing ones on their own cadence; omamori is locally installed and updated on the user's cadence. A `tool_name` allowlist baked into the binary would always be slightly behind reality, so we route by **payload shape** instead of by name. See `README.md` → "How omamori handles new / renamed tools" for the full table.
 
-The threat we care about: a provider-side rename of a write/exec tool silently bypasses Layer 2. Pre-v0.9.6, `HookInput::UnknownTool` short-circuited to allow regardless of the carried `tool_input`. Codex adversarial-review ② A-2 (2026-04-23, critical) flagged this as a forward-compat fail-open, and v0.9.6 closes it: a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` now reaches the full shell pipeline (meta-patterns, env-tampering, unwrap stack) on the strength of the `command` field alone. Wrong-type routing fields (`command: 42`) fail closed.
+The threat we care about: a provider-side rename of a write/exec tool silently bypasses Layer 2. Pre-v0.9.6, `HookInput::UnknownTool` short-circuited to allow regardless of the carried `tool_input`. Codex adversarial-review ② A-2 (2026-04-23, critical) flagged this as a forward-compat fail-open, and v0.9.6 closes it: a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` now reaches the full shell pipeline (Phase 1B detectors, Phase 2 rules, unwrap stack) on the strength of the `command` field alone. Wrong-type routing fields (`command: 42`) fail closed.
 
 The residual risk is `tool_input` shapes we don't recognise at all (no `command`/`cmd`/`file_path`/`path`/`url`). That's still **Allow**, on purpose: starting to block unreviewed payload shapes would break user workflow on every legitimate AI tool update. But the silence is gone — the call is recorded as an `unknown_tool_fail_open` event in the audit chain, stderr carries a one-line hint, and `omamori doctor` surfaces a 30-day count. Users review the events with `omamori audit unknown`.
 
@@ -404,14 +394,14 @@ omamori maintains a bypass corpus — a set of tests that verify both "what we b
 
 | Priority | Pattern | Verified by |
 |----------|---------|-------------|
-| P1 | `/bin/rm` + `/usr/bin/rm` path variants | `meta_patterns_cover_rm_path_boundaries` |
-| P1 | All 6 detector env vars × 3 unset patterns | `meta_patterns_cover_all_detector_env_vars` |
-| P2 | `config disable/enable`, `uninstall`, `init --force` | `meta_patterns_cover_config_modification` |
+| P1 | `/bin/rm` + `/usr/bin/rm` path variants | Phase 2 rule tests in `hook_integration.rs` |
+| P1 | All 6 detector env vars × 3 unset patterns | Phase 1B `detect_env_var_tampering` tests |
+| P2 | `config disable/enable`, `uninstall`, `init --force` | Phase 2 builtin rule tests (`omamori-*-block`) |
 | P3 | `bash -c "rm -rf"`, `sudo env bash -c "rm -rf"` | `unwrap::tests::bash_c_*`, `unwrap::tests::chained_wrappers` |
 | P3 | Pipe-to-shell (`curl \| bash`) | `unwrap::tests::curl_pipe_bash` |
 | P3 | Dynamic generation (`bash -c "$(cmd)"`) | `unwrap::tests::dollar_paren_*` |
 | P4 | False positive: `echo "rm -rf"`, `env NODE_ENV=production npm start` | `unwrap::tests::echo_with_dangerous_string`, `unwrap::tests::env_production_start` |
-| P4 | `/bin/rmdir` false-positive regression | `meta_patterns_do_not_false_positive_on_rmdir` |
+| P4 | `/bin/rmdir` false-positive regression | Phase 2 rule tests (rmdir not matched) |
 
 ### Known limitations (KNOWN_LIMIT)
 
@@ -591,15 +581,15 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 
 | Attack | Defense | Effectiveness |
 |--------|---------|---------------|
-| AI modifies log via omamori hook layer | `blocked_command_patterns` | Detected and blocked |
+| AI modifies log via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
 | AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
 | AI deletes/truncates log entries | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` |
-| AI accesses secret via omamori hook layer | `blocked_command_patterns` | Detected and blocked |
+| AI accesses secret via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
 | AI Edit/Write to protected files (config, audit, hooks, settings.json) | `is_protected_file_path` + `PROTECTED_FILE_PATTERNS` | **Blocked** (v0.8.0 #110) |
 | AI directly operates on files via OS (bypassing hook layer) | None (same OS user) | **Not protected** (structural limitation) |
 | AI reads secret and forges valid chain | None (same OS user) | **Not protected** (structural limitation) |
 
-**Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `blocked_command_patterns` operates at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing — use your AI tool's sandbox (Codex CLI sandbox (on by default), Claude Code `/sandbox`, Cursor agent sandbox) or a dedicated tool like [nono](https://github.com/always-further/nono).
+**Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `PROTECTED_FILE_PATTERNS` and Phase 2 rules operate at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing — use your AI tool's sandbox (Codex CLI sandbox (on by default), Claude Code `/sandbox`, Cursor agent sandbox) or a dedicated tool like [nono](https://github.com/always-further/nono).
 
 ### Audit Log Read Access (v0.9.7+)
 
@@ -652,7 +642,7 @@ strict = true  # default: false
 - **Opt-in**: Default `false` preserves backward compatibility. Users explicitly opt in.
 - **AI-only**: Only affects `detection.protected = true` paths. Human terminal use is never affected.
 - **After re-creation attempt**: `AuditLogger::from_config()` calls `load_or_create_secret()` first. Strict only triggers when re-creation also fails.
-- **Residual TOCTOU**: `secret_available()` check and subsequent `append()` are not atomic. An attacker deleting the secret between check and use could bypass strict mode. This is accepted because: (1) the attacker would need to delete the secret within the same process execution window, (2) `blocked_command_patterns` protects the secret file from AI-layer deletion.
+- **Residual TOCTOU**: `secret_available()` check and subsequent `append()` are not atomic. An attacker deleting the secret between check and use could bypass strict mode. This is accepted because: (1) the attacker would need to delete the secret within the same process execution window, (2) `PROTECTED_FILE_PATTERNS` protects the secret file from AI-layer deletion.
 
 ### Symlink Protection (v0.7.3+)
 
@@ -673,7 +663,7 @@ All audit file operations use `O_NOFOLLOW` to reject symlinks at the kernel leve
 
 | Limitation | Reason | Mitigation |
 |------------|--------|------------|
-| Parent directory symlinks not detected | `O_NOFOLLOW` only applies to the final path component | `create_dir_all` is called by omamori itself; `blocked_command_patterns` protects `.local/share/omamori` |
+| Parent directory symlinks not detected | `O_NOFOLLOW` only applies to the final path component | `create_dir_all` is called by omamori itself; `PROTECTED_FILE_PATTERNS` protects `.local/share/omamori` |
 | Hardlink attacks not detected | `O_NOFOLLOW` does not affect hardlinks | Same-user structural limitation. Hardlinks require same-partition + same-user |
 | Non-Unix platforms have no symlink protection | `O_NOFOLLOW` is Unix-specific (`#[cfg(unix)]`) | On non-Unix, audit operates without symlink protection. Document as known limitation |
 
@@ -696,7 +686,7 @@ retention_days = 90  # 0 = unlimited (default)
 | First-retained binding | `target_hash` = HMAC(secret, "prune-bind:{count}:{first_retained_entry_hash}") |
 | Minimum retention | 7 days enforced (values < 7 clamped with warning) |
 | Minimum entry count | 1000 entries always retained regardless of age |
-| Config protection | `omamori/config.toml` added to `blocked_command_patterns` |
+| Config protection | `omamori/config.toml` protected by `PROTECTED_FILE_PATTERNS` |
 | Trigger frequency | Every 1000 appends (seq % 1000); zero overhead otherwise |
 
 **Threat model**:
@@ -732,22 +722,9 @@ Entries written before v0.7.0 lack chain fields. When `append()` encounters a le
 
 ## Known Operational Caveats
 
-### Layer 2 meta-pattern false-positives on developer workflows (v0.9.7+)
+### Layer 2 meta-pattern false-positives on developer workflows (v0.9.7–v0.10.3, resolved in v0.10.4)
 
-Layer 2 meta-pattern matching uses substring inclusion (`command.contains(pattern)`) on the full Bash command string. This is correct for the protection guarantee — `unset CLAUDECODE` anywhere in a command must block, including inside `echo`. The same broadness produces false-positive blocks on developer workflows that *describe* protected configuration without modifying it. Reproducible cases observed during omamori's own development:
-
-- `git commit -m '...'` where the commit message body mentions paths like `~/.claude/settings.json`, `.integrity.json`, `audit.jsonl`, or `audit-secret` (release-note prose, threat-model documentation, this very file)
-- `grep` / `rg` invocations that pass these strings as search arguments
-- AI-assisted code-review prompts that surface protected-path words densely in a single Bash invocation (e.g. quoting threat-model excerpts inline)
-
-These blocks are correct under the v0.9.7 design: the meta-pattern cannot tell *describing* from *modifying* without a full shell parse, and conservatively blocks both. Workarounds for legitimate developer workflows:
-
-1. Pass commit messages via file: `git commit -F /tmp/msg.txt` keeps the trigger words off the command line.
-2. Split contiguous strings on the Bash command line: e.g. `A=audit B=.jsonl; rg "$A$B"` — the meta-pattern matches the *literal* command string, not its expanded form.
-3. Use AI-tool file-edit interfaces (Read / Edit / Write) instead of Bash for reading or modifying file content; those routes go through `is_protected_file_path`, which is path-aware and does not false-positive on incidental substring mentions in unrelated files.
-4. Use the Codex MCP channel (`mcp__codex__codex`, `mcp__codex__review`) for AI review prompts that necessarily quote protected paths; the MCP transport bypasses the Bash PreToolUse hook entirely.
-
-This is a known trade-off, not a bug. Loosening the meta-pattern toward syntactic precision (e.g. tokenizing every Bash command before substring matching) would weaken the protection against obfuscated access to `audit-secret` / `.integrity.json` and is therefore not on the roadmap. The trade-off is documented here so operators reading omamori's own commit history understand that an occasional false-positive block during development is *evidence the layer is working*, not a regression to investigate.
+**Resolved**: v0.10.4 removed the Phase 1A meta-pattern substring matching layer (25 entries: 18 path-based + 7 verb-based) that caused 5-12 false-positive blocks per day on legitimate developer workflows. The protection previously provided by meta-patterns is now covered by Phase 1B token-level detectors (env-var tampering, PATH override bypass), Phase 2 builtin rules (`omamori-*-block` for self-modification verbs), and `PROTECTED_FILE_PATTERNS` (Edit/Write tool gate). Commands like `git commit -m "fix config disable"`, `grep pattern ~/.claude/settings.json`, and `gh issue create --body "see audit.jsonl"` now pass through without false-positive blocks.
 
 ### Test-suite pollution of contributor `~/.claude/settings.json` (v0.9.7)
 

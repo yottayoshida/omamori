@@ -68,7 +68,7 @@ Bypass classes outside this coverage scope remain possible — this is inherent 
 
 </details>
 
-Layer 2 hooks additionally block evasion patterns such as pipe-to-shell (`curl URL | bash`), dynamic command generation (`bash -c "$(cmd)"`), static shell expansion obfuscation (`$'rm'`, `{rm,-rf,/}`), environment-variable tampering, and PATH override attempts targeting shimmed commands. Since v0.10.3, trigger words inside data arguments (`git commit -m "..."`, `gh issue create --body "..."`) are recognized as non-command context and allowed through.
+Layer 2 hooks additionally block evasion patterns such as pipe-to-shell (`curl URL | bash`), dynamic command generation (`bash -c "$(cmd)"`), static shell expansion obfuscation (`$'rm'`, `{rm,-rf,/}`), environment-variable tampering, PATH override attempts targeting shimmed commands, and self-modification commands (`config disable`, `uninstall`, etc.) via builtin rules.
 
 All rules are customizable via TOML config. See [Configuration](#configuration) below.
 
@@ -122,7 +122,7 @@ Terminal → rm -rf src/
 | **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, Claude Code settings.json | Hook integration tests |
 | **Auto-sync** | Detects version mismatch after `brew upgrade` and auto-regenerates hook files | Smoke test |
 
-Core policy: built-in rules (13 as of v0.10.3, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
+Core policy: built-in rules (13 as of v0.10.4, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
 
 **Performance**: hook check completes in well under 0.1ms in the benchmark harness — typically ~1 µs to block and ~57 µs to allow. Subprocess startup by the AI tool dominates total cost. See `benches/` and [#124](https://github.com/yottayoshida/omamori/issues/124) for methodology.
 
@@ -263,7 +263,7 @@ omamori audit show [--last N] [--json]   # View recent audit entries (default: l
 omamori audit show --all                 # View all entries
 omamori audit show --rule <name>         # Filter by rule (substring match)
 omamori audit show --provider <name>     # Filter by provider
-omamori audit show --relaxed             # Filter to data-context relaxed allows
+omamori audit show --relaxed             # Filter to relaxed allows (legacy data-context flag; pre-v0.10.4 logs only)
 
 omamori config list                      # Show rules with status
 omamori config disable <rule>            # Disable a rule

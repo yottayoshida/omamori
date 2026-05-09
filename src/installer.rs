@@ -462,162 +462,6 @@ pub(crate) const PROTECTED_ENV_VARS: &[&str] = &[
     "AI_GUARD",
 ];
 
-/// Classification of Phase 1A meta-pattern detectors (v0.10.3+, PR1c).
-///
-/// `VerbAtCommandPosition` patterns require `shell_words::split` token-level
-/// position-aware detection (`detect_verb_at_command_position` in `hook.rs`)
-/// to avoid false-positives like `gh issue create --body "config disable bug"`.
-///
-/// `ProtectedPathSubstring` patterns retain `command.contains` substring
-/// match to defend against threats T3 (heredoc redirect to protected path)
-/// where the path mention itself is dangerous regardless of context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetaPatternKind {
-    VerbAtCommandPosition,
-    ProtectedPathSubstring,
-}
-
-/// Verb-based meta-patterns (PR1c, v0.10.3+).
-///
-/// Each entry is `(pattern_token, reason)`. Patterns are matched against
-/// `shell_words::split` token slices at command position by
-/// `detect_verb_at_command_position` (mirror of Phase 1B
-/// `detect_env_var_tampering`). The pattern token (e.g. `"config disable"`,
-/// `"omamori uninstall"`) is surfaced to acceptance test assertions and
-/// `--json-error` output via `HookCheckResult::BlockMeta { matched_pattern, .. }`.
-///
-/// Pattern strings are STABLE across releases — they are referenced from
-/// audit logs and acceptance test assertions (INV-pattern-string-stable).
-pub const META_PATTERNS_VERB: &[(&str, &str)] = &[
-    // Config modification protection (#22)
-    ("config disable", "blocked attempt to modify omamori rules"),
-    ("config enable", "blocked attempt to modify omamori rules"),
-    // Self-uninstall protection (#22)
-    ("omamori uninstall", "blocked attempt to uninstall omamori"),
-    (
-        "omamori init --force",
-        "blocked attempt to overwrite omamori config",
-    ),
-    (
-        "omamori override",
-        "blocked attempt to override omamori core rules",
-    ),
-    // DI-9: doctor --fix and explain are blocked in AI environments
-    (
-        "omamori doctor --fix",
-        "blocked attempt to run doctor --fix via AI",
-    ),
-    (
-        "omamori explain",
-        "blocked attempt to run explain via AI (oracle attack prevention)",
-    ),
-];
-
-/// Path-based meta-patterns (PR1c, v0.10.3+).
-///
-/// Each entry is `(pattern_substring, reason)`. Substring match is PRESERVED
-/// (not token-position-aware) to defend against threat T3 — heredoc redirect
-/// to protected path. Path mention itself is dangerous regardless of context
-/// because shell parsing can promote any path-shaped substring to a redirect
-/// target via `>`/`>>`/`tee` etc. (INV-path-preserve).
-///
-/// PR1d's data-flag allowlist will exempt path mentions inside `gh issue
-/// create --body` etc. via separate logic; the substring match itself stays.
-pub const META_PATTERNS_PATH: &[(&str, &str)] = &[
-    // Direct path execution bypassing PATH shim — match various shell token
-    // boundaries: space, double-quote, tab, single-quote
-    ("/bin/rm ", "blocked direct rm path that bypasses PATH shim"),
-    (
-        "/bin/rm\"",
-        "blocked direct rm path that bypasses PATH shim",
-    ),
-    (
-        "/bin/rm\t",
-        "blocked direct rm path that bypasses PATH shim",
-    ),
-    ("/bin/rm'", "blocked direct rm path that bypasses PATH shim"),
-    (
-        "/usr/bin/rm ",
-        "blocked direct rm path that bypasses PATH shim",
-    ),
-    (
-        "/usr/bin/rm\"",
-        "blocked direct rm path that bypasses PATH shim",
-    ),
-    (
-        "/usr/bin/rm\t",
-        "blocked direct rm path that bypasses PATH shim",
-    ),
-    (
-        "/usr/bin/rm'",
-        "blocked direct rm path that bypasses PATH shim",
-    ),
-    // Claude Code hook registration protection (#110 T3)
-    (
-        ".claude/settings.json",
-        "blocked attempt to edit Claude Code settings (contains hook config)",
-    ),
-    // Integrity baseline protection
-    (
-        ".integrity.json",
-        "blocked attempt to edit integrity baseline",
-    ),
-    // Codex CLI hook protection (#66, T2/T3)
-    (
-        ".codex/hooks.json",
-        "blocked attempt to edit Codex hooks config",
-    ),
-    (".codex/config.toml", "blocked attempt to edit Codex config"),
-    (
-        "config.toml.bak",
-        "blocked attempt to use Codex config backup",
-    ),
-    (
-        "codex_hooks",
-        "blocked attempt to modify Codex hooks feature flag",
-    ),
-    // Audit log protection (#29)
-    ("audit.jsonl", "blocked attempt to modify audit log"),
-    ("audit-secret", "blocked attempt to access audit secret"),
-    // Config protection for retention settings (#29)
-    (
-        "omamori/config.toml",
-        "blocked attempt to edit omamori config",
-    ),
-    // Data directory protection (#29)
-    (
-        ".local/share/omamori",
-        "blocked attempt to modify omamori data directory",
-    ),
-];
-
-/// Write-target verbs (PR1c SoT, v0.10.3+).
-///
-/// Reserved for future v0.11 D-case refactor: scoping path-substring matches
-/// to commands that actually write to a path (`tee`, `vim`, `cat >`, etc.)
-/// rather than every mention. **Currently unused by the Phase 1A detector**;
-/// path patterns retain unconditional substring match in v0.10.3 per
-/// INV-path-preserve. SoT only — populating this list does NOT change PR1c
-/// behavior.
-#[allow(dead_code)]
-pub const WRITE_VERBS: &[&str] = &[
-    "tee", "vim", "vi", "nano", "emacs", "cp", "mv", "dd", "install",
-];
-
-/// Legacy combined meta-pattern list (Phase 1A, all 25 entries).
-///
-/// Returns 18 path-based + 7 verb-based entries concatenated. Kept for
-/// backward compatibility with internal call sites and `scripts/check-invariants.sh`
-/// substring greps. New code should use [`META_PATTERNS_PATH`] and
-/// [`META_PATTERNS_VERB`] directly to dispatch via [`MetaPatternKind`].
-pub fn blocked_string_patterns() -> Vec<(&'static str, &'static str)> {
-    META_PATTERNS_PATH
-        .iter()
-        .chain(META_PATTERNS_VERB.iter())
-        .copied()
-        .collect()
-}
-
 /// Extract the stable Homebrew-linked path from a versioned Cellar path.
 /// Pure function — no filesystem access. Returns `None` for non-Cellar paths.
 ///
@@ -1413,17 +1257,6 @@ mod tests {
         assert!(!snippet.contains(r#"" "path""#));
     }
 
-    // --- Meta-pattern tests (blocked_string_patterns, Phase 1) ---
-    //
-    // Behavioral coverage of `blocked_string_patterns()` now lives in
-    // `tests/hook_integration.rs` (category 15a-15d of HOOK_DECISION_CASES)
-    // as CLI exit-code assertions against `omamori hook-check`. That form
-    // survives internal refactors of the pattern list (renames, grouping,
-    // moving to a const table) and only fails when the attack surface
-    // actually re-opens — which is what the test is there to protect
-    // against. The previous array-shape assertions here tested the data
-    // structure rather than the guarantee and were removed in PR #v096-pr4.
-
     #[test]
     fn protected_env_vars_constant_covers_all_detectors() {
         // Verify PROTECTED_ENV_VARS covers all expected detector variables.
@@ -1717,17 +1550,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // --- omamori override block pattern tests ---
-
-    #[test]
-    fn meta_patterns_block_omamori_override() {
-        let patterns = blocked_string_patterns();
-        assert!(
-            patterns.iter().any(|(p, _)| p.contains("omamori override")),
-            "meta-patterns should block 'omamori override'"
-        );
-    }
-
     // --- Codex CLI hook tests (#66) ---
 
     #[test]
@@ -1973,20 +1795,6 @@ mod tests {
         assert!(content.contains("codex_hooks = false"));
 
         let _ = fs::remove_dir_all(dir);
-    }
-
-    // meta_patterns_cover_codex_protection was moved to
-    // tests/hook_integration.rs as behavioral CLI exit-code assertions
-    // (HOOK_DECISION_CASES category 15c). See the note above
-    // `protected_env_vars_constant_covers_all_detectors` for rationale.
-
-    #[test]
-    fn blocked_string_patterns_include_omamori_override() {
-        let patterns = blocked_string_patterns();
-        assert!(
-            patterns.iter().any(|(p, _)| *p == "omamori override"),
-            "blocked_string_patterns should include 'omamori override'"
-        );
     }
 
     // --- G-12: auto_setup_codex_if_needed ---

@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.4] - 2026-05-09
+
+**Summary**: Remove all 25 Phase 1A meta-patterns (18 path-based + 7 verb-based) that caused 5-12 false-positive blocks per day on legitimate developer workflows. All protection is now provided by Phase 1B token-level detectors (env-var tampering, PATH override bypass), Phase 2 builtin rules (`omamori-*-block` for self-modification verbs), `PROTECTED_FILE_PATTERNS` (Edit/Write tool gate), and the Layer 1 PATH shim. Net change: ~750 lines deleted.
+
+### Removed
+
+- **`META_PATTERNS_PATH` (18 entries) + `META_PATTERNS_VERB` (7 entries)** — substring-matching arrays that powered Phase 1A detection. Bypassable via script file indirection ([#251](https://github.com/yottayoshida/omamori/issues/251)) and the primary source of false-positive blocks on `grep`, `git commit -m`, `gh issue create --body`, and similar commands that mention protected paths or verbs in data context.
+- **`MetaPatternKind` enum**, **`WRITE_VERBS` const**, **`blocked_string_patterns()` fn** from `src/installer.rs`.
+- **`strip_quoted_data()`**, **`env_dash_s_payload()`**, **`EXECUTION_WRAPPERS`**, **`is_verb_executable_position()`**, **`detect_verb_at_command_position()`**, **`matches_verb_pattern_at()`** from `src/engine/hook.rs` — data-context recognition and verb-position detection infrastructure that only served meta-pattern matching.
+- **Property tests 1 & 2** (`prop_trigger_inside_quoted_body_arg_is_allowed`, `prop_trigger_in_raw_command_position_is_blocked`) and supporting generators (`VERB_PATTERNS_FOR_PROPTEST`, `DATA_FLAG_HOSTS`, `arb_verb_pattern`, `arb_data_flag_host`) from `src/property_tests.rs`. Property 3 (`prop_subshell_inner_verb_blocked`) retained — tests Phase 2 defense.
+- **16 `HOOK_DECISION_CASES` entries** (categories 15a, 15c, 15c-iso, 15d) that tested meta-pattern-only detection paths.
+- **7 CLI tests** that asserted meta-pattern blocking behavior.
+- **`META_PATTERN_CATEGORY_FLOORS` const** and `corpus_includes_meta_pattern_coverage()` floor test.
+- **Invariants #6f, #6g, #6h** from `scripts/check-invariants.sh` (meta-pattern floor tests).
+- **Design invariants DI-9, DI-14, DI-15, DI-16** retired in `SECURITY.md` (all depended on meta-pattern or `strip_quoted_data` infrastructure).
+
+### Changed
+
+- **`check_pre_phase_2()` refactored**: removed all meta-pattern loops; now runs Phase 1B detectors (`detect_env_var_tampering`, `detect_path_shim_bypass`) then Phase 2 parse. `relaxed_by` infrastructure removed (`Allow` variant simplified, `audit_log_hook_allow_relaxed()` deleted, `PrePhase2Ok` reduced to `Vec<CommandInvocation>`).
+- **7 `HOOK_DECISION_CASES` entries relabeled** from `meta-pattern-*` to `phase2-self-protect-*` — these commands are now caught by Phase 2 builtin rules instead of meta-patterns.
+- **4 FP-relief test cases added** to `HOOK_DECISION_CASES`: `cat ~/.claude/settings.json`, `grep pattern ~/.claude/settings.json`, `git commit -m "codex_hooks discussion"`, `gh issue create --body "see .claude/settings.json"` — all now Allow.
+- **V-014 audit test** trigger changed from `omamori uninstall` (was BlockMeta via meta-pattern) to `unset CLAUDECODE` (BlockMeta via Phase 1B).
+- **DI-13** updated: Phase 2 builtin rules are now the primary (not defense-in-depth) Layer 2 defense for self-modification verbs.
+- **SECURITY.md**: defense boundary matrix, hook coverage, bypass corpus, audit defense boundary, and known operational caveats sections updated to reflect meta-pattern removal. `blocked_command_patterns` references replaced with `PROTECTED_FILE_PATTERNS` where applicable.
+- **ACCEPTANCE_TEST.md**: all meta-pattern route references updated to Phase 2 builtin rule / `PROTECTED_FILE_PATTERNS` equivalents.
+- **README.md**: Layer 2 description updated; version reference bumped to v0.10.4.
+
+### UX impact
+
+- False-positive blocks on developer workflows: **5-12/day → 0/day**. Commands like `grep pattern ~/.claude/settings.json`, `git commit -m "fix config disable"`, and `gh issue create --body "see audit.jsonl"` no longer trigger false-positive blocks.
+- Security block coverage: unchanged. All self-modification verbs, env-var tampering, PATH override bypass, pipe-to-shell, and file-path protection remain active via Phase 1B + Phase 2 + PROTECTED_FILE_PATTERNS.
+
 ## [0.10.3] - 2026-05-08
 
 **Summary**: Self-block relief for AI workflows ([#240](https://github.com/yottayoshida/omamori/issues/240)). Verb-based meta-pattern detection moves from `command.contains` substring matching to token-level position-aware lattice (mirroring Phase 1B). Path-based 18 entries retain substring match for T3 defense. The data-context residual quote-strip backstop catches verbs invoked via wrapper grammars (`xargs`, `find -exec`, `env -S`, double-quoted `$(...)`, etc.) without re-introducing FP on quoted bodies. Self-modification verbs gain Phase 2 builtin rules (`omamori-*-block`) as defense-in-depth, with `subcommand` position constraint preventing false positives like `omamori exec -- echo disable config`. ACCEPTANCE_TEST.md doc inaccuracies fixed in [#239](https://github.com/yottayoshida/omamori/issues/239) (PR2).
