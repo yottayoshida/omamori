@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.5] - 2026-05-10
+
+**Summary**: Fix stale hook entry accumulation in `~/.claude/settings.json` ([#254](https://github.com/yottayoshida/omamori/issues/254)). When the omamori install root changed (brew upgrade, `--base-dir`, CI temp dirs), `merge_claude_settings()` failed to detect old entries and accumulated duplicates. Now uses `x-omamori-version` tag (primary) + path-based fallback (secondary) to identify ALL omamori-managed entries regardless of origin root, removing stale entries via `retain()` before inserting one clean canonical entry. Also a security fix: stale entries pointing to predictable `/var/folders/` temp paths were exploitable (T3 DREAD 7.6).
+
+### Fixed
+
+- **Stale hook entry accumulation** — `merge_claude_settings()` replaced single-match `.position()` with `retain()` + union identification (`x-omamori-version` tag OR path prefix). N install invocations from any install root now produce exactly 1 omamori PreToolUse entry.
+- **Hybrid entry surgical extraction** — when omamori hooks coexist with user hooks in a single entry, only the omamori inner hook is removed. The `x-omamori-version` tag is stripped after extraction so the remaining user-only entry is not misidentified on subsequent runs.
+- **Shim stale detection** — `ensure_settings_current_for()` now detects multiple omamori entries and forces resync, with command path verification against the current install root.
+
+### Added
+
+- **`StaleEntriesCleaned(usize)` outcome** — install and shim report how many stale entries were cleaned.
+- **Doctor duplicate detection** — `omamori doctor` warns when multiple omamori PreToolUse entries exist, with pattern-based fallback for untagged legacy entries.
+- **New helpers**: `has_omamori_version_tag`, `is_omamori_entry_any_root`, `is_safe_to_remove`, `is_omamori_hook_path` (2-component suffix match).
+- **11 new tests** covering cross-root cleanup, legacy entries, hybrid preservation, uninstall cleanup, shim resync, doctor detection, idempotency, P0 regression (tag strip), and 3 negative tests (over-deletion prevention).
+
 ## [0.10.4] - 2026-05-09
 
 **Summary**: Remove all 25 Phase 1A meta-patterns (18 path-based + 7 verb-based) that caused 5-12 false-positive blocks per day on legitimate developer workflows. All protection is now provided by Phase 1B token-level detectors (env-var tampering, PATH override bypass), Phase 2 builtin rules (`omamori-*-block` for self-modification verbs), `PROTECTED_FILE_PATTERNS` (Edit/Write tool gate), and the Layer 1 PATH shim. Net change: ~750 lines deleted.
