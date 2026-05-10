@@ -408,13 +408,53 @@ fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
         }
     };
 
-    let entry = doc
+    let arr_opt = doc
         .pointer("/hooks/PreToolUse")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| {
+        .and_then(|v| v.as_array());
+
+    // Count all omamori-managed entries (tag OR path OR filename pattern).
+    let omamori_count = arr_opt
+        .map(|arr| {
             arr.iter()
-                .find(|e| installer::is_omamori_owned_entry(e, base_dir))
-        });
+                .filter(|e| {
+                    installer::is_omamori_entry_any_root(e, base_dir) || {
+                        let mut cmds: Vec<&str> = Vec::new();
+                        if let Some(arr) = e.get("hooks").and_then(|v| v.as_array()) {
+                            for h in arr {
+                                if let Some(c) = h.get("command").and_then(|v| v.as_str()) {
+                                    cmds.push(c);
+                                }
+                            }
+                        }
+                        if let Some(c) = e.get("command").and_then(|v| v.as_str()) {
+                            cmds.push(c);
+                        }
+                        cmds.iter().any(|c| {
+                            let unquoted = c.trim_matches('\'').trim_matches('"');
+                            installer::is_omamori_hook_path(Path::new(unquoted))
+                        })
+                    }
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    if omamori_count > 1 {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Warn,
+            detail: format!(
+                "({omamori_count} duplicate omamori PreToolUse hook(s) — stale entries accumulated)"
+            ),
+            remediation: Some(Remediation::RunInstall),
+        };
+    }
+
+    let entry = arr_opt.and_then(|arr| {
+        arr.iter()
+            .find(|e| installer::is_omamori_entry_any_root(e, base_dir))
+    });
 
     let Some(entry) = entry else {
         return CheckItem {
@@ -1675,6 +1715,126 @@ mod tests {
 
         let item = check_claude_settings_integration(&dir.join(".omamori"));
         assert_eq!(item.status, CheckStatus::Ok, "details: {}", item.detail);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // V-007: Doctor detects duplicate/stale omamori entries
+    #[test]
+    #[serial_test::serial]
+    fn doctor_detects_duplicate_omamori_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-int-dup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&script, installer::render_hook_script()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let current = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": omamori_cmd}],
+            "x-omamori-version": env!("CARGO_PKG_VERSION")
+        });
+        let stale = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/var/folders/old/hooks/claude-pretooluse.sh"}],
+            "x-omamori-version": "0.9.7"
+        });
+        let doc = serde_json::json!({
+            "hooks": { "PreToolUse": [current, stale] }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
+        assert_eq!(
+            item.status,
+            CheckStatus::Warn,
+            "should warn about duplicates: {}",
+            item.detail
+        );
+        assert!(
+            item.detail.contains("duplicate"),
+            "detail should mention duplicate: {}",
+            item.detail
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Negative test: a user hook whose filename happens to be
+    /// claude-pretooluse.sh (but outside omamori's hooks/ dir) must NOT
+    /// be counted as a duplicate omamori entry.
+    #[test]
+    fn doctor_does_not_count_user_hook_as_duplicate() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-int-nodup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&script, installer::render_hook_script()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let canonical = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": omamori_cmd}],
+            "x-omamori-version": env!("CARGO_PKG_VERSION")
+        });
+        // User hook with same filename but different parent directory
+        let user_entry = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/usr/local/my-project/scripts/claude-pretooluse.sh"}]
+        });
+        let doc = serde_json::json!({
+            "hooks": { "PreToolUse": [canonical, user_entry] }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
+        assert_ne!(
+            item.status,
+            CheckStatus::Warn,
+            "user hook with same filename must not trigger duplicate warning: {}",
+            item.detail
+        );
 
         match saved {
             Some(v) => unsafe { std::env::set_var("HOME", v) },

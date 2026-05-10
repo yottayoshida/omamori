@@ -173,24 +173,41 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
     };
 
     // Determine resync need:
-    //   1. omamori entry missing → resync (closes the entry-missing silent gap)
+    //   1. omamori entry missing → resync
     //   2. entry present but version stale or matcher legacy → resync
-    //   3. entry present and current → no-op
+    //   3. multiple omamori entries (stale accumulation) → resync
+    //   4. entry present and current, exactly 1 → no-op
     let needs_resync = match doc.pointer("/hooks/PreToolUse").and_then(|v| v.as_array()) {
         Some(arr) => {
-            let omamori_entry = arr
+            let omamori_entries: Vec<&serde_json::Value> = arr
                 .iter()
-                .find(|e| installer::is_omamori_owned_entry(e, base_dir));
-            match omamori_entry {
-                None => true,
-                Some(e) => {
+                .filter(|e| installer::is_omamori_entry_any_root(e, base_dir))
+                .collect();
+            match omamori_entries.len() {
+                0 => true,
+                1 => {
+                    let e = omamori_entries[0];
                     let version = e
                         .get("x-omamori-version")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let matcher = e.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
-                    version != env!("CARGO_PKG_VERSION") || matcher != "Bash"
+                    let expected_script = base_dir.join("hooks/claude-pretooluse.sh");
+                    let path_current = installer::entry_is_omamori_managed(e, base_dir)
+                        || e.get("hooks")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|h| h.get("command").and_then(|v| v.as_str()))
+                            .any(|c| {
+                                let u = c.trim_matches('\'').trim_matches('"');
+                                Path::new(u) == expected_script
+                            });
+                    version != env!("CARGO_PKG_VERSION")
+                        || matcher != "Bash"
+                        || !path_current
                 }
+                _ => true, // multiple entries → stale accumulation, force cleanup
             }
         }
         None => true,
@@ -206,6 +223,10 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
         Ok(installer::ClaudeSettingsOutcome::Skipped(reason)) => {
             eprintln!("omamori: failed to auto-sync Claude settings ({reason})");
             false
+        }
+        Ok(installer::ClaudeSettingsOutcome::StaleEntriesCleaned(n)) => {
+            eprintln!("omamori: cleaned {n} stale hook(s) from Claude settings");
+            true
         }
         Ok(_) => {
             eprintln!(
@@ -897,6 +918,79 @@ mod tests {
 
         let result = ensure_settings_current_for(&dir, &claude_dir);
         assert!(!result, "should be a no-op when settings are current");
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // V-006: Shim resyncs when multiple omamori entries exist (stale accumulation)
+    #[test]
+    #[serial_test::serial]
+    fn ensure_settings_resyncs_when_multiple_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join("hooks");
+        std::fs::create_dir_all(&omamori_hooks).unwrap();
+        std::fs::write(
+            omamori_hooks.join("claude-pretooluse.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+
+        let current_entry = installer::claude_settings_entry(
+            &omamori_hooks.join("claude-pretooluse.sh"),
+        );
+        let stale_entry = serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/var/folders/old/hooks/claude-pretooluse.sh"}],
+            "x-omamori-version": "0.9.7"
+        });
+        let doc = serde_json::json!({
+            "hooks": { "PreToolUse": [current_entry, stale_entry] }
+        });
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        assert!(result, "must resync when multiple omamori entries exist");
+
+        let raw = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = after
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(arr.len(), 1, "only canonical entry should remain after cleanup");
+        let remaining = &arr[0];
+        let remaining_ver = remaining
+            .get("x-omamori-version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            remaining_ver,
+            env!("CARGO_PKG_VERSION"),
+            "surviving entry must be current version"
+        );
+        let remaining_cmd = remaining
+            .pointer("/hooks/0/command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            remaining_cmd.contains(&dir.display().to_string()),
+            "surviving entry must point to current base_dir, got: {remaining_cmd}"
+        );
 
         match saved {
             Some(v) => unsafe { std::env::set_var("HOME", v) },

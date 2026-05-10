@@ -85,6 +85,11 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
                 "  [migrated] Claude Code settings.json: matcher migrated to current spec (\"Bash\")"
             );
         }
+        Some(installer::ClaudeSettingsOutcome::StaleEntriesCleaned(n)) => {
+            println!(
+                "  [done] Claude Code settings.json: cleaned {n} stale hook(s), merged current entry"
+            );
+        }
         Some(installer::ClaudeSettingsOutcome::Skipped(reason)) => {
             println!("  [warn] Claude Code settings.json: {reason}");
             println!(
