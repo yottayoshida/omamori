@@ -1,6 +1,6 @@
 [package]
 name = "omamori"
-version = "0.10.4"
+version = "0.10.5"
 edition = "2024"
 rust-version = "1.92"
 description = "AI Agent's Omamori — protect your system from dangerous commands executed via AI CLI tools"
