@@ -1786,6 +1786,7 @@ mod tests {
     /// claude-pretooluse.sh (but outside omamori's hooks/ dir) must NOT
     /// be counted as a duplicate omamori entry.
     #[test]
+    #[serial_test::serial]
     fn doctor_does_not_count_user_hook_as_duplicate() {
         let dir = std::env::temp_dir().join(format!("omamori-int-nodup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
