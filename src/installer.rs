@@ -1131,7 +1131,7 @@ pub(crate) fn update_codex_config(codex_dir: &Path) -> Result<CodexConfigOutcome
 
     // Backup before modifying
     let backup_path = codex_dir.join("config.toml.bak");
-    fs::copy(&config_path, &backup_path)?;
+    atomic_write(&backup_path, &raw)?;
 
     // Set features.codex_hooks = true (creates [features] section if needed)
     doc["features"]["codex_hooks"] = toml_edit::value(true);
@@ -1879,6 +1879,39 @@ mod tests {
         // File not modified
         let content = fs::read_to_string(dir.join("config.toml")).unwrap();
         assert!(content.contains("codex_hooks = false"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_codex_config_bak_symlink_is_safe() {
+        let dir = std::env::temp_dir().join(format!("omamori-toml-sym-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let original = "model = \"gpt-5.3-codex\"\n";
+        fs::write(dir.join("config.toml"), original).unwrap();
+
+        // Place a symlink at config.toml.bak -> canary file
+        let canary = dir.join("canary.txt");
+        fs::write(&canary, "DO NOT OVERWRITE").unwrap();
+        std::os::unix::fs::symlink(&canary, dir.join("config.toml.bak")).unwrap();
+
+        let result = update_codex_config(&dir).unwrap();
+        assert!(matches!(result, CodexConfigOutcome::Added));
+
+        // Canary must be untouched (symlink target not followed)
+        assert_eq!(fs::read_to_string(&canary).unwrap(), "DO NOT OVERWRITE");
+
+        // Backup must be a regular file (symlink replaced by atomic_write rename)
+        let bak = dir.join("config.toml.bak");
+        assert!(!bak.is_symlink(), "backup must not be a symlink after fix");
+        assert_eq!(fs::read_to_string(&bak).unwrap(), original);
+
+        // Config must be updated
+        let config = fs::read_to_string(dir.join("config.toml")).unwrap();
+        assert!(config.contains("codex_hooks = true"));
 
         let _ = fs::remove_dir_all(dir);
     }
