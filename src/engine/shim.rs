@@ -203,9 +203,7 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
                                 let u = c.trim_matches('\'').trim_matches('"');
                                 Path::new(u) == expected_script
                             });
-                    version != env!("CARGO_PKG_VERSION")
-                        || matcher != "Bash"
-                        || !path_current
+                    version != env!("CARGO_PKG_VERSION") || matcher != "Bash" || !path_current
                 }
                 _ => true, // multiple entries → stale accumulation, force cleanup
             }
@@ -930,8 +928,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn ensure_settings_resyncs_when_multiple_entries() {
-        let dir =
-            std::env::temp_dir().join(format!("omamori-shim-multi-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-shim-multi-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let claude_dir = dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
@@ -943,9 +940,8 @@ mod tests {
         )
         .unwrap();
 
-        let current_entry = installer::claude_settings_entry(
-            &omamori_hooks.join("claude-pretooluse.sh"),
-        );
+        let current_entry =
+            installer::claude_settings_entry(&omamori_hooks.join("claude-pretooluse.sh"));
         let stale_entry = serde_json::json!({
             "matcher": "Bash",
             "hooks": [{"type": "command", "command": "/var/folders/old/hooks/claude-pretooluse.sh"}],
@@ -972,7 +968,11 @@ mod tests {
             .pointer("/hooks/PreToolUse")
             .and_then(|v| v.as_array())
             .unwrap();
-        assert_eq!(arr.len(), 1, "only canonical entry should remain after cleanup");
+        assert_eq!(
+            arr.len(),
+            1,
+            "only canonical entry should remain after cleanup"
+        );
         let remaining = &arr[0];
         let remaining_ver = remaining
             .get("x-omamori-version")
