@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.6] - 2026-05-12
+
+**Summary**: Four bug fixes — CI format blocker, symlink-via-backup arbitrary file overwrite (security), flaky parallel test, and stale acceptance test version.
+
+### Fixed
+
+- **CI format blocker** — `cargo fmt --all` applied to `src/engine/shim.rs`, `src/installer.rs`, `src/integrity.rs` (10 hunks, whitespace-only). Unblocked CI for all subsequent PRs. ([#259](https://github.com/yottayoshida/omamori/issues/259))
+- **Symlink-via-backup file overwrite (security)** — Replaced `fs::copy` with `atomic_write` for the backup path in `update_codex_config`. `fs::copy` followed symlinks, so a symlink at `config.toml.bak` could overwrite an arbitrary file. `atomic_write` uses temp file + `rename(2)`, which atomically replaces the symlink without following it. Zero `fs::copy` calls remain in the codebase. DREAD 5.2 (Medium). ([#258](https://github.com/yottayoshida/omamori/issues/258))
+- **Flaky parallel test** — Added missing `#[serial_test::serial]` to `doctor_does_not_count_user_hook_as_duplicate`, which mutated HOME without serialization, causing intermittent failures in other HOME-dependent tests. ([#260](https://github.com/yottayoshida/omamori/issues/260))
+- **Stale acceptance test version** — Updated `ACCEPTANCE_TEST.md` sanity check from `0.10.3` to `0.10.6`. ([#261](https://github.com/yottayoshida/omamori/issues/261))
+
 ## [0.10.5] - 2026-05-10
 
 **Summary**: Fix stale hook entry accumulation in `~/.claude/settings.json` ([#254](https://github.com/yottayoshida/omamori/issues/254)). When the omamori install root changed (brew upgrade, `--base-dir`, CI temp dirs), `merge_claude_settings()` failed to detect old entries and accumulated duplicates. Now uses `x-omamori-version` tag (primary) + path-based fallback (secondary) to identify ALL omamori-managed entries regardless of origin root, removing stale entries via `retain()` before inserting one clean canonical entry. Also a security fix: stale entries pointing to predictable `/var/folders/` temp paths were exploitable (T3 DREAD 7.6).
