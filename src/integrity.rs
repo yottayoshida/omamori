@@ -408,9 +408,7 @@ fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
         }
     };
 
-    let arr_opt = doc
-        .pointer("/hooks/PreToolUse")
-        .and_then(|v| v.as_array());
+    let arr_opt = doc.pointer("/hooks/PreToolUse").and_then(|v| v.as_array());
 
     // Count all omamori-managed entries (tag OR path OR filename pattern).
     let omamori_count = arr_opt
@@ -1727,8 +1725,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn doctor_detects_duplicate_omamori_entries() {
-        let dir =
-            std::env::temp_dir().join(format!("omamori-int-dup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-int-dup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let claude_dir = dir.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
@@ -1790,8 +1787,7 @@ mod tests {
     /// be counted as a duplicate omamori entry.
     #[test]
     fn doctor_does_not_count_user_hook_as_duplicate() {
-        let dir =
-            std::env::temp_dir().join(format!("omamori-int-nodup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-int-nodup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let claude_dir = dir.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();

@@ -834,7 +834,11 @@ pub(crate) fn is_safe_to_remove(entry: &serde_json::Value) -> bool {
 /// false positives on user scripts that happen to share the filename.
 pub(crate) fn is_omamori_hook_path(path: &Path) -> bool {
     path.file_name().and_then(|f| f.to_str()) == Some("claude-pretooluse.sh")
-        && path.parent().and_then(|p| p.file_name()).and_then(|d| d.to_str()) == Some("hooks")
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|d| d.to_str())
+            == Some("hooks")
 }
 
 /// True if `matcher` is a legacy form that the current Claude Code parser
@@ -2565,11 +2569,7 @@ mod tests {
             .pointer("/hooks/PreToolUse")
             .and_then(|v| v.as_array())
             .unwrap();
-        assert_eq!(
-            arr.len(),
-            2,
-            "hybrid (user-only now) + canonical pushed"
-        );
+        assert_eq!(arr.len(), 2, "hybrid (user-only now) + canonical pushed");
         // The hybrid entry should now have only the user hook (omamori extracted)
         assert_eq!(
             arr[0].pointer("/hooks/0/command").and_then(|v| v.as_str()),
@@ -2873,9 +2873,7 @@ mod tests {
         let hybrid_hooks = hybrid.get("hooks").and_then(|v| v.as_array()).unwrap();
         assert_eq!(hybrid_hooks.len(), 1, "only user hook remains in hybrid");
         assert_eq!(
-            hybrid_hooks[0]
-                .get("command")
-                .and_then(|v| v.as_str()),
+            hybrid_hooks[0].get("command").and_then(|v| v.as_str()),
             Some("/usr/local/bin/userhook")
         );
 
