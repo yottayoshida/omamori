@@ -498,7 +498,7 @@ mod tests {
     //     to their intent (exercising git-aware evaluation that shells out
     //     to `git`).
     //
-    // v0.10.0 #175 tracks the full public-API promotion of
+    // Since v0.10.0, #175 tracks the full public-API promotion of
     // `normalize_path`/`resolve_path`/`evaluate_context` to require an
     // explicit `base: &Path`, at which point the process CWD can be banned
     // outside the shim/hook entry points via `.clippy.toml` disallowed_methods.

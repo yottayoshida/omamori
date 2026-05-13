@@ -1113,9 +1113,9 @@ pub(crate) fn is_env_assignment(token: &str) -> bool {
 /// -s` consume `-s` as a script path (Codex Round 2 Axis 5/Axis 1 P0).
 ///
 /// Single source of truth for redirect classification in this module.
-/// Designed to migrate to `src/parser/redirect.rs` in v0.10.0
-/// (shape_complexity refactor, Codex Round 2 Axis 6 + architect Round 3
-/// confidence 0.88).
+/// Originally planned for v0.10.0, now deferred to v0.11.0 with
+/// `src/parser/` extraction (shape_complexity refactor, Codex Round 2
+/// Axis 6 + architect Round 3 confidence 0.88).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RedirectToken {
     /// Standalone redirect operator that consumes the *next* token as its
@@ -1166,7 +1166,7 @@ impl RedirectToken {
     /// Multi-digit fd (`10<file`) is deliberately NOT recognized; only
     /// single digits 0-9 are accepted as fd prefix. Real-world AI default
     /// mutation uses single-digit fd; multi-digit expansion deferred to
-    /// v0.10.0 with `src/parser/` extraction (architect Round 3 Open Q 2,
+    /// v0.11.0 with `src/parser/` extraction (architect Round 3 Open Q 2,
     /// orchestrator pre-defer recommendation).
     pub(crate) fn classify(token: &str) -> Self {
         if token.is_empty() {
@@ -1566,7 +1566,7 @@ fn segment_has_stdin_redirect(tokens: &[String]) -> bool {
         // exemption. shell_words::split strips quotes, leaving the bare
         // operator indistinguishable from the real form except by the
         // presence of an operand (QA P0-2 fix).
-        // TODO(v0.10.0): unify with `RedirectToken` after `src/parser/`
+        // TODO(v0.11.0): unify with `RedirectToken` after `src/parser/`
         // extraction. The literal sets here intentionally diverge from
         // `RedirectToken::classify` because this function answers a
         // different question (does the segment have an *explicit stdin*
@@ -4870,7 +4870,7 @@ mod tests {
     // protected (pipe-to-shell detection catches the RHS of the synthetic
     // pipe split), but the FP side cannot round-trip through the parser
     // intact. Correct handling requires `src/parser/` extraction to layer
-    // redirect tokenization above pipe normalization, deferred to v0.10.0.
+    // redirect tokenization above pipe normalization, deferred to v0.11.0.
 
     #[test]
     fn fp_pin_readwrite_redirect_allowed() {

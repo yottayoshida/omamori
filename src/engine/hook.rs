@@ -29,7 +29,7 @@ use crate::unwrap;
 pub(crate) enum HookCheckResult {
     /// Command is allowed — no protected pattern matched.
     Allow,
-    /// Command is blocked by a meta-pattern (string-level).
+    /// Command is blocked by a phase-1b token-level meta-pattern.
     ///
     /// `matched_pattern` carries the protected pattern token (`"config disable"`,
     /// `"omamori uninstall"`, etc.) for acceptance test assertions and
@@ -498,14 +498,14 @@ fn run_hook_check_command(
                 eprintln!("omamori hook: blocked — {reason}");
                 if verbose {
                     eprintln!("  provider: {provider}");
-                    eprintln!("  layer: meta-pattern (string-level)");
+                    eprintln!("  layer: phase-1b (token-level)");
                     if let Some(p) = matched_pattern {
                         eprintln!("  matched: {p:?}");
                     }
                 }
                 eprintln!("  hint: run `omamori explain -- {command}` for details");
                 eprintln!(
-                    "  bypass: if the protected token is inside data context (e.g. `gh issue create --body`), use --body-file <path> for one-off"
+                    "  hint: if the protected token is inside data context, pass it via a file (e.g. `--body-file <path>`) to avoid the match"
                 );
             }
             Ok(2)

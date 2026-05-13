@@ -5,7 +5,7 @@
 //! hook) MUST block the wrapped command string. The reverse direction is
 //! intentionally not pinned: Layer 2 may legitimately block strings whose
 //! tokenized form Layer 1 allows (e.g. parse errors, env-var tampering on
-//! non-shim verbs, structural pipe-to-shell, meta-pattern path bypass).
+//! non-shim verbs, structural pipe-to-shell, phase-1b token-level bypass).
 //!
 //! ## Why a crate-internal test, not `tests/`
 //!
@@ -120,7 +120,7 @@ fn layer1_destructive(program: &str, args: &[String], rules: &[RuleConfig]) -> b
 
 /// Layer 2 blocking verdict against an explicit rule slice (hermetic; does
 /// not read on-disk config). Returns true for any of the three blocking
-/// variants of `check_command_for_hook_with_rules` (meta-pattern,
+/// variants of `check_command_for_hook_with_rules` (phase-1b token,
 /// structural unwrap, rule match).
 fn layer2_blocks(command: &str, rules: &[RuleConfig]) -> bool {
     matches!(
