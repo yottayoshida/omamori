@@ -451,10 +451,7 @@ pub fn default_rules() -> Vec<RuleConfig> {
                 "-fr".to_string(),
                 "--recursive".to_string(),
             ],
-            Some(
-                "omamori moved the recursive rm targets to Trash instead of deleting them"
-                    .to_string(),
-            ),
+            Some("omamori intercepted recursive rm — targets not deleted".to_string()),
         )
         .with_builtin(true),
         RuleConfig::new(
@@ -463,7 +460,7 @@ pub fn default_rules() -> Vec<RuleConfig> {
             ActionKind::StashThenExec,
             vec!["reset".to_string(), "--hard".to_string()],
             Vec::new(),
-            Some("omamori stashed changes before running git reset --hard".to_string()),
+            Some("omamori intercepted git reset --hard — changes preserved".to_string()),
         )
         .with_builtin(true),
         RuleConfig::new(
