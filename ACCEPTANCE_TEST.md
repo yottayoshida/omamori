@@ -22,6 +22,18 @@ omamori の shim/hook は AI 環境検知時のみ発火する (`CLAUDECODE` 等
 >
 > ⚠️ **shim が PATH 先頭にあること**: `which rm` が `~/.omamori/shim/rm` を返すこと。`omamori install` 既定の shim base は `~/.omamori/shim`、`--base-dir` 指定時はその下の `shim/` を確認。
 
+## Headless / Codex compatibility
+
+Not all rows can run in headless CI or Codex sandbox environments. `hook-check` provides a Layer 2 dry-run alternative for some rows, but it **cannot replace** Layer 1 shim interception (S-\*), real session tamper protection (T-1, T-2, T-3'), or real audit side effects (A-\*).
+
+| Compat | Rows | Notes |
+|--------|------|-------|
+| **full-headless** | H-1, H-2, H-3, H-4, H-5, H-6, D-3, D-4, D-5, D-6, D-7 | `hook-check` JSON dry-run or `omamori doctor` — no shim/session required |
+| **hook-check-alternative** | S-7, S-8, T-3 | Allow-path rows verifiable via `hook-check` exit 0, but shim behavior not tested |
+| **non-headless-required** | S-1, S-2, S-3, S-3', S-4, S-5, S-6, T-1, T-2, T-3', D-1, D-2, A-1, A-2 | Require real shim (S-\*), real AI session (T-1, T-2, T-3'), or real audit log (A-\*) |
+
+Headless CI should run the `full-headless` and `hook-check-alternative` rows. The `non-headless-required` rows must be run in a real environment with `CLAUDECODE=1` and shims installed.
+
 ## Observed AI harness patterns
 
 AI agent harness (Claude Code 含む) で `tool_input.command` に観測される command 整形 pattern。本 acceptance test の assertion はこれら pattern の混入下でも fact 確定できる粒度で書く:
@@ -49,7 +61,7 @@ omamori install --force
 #    既存 session 内 hook script は古い binary path を embed している場合がある
 
 # (4) 開始時 sanity check (このセクションを始める前に必ず通す)
-omamori --version | grep -qE '0\.10\.6' && echo "v0.10.6 ready" || { echo "FAIL: install release-candidate binary first"; exit 1; }
+omamori --version | grep -qE '0\.10\.7' && echo "v0.10.7 ready" || { echo "FAIL: install release-candidate binary first"; exit 1; }
 
 # (5) AI 環境を維持 (raw terminal でも同じ)
 export CLAUDECODE=1
