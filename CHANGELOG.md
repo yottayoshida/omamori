@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.7] - 2026-05-13
+
+**Summary**: Documentation accuracy, CI parity, and developer tooling improvements — no detection logic changes.
+
+### Fixed
+
+- **SECURITY.md fd-dup limitation accuracy** — Narrowed the `source /dev/fd/N N<&0` limitation entry: piped variants (e.g. `curl … | bash -c 'source /dev/fd/3' 3<&0`) ARE caught by pipe-to-shell detection; only standalone fd-dup invocations without a pipe context remain undetected. Empirically verified before doc edit. ([#262](https://github.com/yottayoshida/omamori/issues/262))
+- **Human-facing terminology cleanup** — Renamed "string-level" to "token-level" / "phase-1b" in doc comments and verbose stderr output. JSON output (`layer2:meta-pattern`), audit log tags, and taxonomy constants are frozen for v0.11.0 backward compatibility. ([#263](https://github.com/yottayoshida/omamori/issues/263))
+- **CI clippy parity** — Added `--all-targets --all-features` to CI clippy job, matching the local `pre-pr-check.sh` invocation. ([#264](https://github.com/yottayoshida/omamori/issues/264))
+- **Lockfile script diagnostics** — Removed `2>/dev/null` from `cargo metadata` call in `check-lockfile-regressions.sh` so errors surface instead of being silently swallowed. ([#265](https://github.com/yottayoshida/omamori/issues/265))
+- **Stale TODO hygiene** — Updated `TODO(v0.10.0)` refs to `v0.11.0` and historical version refs to "since v0.10.0" where they describe shipped features. ([#266](https://github.com/yottayoshida/omamori/issues/266))
+
+### Added
+
+- **Acceptance test headless compatibility** — Added "Headless / Codex compatibility" section to `ACCEPTANCE_TEST.md` classifying each row as full-headless, hook-check-alternative, or non-headless-required. `hook-check` is Layer 2 dry-run only and cannot replace Layer 1 shim, real session tamper protection, or real audit side effects. ([#257](https://github.com/yottayoshida/omamori/issues/257))
+
 ## [0.10.6] - 2026-05-12
 
 **Summary**: Four bug fixes — CI format blocker, symlink-via-backup arbitrary file overwrite (security), flaky parallel test, and stale acceptance test version.
