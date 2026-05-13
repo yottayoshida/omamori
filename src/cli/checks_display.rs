@@ -1,7 +1,7 @@
 //! Shared display utilities for doctor/status check output.
 //!
 //! Maps integrity `CheckItem.category` strings to doctor's 4-section model.
-//! Status retains its own legacy formatter (v0.10.0 compat).
+//! Status retains its own legacy formatter (since v0.10.0).
 
 use crate::integrity::CheckItem;
 

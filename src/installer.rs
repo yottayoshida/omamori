@@ -1346,8 +1346,8 @@ mod tests {
     #[test]
     fn protected_env_vars_constant_covers_all_detectors() {
         // Verify PROTECTED_ENV_VARS covers all expected detector variables.
-        // Env var tampering detection is now handled by Phase 1B (token-level)
-        // in hook.rs, not by string-level patterns.
+        // Env var tampering detection is handled by Phase 1B (token-level)
+        // in hook.rs.
         for var in &[
             "CLAUDECODE",
             "CODEX_CI",

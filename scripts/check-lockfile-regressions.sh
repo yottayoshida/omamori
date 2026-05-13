@@ -60,7 +60,7 @@ direct_deps() {
     # Splitting on "@" and taking the last element yields the version.
     # (Git / path dependencies also suffix "@X.Y.Z" when resolved, so this
     # holds across source types.)
-    cargo metadata --locked --format-version 1 2>/dev/null \
+    cargo metadata --locked --format-version 1 \
         | jq -r '
             .resolve.root as $root
             | .resolve.nodes[] | select(.id == $root) | .deps[]

@@ -75,7 +75,7 @@ pub(crate) fn run_explain_command(args: &[OsString]) -> Result<i32, AppError> {
     // --- Layer 1 evaluation (shim / PATH-level) ---
     let layer1 = evaluate_layer1(&command_parts, config_path.as_deref());
 
-    // --- Layer 2 evaluation (hook / string-level) ---
+    // --- Layer 2 evaluation (hook / token-level) ---
     let layer2 = evaluate_layer2(&command_str);
 
     // --- Verdict ---

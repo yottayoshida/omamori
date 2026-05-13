@@ -5,7 +5,7 @@
 //! - `retention`: Automatic pruning of old entries
 //! - `secret`: HMAC key management, symlink-safe I/O, key rotation
 //! - `verify`: Chain verification, entry display, summary for CLI
-//! - `report`: Aggregation for `omamori report` (v0.10.0, #221)
+//! - `report`: Aggregation for `omamori report` (since v0.10.0, #221)
 
 pub mod chain;
 pub mod report;
