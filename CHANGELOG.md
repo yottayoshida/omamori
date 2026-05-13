@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.8] - 2026-05-13
+
+**Summary**: Fix misleading hook-check messages — `RuleConfig.message` is shared by both the shim path (which executes Trash/stash actions) and the hook-check path (which only blocks), so the old action-completed wording ("moved to Trash", "stashed changes") was false in the hook-check path. Replaced with neutral wording ("intercepted … targets not deleted", "intercepted … changes preserved") that is accurate in both paths.
+
+### Fixed
+
+- **Misleading hook-check messages** — The `rm-recursive-to-trash` and `git-reset-hard-stash` rules claimed actions were taken ("moved to Trash", "stashed changes before running") even when the hook-check path only blocked the command without executing any action. Replaced with neutral "intercepted" wording that is truthful in both the shim path (action executed) and hook-check path (block only). ([#274](https://github.com/yottayoshida/omamori/issues/274))
+
 ## [0.10.7] - 2026-05-13
 
 **Summary**: Documentation accuracy, CI parity, and developer tooling improvements — no detection logic changes.
