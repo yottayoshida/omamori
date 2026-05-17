@@ -1273,7 +1273,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn path_order_shim_before_usr_bin_is_ok() {
         let dir =
             std::env::temp_dir().join(format!("omamori-integrity-g10-1-{}", std::process::id()));
@@ -1293,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn path_order_shim_after_usr_bin_is_warn() {
         let dir =
             std::env::temp_dir().join(format!("omamori-integrity-g10-2-{}", std::process::id()));
@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn path_order_shim_not_in_path_is_warn() {
         let dir =
             std::env::temp_dir().join(format!("omamori-integrity-g10-3-{}", std::process::id()));
@@ -1332,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn path_order_usr_bin_not_in_path_is_ok() {
         let dir =
             std::env::temp_dir().join(format!("omamori-integrity-g10-4-{}", std::process::id()));
@@ -1502,7 +1502,7 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_claude_settings_warns_when_missing() {
         let dir =
             std::env::temp_dir().join(format!("omamori-int-no-claude-{}", std::process::id()));
@@ -1523,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_claude_settings_fails_on_legacy_matcher() {
         let dir = std::env::temp_dir().join(format!("omamori-int-legacy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_claude_settings_fails_when_only_hybrid_entry_exists() {
         // R2 regression (Codex Round 2): if the user has merged the omamori
         // command into a hybrid entry (with sibling user hooks), there is no
@@ -1619,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     #[cfg(unix)]
     fn check_claude_settings_fails_on_non_executable_script() {
         // P1-4 (Codex R1): if the script is not executable, hash match alone
@@ -1675,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_claude_settings_ok_when_wired_up() {
         let dir = std::env::temp_dir().join(format!("omamori-int-ok-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1723,7 +1723,7 @@ mod tests {
 
     // V-007: Doctor detects duplicate/stale omamori entries
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn doctor_detects_duplicate_omamori_entries() {
         let dir = std::env::temp_dir().join(format!("omamori-int-dup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1786,7 +1786,7 @@ mod tests {
     /// claude-pretooluse.sh (but outside omamori's hooks/ dir) must NOT
     /// be counted as a duplicate omamori entry.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn doctor_does_not_count_user_hook_as_duplicate() {
         let dir = std::env::temp_dir().join(format!("omamori-int-nodup-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

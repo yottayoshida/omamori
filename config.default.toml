@@ -158,17 +158,16 @@ message = "omamori blocked explain via AI (oracle attack prevention)"
 # match_any = ["-r", "-rf", "-fr", "--recursive"]
 # message = "omamori moved targets to backup instead of deleting"
 
-# --- Context-aware evaluation (new in v0.4) ---
-# Uncomment to enable context-aware rule evaluation.
-# When present (even empty), built-in defaults for protected/regenerable paths activate.
-#
-# [context]
-# protected_paths = ["src/", "lib/", ".git/", ".env", ".ssh/"]
-# regenerable_paths = ["target/", "dist/", "node_modules/", "build/", "__pycache__/", ".cache/"]
-#
-# [context.git]
-# enabled = true
-# timeout_ms = 100
+# --- Context-aware evaluation (enabled by default since v0.10.9) ---
+# Built-in defaults are active. Uncomment individual fields to customize.
+
+[context]
+protected_paths = ["src/", "lib/", ".git/", ".env", ".ssh/"]
+regenerable_paths = ["target/", "node_modules/", ".next/", "dist/", "build/", "__pycache__/", ".cache/"]
+
+[context.git]
+enabled = true
+timeout_ms = 100
 
 [audit]
 enabled = false

@@ -23,8 +23,8 @@ pub struct Config {
     pub rules: Vec<RuleConfig>,
     #[serde(default)]
     pub audit: AuditConfig,
-    /// Context-aware evaluation config. None = context evaluation disabled (v0.3 compat).
-    /// Present (even empty) = built-in defaults active.
+    /// Context-aware evaluation config. Enabled by default (v0.10.9+).
+    /// None disables context evaluation; Some(_) activates built-in defaults.
     #[serde(default)]
     pub context: Option<ContextConfig>,
 }
@@ -35,7 +35,7 @@ impl Default for Config {
             detectors: default_detectors(),
             rules: default_rules(),
             audit: AuditConfig::default(),
-            context: None,
+            context: Some(crate::context::ContextConfig::default()),
         }
     }
 }
@@ -651,6 +651,18 @@ pub fn config_template() -> String {
          # destination = \"/tmp/omamori-quarantine/\"\n\
          # match_any = [\"-r\", \"-rf\", \"-fr\", \"--recursive\"]\n\
          # message = \"omamori moved targets to backup instead of deleting\"\n",
+    );
+    out.push_str(
+        "\n# --- Context-aware evaluation (enabled by default) ---\n\
+         # Built-in defaults are active. Uncomment lines below to customize.\n\
+         [context]\n\
+         # regenerable_paths = [\"target/\", \"node_modules/\", \".next/\", \"dist/\", \
+         \"build/\", \"__pycache__/\", \".cache/\"]\n\
+         # protected_paths = [\"src/\", \"lib/\", \".git/\", \".env\", \".ssh/\"]\n\
+         #\n\
+         # [context.git]\n\
+         # enabled = true\n\
+         # timeout_ms = 100\n",
     );
     out
 }
@@ -1363,6 +1375,79 @@ action = "block"
              In code only: {:?}",
             toml_names.difference(&code_names).collect::<Vec<_>>(),
             code_names.difference(&toml_names).collect::<Vec<_>>(),
+        );
+    }
+
+    // --- Context default-on (v0.10.9) ---
+
+    #[test]
+    fn default_config_has_context_enabled() {
+        let config = Config::default();
+        assert!(
+            config.context.is_some(),
+            "context should be enabled by default"
+        );
+        let ctx = config.context.unwrap();
+        assert!(!ctx.regenerable_paths.is_empty());
+        assert!(!ctx.protected_paths.is_empty());
+        assert!(ctx.git.enabled, "git-aware should be enabled by default");
+    }
+
+    #[test]
+    fn config_default_toml_context_matches_defaults() {
+        let toml_str = include_str!("../config.default.toml");
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        let code_ctx = crate::context::ContextConfig::default();
+        let toml_ctx = parsed
+            .context
+            .expect("config.default.toml must have [context]");
+        assert_eq!(toml_ctx.regenerable_paths, code_ctx.regenerable_paths);
+        assert_eq!(toml_ctx.protected_paths, code_ctx.protected_paths);
+        assert_eq!(toml_ctx.git.enabled, code_ctx.git.enabled);
+        assert_eq!(toml_ctx.git.timeout_ms, code_ctx.git.timeout_ms);
+    }
+
+    #[test]
+    fn config_template_roundtrip_has_context() {
+        let template = config_template();
+        let parsed: Config = toml::from_str(&template).unwrap();
+        assert!(
+            parsed.context.is_some(),
+            "config_template() must produce a TOML with [context] active"
+        );
+    }
+
+    #[test]
+    fn serde_empty_git_section_defaults_enabled_true() {
+        let toml_str = "[context]\n[context.git]\n";
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        let ctx = parsed.context.expect("[context] should parse");
+        assert!(
+            ctx.git.enabled,
+            "empty [context.git] should default to enabled=true"
+        );
+    }
+
+    #[test]
+    fn existing_config_without_context_stays_none() {
+        let toml_str = r#"
+[[detectors]]
+name = "claude-code"
+type = "env_var"
+env_key = "CLAUDECODE"
+env_value = "1"
+
+[[rules]]
+name = "rm-recursive-to-trash"
+command = "rm"
+action = "trash"
+match_any = ["-r", "-rf"]
+message = "moved to trash"
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(
+            parsed.context.is_none(),
+            "config without [context] section must parse to context: None"
         );
     }
 
