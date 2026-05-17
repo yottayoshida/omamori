@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.9] - 2026-05-17
+
+**Summary**: Context-aware evaluation is now enabled by default. New installs get smart regenerable-path downgrade (Tier 1) and git-aware evaluation (Tier 2) out of the box, eliminating first-day false positives on `rm -rf target/`, `rm -rf node_modules/`, etc. Existing users without a `[context]` section in their config are completely unaffected (`context` remains `None`). Users with `[context]` but no `[context.git]` will now get git-aware evaluation activated (safer direction — opt out by adding `[context.git]\nenabled = false`).
+
+### Changed
+
+- **`Config::default()` now includes `context: Some(ContextConfig::default())`** — previously `context: None`. First-time users (no config file) and `omamori init` users both get context-aware evaluation active from the start. ([#279](https://github.com/yottayoshida/omamori/issues/279))
+- **`GitContextConfig` serde default for `enabled` field** — changed from `#[serde(default)]` (= `false`) to `#[serde(default = "default_git_enabled")]` (= `true`). When a config file has `[context.git]` without an explicit `enabled` key, git-aware evaluation is now on by default. ([#279](https://github.com/yottayoshida/omamori/issues/279))
+- **`config_template()` output** — `[context]` section header is now uncommented so that `omamori init` creates a config file with context-aware evaluation active. Individual fields remain commented (serde defaults apply). ([#279](https://github.com/yottayoshida/omamori/issues/279))
+- **`config.default.toml`** — `[context]` and `[context.git]` sections uncommented. `regenerable_paths` aligned with code defaults (added `.next/`, `.cache/`). ([#279](https://github.com/yottayoshida/omamori/issues/279))
+
+### Added
+
+- **`impl Default for ContextConfig`** — explicit default implementation with `default_regenerable_paths()`, `default_protected_paths()`, and `GitContextConfig::default()`.
+- **4 new tests** — `default_config_has_context_enabled`, `config_default_toml_context_matches_defaults`, `config_template_roundtrip_has_context`, `serde_empty_git_section_defaults_enabled_true`.
+
 ## [0.10.8] - 2026-05-13
 
 **Summary**: Fix misleading hook-check messages — `RuleConfig.message` is shared by both the shim path (which executes Trash/stash actions) and the hook-check path (which only blocks), so the old action-completed wording ("moved to Trash", "stashed changes") was false in the hook-check path. Replaced with neutral wording ("intercepted … targets not deleted", "intercepted … changes preserved") that is accurate in both paths.

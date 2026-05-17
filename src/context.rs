@@ -26,9 +26,19 @@ pub struct ContextConfig {
     pub git: GitContextConfig,
 }
 
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            regenerable_paths: default_regenerable_paths(),
+            protected_paths: default_protected_paths(),
+            git: GitContextConfig::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitContextConfig {
-    #[serde(default)]
+    #[serde(default = "default_git_enabled")]
     pub enabled: bool,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -37,7 +47,7 @@ pub struct GitContextConfig {
 impl Default for GitContextConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             timeout_ms: default_timeout_ms(),
         }
     }
@@ -45,6 +55,10 @@ impl Default for GitContextConfig {
 
 fn default_timeout_ms() -> u64 {
     100
+}
+
+fn default_git_enabled() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------

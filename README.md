@@ -175,12 +175,11 @@ omamori can adjust actions based on what the command targets:
 | `rm -rf src/` | trash | **block** (protected) |
 | `git reset --hard` (no changes) | stash-then-exec | **log-only** (git-aware) |
 
-**Opt-in**: add `[context]` to `~/.config/omamori/config.toml`. Built-in lists for regenerable (`target/`, `node_modules/`, etc.) and protected (`src/`, `.git/`, `.env`, etc.) paths activate automatically.
+**Enabled by default** (v0.10.9+). Built-in lists for regenerable (`target/`, `node_modules/`, etc.) and protected (`src/`, `.git/`, `.env`, etc.) paths are active out of the box. To customize, add a `[context]` section to `~/.config/omamori/config.toml`:
 
 ```toml
 [context]
-# Built-in defaults activate with just [context].
-# To customize, specify your own lists (replaces built-in defaults):
+# Specifying a list replaces the built-in defaults (not appends).
 # regenerable_paths = ["target/", "node_modules/", "my-cache/"]
 # protected_paths = ["src/", "lib/", ".git/", ".env", ".ssh/", "secrets/"]
 ```
