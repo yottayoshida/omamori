@@ -735,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn ensure_settings_resyncs_on_legacy_matcher() {
         let dir = std::env::temp_dir().join(format!("omamori-shim-legacy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -792,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn ensure_settings_resyncs_when_entry_missing() {
         // P1-1 (Codex R1): if settings.json exists with user hooks but no
         // omamori entry, the shim must merge one in, not silently no-op.
@@ -847,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn ensure_settings_returns_false_on_skipped() {
         // P1-3 (Codex R1): merge result Skipped (e.g. symlink target) must NOT
         // be reported as a successful re-sync.
@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn ensure_settings_no_op_when_current() {
         let dir = std::env::temp_dir().join(format!("omamori-shim-current-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -926,7 +926,7 @@ mod tests {
 
     // V-006: Shim resyncs when multiple omamori entries exist (stale accumulation)
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn ensure_settings_resyncs_when_multiple_entries() {
         let dir = std::env::temp_dir().join(format!("omamori-shim-multi-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

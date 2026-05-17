@@ -1331,14 +1331,14 @@ mod tests {
     /// cannot find config.toml and falls back to `Config::default()`.
     ///
     /// # Safety
-    /// Env-var mutation is guarded by `#[serial_test::serial]` on every caller.
+    /// Env-var mutation is guarded by `#[serial_test::serial(home_env)]` on every caller.
     fn isolate_config() -> (Option<String>, Option<String>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("omamori-gr-iso-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let old_home = std::env::var("HOME").ok();
-        // SAFETY: serialized by #[serial_test::serial] — no concurrent env reads.
+        // SAFETY: serialized by #[serial_test::serial(home_env)] — no concurrent env reads.
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", dir.join("xdg"));
             std::env::set_var("HOME", &dir);
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     fn restore_config(old_xdg: Option<String>, old_home: Option<String>, dir: PathBuf) {
-        // SAFETY: serialized by #[serial_test::serial] — no concurrent env reads.
+        // SAFETY: serialized by #[serial_test::serial(home_env)] — no concurrent env reads.
         unsafe {
             match old_xdg {
                 Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
@@ -1362,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_command_for_hook_blocks_rm_rf_with_default_rules() {
         let (old_xdg, old_home, dir) = isolate_config();
 
@@ -1387,7 +1387,7 @@ mod tests {
     /// detectors operate at the token level without a single pattern string
     /// or byte offset to report.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn block_meta_phase1b_has_null_metadata() {
         let (old_xdg, old_home, dir) = isolate_config();
         let result = check_command_for_hook("unset CLAUDECODE");
@@ -1414,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_command_for_hook_allows_safe_command() {
         let (old_xdg, old_home, dir) = isolate_config();
 
@@ -1731,7 +1731,7 @@ mod tests {
     // --- GR-007: check_command_for_hook meta-pattern ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_command_for_hook_blocks_meta_pattern() {
         let (old_xdg, old_home, dir) = isolate_config();
 
@@ -1747,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn check_command_for_hook_allows_echo() {
         let (old_xdg, old_home, dir) = isolate_config();
 
@@ -1820,13 +1820,13 @@ mod tests {
     // --- BLOCK: whitespace bypass (#145) — all use assert_blocks_meta ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_unset_double_space() {
         assert_blocks_meta("unset  CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_unset_tab() {
         assert_blocks_meta("unset\tCLAUDECODE");
     }
@@ -1834,13 +1834,13 @@ mod tests {
     // --- BLOCK: VARNAME= assignment (Codex 6-B: missing test) ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_var_assignment_empty() {
         assert_blocks_meta("CLAUDECODE=");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_var_assignment_value() {
         assert_blocks_meta("CLAUDECODE=fake");
     }
@@ -1848,19 +1848,19 @@ mod tests {
     // --- BLOCK: separator-adjacent (Codex 6-A regression fix) ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_semicolon_adjacent_unset() {
         assert_blocks_meta("echo ok;unset CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_and_adjacent_export() {
         assert_blocks_meta("cmd&&export -nCLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_newline_adjacent_env_u() {
         assert_blocks_meta("echo ok\nenv -u CLAUDECODE bash");
     }
@@ -1868,43 +1868,43 @@ mod tests {
     // --- BLOCK: operator-after command position (Codex 6-B: missing boundary) ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_after_semicolon() {
         assert_blocks_meta("echo ok ; unset CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_after_pipe() {
         assert_blocks_meta("cat /dev/null | unset CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_env_u_extra_spaces() {
         assert_blocks_meta("env  -u  CLAUDECODE bash");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_env_u_tabs() {
         assert_blocks_meta("env\t-u\tCLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_env_u_combined() {
         assert_blocks_meta("env -uCLAUDECODE bash");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_export_n_extra_space() {
         assert_blocks_meta("export  -n  CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_export_n_combined() {
         assert_blocks_meta("export -nCLAUDECODE");
     }
@@ -1912,19 +1912,19 @@ mod tests {
     // --- BLOCK: assignment prefix (#145) ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_assignment_prefix_unset() {
         assert_blocks_meta("FOO=1 unset CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_assignment_prefix_env_u() {
         assert_blocks_meta("BAR=x env -uCLAUDECODE bash");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_multi_assignment_export() {
         assert_blocks_meta("X=1 Y=2 export -n CLAUDECODE");
     }
@@ -1932,25 +1932,25 @@ mod tests {
     // --- ALLOW: command position false positive prevention (#145) ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_printf_unset_args() {
         assert_allows("printf '%s %s' unset CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_echo_unset() {
         assert_allows("echo unset CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_echo_env_u() {
         assert_allows("echo env -u CLAUDECODE");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_printf_var_assignment() {
         assert_allows("printf %s CLAUDECODE=test");
     }
@@ -1958,25 +1958,25 @@ mod tests {
     // --- ALLOW: quoted string false positive prevention (#145) ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_printf_unset_quoted() {
         assert_allows("printf 'unset  CLAUDECODE'");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_echo_env_u_quoted() {
         assert_allows("echo \"env  -u  CLAUDECODE\"");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_echo_newline_in_quotes() {
         assert_allows("echo 'line1\nline2'");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_benign_env_assignment_in_string() {
         assert_allows("echo 'CLAUDECODE=test'");
     }
@@ -1984,79 +1984,79 @@ mod tests {
     // --- BLOCK: PATH override shim bypass (#227) — all use assert_blocks_meta ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_inline_rm() {
         assert_blocks_meta("PATH=/usr/bin:$PATH rm dummy.txt");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_inline_git() {
         assert_blocks_meta("PATH=/usr/bin git status");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_inline_chmod() {
         assert_blocks_meta("PATH=/opt/bin chmod 755 file");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_inline_find() {
         assert_blocks_meta("PATH=/usr/bin find . -name foo");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_inline_rsync() {
         assert_blocks_meta("PATH=/usr/bin rsync -a src/ dst/");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_empty_value_rm() {
         assert_blocks_meta("PATH= rm file");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_env_rm() {
         assert_blocks_meta("env PATH=/usr/bin rm file");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_env_i_rm() {
         assert_blocks_meta("env -i PATH=/usr/bin rm file");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_env_u_home_path_rm() {
         assert_blocks_meta("env -uHOME PATH=/usr/bin rm file");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_env_dashdash_rm() {
         assert_blocks_meta("env -- PATH=/usr/bin rm file");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_usr_bin_env_rm() {
         assert_blocks_meta("/usr/bin/env PATH=/usr/bin rm file");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_env_git() {
         assert_blocks_meta("env PATH=/opt/git/bin git push");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_compound_tail() {
         assert_blocks_meta("echo ok; PATH=/usr/bin rm file");
     }
@@ -2064,25 +2064,25 @@ mod tests {
     // --- ALLOW: PATH override with non-shim commands ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_non_shim_node() {
         assert_allows("PATH=/custom/dir node script.js");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_non_shim_python() {
         assert_allows("PATH=/opt/python/bin python -c 'print(1)'");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_export_path() {
         assert_allows("export PATH=/usr/local/bin:$PATH");
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn phase1b_path_override_env_non_shim() {
         assert_allows("env PATH=/custom/dir node script.js");
     }
@@ -2095,7 +2095,7 @@ mod tests {
     /// performance contract. CI runs on a known-slow shared runner so the
     /// budget is generous; local Apple Silicon p99 typically ~ 1ms.
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn p99_hook_check_latency_under_budget() {
         const SAMPLES: usize = 500;
         const P99_BUDGET_MICROS: u128 = 12_000;

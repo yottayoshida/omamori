@@ -1919,7 +1919,7 @@ mod tests {
     // --- G-12: auto_setup_codex_if_needed ---
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn auto_setup_codex_skips_without_env() {
         // SAFETY: serial_test ensures no concurrent access to env vars
         let saved = std::env::var_os("CODEX_CI");
@@ -1939,7 +1939,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn auto_setup_codex_skips_when_wrapper_exists() {
         // SAFETY: serial_test ensures no concurrent access to env vars
         let saved = std::env::var_os("CODEX_CI");
@@ -2015,7 +2015,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_creates_when_missing() {
         let dir = fresh_test_dir("v001");
         let script = fake_script(&dir);
@@ -2044,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_preserves_user_hooks() {
         let dir = fresh_test_dir("v002");
         let script = fake_script(&dir);
@@ -2093,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_is_idempotent() {
         let dir = fresh_test_dir("v003");
         let script = fake_script(&dir);
@@ -2124,7 +2124,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_migrates_legacy_boolean_matcher() {
         let dir = fresh_test_dir("v004");
         let script = fake_script(&dir);
@@ -2167,7 +2167,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_migrates_wildcard_matcher() {
         let dir = fresh_test_dir("v005");
         let script = fake_script(&dir);
@@ -2198,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     #[cfg(unix)]
     fn merge_claude_writes_with_mode_0o600() {
         use std::os::unix::fs::PermissionsExt;
@@ -2225,7 +2225,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_skips_corrupted_json() {
         let dir = fresh_test_dir("v007");
         let script = fake_script(&dir);
@@ -2246,7 +2246,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_handles_large_settings_file() {
         let dir = fresh_test_dir("v008");
         let script = fake_script(&dir);
@@ -2289,7 +2289,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_handles_empty_file() {
         let dir = fresh_test_dir("v009");
         let script = fake_script(&dir);
@@ -2308,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     #[cfg(unix)]
     fn merge_claude_skips_symlink() {
         let dir = fresh_test_dir("v011");
@@ -2400,7 +2400,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_handles_custom_base_dir() {
         // P2-2 (Codex R1): identification must work for `--base-dir` installs,
         // not just the default ~/.omamori prefix.
@@ -2434,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn remove_claude_does_not_touch_user_hook_inside_omamori_dir() {
         // R4 regression (Codex Round 4): the surgical pass must match the
         // CANONICAL omamori script path, not any path under base_dir.
@@ -2500,7 +2500,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn remove_claude_surgically_removes_omamori_from_hybrid() {
         // R3 regression (Codex Round 3): uninstall must surgically remove
         // the omamori inner hook from a hybrid entry, even though the
@@ -2561,7 +2561,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_does_not_replace_hybrid_entry() {
         // R2 regression (Codex Round 2): a "hybrid" entry — one that contains
         // BOTH the omamori command and a user-managed sibling hook — must NOT
@@ -2622,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn remove_claude_settings_entry_preserves_hybrid_entry() {
         // R2 regression (Codex Round 2): uninstall must not delete a hybrid
         // entry, because it contains a user hook. Only canonical (omamori-
@@ -2674,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn remove_claude_settings_entry_preserves_user_hooks() {
         // P1-2 (Codex R1): uninstall must remove the omamori entry but leave
         // user-managed hooks intact.
@@ -2742,7 +2742,7 @@ mod tests {
     // V-001: Cross-root stale cleanup (core #254 bug)
     // -----------------------------------------------------------------------
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_removes_all_stale_entries_from_different_roots() {
         let dir = fresh_test_dir("v001-stale");
         let script = fake_script(&dir);
@@ -2805,7 +2805,7 @@ mod tests {
     // V-002: Legacy entry cleanup (untagged, path-based fallback)
     // -----------------------------------------------------------------------
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_cleans_legacy_entry_without_version_tag() {
         let dir = fresh_test_dir("v002-legacy");
         let script = fake_script(&dir);
@@ -2856,7 +2856,7 @@ mod tests {
     // V-004: Hybrid entry preservation with stale cleanup
     // -----------------------------------------------------------------------
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_preserves_hybrid_with_stale_cleanup() {
         let dir = fresh_test_dir("v004-hybrid");
         let script = fake_script(&dir);
@@ -2917,7 +2917,7 @@ mod tests {
     // V-005: Uninstall cleans multiple stale entries
     // -----------------------------------------------------------------------
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn remove_claude_cleans_multiple_stale_entries() {
         let dir = fresh_test_dir("v005-rm-stale");
         let base_dir = dir.join(".omamori");
@@ -2977,7 +2977,7 @@ mod tests {
     // V-008: Idempotency after stale cleanup
     // -----------------------------------------------------------------------
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn merge_claude_idempotent_after_stale_cleanup() {
         let dir = fresh_test_dir("v008-idem");
         let script = fake_script(&dir);
