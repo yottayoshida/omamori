@@ -1383,7 +1383,10 @@ action = "block"
     #[test]
     fn default_config_has_context_enabled() {
         let config = Config::default();
-        assert!(config.context.is_some(), "context should be enabled by default");
+        assert!(
+            config.context.is_some(),
+            "context should be enabled by default"
+        );
         let ctx = config.context.unwrap();
         assert!(!ctx.regenerable_paths.is_empty());
         assert!(!ctx.protected_paths.is_empty());
@@ -1395,7 +1398,9 @@ action = "block"
         let toml_str = include_str!("../config.default.toml");
         let parsed: Config = toml::from_str(toml_str).unwrap();
         let code_ctx = crate::context::ContextConfig::default();
-        let toml_ctx = parsed.context.expect("config.default.toml must have [context]");
+        let toml_ctx = parsed
+            .context
+            .expect("config.default.toml must have [context]");
         assert_eq!(toml_ctx.regenerable_paths, code_ctx.regenerable_paths);
         assert_eq!(toml_ctx.protected_paths, code_ctx.protected_paths);
         assert_eq!(toml_ctx.git.enabled, code_ctx.git.enabled);
