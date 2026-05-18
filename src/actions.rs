@@ -221,18 +221,31 @@ impl ExecOps for SystemOps {
     }
 
     fn git_stash(&mut self) -> Result<(), String> {
+        use std::io::Write;
+        use std::process::Stdio;
+
         // Remove AI detector env vars so the internal git call does not
         // trigger omamori's own protection (self-interference prevention).
         let mut cmd = Command::new("git");
-        cmd.arg("stash").arg("push").arg("--include-untracked");
+        cmd.arg("stash")
+            .arg("push")
+            .arg("--include-untracked")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
         for key in &self.detector_env_keys {
             cmd.env_remove(key);
         }
-        let status = cmd.status().map_err(|error| error.to_string())?;
-        if status.success() {
+        let output = cmd.output().map_err(|error| error.to_string())?;
+        if !output.stdout.is_empty() {
+            let _ = io::stderr().write_all(&output.stdout);
+        }
+        if output.status.success() {
             Ok(())
         } else {
-            Err(format!("git stash exited with status {:?}", status.code()))
+            Err(format!(
+                "git stash exited with status {:?}",
+                output.status.code(),
+            ))
         }
     }
 }
