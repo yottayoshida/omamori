@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.10] - 2026-05-18
+
+**Summary**: Fix stash-then-exec stdout leak — `git stash push` informational output ("Saved working directory...") was leaking to the parent process stdout, violating omamori's output channel contract. Now captured and redirected to stderr (byte-preserving).
+
+### Fixed
+
+- **git stash stdout leak during stash-then-exec** — `SystemOps::git_stash()` used `.status()` which inherited stdout from the parent process. Switched to `.output()` with `.stdout(Stdio::piped())` and `.stderr(Stdio::inherit())`, then `write_all` captured stdout to stderr. The original command's stdout (e.g. `git reset --hard` output) is unaffected. ([#283](https://github.com/yottayoshida/omamori/issues/283))
+
 ## [0.10.9] - 2026-05-17
 
 **Summary**: Context-aware evaluation is now enabled by default. New installs get smart regenerable-path downgrade (Tier 1) and git-aware evaluation (Tier 2) out of the box, eliminating first-day false positives on `rm -rf target/`, `rm -rf node_modules/`, etc. Existing users without a `[context]` section in their config are completely unaffected (`context` remains `None`). Users with `[context]` but no `[context.git]` will now get git-aware evaluation activated (safer direction — opt out by adding `[context.git]\nenabled = false`).
