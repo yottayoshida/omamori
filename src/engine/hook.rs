@@ -759,10 +759,20 @@ fn audit_log_unknown_tool_fail_open(
     event.target_count = tool_input.as_object().map(|o| o.len()).unwrap_or(0);
 
     if let Err(e) = logger.append(event) {
-        eprintln!(
-            "omamori warning: failed to record unknown_tool_fail_open event for '{tool_name}': {e}. \
-             The 'omamori audit unknown' review surface is incomplete for this event."
-        );
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!(
+                "omamori warning: audit write denied for unknown tool '{tool_name}': {e}. \
+                 This is expected in sandboxed environments (e.g. Codex CLI) where writes to \
+                 ~/.local/share/omamori/ are restricted. The fail-open decision is unaffected — \
+                 only audit recording failed. To enable audit in sandbox, add \
+                 ~/.local/share/omamori to your sandbox's writable paths."
+            );
+        } else {
+            eprintln!(
+                "omamori warning: failed to record unknown_tool_fail_open event for '{tool_name}': {e}. \
+                 The 'omamori audit unknown' review surface is incomplete for this event."
+            );
+        }
     }
 }
 
@@ -876,10 +886,20 @@ fn audit_log_hook_block(
     event.unwrap_chain = unwrap_chain.map(|c| vec![c]);
 
     if let Err(e) = logger.append(event) {
-        eprintln!(
-            "omamori warning: failed to record Layer 2 hook deny event for {command:?}: {e}. \
-             The 'omamori audit show --action block' surface is incomplete for this event."
-        );
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            eprintln!(
+                "omamori warning: audit write denied for {command:?}: {e}. \
+                 This is expected in sandboxed environments (e.g. Codex CLI) where writes to \
+                 ~/.local/share/omamori/ are restricted. The block decision is unaffected — \
+                 only audit recording failed. To enable audit in sandbox, add \
+                 ~/.local/share/omamori to your sandbox's writable paths."
+            );
+        } else {
+            eprintln!(
+                "omamori warning: failed to record Layer 2 hook deny event for {command:?}: {e}. \
+                 The 'omamori audit show --action block' surface is incomplete for this event."
+            );
+        }
     }
 }
 

@@ -748,6 +748,26 @@ This filter assumes the live entry's command path does not contain `omamori-inst
 
 **Why no automatic fix**: a full automated cleanup would require ~500 lines (test HOME isolation across 7 sites + dedup logic strengthening + warning UX + CI lint to prevent regression) for an issue with zero impact on production users and a one-line manual cleanup for contributors. The cost/value did not justify implementation in v0.9.7. If the contributor population grows or a related issue surfaces (e.g. [#206](https://github.com/yottayoshida/omamori/issues/206) OpenClaw hook coexistence touches the same identification logic), this can be reopened. See [#210 close comment](https://github.com/yottayoshida/omamori/issues/210#issuecomment-4350136214) for the full investigation log.
 
+### Codex CLI sandbox constraints (v0.10.11+)
+
+Codex CLI runs commands inside a [sandbox](https://developers.openai.com/codex/concepts/sandboxing) that restricts filesystem writes to the working directory and `/tmp` by default (`workspace-write` mode). This creates two structural limitations for omamori:
+
+| Constraint | Root cause | Impact | Mitigation |
+|------------|-----------|--------|------------|
+| **Layer 1 PATH shim ineffective** | Codex spawns non-login shells — `~/.zshrc` is never sourced, so `~/.omamori/shim` is not in `$PATH` | Layer 1 interception does not fire. Commands like `rm -rf /` go directly to the system binary | Layer 2 hook (`hook-check --provider codex` via `~/.codex/hooks.json`) is unaffected and catches the same commands. Layer 1 is defense-in-depth; Layer 2 is the primary gate in Codex environments |
+| **Audit log write fails (EPERM)** | `~/.local/share/omamori/audit.jsonl` is outside the sandbox's writable roots | `logger.append()` returns `PermissionDenied`. The audit chain has a gap for events that occur inside the sandbox | Block decisions are **not affected** — the hook returns "block" to the AI tool regardless of audit success (best-effort audit, SEC-7 invariant). omamori emits a stderr warning with sandbox-specific guidance when this occurs |
+
+**Security impact**: None. Layer 2 hook protection is fully functional in Codex CLI. The PATH shim (Layer 1) is defense-in-depth that is already documented as bypassable via absolute paths (`/bin/rm`). Audit gaps mean `omamori audit show --action block` is incomplete for sandboxed sessions, but the block enforcement itself is intact.
+
+**Workaround** (optional — enables audit recording inside sandbox): Add the omamori data directory to Codex's writable roots in `~/.codex/config.toml`:
+
+```toml
+[sandbox_workspace_write]
+writable_roots = ["~/.local/share/omamori"]
+```
+
+See also: [ACCEPTANCE_TEST.md "Headless / Codex compatibility"](./ACCEPTANCE_TEST.md) for which acceptance test rows require non-sandboxed execution. Filed as [#271](https://github.com/yottayoshida/omamori/issues/271).
+
 ## AI-assisted Contribution Invariants (v0.9.3+)
 
 omamori is developed with AI coding assistants (Claude Code / Codex). That
