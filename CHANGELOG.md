@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.11] - 2026-05-19
+
+**Summary**: Document Codex CLI sandbox structural constraints in SECURITY.md and improve audit write failure warnings with `PermissionDenied` detection. Block decisions are completely unaffected (SEC-7 invariant preserved).
+
+### Added
+
+- **SECURITY.md: Codex CLI sandbox constraints section** — Documents two structural limitations when running under Codex CLI sandbox: PATH shim ineffectiveness (non-login shell) and audit write EPERM (restricted writable roots). Includes workaround guidance and cross-references. ([#271](https://github.com/yottayoshida/omamori/issues/271))
+
+### Changed
+
+- **Improved audit failure warnings for sandboxed environments** — When `logger.append()` fails with `PermissionDenied`, the warning now explains the sandbox context and provides actionable guidance (add audit log directory to writable paths) instead of a generic "failed to record" message. Non-permission errors retain the original message. Extracted `warn_audit_append_error` helper to centralize the branching logic. ([#271](https://github.com/yottayoshida/omamori/issues/271))
+
 ## [0.10.10] - 2026-05-18
 
 **Summary**: Fix stash-then-exec stdout leak — `git stash push` informational output ("Saved working directory...") was leaking to the parent process stdout, violating omamori's output channel contract. Now captured and redirected to stderr (byte-preserving).
