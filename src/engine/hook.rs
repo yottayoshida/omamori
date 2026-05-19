@@ -777,10 +777,10 @@ fn warn_audit_append_error(
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         eprintln!(
             "omamori warning: audit write denied for {context}: {e}. \
-             This is expected in sandboxed environments (e.g. Codex CLI) where writes to \
-             ~/.local/share/omamori/ are restricted. The {decision_kind} decision is \
-             unaffected — only audit recording failed. To enable audit in sandbox, add \
-             ~/.local/share/omamori to your sandbox's writable paths."
+             This is expected in sandboxed environments (e.g. Codex CLI) that restrict \
+             writes outside the working directory. The {decision_kind} decision is \
+             unaffected — only audit recording failed. Add the audit log's parent \
+             directory to your sandbox's writable paths to restore recording."
         );
     } else {
         eprintln!(
