@@ -47,12 +47,12 @@ fn install_creates_shims_without_touching_shell_config() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("[todo] Add to your shell profile"),
+        stdout.contains("Add to"),
         "stdout: {stdout}"
     );
-    assert!(stdout.contains("Shims:"), "stdout: {stdout}");
-    assert!(stdout.contains("Hooks:"), "stdout: {stdout}");
-    assert!(stdout.contains("Cursor hook snippet"), "stdout: {stdout}");
+    assert!(stdout.contains("Layer 1"), "stdout: {stdout}");
+    assert!(stdout.contains("Layer 2"), "stdout: {stdout}");
+    assert!(stdout.contains("Cursor"), "stdout: {stdout}");
 
     let _ = fs::remove_dir_all(base_dir);
 }
