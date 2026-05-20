@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.12] - 2026-05-20
+
+**Summary**: Replace verbose `omamori install` output (40+ lines of per-file paths and outcome variants) with a concise 4-line summary banner showing Layer 1 (shims), Layer 2 (hooks), Config, and Policy status at a glance. Users can now answer "am I protected?" in under one second.
+
+### Changed
+
+- **Install output replaced with summary banner** — `omamori install --hooks` now prints a 4-line status summary (`✓ Layer 1`, `✓ Layer 2`, `✓ Config`, `✓ Policy`) instead of listing every file path and merge outcome individually. Warnings (Codex CLI config disabled, Cursor manual merge needed) are collected and shown below the banner with `!` prefix and actionable remediation steps. Running without `--hooks` shows `- Layer 2: not requested (run with --hooks)`. ([#278](https://github.com/yottayoshida/omamori/issues/278))
+- **Codex CLI false-OK prevention** — Layer 2 status now requires both `codex_hooks` and `codex_config` to be OK before classifying Codex CLI as "configured". Previously, hooks-only success could mask a user-disabled config (`codex_hooks = false`). ([#278](https://github.com/yottayoshida/omamori/issues/278))
+
+### Added
+
+- **`aggregate_layer2_status()` function** — Extracted Layer 2 tool classification into a testable function with 5 unit tests covering all-success, config-disabled-warn, all-none, mixed (Claude OK / Codex skipped), and Cursor-always-warns paths. ([#278](https://github.com/yottayoshida/omamori/issues/278))
+
 ## [0.10.11] - 2026-05-19
 
 **Summary**: Document Codex CLI sandbox structural constraints in SECURITY.md and improve audit write failure warnings with `PermissionDenied` detection. Block decisions are completely unaffected (SEC-7 invariant preserved).
