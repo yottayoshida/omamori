@@ -46,10 +46,7 @@ fn install_creates_shims_without_touching_shell_config() {
     assert!(base_dir.join("hooks/cursor-hooks.snippet.json").exists());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Add to"),
-        "stdout: {stdout}"
-    );
+    assert!(stdout.contains("Add to"), "stdout: {stdout}");
     assert!(stdout.contains("Layer 1"), "stdout: {stdout}");
     assert!(stdout.contains("Layer 2"), "stdout: {stdout}");
     assert!(stdout.contains("Cursor"), "stdout: {stdout}");

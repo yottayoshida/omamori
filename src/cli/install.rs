@@ -158,8 +158,7 @@ fn aggregate_layer2_status(result: &installer::InstallResult) -> Layer2Status {
         Some(installer::ClaudeSettingsOutcome::Skipped(reason)) => {
             warnings.push(format!("Claude Code: {reason}"));
             if result.settings_snippet.is_some() {
-                warnings
-                    .push("  cat ~/.omamori/hooks/claude-settings.snippet.json".to_string());
+                warnings.push("  cat ~/.omamori/hooks/claude-settings.snippet.json".to_string());
             }
         }
         Some(_) => tools.push("Claude Code".to_string()),
@@ -184,8 +183,7 @@ fn aggregate_layer2_status(result: &installer::InstallResult) -> Layer2Status {
     } else if codex_hooks_ok && codex_config_disabled {
         warnings.push("Codex CLI: codex_hooks = false (set by user)".to_string());
         warnings.push("  set codex_hooks = true in ~/.codex/config.toml".to_string());
-    } else if let Some(installer::CodexHooksOutcome::Skipped(reason)) =
-        &result.codex_hooks_outcome
+    } else if let Some(installer::CodexHooksOutcome::Skipped(reason)) = &result.codex_hooks_outcome
     {
         warnings.push(format!("Codex CLI: {reason}"));
     }
@@ -274,7 +272,11 @@ mod tests {
 
         let l2 = aggregate_layer2_status(&r);
         assert_eq!(l2.tools, vec!["Claude Code"]);
-        assert!(l2.warnings.iter().any(|w| w.contains("codex_hooks = false")));
+        assert!(
+            l2.warnings
+                .iter()
+                .any(|w| w.contains("codex_hooks = false"))
+        );
     }
 
     #[test]
@@ -289,8 +291,9 @@ mod tests {
     fn claude_ok_codex_skipped_mixed() {
         let mut r = empty_result();
         r.claude_settings_outcome = Some(installer::ClaudeSettingsOutcome::AlreadyPresent);
-        r.codex_hooks_outcome =
-            Some(installer::CodexHooksOutcome::Skipped("not installed".to_string()));
+        r.codex_hooks_outcome = Some(installer::CodexHooksOutcome::Skipped(
+            "not installed".to_string(),
+        ));
 
         let l2 = aggregate_layer2_status(&r);
         assert_eq!(l2.tools, vec!["Claude Code"]);
