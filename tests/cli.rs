@@ -2000,3 +2000,218 @@ fn hook_check_json_error_stderr_is_single_object() {
         "stderr must be a single JSON object (got {trimmed:?})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #249: --json-error for MalformedJson, MalformedMissingField, FileOp
+// ---------------------------------------------------------------------------
+
+#[test]
+fn hook_check_json_error_malformed_json() {
+    let (stdout, stderr, exit_code) =
+        run_hook_check_json_error("this is not json at all");
+    assert_eq!(exit_code, 2);
+    assert!(stdout.is_empty());
+    let json = parse_json_error_stderr(&stderr);
+    assert_eq!(json["blocked"], serde_json::Value::Bool(true));
+    assert_eq!(json["layer"], "layer2:input-validation");
+    assert_eq!(json["rule_id"], "invalid-input");
+    assert_eq!(json["reason"], "hook input could not be validated");
+    assert!(json["matched_pattern"].is_null());
+    assert!(json["matched_position"].is_null());
+    assert!(
+        json["hint"].as_str().unwrap().starts_with("Tell the user:"),
+        "hint must use Tell-the-user pattern"
+    );
+}
+
+#[test]
+fn hook_check_json_error_malformed_missing_field() {
+    let input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {}
+    })
+    .to_string();
+    let (stdout, stderr, exit_code) = run_hook_check_json_error(&input);
+    assert_eq!(exit_code, 2);
+    assert!(stdout.is_empty());
+    let json = parse_json_error_stderr(&stderr);
+    assert_eq!(json["blocked"], serde_json::Value::Bool(true));
+    assert_eq!(
+        json["layer"], "layer2:input-validation",
+        "MalformedMissingField uses same layer as MalformedJson (oracle minimization)"
+    );
+    assert_eq!(
+        json["rule_id"], "invalid-input",
+        "MalformedMissingField uses same rule_id as MalformedJson (oracle minimization)"
+    );
+    assert_eq!(json["reason"], "hook input could not be validated");
+    assert!(json["matched_pattern"].is_null());
+}
+
+#[test]
+fn hook_check_json_error_fileop_protected_file() {
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "/home/user/.config/omamori/config.toml",
+            "old_string": "x",
+            "new_string": "y"
+        }
+    })
+    .to_string();
+    let (stdout, stderr, exit_code) = run_hook_check_json_error(&input);
+    assert_eq!(exit_code, 2);
+    assert!(stdout.is_empty());
+    let json = parse_json_error_stderr(&stderr);
+    assert_eq!(json["blocked"], serde_json::Value::Bool(true));
+    assert_eq!(json["layer"], "layer2:file-protection");
+    assert_eq!(json["rule_id"], "protected-file");
+    assert!(
+        json["reason"]
+            .as_str()
+            .unwrap()
+            .contains("protected file"),
+        "reason must mention protected file"
+    );
+    assert!(
+        json["matched_pattern"].is_string(),
+        "FileOp must report the matched pattern"
+    );
+    assert!(
+        json["hint"].as_str().unwrap().starts_with("Tell the user:"),
+        "hint must use Tell-the-user pattern"
+    );
+}
+
+#[test]
+fn hook_check_json_error_fileop_unknown_tool() {
+    let input = serde_json::json!({
+        "tool_name": "SomeEditor",
+        "tool_input": {
+            "file_path": "/home/user/.config/omamori/config.toml"
+        }
+    })
+    .to_string();
+    let (stdout, stderr, exit_code) = run_hook_check_json_error(&input);
+    assert_eq!(exit_code, 2);
+    assert!(stdout.is_empty());
+    let json = parse_json_error_stderr(&stderr);
+    assert_eq!(json["blocked"], serde_json::Value::Bool(true));
+    assert_eq!(json["layer"], "layer2:file-protection");
+    assert_eq!(json["rule_id"], "protected-file");
+    assert!(
+        json["matched_pattern"].is_string(),
+        "FileOp via unknown tool must also report matched pattern"
+    );
+}
+
+#[test]
+fn hook_check_json_error_malformed_single_object_contract() {
+    let (_, stderr, _) = run_hook_check_json_error("not json");
+    let trimmed = stderr.trim();
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "MalformedJson stderr must be a single JSON object (got {trimmed:?})"
+    );
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "stderr must be exactly one line"
+    );
+}
+
+#[test]
+fn hook_check_json_error_fileop_single_object_contract() {
+    let input = serde_json::json!({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "/home/user/.config/omamori/config.toml",
+            "content": "x"
+        }
+    })
+    .to_string();
+    let (_, stderr, _) = run_hook_check_json_error(&input);
+    let trimmed = stderr.trim();
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "FileOp stderr must be a single JSON object (got {trimmed:?})"
+    );
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "stderr must be exactly one line"
+    );
+}
+
+fn run_hook_check_json_error_verbose(input: &str) -> (String, String, i32) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_home = std::env::temp_dir().join(format!("omamori-cli-jsonerr-v-{nanos}"));
+    let _ = std::fs::create_dir_all(&test_home);
+
+    let mut child = Command::new(binary())
+        .args(["hook-check", "--provider", "claude-code", "--json-error"])
+        .env("HOME", &test_home)
+        .env("XDG_CONFIG_HOME", test_home.join(".config"))
+        .env("XDG_DATA_HOME", test_home.join(".local/share"))
+        .env("XDG_CACHE_HOME", test_home.join(".cache"))
+        .env("OMAMORI_VERBOSE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hook-check --json-error verbose");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().expect("failed to wait");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+    let _ = std::fs::remove_dir_all(&test_home);
+    (stdout, stderr, exit_code)
+}
+
+#[test]
+fn hook_check_json_error_verbose_malformed_no_raw_input() {
+    let (_, stderr, exit_code) =
+        run_hook_check_json_error_verbose("this is not json at all");
+    assert_eq!(exit_code, 2);
+    let trimmed = stderr.trim();
+    assert!(
+        trimmed.starts_with('{') && trimmed.ends_with('}'),
+        "verbose + json-error must still be single JSON (got {trimmed:?})"
+    );
+    assert!(
+        !trimmed.contains("raw input"),
+        "verbose raw-input must not leak in json-error mode"
+    );
+}
+
+#[test]
+fn hook_check_json_error_verbose_fileop_no_extra_lines() {
+    let input = serde_json::json!({
+        "tool_name": "Edit",
+        "tool_input": {
+            "file_path": "/home/user/.config/omamori/config.toml",
+            "old_string": "x",
+            "new_string": "y"
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check_json_error_verbose(&input);
+    assert_eq!(exit_code, 2);
+    let trimmed = stderr.trim();
+    assert_eq!(
+        trimmed.lines().count(),
+        1,
+        "verbose + json-error FileOp must be single line (got {trimmed:?})"
+    );
+}

@@ -115,23 +115,23 @@ This rule ensures that the boundary matrix and test corpus grow together and tha
 | DI-15 | *(Retired in v0.10.4)* | Was: data-context substitution preservation via `subst_depth` tracking (v0.10.3). Removed with `strip_quoted_data` — no longer needed since meta-pattern substring matching is gone. |
 | DI-16 | *(Retired in v0.10.4)* | Was: data-flag allow emits audit with `layer2:relaxed:*` tag (v0.10.3). Removed with the data-context heuristic — `relaxed_by` field is always `None`. |
 
-### `hook-check --json-error` schema (v0.10.3+, PR1b)
+### `hook-check --json-error` schema (v0.10.3+, extended in #249)
 
-When `--json-error` is passed to `omamori hook-check`, **blocked shell commands** emit a single JSON object to **stderr** (in place of free-form text). Allow paths still emit the regular Claude Code hook response on stdout. AI agent integrations consume this for retry / approach-switch decisions.
+When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a single JSON object to **stderr** (in place of free-form text). Allow paths still emit the regular Claude Code hook response on stdout. AI agent integrations consume this for retry / approach-switch decisions.
 
-**Current scope**: the JSON contract applies to the **shell-command path** only (i.e. `tool_input.command` blocked by Phase 1B token detection / Phase 2 rule match / Phase 2 structural unwrap). Other deny paths — malformed hook input, file-op deny on protected paths, unknown-tool fail-open — currently retain free-form stderr; extension to those paths is tracked as a follow-up issue. AI agents can still detect these blocks by exit code 2.
+**Scope**: the JSON contract applies to all deny paths — shell-command blocks (Phase 1B token detection / Phase 2 rule match / Phase 2 structural unwrap), malformed hook input, and file-op deny on protected paths. AI agents parse one format regardless of block reason.
 
 **Schema**:
 
 ```json
 {
   "blocked": true,
-  "layer": "layer2:meta-pattern" | "layer2:rule" | "layer2:structural" | "layer2:pipe-to-shell:<wrapper>" | "layer2:obfuscated-expansion",
+  "layer": "layer2:meta-pattern" | "layer2:rule" | "layer2:structural" | "layer2:pipe-to-shell:<wrapper>" | "layer2:obfuscated-expansion" | "layer2:input-validation" | "layer2:file-protection",
   "rule_id": "<rule_name or layer-specific identifier>",
   "reason": "<human-readable message>",
-  "matched_pattern": "<protected pattern token>" | null,
+  "matched_pattern": "<pattern string>" | null,
   "matched_position": { "start": <usize>, "end": <usize> } | null,
-  "hint": "run `omamori explain -- <command>` for details"
+  "hint": "<action guidance for AI agent>"
 }
 ```
 
@@ -139,9 +139,24 @@ When `--json-error` is passed to `omamori hook-check`, **blocked shell commands*
 
 - `blocked`: always `true` (allow path uses Claude Code hook response, not this schema)
 - `layer`: forensic layer identifier prefixed with `layer2:` to match the audit log `detection_layer` field exactly. Stderr JSON `layer` and audit row `detection_layer` are interchangeable for correlation
-- `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`
-- `matched_pattern`: the protected pattern token (`"config disable"`, `"omamori uninstall"`, etc.) when known. `null` for structural blocks (no specific pattern matched) and Phase 1B token-level detections (env tampering / PATH override) where no single substring identifies the trigger
+- `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`; for input validation it is `"invalid-input"`; for file protection it is `"protected-file"`
+- `matched_pattern`: the protected pattern token when known. `null` for structural blocks, Phase 1B token-level detections, and input validation errors
 - `matched_position`: byte range `[start, end)` of the match in the original command string when known; `null` when position tracking is not available for the layer
+- `hint`: action guidance for the AI agent consumer. Shell-command blocks reference `omamori explain`; input validation and file protection blocks use a "Tell the user:" pattern directing the AI to inform the user and offer alternatives
+
+**Layer values**:
+
+| Layer | Deny path |
+|-------|-----------|
+| `layer2:meta-pattern` | Phase 1B token-level detection (env tampering, config commands) |
+| `layer2:rule` | Phase 2 rule match (e.g. `rm-recursive-to-trash`) |
+| `layer2:structural` | Phase 2 structural detection (no wrapper kind) |
+| `layer2:pipe-to-shell:<wrapper>` | Phase 2 pipe-to-shell with wrapper (e.g. `env`, `bash`) |
+| `layer2:obfuscated-expansion` | Phase 2 obfuscated expansion detection |
+| `layer2:input-validation` | Malformed or incomplete hook input (JSON parse failure or missing fields) |
+| `layer2:file-protection` | Protected file modification attempt |
+
+**Security note — input validation errors**: `MalformedJson` and `MalformedMissingField` emit identical JSON (same layer, rule_id, reason) to minimize oracle exposure. Attackers cannot distinguish JSON parse failures from missing-field errors, preventing incremental input refinement. The reason string is static and never includes raw stdin content to prevent reflection attacks.
 
 **Trade-off — audit gap in `--json-error` mode**:
 
