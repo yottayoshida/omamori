@@ -389,6 +389,17 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
 
     match extract_hook_input(&input) {
         HookInput::MalformedJson => {
+            if json_error {
+                emit_json_error(
+                    "layer2:input-validation",
+                    "invalid-input",
+                    "hook input could not be validated",
+                    None,
+                    None,
+                    HINT_INPUT_VALIDATION,
+                );
+                return Ok(2);
+            }
             eprintln!("omamori hook: blocked — hook input is not valid JSON");
             eprintln!("  The command was denied because omamori cannot verify its safety.");
             eprintln!(
@@ -404,6 +415,17 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
             Ok(2)
         }
         HookInput::MalformedMissingField => {
+            if json_error {
+                emit_json_error(
+                    "layer2:input-validation",
+                    "invalid-input",
+                    "hook input could not be validated",
+                    None,
+                    None,
+                    HINT_INPUT_VALIDATION,
+                );
+                return Ok(2);
+            }
             eprintln!("omamori hook: blocked — required fields missing from hook input");
             eprintln!("  The command was denied because omamori cannot verify its safety.");
             eprintln!("  Expected: tool_input.command or tool_input.file_path");
@@ -421,8 +443,19 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
             tool_input,
         } => run_hook_check_unknown_tool(&tool_name, &tool_input, &provider, verbose, json_error),
         HookInput::FileOp { tool, path } => {
-            if let Some(reason) = is_protected_file_path(&path) {
-                eprintln!("omamori hook: blocked {tool} to protected file — {reason}");
+            if let Some((pattern, description)) = is_protected_file_path(&path) {
+                if json_error {
+                    emit_json_error(
+                        "layer2:file-protection",
+                        "protected-file",
+                        &format!("blocked {tool} to protected file — {description}"),
+                        Some(pattern),
+                        None,
+                        HINT_FILE_PROTECTION,
+                    );
+                    return Ok(2);
+                }
+                eprintln!("omamori hook: blocked {tool} to protected file — {description}");
                 eprintln!("  AI agents cannot modify omamori configuration or security files.");
                 eprintln!(
                     "  To edit config: use `omamori config` CLI or edit the file directly in your terminal."
@@ -485,7 +518,7 @@ fn run_hook_check_command(
                     reason,
                     matched_pattern,
                     matched_position.as_ref(),
-                    command,
+                    &format!("run `omamori explain -- {command}` for details"),
                 );
             } else {
                 audit_log_hook_block(
@@ -524,7 +557,7 @@ fn run_hook_check_command(
                     &message,
                     matched_pattern,
                     matched_position.as_ref(),
-                    command,
+                    &format!("run `omamori explain -- {command}` for details"),
                 );
             } else {
                 audit_log_hook_block(
@@ -571,7 +604,7 @@ fn run_hook_check_command(
                     &message,
                     matched_pattern,
                     matched_position.as_ref(),
-                    command,
+                    &format!("run `omamori explain -- {command}` for details"),
                 );
             } else {
                 audit_log_hook_block(command, provider, None, None, detection_layer);
@@ -634,8 +667,19 @@ fn run_hook_check_unknown_tool(
             run_hook_check_command(cmd, provider, verbose, json_error)
         }
         InputShape::FileOp(path) => {
-            if let Some(reason) = is_protected_file_path(path) {
-                eprintln!("omamori hook: blocked {tool_name} to protected file — {reason}");
+            if let Some((pattern, description)) = is_protected_file_path(path) {
+                if json_error {
+                    emit_json_error(
+                        "layer2:file-protection",
+                        "protected-file",
+                        &format!("blocked {tool_name} to protected file — {description}"),
+                        Some(pattern),
+                        None,
+                        HINT_FILE_PROTECTION,
+                    );
+                    return Ok(2);
+                }
+                eprintln!("omamori hook: blocked {tool_name} to protected file — {description}");
                 eprintln!("  AI agents cannot modify omamori configuration or security files.");
                 eprintln!(
                     "  To edit config: use `omamori config` CLI or edit the file directly in your terminal."
@@ -824,6 +868,8 @@ const VALID_DETECTION_LAYERS_STATIC: &[&str] = &[
     "layer2:rule",
     "layer2:structural",
     "layer2:obfuscated-expansion",
+    "layer2:input-validation",
+    "layer2:file-protection",
 ];
 
 /// Validate that `detection_layer` value falls within the v0.9.7 taxonomy.
@@ -1017,7 +1063,7 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, &str)] = &[
 ];
 
 /// Check whether a file path targets a protected omamori file.
-fn is_protected_file_path(path: &str) -> Option<&'static str> {
+fn is_protected_file_path(path: &str) -> Option<(&'static str, &'static str)> {
     let lexical = crate::context::normalize_path(path);
 
     let candidates: Vec<std::path::PathBuf> = match std::fs::canonicalize(&lexical) {
@@ -1033,11 +1079,11 @@ fn is_protected_file_path(path: &str) -> Option<&'static str> {
     let lexical_str = lexical.to_string_lossy();
     for &(pattern, reason) in PROTECTED_FILE_PATTERNS {
         if lexical_str.contains(pattern) {
-            return Some(reason);
+            return Some((pattern, reason));
         }
         for candidate in &candidates {
             if candidate.to_string_lossy().contains(pattern) {
-                return Some(reason);
+                return Some((pattern, reason));
             }
         }
     }
@@ -1262,6 +1308,10 @@ fn parse_json_error_flag(args: &[OsString]) -> bool {
     args.iter().any(|a| a.to_str() == Some("--json-error"))
 }
 
+const HINT_INPUT_VALIDATION: &str = "Tell the user: this action was blocked by omamori because the input could not be verified. Ask if you should try a different approach or if the user prefers to handle it directly.";
+
+const HINT_FILE_PROTECTION: &str = "Tell the user: this file is protected by omamori and AI modifications are blocked. Describe the intended change and ask if you should try a different approach or if the user prefers to make the change directly.";
+
 /// Emit a structured JSON error to stderr for `--json-error` mode.
 /// Schema is documented in SECURITY.md "hook-check --json-error schema".
 fn emit_json_error(
@@ -1270,7 +1320,7 @@ fn emit_json_error(
     reason: &str,
     matched_pattern: Option<&str>,
     matched_position: Option<&Range<usize>>,
-    command: &str,
+    hint: &str,
 ) {
     let payload = serde_json::json!({
         "blocked": true,
@@ -1282,7 +1332,7 @@ fn emit_json_error(
             "start": r.start,
             "end": r.end,
         })),
-        "hint": format!("run `omamori explain -- {command}` for details"),
+        "hint": hint,
     });
     eprintln!(
         "{}",
