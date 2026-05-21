@@ -61,7 +61,7 @@ omamori install --force
 #    既存 session 内 hook script は古い binary path を embed している場合がある
 
 # (4) 開始時 sanity check (このセクションを始める前に必ず通す)
-omamori --version | grep -qE '0\.10\.12' && echo "v0.10.12 ready" || { echo "FAIL: install release-candidate binary first"; exit 1; }
+omamori --version | grep -qE '0\.10\.13' && echo "v0.10.13 ready" || { echo "FAIL: install release-candidate binary first"; exit 1; }
 
 # (5) AI 環境を維持 (raw terminal でも同じ)
 export CLAUDECODE=1

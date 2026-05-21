@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.13] - 2026-05-21
+
+**Summary**: Extend `--json-error` structured JSON output from shell-command blocks to all deny paths — malformed input, missing fields, and protected file operations. AI agents now parse one JSON format regardless of block reason, eliminating fallback to exit-code-only detection for non-command blocks.
+
+### Changed
+
+- **`emit_json_error` signature: `command` → `hint`** — Callers now pass the hint string directly instead of having it derived internally from the command. This enables non-command deny paths (input validation, file protection) to provide context-appropriate hints. Existing shell-command call sites pass `format!("run \`omamori explain -- {command}\` for details")` preserving current behavior. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+- **`is_protected_file_path` return type: `Option<&str>` → `Option<(&str, &str)>`** — Returns `(pattern, reason)` tuple so `matched_pattern` can be populated in JSON output for file protection blocks. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+- **SECURITY.md schema documentation updated** — Scope expanded from "shell-command path only" to "all deny paths". New `layer2:input-validation` and `layer2:file-protection` layer values documented. Oracle minimization for input validation errors noted. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+
+### Added
+
+- **`--json-error` for MalformedJson and MalformedMissingField** — Both emit identical JSON (`layer: "layer2:input-validation"`, `rule_id: "invalid-input"`) to minimize oracle exposure. Attackers cannot distinguish JSON parse failures from missing-field errors. Reason string is static (never includes raw stdin content). Early return pattern prevents verbose raw-input leakage. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+- **`--json-error` for FileOp protected file deny** — Both direct and unknown-tool paths emit `layer: "layer2:file-protection"`, `rule_id: "protected-file"` with `matched_pattern` populated from `PROTECTED_FILE_PATTERNS`. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+- **"Tell the user:" hint pattern** — New deny paths use a structured hint format directing AI agents to inform the user about the block and offer two choices: try a different approach or handle it directly. No bypass information provided. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+- **`HINT_INPUT_VALIDATION` and `HINT_FILE_PROTECTION` constants** — Module-level constants for hint strings, eliminating inline duplication across 4 call sites. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+- **8 new integration tests** — MalformedJson, MalformedMissingField, FileOp (direct + unknown-tool), single-object contract assertions, and verbose+json-error interaction tests confirming no raw-input leakage. ([#249](https://github.com/yottayoshida/omamori/issues/249))
+
 ## [0.10.12] - 2026-05-20
 
 **Summary**: Replace verbose `omamori install` output (40+ lines of per-file paths and outcome variants) with a concise 4-line summary banner showing Layer 1 (shims), Layer 2 (hooks), Config, and Policy status at a glance. Users can now answer "am I protected?" in under one second.
