@@ -1846,21 +1846,26 @@ fn hook_check_blocks_rm_reversed_flags() {
 // Codex review (Phase 6-B) flagged the previous internal-enum-only test
 // as insufficient (mutation resistance weak, false confidence high).
 
-/// Run `omamori hook-check --json-error --provider claude-code` with stdin.
-fn run_hook_check_json_error(input: &str) -> (String, String, i32) {
+fn run_hook_check_json_error_impl(input: &str, verbose: bool) -> (String, String, i32) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let test_home = std::env::temp_dir().join(format!("omamori-cli-jsonerr-{nanos}"));
+    let suffix = if verbose { "-v" } else { "" };
+    let test_home = std::env::temp_dir().join(format!("omamori-cli-jsonerr{suffix}-{nanos}"));
     let _ = std::fs::create_dir_all(&test_home);
 
-    let mut child = Command::new(binary())
-        .args(["hook-check", "--provider", "claude-code", "--json-error"])
+    let mut cmd = Command::new(binary());
+    cmd.args(["hook-check", "--provider", "claude-code", "--json-error"])
         .env("HOME", &test_home)
         .env("XDG_CONFIG_HOME", test_home.join(".config"))
         .env("XDG_DATA_HOME", test_home.join(".local/share"))
-        .env("XDG_CACHE_HOME", test_home.join(".cache"))
+        .env("XDG_CACHE_HOME", test_home.join(".cache"));
+    if verbose {
+        cmd.env("OMAMORI_VERBOSE", "1");
+    }
+
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1880,6 +1885,11 @@ fn run_hook_check_json_error(input: &str) -> (String, String, i32) {
     let exit_code = output.status.code().unwrap_or(-1);
     let _ = std::fs::remove_dir_all(&test_home);
     (stdout, stderr, exit_code)
+}
+
+/// Run `omamori hook-check --json-error --provider claude-code` with stdin.
+fn run_hook_check_json_error(input: &str) -> (String, String, i32) {
+    run_hook_check_json_error_impl(input, false)
 }
 
 /// Parse the stderr of `--json-error` mode as a single JSON object.
@@ -2144,39 +2154,7 @@ fn hook_check_json_error_fileop_single_object_contract() {
 }
 
 fn run_hook_check_json_error_verbose(input: &str) -> (String, String, i32) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let test_home = std::env::temp_dir().join(format!("omamori-cli-jsonerr-v-{nanos}"));
-    let _ = std::fs::create_dir_all(&test_home);
-
-    let mut child = Command::new(binary())
-        .args(["hook-check", "--provider", "claude-code", "--json-error"])
-        .env("HOME", &test_home)
-        .env("XDG_CONFIG_HOME", test_home.join(".config"))
-        .env("XDG_DATA_HOME", test_home.join(".local/share"))
-        .env("XDG_CACHE_HOME", test_home.join(".cache"))
-        .env("OMAMORI_VERBOSE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn hook-check --json-error verbose");
-
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-
-    let output = child.wait_with_output().expect("failed to wait");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-    let _ = std::fs::remove_dir_all(&test_home);
-    (stdout, stderr, exit_code)
+    run_hook_check_json_error_impl(input, true)
 }
 
 #[test]

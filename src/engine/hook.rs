@@ -396,7 +396,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                     "hook input could not be validated",
                     None,
                     None,
-                    "Tell the user: this action was blocked by omamori because the input could not be verified. Ask if you should try a different approach or if the user prefers to handle it directly.",
+                    HINT_INPUT_VALIDATION,
                 );
                 return Ok(2);
             }
@@ -422,7 +422,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                     "hook input could not be validated",
                     None,
                     None,
-                    "Tell the user: this action was blocked by omamori because the input could not be verified. Ask if you should try a different approach or if the user prefers to handle it directly.",
+                    HINT_INPUT_VALIDATION,
                 );
                 return Ok(2);
             }
@@ -451,7 +451,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                         &format!("blocked {tool} to protected file — {description}"),
                         Some(pattern),
                         None,
-                        "Tell the user: this file is protected by omamori and AI modifications are blocked. Describe the intended change and ask if you should try a different approach or if the user prefers to make the change directly.",
+                        HINT_FILE_PROTECTION,
                     );
                     return Ok(2);
                 }
@@ -675,7 +675,7 @@ fn run_hook_check_unknown_tool(
                         &format!("blocked {tool_name} to protected file — {description}"),
                         Some(pattern),
                         None,
-                        "Tell the user: this file is protected by omamori and AI modifications are blocked. Describe the intended change and ask if you should try a different approach or if the user prefers to make the change directly.",
+                        HINT_FILE_PROTECTION,
                     );
                     return Ok(2);
                 }
@@ -1307,6 +1307,10 @@ fn parse_provider_flag(args: &[OsString]) -> String {
 fn parse_json_error_flag(args: &[OsString]) -> bool {
     args.iter().any(|a| a.to_str() == Some("--json-error"))
 }
+
+const HINT_INPUT_VALIDATION: &str = "Tell the user: this action was blocked by omamori because the input could not be verified. Ask if you should try a different approach or if the user prefers to handle it directly.";
+
+const HINT_FILE_PROTECTION: &str = "Tell the user: this file is protected by omamori and AI modifications are blocked. Describe the intended change and ask if you should try a different approach or if the user prefers to make the change directly.";
 
 /// Emit a structured JSON error to stderr for `--json-error` mode.
 /// Schema is documented in SECURITY.md "hook-check --json-error schema".
