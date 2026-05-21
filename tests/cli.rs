@@ -2017,8 +2017,7 @@ fn hook_check_json_error_stderr_is_single_object() {
 
 #[test]
 fn hook_check_json_error_malformed_json() {
-    let (stdout, stderr, exit_code) =
-        run_hook_check_json_error("this is not json at all");
+    let (stdout, stderr, exit_code) = run_hook_check_json_error("this is not json at all");
     assert_eq!(exit_code, 2);
     assert!(stdout.is_empty());
     let json = parse_json_error_stderr(&stderr);
@@ -2077,10 +2076,7 @@ fn hook_check_json_error_fileop_protected_file() {
     assert_eq!(json["layer"], "layer2:file-protection");
     assert_eq!(json["rule_id"], "protected-file");
     assert!(
-        json["reason"]
-            .as_str()
-            .unwrap()
-            .contains("protected file"),
+        json["reason"].as_str().unwrap().contains("protected file"),
         "reason must mention protected file"
     );
     assert!(
@@ -2159,8 +2155,7 @@ fn run_hook_check_json_error_verbose(input: &str) -> (String, String, i32) {
 
 #[test]
 fn hook_check_json_error_verbose_malformed_no_raw_input() {
-    let (_, stderr, exit_code) =
-        run_hook_check_json_error_verbose("this is not json at all");
+    let (_, stderr, exit_code) = run_hook_check_json_error_verbose("this is not json at all");
     assert_eq!(exit_code, 2);
     let trimmed = stderr.trim();
     assert!(
