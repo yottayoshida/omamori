@@ -219,7 +219,10 @@ mod tests {
         let text = usage_text();
         assert!(text.contains("ESSENTIALS"), "missing ESSENTIALS header");
         assert!(text.contains("DIAGNOSTICS"), "missing DIAGNOSTICS header");
-        assert!(text.contains("CONFIGURATION"), "missing CONFIGURATION header");
+        assert!(
+            text.contains("CONFIGURATION"),
+            "missing CONFIGURATION header"
+        );
         assert!(text.contains("FLAGS"), "missing FLAGS header");
     }
 
@@ -227,7 +230,10 @@ mod tests {
     fn help_hides_internal_commands() {
         let text = usage_text();
         assert!(!text.contains("hook-check"), "hook-check should be hidden");
-        assert!(!text.contains("cursor-hook"), "cursor-hook should be hidden");
+        assert!(
+            !text.contains("cursor-hook"),
+            "cursor-hook should be hidden"
+        );
         assert!(
             !text.contains("exec [--config"),
             "exec should be hidden from default help"
@@ -308,8 +314,17 @@ mod tests {
         let help_all = usage_text_full();
 
         let routable = [
-            "test", "install", "uninstall", "init", "config", "override", "audit", "doctor",
-            "explain", "report", "status",
+            "test",
+            "install",
+            "uninstall",
+            "init",
+            "config",
+            "override",
+            "audit",
+            "doctor",
+            "explain",
+            "report",
+            "status",
         ];
         for cmd in &routable {
             assert!(
