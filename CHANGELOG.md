@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.10.14] - 2026-05-24
+
+**Summary**: Categorize `omamori --help` output into ESSENTIALS / DIAGNOSTICS / CONFIGURATION sections and hide internal commands (`hook-check`, `cursor-hook`, `exec`) behind `--help-all`. Error messages now show a concise one-line hint instead of the full usage dump. Display-only change with no behavioral or routing modifications.
+
+### Changed
+
+- **`--help` output categorized** — 17 flat-listed subcommands reorganized into 3 sections (ESSENTIALS, DIAGNOSTICS, CONFIGURATION) with 11 user-facing commands visible. Internal commands hidden from default help. Reduces Hick's Law decision time ~61% (log2(17) → log2(3) first-stage). ([#281](https://github.com/yottayoshida/omamori/issues/281))
+- **Error messages use concise hint** — All 15+ error-path format strings across 9 files replaced verbose full-usage dumps with `Run 'omamori --help' for usage.` (one-line `USAGE_HINT` constant). Matches git/cargo/rustup convention. `audit` subcommand errors similarly use `Run 'omamori audit' for usage.` instead of the full audit usage block. ([#281](https://github.com/yottayoshida/omamori/issues/281))
+
+### Added
+
+- **`--help-all` / `help-all` subcommand** — Shows all commands including INTERNAL section (`hook-check`, `cursor-hook`, `exec`) and the PATH shim paragraph. Additive match arm only — no existing routing modified. ([#281](https://github.com/yottayoshida/omamori/issues/281))
+- **16 content assertion tests** — 11 tests in `src/util.rs` verifying category headers, internal command visibility, hint format, and help inventory coverage. 5 routing tests in `src/lib.rs` for `help`, `-h`, `--help-all`, `help-all`, `--version`. 6 tests in `src/cli/audit_cmd.rs` for audit error path hint format. ([#281](https://github.com/yottayoshida/omamori/issues/281))
+
 ## [0.10.13] - 2026-05-21
 
 **Summary**: Extend `--json-error` structured JSON output from shell-command blocks to all deny paths — malformed input, missing fields, and protected file operations. AI agents now parse one JSON format regardless of block reason, eliminating fallback to exit-code-only detection for non-command blocks.
