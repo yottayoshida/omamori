@@ -13,7 +13,7 @@ use crate::engine::shim::{emit_config_warnings, update_baseline_silent};
 use crate::installer::default_base_dir;
 use crate::integrity;
 use crate::rules;
-use crate::util::usage_text;
+use crate::util::USAGE_HINT;
 
 // ---------------------------------------------------------------------------
 // config subcommand
@@ -37,11 +37,11 @@ pub(crate) fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
         }
         Some(other) => Err(AppError::Usage(format!(
             "unknown config subcommand: {other}\n\n{}",
-            usage_text()
+            USAGE_HINT
         ))),
         None => Err(AppError::Usage(format!(
             "config requires a subcommand\n\n{}",
-            usage_text()
+            USAGE_HINT
         ))),
     }
 }
@@ -66,11 +66,11 @@ pub(crate) fn run_override_command(args: &[OsString]) -> Result<i32, AppError> {
         }
         Some(other) => Err(AppError::Usage(format!(
             "unknown override subcommand: {other}\n\n{}",
-            usage_text()
+            USAGE_HINT
         ))),
         None => Err(AppError::Usage(format!(
             "override requires a subcommand (disable|enable)\n\n{}",
-            usage_text()
+            USAGE_HINT
         ))),
     }
 }
@@ -97,7 +97,7 @@ pub(crate) fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
             _ => {
                 return Err(AppError::Usage(format!(
                     "unknown init flag: {arg}\n\n{}",
-                    usage_text()
+                    USAGE_HINT
                 )));
             }
         }

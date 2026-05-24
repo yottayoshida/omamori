@@ -8,7 +8,7 @@ use crate::audit;
 use crate::config::load_config;
 use crate::installer::default_base_dir;
 use crate::integrity;
-use crate::util::usage_text;
+use crate::util::USAGE_HINT;
 
 pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut base_dir = default_base_dir();
@@ -31,7 +31,7 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
             _ => {
                 return Err(AppError::Usage(format!(
                     "unknown status flag: {arg}\n\n{}",
-                    usage_text()
+                    USAGE_HINT
                 )));
             }
         }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::shim::run_command;
 use crate::AppError;
-use crate::util::{binary_name, usage_text};
+use crate::util::binary_name;
 
 pub(crate) fn run_exec_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut position = 2usize;
@@ -20,10 +20,11 @@ pub(crate) fn run_exec_command(args: &[OsString]) -> Result<i32, AppError> {
     };
 
     if args.get(position).and_then(|item| item.to_str()) != Some("--") {
-        return Err(AppError::Usage(format!(
-            "exec requires `--` before the target command\n\n{}",
-            usage_text()
-        )));
+        return Err(AppError::Usage(
+            "exec requires `--` before the target command\n\n\
+             Usage: omamori exec [--config PATH] -- <command> [args...]"
+                .to_string(),
+        ));
     }
 
     let program = args

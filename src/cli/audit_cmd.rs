@@ -17,8 +17,7 @@ pub(crate) fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
         // Sugar over `audit show --action unknown_tool_fail_open --all`.
         Some("unknown") => run_audit_unknown(args),
         Some(other) => Err(AppError::Usage(format!(
-            "unknown audit subcommand: {other}\n\n{}",
-            audit_usage()
+            "unknown audit subcommand: {other}\n\n{AUDIT_USAGE_HINT}"
         ))),
         None => {
             eprintln!("{}", audit_usage());
@@ -147,8 +146,7 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
             }
             other => {
                 return Err(AppError::Usage(format!(
-                    "unknown show flag: {other}\n\n{}",
-                    audit_usage()
+                    "unknown show flag: {other}\n\n{AUDIT_USAGE_HINT}"
                 )));
             }
         }
@@ -206,8 +204,7 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
             }
             other => {
                 return Err(AppError::Usage(format!(
-                    "unknown 'audit unknown' flag: {other}\n\n{}",
-                    audit_usage()
+                    "unknown 'audit unknown' flag: {other}\n\n{AUDIT_USAGE_HINT}"
                 )));
             }
         }
@@ -256,15 +253,15 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
             }
         }
         Some(other) => Err(AppError::Usage(format!(
-            "unknown audit key subcommand: {other}\n\n{}",
-            audit_usage()
+            "unknown audit key subcommand: {other}\n\n{AUDIT_USAGE_HINT}"
         ))),
         None => Err(AppError::Usage(format!(
-            "audit key requires a subcommand\n\n{}",
-            audit_usage()
+            "audit key requires a subcommand\n\n{AUDIT_USAGE_HINT}"
         ))),
     }
 }
+
+const AUDIT_USAGE_HINT: &str = "Run `omamori audit` for usage.";
 
 fn audit_usage() -> &'static str {
     "omamori audit — audit log commands
@@ -278,4 +275,77 @@ fn audit_usage() -> &'static str {
   omamori audit show --relaxed                   Filter to relaxed allows (legacy data-context flag; pre-v0.10.4 logs only)
   omamori audit unknown [--last N] [--json]      Show forward-compat fail-opens for unknown tools (#182)
   omamori audit key rotate                       Rotate HMAC signing key"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // V-012: audit error paths use short hint, not full audit_usage() dump
+
+    #[test]
+    fn unknown_audit_subcommand_uses_hint() {
+        let args: Vec<OsString> = vec!["omamori".into(), "audit".into(), "bogus".into()];
+        let err = run_audit_command(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(AUDIT_USAGE_HINT), "should use short hint");
+        assert!(
+            !msg.contains("omamori audit verify"),
+            "should not dump full audit usage"
+        );
+    }
+
+    #[test]
+    fn unknown_show_flag_uses_hint() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--bogus".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(AUDIT_USAGE_HINT));
+    }
+
+    #[test]
+    fn audit_no_subcommand_shows_full_usage() {
+        let args: Vec<OsString> = vec!["omamori".into(), "audit".into()];
+        let code = run_audit_command(&args).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn unknown_audit_key_subcommand_uses_hint() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "key".into(),
+            "bogus".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(AUDIT_USAGE_HINT));
+    }
+
+    #[test]
+    fn audit_key_no_subcommand_uses_hint() {
+        let args: Vec<OsString> = vec!["omamori".into(), "audit".into(), "key".into()];
+        let err = run_audit_command(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(AUDIT_USAGE_HINT));
+    }
+
+    #[test]
+    fn unknown_audit_unknown_flag_uses_hint() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "unknown".into(),
+            "--bogus".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(AUDIT_USAGE_HINT));
+    }
 }
