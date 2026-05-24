@@ -10,27 +10,65 @@ use super::AppError;
 // Usage text
 // ---------------------------------------------------------------------------
 
+pub(crate) const USAGE_HINT: &str = "Run `omamori --help` for usage.";
+
 pub(crate) fn usage_text() -> &'static str {
-    "omamori usage:
-  omamori --version                                      # Show version
-  omamori test [--config PATH]
-  omamori exec [--config PATH] -- <command> [args...]
-  omamori install [--base-dir PATH] [--source PATH] [--hooks]
-  omamori uninstall [--base-dir PATH]
-  omamori init [--force] [--stdout]
-  omamori config list
-  omamori config disable <rule>
-  omamori config enable <rule>
-  omamori audit verify                                    # Verify hash chain integrity
-  omamori audit show [--last N] [--json] [--all]          # View audit log entries
-  omamori doctor [--fix] [--verbose] [--json]             # Diagnose and repair installation
-  omamori report [--last <duration>] [--json] [--verbose] # Aggregate audit summary (e.g. --last 7d)
-  omamori explain [--json] [--config PATH] -- <cmd...>   # Explain what would happen to a command
-  omamori status [--refresh]                              # Health check all defense layers
-  omamori override disable <rule>                        # Override a core safety rule
-  omamori override enable <rule>                         # Restore a core safety rule
-  omamori hook-check [--provider NAME] [--json-error]    # Hook detection engine (stdin → exit code)
-  omamori cursor-hook                                   # Cursor beforeShellExecution handler
+    "\
+omamori — AI tool safety guard
+
+ESSENTIALS
+  doctor                                          Check protection health
+  test                                            Verify policy rules match expected actions
+
+DIAGNOSTICS
+  report [--last <duration>] [--json] [--verbose] Aggregate audit summary
+  explain [--json] [--config PATH] -- <cmd...>    Show what omamori would do for a command
+  audit <verify|show> [options]                   Audit log operations
+  status [--refresh]                              Show installed defense layers
+
+CONFIGURATION
+  config <list|disable|enable> [rule]             Rule management
+  override <disable|enable> <rule>                Disable/restore core safety rules
+  init [--force] [--stdout]                       Generate starter config template
+  install [--base-dir PATH] [--source PATH] [--hooks]  Install PATH shims (and hooks)
+  uninstall [--base-dir PATH]                     Remove PATH shims
+
+FLAGS
+  --version                                       Show version
+  --help                                          Show this help
+  --help-all                                      Show all commands including internal ones"
+}
+
+pub(crate) fn usage_text_full() -> &'static str {
+    "\
+omamori — AI tool safety guard
+
+ESSENTIALS
+  doctor                                          Check protection health
+  test                                            Verify policy rules match expected actions
+
+DIAGNOSTICS
+  report [--last <duration>] [--json] [--verbose] Aggregate audit summary
+  explain [--json] [--config PATH] -- <cmd...>    Show what omamori would do for a command
+  audit <verify|show> [options]                   Audit log operations
+  status [--refresh]                              Show installed defense layers
+
+CONFIGURATION
+  config <list|disable|enable> [rule]             Rule management
+  override <disable|enable> <rule>                Disable/restore core safety rules
+  init [--force] [--stdout]                       Generate starter config template
+  install [--base-dir PATH] [--source PATH] [--hooks]  Install PATH shims (and hooks)
+  uninstall [--base-dir PATH]                     Remove PATH shims
+
+INTERNAL (called by hooks, not intended for direct use)
+  hook-check [--provider NAME] [--json-error]     Hook detection engine (stdin → exit code)
+  cursor-hook                                     Cursor beforeShellExecution handler
+  exec [--config PATH] -- <command> [args...]     Shim execution wrapper
+
+FLAGS
+  --version                                       Show version
+  --help                                          Show this help
+  --help-all                                      Show all commands including internal ones
 
 When installed as a PATH shim (for example via a symlink named `rm`), omamori
 uses the invoked binary name as the target command and evaluates its policies."
@@ -38,6 +76,10 @@ uses the invoked binary name as the target command and evaluates its policies."
 
 pub(crate) fn print_usage() {
     println!("{}", usage_text());
+}
+
+pub(crate) fn print_usage_full() {
+    println!("{}", usage_text_full());
 }
 
 // ---------------------------------------------------------------------------
@@ -50,8 +92,7 @@ pub(crate) fn parse_config_flag(args: &[OsString]) -> Result<Option<PathBuf>, Ap
     }
     if args.len() != 2 || args[0].to_str() != Some("--config") {
         return Err(AppError::Usage(format!(
-            "expected `--config PATH`\n\n{}",
-            usage_text()
+            "expected `--config PATH`\n\n{USAGE_HINT}"
         )));
     }
     Ok(Some(PathBuf::from(&args[1])))
@@ -170,6 +211,121 @@ mod tests {
     // Note: Testing the true path (euid=0 + SUDO_USER set) requires actual
     // root privileges. We test the negative path and trust the implementation.
     // The function is 2 lines of platform-specific code with no branching.
+
+    // --- V-001: --help shows category headers, hides internal commands ---
+
+    #[test]
+    fn help_contains_category_headers() {
+        let text = usage_text();
+        assert!(text.contains("ESSENTIALS"), "missing ESSENTIALS header");
+        assert!(text.contains("DIAGNOSTICS"), "missing DIAGNOSTICS header");
+        assert!(text.contains("CONFIGURATION"), "missing CONFIGURATION header");
+        assert!(text.contains("FLAGS"), "missing FLAGS header");
+    }
+
+    #[test]
+    fn help_hides_internal_commands() {
+        let text = usage_text();
+        assert!(!text.contains("hook-check"), "hook-check should be hidden");
+        assert!(!text.contains("cursor-hook"), "cursor-hook should be hidden");
+        assert!(
+            !text.contains("exec [--config"),
+            "exec should be hidden from default help"
+        );
+        assert!(
+            !text.contains("INTERNAL"),
+            "INTERNAL section should not appear in default help"
+        );
+    }
+
+    // --- V-002: --help-all shows ALL commands including internal ---
+
+    #[test]
+    fn help_all_contains_internal_section() {
+        let text = usage_text_full();
+        assert!(text.contains("INTERNAL"), "missing INTERNAL header");
+        assert!(text.contains("hook-check"), "missing hook-check");
+        assert!(text.contains("cursor-hook"), "missing cursor-hook");
+        assert!(text.contains("exec [--config"), "missing exec");
+    }
+
+    #[test]
+    fn help_all_contains_all_categories() {
+        let text = usage_text_full();
+        assert!(text.contains("ESSENTIALS"));
+        assert!(text.contains("DIAGNOSTICS"));
+        assert!(text.contains("CONFIGURATION"));
+        assert!(text.contains("INTERNAL"));
+        assert!(text.contains("FLAGS"));
+    }
+
+    // --- V-003: error messages use short hint, not full usage ---
+
+    #[test]
+    fn usage_hint_is_concise() {
+        assert!(
+            USAGE_HINT.contains("--help"),
+            "hint should reference --help"
+        );
+        assert!(
+            !USAGE_HINT.contains("ESSENTIALS"),
+            "hint should not contain full usage text"
+        );
+        assert!(USAGE_HINT.len() < 60, "hint should be a short one-liner");
+    }
+
+    // --- V-007: --help-all does NOT contain the "Use --help-all" footer ---
+
+    #[test]
+    fn help_all_no_self_referential_footer() {
+        let text = usage_text_full();
+        let has_footer = text.contains("--help-all")
+            && text
+                .lines()
+                .any(|l| l.contains("--help-all") && !l.trim().starts_with("--help-all"));
+        assert!(
+            !has_footer,
+            "--help-all should not suggest using --help-all"
+        );
+    }
+
+    // --- V-008: --help contains "Use --help-all" pointer ---
+
+    #[test]
+    fn help_references_help_all() {
+        let text = usage_text();
+        assert!(
+            text.contains("--help-all"),
+            "--help should mention --help-all"
+        );
+    }
+
+    // --- V-011: help inventory covers all routable commands ---
+
+    #[test]
+    fn help_inventory_covers_routable_commands() {
+        let help = usage_text();
+        let help_all = usage_text_full();
+
+        let routable = [
+            "test", "install", "uninstall", "init", "config", "override", "audit", "doctor",
+            "explain", "report", "status",
+        ];
+        for cmd in &routable {
+            assert!(
+                help.contains(cmd),
+                "routable command '{cmd}' missing from --help"
+            );
+        }
+
+        let internal = ["hook-check", "cursor-hook", "exec"];
+        for cmd in &internal {
+            assert!(
+                help_all.contains(cmd),
+                "internal command '{cmd}' missing from --help-all"
+            );
+        }
+    }
 
     #[test]
     fn resolve_real_command_skips_the_shim_path() {

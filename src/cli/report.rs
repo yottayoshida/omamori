@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use crate::AppError;
 use crate::audit::report::{ChainStatus, ReportAggregate, aggregate_report};
 use crate::config;
-use crate::util::usage_text;
+use crate::util::USAGE_HINT;
 
 pub(crate) fn run_report_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut days: u32 = 7;
@@ -38,8 +38,7 @@ pub(crate) fn run_report_command(args: &[OsString]) -> Result<i32, AppError> {
             }
             _ => {
                 return Err(AppError::Usage(format!(
-                    "unknown flag: {arg}\n\n{}",
-                    usage_text()
+                    "unknown flag: {arg}\n\n{USAGE_HINT}"
                 )));
             }
         }

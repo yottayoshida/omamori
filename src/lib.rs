@@ -24,7 +24,7 @@ use cli::status::run_status_command;
 use engine::exec::run_exec_command;
 use engine::hook::{run_cursor_hook, run_hook_check};
 use engine::shim::run_shim;
-use util::{binary_name, print_usage, usage_text};
+use util::{USAGE_HINT, binary_name, print_usage, print_usage_full};
 
 // Re-export public API items
 pub use cli::policy_test::{PolicyTestResult, run_policy_tests};
@@ -97,9 +97,12 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
             print_usage();
             Ok(0)
         }
+        Some("--help-all") | Some("help-all") => {
+            print_usage_full();
+            Ok(0)
+        }
         Some(other) => Err(AppError::Usage(format!(
-            "unknown subcommand: {other}\n\n{}",
-            usage_text()
+            "unknown subcommand: {other}\n\n{USAGE_HINT}"
         ))),
     }
 }
@@ -112,6 +115,48 @@ mod tests {
     fn run_usage_succeeds() {
         let args = vec![OsString::from("omamori")];
         let code = run(&args).expect("usage should succeed");
+        assert_eq!(code, 0);
+    }
+
+    // V-004: `help` (no dashes) = same as `--help`
+    #[test]
+    fn run_help_succeeds() {
+        let args = vec![OsString::from("omamori"), OsString::from("help")];
+        let code = run(&args).expect("help should succeed");
+        assert_eq!(code, 0);
+    }
+
+    // V-005: `-h` = same as `--help`
+    #[test]
+    fn run_dash_h_succeeds() {
+        let args = vec![OsString::from("omamori"), OsString::from("-h")];
+        let code = run(&args).expect("-h should succeed");
+        assert_eq!(code, 0);
+    }
+
+    // V-006: no args = same as `--help`
+    // (already covered by run_usage_succeeds)
+
+    // V-010: exit code 0 for --help-all
+    #[test]
+    fn run_help_all_flag_succeeds() {
+        let args = vec![OsString::from("omamori"), OsString::from("--help-all")];
+        let code = run(&args).expect("--help-all should succeed");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn run_help_all_subcommand_succeeds() {
+        let args = vec![OsString::from("omamori"), OsString::from("help-all")];
+        let code = run(&args).expect("help-all should succeed");
+        assert_eq!(code, 0);
+    }
+
+    // V-009: --version unaffected
+    #[test]
+    fn run_version_succeeds() {
+        let args = vec![OsString::from("omamori"), OsString::from("--version")];
+        let code = run(&args).expect("--version should succeed");
         assert_eq!(code, 0);
     }
 }

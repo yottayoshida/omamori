@@ -12,7 +12,7 @@ use crate::audit::report::{ChainStatus, aggregate_report};
 use crate::engine::guard::guard_ai_config_modification;
 use crate::installer;
 use crate::integrity::{self, CheckItem, CheckStatus, Remediation};
-use crate::util::usage_text;
+use crate::util::USAGE_HINT;
 
 use super::checks_display::group_by_section;
 
@@ -50,8 +50,7 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
             }
             _ => {
                 return Err(AppError::Usage(format!(
-                    "unknown doctor flag: {arg}\n\n{}",
-                    usage_text()
+                    "unknown doctor flag: {arg}\n\n{USAGE_HINT}"
                 )));
             }
         }

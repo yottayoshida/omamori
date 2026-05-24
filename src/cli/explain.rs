@@ -13,7 +13,7 @@ use crate::context;
 use crate::engine::guard::guard_ai_config_modification;
 use crate::engine::hook::{HookCheckResult, check_command_for_hook};
 use crate::rules::{CommandInvocation, match_rule};
-use crate::util::{parse_config_flag, usage_text};
+use crate::util::{USAGE_HINT, parse_config_flag};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -55,7 +55,7 @@ pub(crate) fn run_explain_command(args: &[OsString]) -> Result<i32, AppError> {
             _ => {
                 return Err(AppError::Usage(format!(
                     "unknown explain flag: {arg}\n\nUsage: omamori explain [--json] [--config PATH] -- <command...>\n\n{}",
-                    usage_text()
+                    USAGE_HINT
                 )));
             }
         }
@@ -63,8 +63,7 @@ pub(crate) fn run_explain_command(args: &[OsString]) -> Result<i32, AppError> {
 
     if command_parts.is_empty() {
         return Err(AppError::Usage(format!(
-            "explain requires a command after `--`\n\nUsage: omamori explain [--json] [--config PATH] -- <command...>\n\n{}",
-            usage_text()
+            "explain requires a command after `--`\n\nUsage: omamori explain [--json] [--config PATH] -- <command...>\n\n{USAGE_HINT}"
         )));
     }
 

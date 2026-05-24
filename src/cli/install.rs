@@ -9,7 +9,7 @@ use crate::AppError;
 use crate::config::{self, load_config};
 use crate::engine::guard::guard_ai_config_modification;
 use crate::installer::{self, InstallOptions, default_base_dir, install, uninstall};
-use crate::util::usage_text;
+use crate::util::USAGE_HINT;
 
 pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut base_dir = default_base_dir();
@@ -40,7 +40,7 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
             _ => {
                 return Err(AppError::Usage(format!(
                     "unknown install flag: {arg}\n\n{}",
-                    usage_text()
+                    USAGE_HINT
                 )));
             }
         }
@@ -217,7 +217,7 @@ pub(crate) fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> 
             _ => {
                 return Err(AppError::Usage(format!(
                     "unknown uninstall flag: {arg}\n\n{}",
-                    usage_text()
+                    USAGE_HINT
                 )));
             }
         }
