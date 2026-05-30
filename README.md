@@ -21,17 +21,15 @@ omamori is not a sandbox or a permission classifier. It is a local deterministic
 # Install (macOS)
 brew install yottayoshida/tap/omamori
 
-# Setup (shims + hooks + config — all in one)
-omamori install --hooks
-
-# Add to your shell profile (~/.zshrc or ~/.bashrc)
-export PATH="$HOME/.omamori/shim:$PATH"
-
-# Verify everything is healthy
-omamori doctor
+# One-command setup: shims + hooks + shell PATH + verify
+omamori setup
 ```
 
-That's it. Works with Claude Code Auto mode — no extra config needed.
+That's it. `setup` installs shims and hooks, appends `$HOME/.omamori/shim` to your shell profile, and runs `omamori doctor` — all in one step. Works with Claude Code Auto mode, no extra config needed.
+
+> **Already installed?** `omamori setup` is idempotent — safe to re-run after upgrades.
+> For non-interactive environments (CI, scripts): `omamori setup --non-interactive`.
+> Preview without changes: `omamori setup --dry-run`.
 
 > `report` and the trust-dashboard `doctor` output require omamori >= 0.10.0.
 
@@ -199,7 +197,7 @@ omamori config enable git-push-force-block   # restore default
 omamori test                                 # verify policy
 ```
 
-Or edit `~/.config/omamori/config.toml` directly. Config is auto-created by `install --hooks`. See `omamori init --stdout` for the full template.
+Or edit `~/.config/omamori/config.toml` directly. Config is auto-created by `omamori setup` (or `install --hooks`). See `omamori init --stdout` for the full template.
 
 <details>
 <summary>Configuration examples</summary>
@@ -248,7 +246,8 @@ strict = true  # default: false. Hook-only commands (ls, cat, etc.) are not affe
 ## CLI Reference
 
 ```
-omamori install [--hooks]                # Setup shims + hooks + config (re-run after brew upgrade for Cursor)
+omamori setup [--dry-run] [--non-interactive]  # One-command install + shell profile + verify
+omamori install [--hooks]                # Install shims + hooks (no shell profile)
 omamori doctor [--fix] [--verbose] [--json]  # Diagnose and auto-repair installation
 omamori explain [--json] -- <cmd...>     # Show what would happen to a command and why
 omamori test [--config PATH]             # Verify policy rules
