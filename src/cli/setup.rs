@@ -8,11 +8,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use crate::AppError;
 use crate::config;
 use crate::installer::{self, InstallOptions, SHIM_COMMANDS};
 use crate::integrity::{self, CheckStatus};
 use crate::util::USAGE_HINT;
-use crate::AppError;
 
 use super::doctor::is_ai_environment;
 
@@ -81,7 +81,7 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     }
 
     let shell = detect_shell();
-    let profile = shell.and_then(|s| detect_profile_path(s));
+    let profile = shell.and_then(detect_profile_path);
 
     if dry_run {
         return print_dry_run(&base_dir, shell, profile.as_deref(), custom_base, ai_env);
@@ -132,12 +132,12 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
         println!("  - Custom --base-dir; add PATH manually:");
         print_manual_path_instructions(&result.shim_dir);
         false
+    } else if let (Some(s), Some(profile_path)) = (shell, &profile) {
+        handle_profile(profile_path, &result.shim_dir, s, non_interactive)?
     } else if shell.is_none() {
         println!("  - Unknown shell; add PATH manually:");
         print_manual_path_instructions(&result.shim_dir);
         false
-    } else if let Some(ref profile_path) = profile {
-        handle_profile(profile_path, &result.shim_dir, shell.unwrap(), non_interactive)?
     } else {
         println!("  - Shell profile not found; add PATH manually:");
         print_manual_path_instructions(&result.shim_dir);
@@ -167,11 +167,9 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     // --- Summary ---
     println!("\n  Setup complete!\n");
     println!("    Protected commands: {}", SHIM_COMMANDS.join(", "));
-    if profile_done {
-        if let Some(ref p) = profile {
-            println!("    \u{25b8} Activate now:  source {}", p.display());
-            println!("      (or open a new terminal tab)");
-        }
+    if profile_done && let Some(ref p) = profile {
+        println!("    \u{25b8} Activate now:  source {}", p.display());
+        println!("      (or open a new terminal tab)");
     }
     println!("    Verify anytime:  omamori doctor");
     println!();
@@ -287,10 +285,7 @@ fn append_path_to_profile(profile: &Path) -> Result<(), AppError> {
         env!("CARGO_PKG_VERSION"),
     );
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(profile)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(profile)?;
     file.write_all(block.as_bytes())?;
     Ok(())
 }

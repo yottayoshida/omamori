@@ -2431,10 +2431,7 @@ fn setup_non_tty_without_flag_exits_1() {
     assert_eq!(code, 1, "non-TTY without --non-interactive should exit 1");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("not a terminal"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("not a terminal"), "stderr: {stderr}");
 
     // No mutations should have occurred
     assert!(
@@ -2528,8 +2525,5 @@ fn setup_unknown_flag_errors() {
 
     assert!(!output.status.success(), "unknown flag should fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unknown setup flag"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("unknown setup flag"), "stderr: {stderr}");
 }
