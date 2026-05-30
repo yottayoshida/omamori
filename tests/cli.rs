@@ -2188,3 +2188,342 @@ fn hook_check_json_error_verbose_fileop_no_extra_lines() {
         "verbose + json-error FileOp must be single line (got {trimmed:?})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// setup command tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_dry_run_no_mutations() {
+    let base = unique_dir("setup-dry");
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--dry-run", "--base-dir"])
+        .arg(&base)
+        .env("SHELL", "/bin/zsh")
+        .output()
+        .expect("failed to run setup --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("dry-run"), "stdout: {stdout}");
+    assert!(stdout.contains("No changes made"), "stdout: {stdout}");
+
+    let shim_dir = base.join("shim");
+    assert!(!shim_dir.exists(), "dry-run should not create shim dir");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn setup_non_interactive_installs_and_appends() {
+    let home = unique_dir("setup-ni-home");
+    let profile = home.join(".zshrc");
+    fs::write(&profile, "# existing content\n").unwrap();
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("SHELL", "/bin/zsh")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup --non-interactive");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "exit={} stderr: {}",
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("[1/3]"), "stdout: {stdout}");
+    assert!(stdout.contains("Setup complete"), "stdout: {stdout}");
+
+    // Shims installed under $HOME/.omamori/shim
+    let shim_dir = home.join(".omamori").join("shim");
+    assert!(shim_dir.join("rm").exists(), "rm shim missing");
+
+    let content = fs::read_to_string(&profile).unwrap();
+    assert!(
+        content.contains("# Added by omamori setup"),
+        "profile: {content}"
+    );
+    assert!(
+        content.contains("export PATH=\""),
+        "profile must contain export PATH line: {content}"
+    );
+    assert!(
+        content.contains(".omamori/shim"),
+        "export PATH must reference .omamori/shim: {content}"
+    );
+    assert!(
+        content.starts_with("# existing content"),
+        "existing content must be preserved"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_idempotent_no_duplicate_path() {
+    let home = unique_dir("setup-idem-home");
+    let profile = home.join(".zshrc");
+    fs::write(&profile, "").unwrap();
+
+    for _ in 0..2 {
+        let mut cmd = Command::new(binary());
+        clean_ai_env(&mut cmd);
+        let output = cmd
+            .args(["setup", "--non-interactive"])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("SHELL", "/bin/zsh")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run setup");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let content = fs::read_to_string(&profile).unwrap();
+    let marker_count = content.matches("# Added by omamori setup").count();
+    assert_eq!(
+        marker_count, 1,
+        "marker should appear exactly once, got {marker_count}"
+    );
+    let export_count = content.matches("export PATH=").count();
+    assert_eq!(
+        export_count, 1,
+        "export PATH should appear exactly once, got {export_count}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_unknown_shell_exits_2() {
+    let home = unique_dir("setup-unk-sh-home");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env_remove("SHELL")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup");
+
+    let code = output.status.code().unwrap_or(-1);
+    assert_eq!(code, 2, "unknown shell should exit 2");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Unknown shell"),
+        "stdout should mention unknown shell: {stdout}"
+    );
+
+    // Shims should still be installed (only profile is skipped)
+    assert!(
+        home.join(".omamori").join("shim").join("rm").exists(),
+        "shims should still be installed"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_ai_env_skips_profile() {
+    let base = unique_dir("setup-ai");
+    let home = unique_dir("setup-ai-home");
+    let profile = home.join(".zshrc");
+    fs::write(&profile, "").unwrap();
+
+    let output = Command::new(binary())
+        .args(["setup", "--base-dir"])
+        .arg(&base)
+        .env("HOME", &home)
+        .env("SHELL", "/bin/zsh")
+        .env("CLAUDECODE", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup in AI env");
+
+    let code = output.status.code().unwrap_or(-1);
+    assert_eq!(code, 2, "AI env should exit 2");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("AI environment"),
+        "should mention AI env: {stdout}"
+    );
+
+    let content = fs::read_to_string(&profile).unwrap();
+    assert!(
+        content.is_empty(),
+        "AI env should not modify profile: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_already_configured_exits_0() {
+    let home = unique_dir("setup-already-home");
+    let profile = home.join(".zshrc");
+    fs::write(
+        &profile,
+        "# existing\n# Added by omamori setup (v0.10.0)\nexport PATH=\"/x:$PATH\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("SHELL", "/bin/zsh")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup");
+
+    let code = output.status.code().unwrap_or(-1);
+    assert_eq!(code, 0, "already configured should exit 0");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Already in PATH"),
+        "should say already in PATH: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_non_tty_without_flag_exits_1() {
+    let home = unique_dir("setup-nontty-home");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup"])
+        .env("HOME", &home)
+        .env("SHELL", "/bin/zsh")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup");
+
+    let code = output.status.code().unwrap_or(-1);
+    assert_eq!(code, 1, "non-TTY without --non-interactive should exit 1");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not a terminal"), "stderr: {stderr}");
+
+    // No mutations should have occurred
+    assert!(
+        !home.join(".omamori").exists(),
+        "no shims should be installed"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_bash_uses_bashrc() {
+    let home = unique_dir("setup-bash-home");
+    // No .bash_profile → should fall back to .bashrc
+    let bashrc = home.join(".bashrc");
+    fs::write(&bashrc, "").unwrap();
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("SHELL", "/bin/bash")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup with bash");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let content = fs::read_to_string(&bashrc).unwrap();
+    assert!(
+        content.contains("# Added by omamori setup"),
+        ".bashrc should be modified: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_bash_prefers_bash_profile() {
+    let home = unique_dir("setup-bashprof-home");
+    let bash_profile = home.join(".bash_profile");
+    let bashrc = home.join(".bashrc");
+    fs::write(&bash_profile, "").unwrap();
+    fs::write(&bashrc, "").unwrap();
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("SHELL", "/bin/bash")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup with bash");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let bp_content = fs::read_to_string(&bash_profile).unwrap();
+    let rc_content = fs::read_to_string(&bashrc).unwrap();
+    assert!(
+        bp_content.contains("# Added by omamori setup"),
+        ".bash_profile should be modified: {bp_content}"
+    );
+    assert!(
+        !rc_content.contains("# Added by omamori setup"),
+        ".bashrc should NOT be modified when .bash_profile exists: {rc_content}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_unknown_flag_errors() {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--bogus"])
+        .output()
+        .expect("failed to run setup");
+
+    assert!(!output.status.success(), "unknown flag should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown setup flag"), "stderr: {stderr}");
+}

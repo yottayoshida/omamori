@@ -491,7 +491,7 @@ fn remediation_hint(rem: &Remediation, ai_env: bool) -> String {
 }
 
 /// Lightweight AI environment check reusing the detector infrastructure.
-fn is_ai_environment() -> bool {
+pub(crate) fn is_ai_environment() -> bool {
     let detectors = crate::config::default_detectors();
     let env_pairs: Vec<(String, String)> = std::env::vars().collect();
     let detection = crate::detector::evaluate_detectors(&detectors, &env_pairs);

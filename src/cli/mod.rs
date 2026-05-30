@@ -15,4 +15,5 @@ pub(crate) mod explain;
 pub(crate) mod install;
 pub(crate) mod policy_test;
 pub(crate) mod report;
+pub(crate) mod setup;
 pub(crate) mod status;

@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.11.0] - 2026-05-30
+
+**Summary**: Add `omamori setup` — a single interactive command that replaces the 5-step manual onboarding flow (install → hooks → edit shell profile → source → doctor) with one guided wizard. The y/n prompt (default Y) appends a portable `$HOME/.omamori/shim` PATH entry to the user's shell profile. AI environments auto-skip the profile prompt. Includes `--dry-run` preview and `--non-interactive` mode for CI.
+
+### Added
+
+- **`omamori setup` subcommand** — Orchestrates `installer::install()` (shims + hooks), shell profile PATH append, and `integrity::full_check()` verification in a 3-step guided flow. Detects shell from `$SHELL` basename (zsh, bash only). Appends `export PATH="$HOME/.omamori/shim:$PATH"` with a versioned marker comment for idempotency. Exit codes: 0 (all done), 1 (preflight error or doctor failure), 2 (installed but profile skipped). ([#277](https://github.com/yottayoshida/omamori/issues/277))
+- **`--dry-run` flag** — Shows what `setup` would do without creating or modifying any files. Correctly reflects AI environment detection (skips profile preview when AI env detected). ([#277](https://github.com/yottayoshida/omamori/issues/277))
+- **`--non-interactive` flag** — Auto-appends PATH without prompting. Automatically enabled in AI environments (`CLAUDECODE`, `CODEX_CLI`, etc.). ([#277](https://github.com/yottayoshida/omamori/issues/277))
+- **AI environment detection (DI-7)** — Reuses `doctor::is_ai_environment()` to skip profile modification when running inside AI agents. Install and hooks proceed normally (they strengthen protection). Manual PATH instructions printed instead. ([#277](https://github.com/yottayoshida/omamori/issues/277))
+- **Broken symlink detection** — `handle_profile()` uses `fs::symlink_metadata()` to detect broken symlinks at the shell profile path before attempting any I/O, providing a clear error message instead of a confusing OS-level "No such file or directory". ([#277](https://github.com/yottayoshida/omamori/issues/277))
+- **10 integration tests** — Covering non-interactive, idempotency, dry-run, AI env, unknown shell, already-configured, non-TTY stdin, bash profile selection, and unknown flag error paths. ([#277](https://github.com/yottayoshida/omamori/issues/277))
+
+### Changed
+
+- **`is_ai_environment()` visibility** — Changed from private to `pub(crate)` in `doctor.rs` so `setup.rs` can reuse it. No public API change. ([#277](https://github.com/yottayoshida/omamori/issues/277))
+- **`layer2_tool_names()` respects `codex_config_outcome`** — No longer reports "Codex CLI" as installed when `codex_hooks = false` in the user's config (`ExplicitlyDisabled`). Previously only checked `codex_hooks_outcome`. ([#277](https://github.com/yottayoshida/omamori/issues/277))
+- **Exit code reflects doctor verification** — `setup` returns exit 1 when `integrity::full_check()` finds failures, even if install and profile steps succeeded. Previously only checked profile status. ([#277](https://github.com/yottayoshida/omamori/issues/277))
+
 ## [0.10.14] - 2026-05-24
 
 **Summary**: Categorize `omamori --help` output into ESSENTIALS / DIAGNOSTICS / CONFIGURATION sections and hide internal commands (`hook-check`, `cursor-hook`, `exec`) behind `--help-all`. Error messages now show a concise one-line hint instead of the full usage dump. Display-only change with no behavioral or routing modifications.
