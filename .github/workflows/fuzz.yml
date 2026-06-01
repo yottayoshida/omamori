@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           # Pinned: nightly-2026-05-04+ breaks cargo-fuzz 0.13.1 via rustix 0.36.5
           # (rustc_attrs reservation). Unpin once cargo-fuzz ships a fix.
