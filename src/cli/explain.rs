@@ -204,6 +204,14 @@ fn evaluate_layer2(command_str: &str) -> Layer2Result {
             phase: "allow".to_string(),
             detail: "no Phase 1B or rule match".to_string(),
         },
+        HookCheckResult::AllowByBreakGlass {
+            rule_name,
+            expires_at,
+        } => Layer2Result {
+            blocked: false,
+            phase: format!("break-glass: {rule_name}"),
+            detail: format!("bypassed (expires {expires_at})"),
+        },
         HookCheckResult::BlockMeta { reason, .. } => Layer2Result {
             blocked: true,
             phase: "meta-pattern".to_string(),

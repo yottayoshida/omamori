@@ -457,19 +457,51 @@ pub(crate) fn run_command(
         ActionExecutor::new(SystemOps::new(resolved_program, detector_env_keys.clone()));
 
     let outcome = if let Some(rule) = effective_rule {
-        let outcome = executor.execute(&invocation, rule)?;
-        match &outcome {
-            ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. } => {
-                eprintln!("{}", outcome.message());
-                let explain_cmd = format_explain_hint(&invocation);
-                eprintln!("  hint: run `{explain_cmd}` for details");
+        // Break-glass: if rule is bypassed, skip enforcement and pass through
+        if crate::break_glass::is_bypassed(&rule.name) {
+            eprintln!(
+                "omamori: break-glass bypass active for '{}' — executing without protection",
+                rule.name
+            );
+            // Audit the bypass
+            if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
+                let provider = detection
+                    .matched_detectors
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "none".to_string());
+                let event = crate::cli::break_glass_cmd::create_bypass_event(
+                    &rule.name,
+                    &invocation.program,
+                    &provider,
+                    "layer1:break-glass",
+                );
+                if let Some(code) =
+                    try_audit_append(&logger, event, load_result.config.audit.strict)
+                {
+                    return Ok(code);
+                }
             }
-            ActionOutcome::Trashed { message, .. } | ActionOutcome::MovedTo { message, .. } => {
-                eprintln!("{message}");
+            executor.exec_passthrough(&invocation)?
+        } else {
+            let outcome = executor.execute(&invocation, rule)?;
+            match &outcome {
+                ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. } => {
+                    eprintln!("{}", outcome.message());
+                    let explain_cmd = format_explain_hint(&invocation);
+                    eprintln!("  hint: run `{explain_cmd}` for details");
+                    eprintln!(
+                        "  hint: false positive? run `omamori break-glass --rule {}` to bypass for 1h",
+                        rule.name
+                    );
+                }
+                ActionOutcome::Trashed { message, .. } | ActionOutcome::MovedTo { message, .. } => {
+                    eprintln!("{message}");
+                }
+                _ => {}
             }
-            _ => {}
+            outcome
         }
-        outcome
     } else {
         executor.exec_passthrough(&invocation)?
     };

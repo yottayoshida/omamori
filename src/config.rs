@@ -584,10 +584,20 @@ pub fn default_rules() -> Vec<RuleConfig> {
         )
         .with_subcommand("explain")
         .with_builtin(true),
+        RuleConfig::new(
+            "omamori-break-glass-block",
+            "omamori",
+            ActionKind::Block,
+            Vec::new(),
+            Vec::new(),
+            Some("omamori blocked break-glass activation via AI".to_string()),
+        )
+        .with_subcommand("break-glass")
+        .with_builtin(true),
     ]
 }
 
-/// Names of the 13 core (built-in) safety rules: 7 generic + 6 omamori-* (DI-13).
+/// Names of the 14 core (built-in) safety rules: 7 generic + 7 omamori-* (DI-13).
 pub fn core_rule_names() -> Vec<&'static str> {
     vec![
         "rm-recursive-to-trash",
@@ -603,6 +613,7 @@ pub fn core_rule_names() -> Vec<&'static str> {
         "omamori-override-block",
         "omamori-doctor-fix-block",
         "omamori-explain-block",
+        "omamori-break-glass-block",
     ]
 }
 

@@ -119,6 +119,30 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
             );
         }
     }
+
+    // Break-glass status
+    let bg_entries = crate::break_glass::read_active_entries();
+    if !bg_entries.is_empty() {
+        let names: Vec<String> = bg_entries
+            .iter()
+            .map(|e| {
+                let r = e.remaining_secs().unwrap_or(0);
+                format!(
+                    "{} ({})",
+                    e.rule_id,
+                    crate::break_glass::format_remaining(r)
+                )
+            })
+            .collect();
+        println!(
+            "  {:<6} {:<36} {} rule(s) bypassed: {}",
+            "[warn]",
+            "Break-glass",
+            bg_entries.len(),
+            names.join(", ")
+        );
+    }
+
     println!();
 
     let exit_code = report.exit_code();

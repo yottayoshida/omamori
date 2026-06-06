@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.11.1] - 2026-06-06
+
+**Summary**: Add `omamori break-glass` — a time-limited, audited bypass for specific rules when false positives occur. Activation requires interactive human confirmation (AI agents are blocked by two independent gates: `guard_ai_config_modification()` and a DI-13 builtin rule). All bypass activations and passthroughs are HMAC audit-logged. DI-13 self-protection rules (7 `omamori-*` rules) are structurally excluded from bypass at both activation time and evaluation time.
+
+### Added
+
+- **`omamori break-glass --rule <id>` subcommand** — Activates a time-limited bypass for a specific rule. Default duration 1 hour, configurable from 5 minutes to 24 hours (`--duration 30m`, `--duration 8h`). Maximum 3 concurrent bypasses. Interactive confirmation prompt with no `--yes` flag to prevent AI activation. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **`omamori break-glass --status`** — Shows all active bypasses with remaining time. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **`omamori break-glass --clear [--rule <id>]`** — Revokes one or all active bypasses early. Audit-logged. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **Layer 1 + Layer 2 break-glass integration** — Both PATH shim (Layer 1) and PreToolUse hook (Layer 2) check `is_bypassed()` before blocking. Bypassed commands execute with full audit trail. In strict audit mode, audit failure blocks the command (fail-closed). ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **`HookCheckResult::AllowByBreakGlass` variant** — Distinguishes break-glass allow from normal allow for audit purposes. Includes rule name and expiry time. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **DI-13 rule: `omamori-break-glass-block`** — Prevents AI agents from activating break-glass via Layer 2 hook detection. Combined with `guard_ai_config_modification()` for defense-in-depth. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **Break-glass hint in block messages** — When a command is blocked, stderr now includes a hint: `hint: false positive? run 'omamori break-glass --rule <id>' to bypass for 1h`. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **`omamori doctor` break-glass section** — Shows active bypasses with remaining time in health check output. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **`omamori status` break-glass display** — Shows `[warn]` with bypassed rule names and remaining time. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **State file: `~/.local/share/omamori/break-glass.json`** — JSON state file with version field, atomic writes (tmp+fsync+rename), 0o600 permissions, symlink rejection. Already protected by `PROTECTED_FILE_PATTERNS`. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **`is_bypassed()` fail-closed on all error paths** — No file, corrupted JSON, wrong version, symlink, expired entry, I/O error all return `false`. Non-bypassable rules checked at both activation and evaluation time. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+- **17 unit tests** — Covering no-file, corrupted JSON, wrong version, expired entry, active entry, non-bypassable rules, wrong rule, symlink rejection, duration parsing (valid/too-short/too-long/invalid), DI-13 denylist sync, and format_remaining display. ([#247](https://github.com/yottayoshida/omamori/issues/247))
+
 ## [0.11.0] - 2026-05-30
 
 **Summary**: Add `omamori setup` — a single interactive command that replaces the 5-step manual onboarding flow (install → hooks → edit shell profile → source → doctor) with one guided wizard. The y/n prompt (default Y) appends a portable `$HOME/.omamori/shim` PATH entry to the user's shell profile. AI environments auto-skip the profile prompt. Includes `--dry-run` preview and `--non-interactive` mode for CI.

@@ -26,6 +26,9 @@ DIAGNOSTICS
   explain [--json] [--config PATH] -- <cmd...>    Show what omamori would do for a command
   audit <verify|show> [options]                   Audit log operations
   status [--refresh]                              Show installed defense layers
+  break-glass --rule <id> [--duration <dur>]      Time-limited bypass for false positives
+  break-glass --status                            Show active bypasses
+  break-glass --clear [--rule <id>]               Revoke bypass(es)
 
 CONFIGURATION
   config <list|disable|enable> [rule]             Rule management
@@ -54,6 +57,9 @@ DIAGNOSTICS
   explain [--json] [--config PATH] -- <cmd...>    Show what omamori would do for a command
   audit <verify|show> [options]                   Audit log operations
   status [--refresh]                              Show installed defense layers
+  break-glass --rule <id> [--duration <dur>]      Time-limited bypass for false positives
+  break-glass --status                            Show active bypasses
+  break-glass --clear [--rule <id>]               Revoke bypass(es)
 
 CONFIGURATION
   config <list|disable|enable> [rule]             Rule management

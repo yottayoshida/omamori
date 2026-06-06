@@ -1,5 +1,6 @@
 pub mod actions;
 pub mod audit;
+pub(crate) mod break_glass;
 mod cli;
 pub mod config;
 pub mod context;
@@ -14,6 +15,7 @@ mod util;
 use std::ffi::OsString;
 
 use cli::audit_cmd::run_audit_command;
+use cli::break_glass_cmd::run_break_glass_command;
 use cli::config_cmd::{run_config_command, run_init_command, run_override_command};
 use cli::doctor::run_doctor_command;
 use cli::explain::run_explain_command;
@@ -84,6 +86,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("config") => run_config_command(args),
         Some("override") => run_override_command(args),
         Some("audit") => run_audit_command(args),
+        Some("break-glass") => run_break_glass_command(args),
         Some("doctor") => run_doctor_command(args),
         Some("setup") => run_setup_command(args),
         Some("explain") => run_explain_command(args),
