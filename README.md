@@ -120,7 +120,7 @@ Terminal → rm -rf src/
 | **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, Claude Code settings.json | Hook integration tests |
 | **Auto-sync** | Detects version mismatch after `brew upgrade` and auto-regenerates hook files | Smoke test |
 
-Core policy: built-in rules (13 as of v0.10.4, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
+Core policy: built-in rules (14 as of v0.11.1, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
 
 **Performance**: hook check completes in well under 0.1ms in the benchmark harness — typically ~1 µs to block and ~57 µs to allow. Subprocess startup by the AI tool dominates total cost. See `benches/` and [#124](https://github.com/yottayoshida/omamori/issues/124) for methodology.
 
@@ -269,6 +269,10 @@ omamori config enable <rule>             # Re-enable a rule
 omamori override disable <rule>          # Override a core safety rule
 omamori override enable <rule>           # Restore a core safety rule
 
+omamori break-glass --rule <id> [--duration <dur>]  # Time-limited bypass for false positives
+omamori break-glass --status             # Show active bypasses
+omamori break-glass --clear [--rule <id>]  # Revoke bypass(es)
+
 omamori init [--force] [--stdout]        # Create/reset config
 omamori uninstall                        # Remove shims + hooks
 omamori hook-check [--provider NAME] [--json-error]  # Hook detection engine (used internally by hooks)
@@ -295,7 +299,7 @@ These are inherent to the PATH shim approach:
 - **`sudo`** changes PATH — omamori blocks when it detects elevated execution.
 - **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected. [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools.
 - **Obfuscated commands** (base64, runtime variable indirection) — runtime-evaluated forms cannot be detected by static analysis. Static shell expansion at command verb position (`$'rm'`, `{rm,-rf,/}`) is caught since v0.10.2.
-- **AI self-bypass** — `config disable` / `uninstall` are blocked; direct file editing blocked by hooks (Claude Code only).
+- **AI self-bypass** — `config disable` / `uninstall` / `break-glass` are blocked; direct file editing blocked by hooks (Claude Code only). For human-initiated false positive recovery, use `omamori break-glass --rule <id>` (time-limited, audit-logged).
 
 For what omamori **does not** catch — by design or by structural limit — and for the full security model and bypass corpus, see [SECURITY.md](SECURITY.md).
 

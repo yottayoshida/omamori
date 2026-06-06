@@ -149,6 +149,13 @@ action = "block"
 subcommand = "explain"
 message = "omamori blocked explain via AI (oracle attack prevention)"
 
+[[rules]]
+name = "omamori-break-glass-block"
+command = "omamori"
+action = "block"
+subcommand = "break-glass"
+message = "omamori blocked break-glass activation via AI"
+
 # --- Example: move-to action (new in v0.2) ---
 # [[rules]]
 # name = "rm-to-backup"

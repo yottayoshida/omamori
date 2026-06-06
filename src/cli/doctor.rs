@@ -142,6 +142,9 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     // Section 4: Recent risk signals (from audit aggregation)
     print_risk_signals_section(ai_env);
 
+    // Section 5: Break-glass status
+    print_break_glass_section();
+
     println!();
 
     let problems: Vec<_> = items
@@ -221,6 +224,23 @@ fn print_risk_signals_section(ai_env: bool) {
         } else {
             println!("    chain: broken — run omamori audit verify");
         }
+    }
+}
+
+fn print_break_glass_section() {
+    let entries = crate::break_glass::read_active_entries();
+    if entries.is_empty() {
+        return;
+    }
+    println!();
+    println!("  [Break-glass] {} active bypass(es)", entries.len());
+    for entry in &entries {
+        let remaining = entry.remaining_secs().unwrap_or(0);
+        println!(
+            "    {}: {} remaining",
+            entry.rule_id,
+            crate::break_glass::format_remaining(remaining)
+        );
     }
 }
 

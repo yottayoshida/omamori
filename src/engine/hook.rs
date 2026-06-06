@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::ops::Range;
 
 use crate::AppError;
+use crate::audit::AuditLogger;
 use crate::config::{self, ConfigLoadResult, load_config};
 use crate::installer;
 use crate::rules::{CommandInvocation, match_rule};
@@ -47,6 +48,11 @@ pub(crate) enum HookCheckResult {
         unwrap_chain: Option<String>,
         matched_pattern: Option<&'static str>,
         matched_position: Option<Range<usize>>,
+    },
+    /// Command is allowed via break-glass bypass (rule matched but bypass active).
+    AllowByBreakGlass {
+        rule_name: String,
+        expires_at: String,
     },
     /// Command is blocked by the unwrap stack (structural block: pipe-to-shell, etc.).
     ///
@@ -284,6 +290,13 @@ fn match_invocations_against_rules(
 ) -> HookCheckResult {
     for inv in invocations {
         if let Some(rule) = match_rule(rules, inv) {
+            // Break-glass: if rule is bypassed, allow instead of block
+            if let Some(entry) = crate::break_glass::bypass_info(&rule.name) {
+                return HookCheckResult::AllowByBreakGlass {
+                    rule_name: rule.name.clone(),
+                    expires_at: entry.expires_at,
+                };
+            }
             let chain_desc = format_unwrap_chain(command, inv);
             let msg = rule
                 .message
@@ -495,6 +508,42 @@ fn run_hook_check_command(
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
         }
+        HookCheckResult::AllowByBreakGlass {
+            rule_name,
+            expires_at,
+        } => {
+            eprintln!(
+                "omamori hook: break-glass bypass active for '{rule_name}' — allowing (expires {expires_at})"
+            );
+            // Audit the bypass — in strict mode, audit failure blocks the command
+            if let Some(logger) = crate::config::load_config(None)
+                .ok()
+                .and_then(|r| AuditLogger::from_config(&r.config.audit))
+            {
+                let event = crate::cli::break_glass_cmd::create_bypass_event(
+                    &rule_name,
+                    command,
+                    provider,
+                    "layer2:break-glass",
+                );
+                let strict = crate::config::load_config(None)
+                    .map(|r| r.config.audit.strict)
+                    .unwrap_or(false);
+                if let Err(e) = logger.append(event) {
+                    eprintln!("omamori warning: failed to audit-log break-glass bypass: {e}");
+                    if strict {
+                        eprintln!(
+                            "omamori error: audit strict mode — blocking because bypass audit is required"
+                        );
+                        return Ok(2);
+                    }
+                }
+            }
+            print_hook_check_allow_response(
+                "omamori: break-glass bypass active — allowing command",
+            );
+            Ok(0)
+        }
         HookCheckResult::BlockMeta {
             reason,
             matched_pattern,
@@ -578,6 +627,9 @@ fn run_hook_check_command(
                     eprintln!("  layer: unwrap-stack (token-level)");
                 }
                 eprintln!("  hint: run `omamori explain -- {command}` for details");
+                eprintln!(
+                    "  hint: false positive? run `omamori break-glass --rule {rule_name}` to bypass for 1h"
+                );
             }
             Ok(2)
         }
@@ -989,6 +1041,15 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
 
     match check_command_for_hook(&command) {
         HookCheckResult::Allow => {
+            print_cursor_response(true, "allow", None, None);
+        }
+        HookCheckResult::AllowByBreakGlass {
+            rule_name,
+            expires_at,
+        } => {
+            eprintln!(
+                "omamori cursor-hook: break-glass bypass for '{rule_name}' (expires {expires_at})"
+            );
             print_cursor_response(true, "allow", None, None);
         }
         HookCheckResult::BlockMeta { reason, .. } => {
@@ -1450,7 +1511,7 @@ mod tests {
                 );
             }
             HookCheckResult::BlockMeta { .. } | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow => {
+            HookCheckResult::Allow | HookCheckResult::AllowByBreakGlass { .. } => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: rm -rf / was ALLOWED — fail-close fallback is broken");
             }
@@ -1506,6 +1567,8 @@ mod tests {
                             format!("BlockRule({rule_name})"),
                         HookCheckResult::BlockStructural { message: r, .. } =>
                             format!("BlockStructural({r})"),
+                        HookCheckResult::AllowByBreakGlass { rule_name, .. } =>
+                            format!("AllowByBreakGlass({rule_name})"),
                         HookCheckResult::Allow => unreachable!(),
                     }
                 );
@@ -1814,7 +1877,7 @@ mod tests {
         match check_command_for_hook("unset CLAUDECODE") {
             HookCheckResult::BlockMeta { .. } => {}
             HookCheckResult::BlockRule { .. } | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow => {
+            HookCheckResult::Allow | HookCheckResult::AllowByBreakGlass { .. } => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: 'unset CLAUDECODE' was ALLOWED — meta-pattern is broken");
             }
@@ -1883,6 +1946,9 @@ mod tests {
                     }
                     HookCheckResult::BlockStructural { message: r, .. } => {
                         format!("BlockStructural({r})")
+                    }
+                    HookCheckResult::AllowByBreakGlass { rule_name, .. } => {
+                        format!("AllowByBreakGlass({rule_name})")
                     }
                     HookCheckResult::Allow => unreachable!(),
                 };
