@@ -244,7 +244,7 @@ The format is based on Keep a Changelog.
 
 ### Known limitations
 
-- **`--break-glass` flag not yet implemented**: if a new false-positive pattern surfaces post-v0.10.3, recovery path is `omamori uninstall` → wait for patch release → `omamori install`. A proper `--break-glass` with audit emission and rate-limit is planned for v0.11.x.
+- **`omamori break-glass` implemented in v0.11.1**: time-limited, audited bypass for false positives. See [0.11.1] entry above.
 - **Path-based 18 entries retain substring match**: `gh issue create --body "see ~/.claude/settings.json"` is still BLOCKED by design (T3 heredoc redirect to protected path defense). Use `--body-file <path>` as a one-off bypass. A structural revision scoping path patterns to writeable surface only is planned for v0.11.x.
 - **v0.10.2 → v0.10.3 incidental coverage narrow**: 5 vectors that v0.10.2's broad substring match incidentally caught are now allowed. All consistent with previously-declared scope-outs (non-default shells `tcsh`/`su`, interpreter family `awk`/`perl` per [#74](https://github.com/yottayoshida/omamori/issues/74), alias dynamic dispatch). Documented in `SECURITY.md` "Broad match by design" section.
 - **`--json-error` JSON contract scope**: applies to the shell-command path only. Other deny paths (malformed hook input, file-op deny, unknown-tool fail-open) retain free-form stderr; extension is a follow-up.
