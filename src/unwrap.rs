@@ -75,6 +75,21 @@ pub enum BlockReason {
 }
 
 impl BlockReason {
+    /// Whether this block reason is eligible for materialize (allow + audit + staging)
+    /// instead of hard-block. Materializable reasons have low evasion signal and high
+    /// false-positive rates in practice. Non-materializable reasons indicate active
+    /// evasion or opaque content that must always be blocked.
+    pub fn is_materializable(&self) -> bool {
+        match self {
+            Self::PipeToShell { .. }
+            | Self::ParseError
+            | Self::InputTooLarge
+            | Self::TooManyTokens
+            | Self::TooManySegments => true,
+            Self::ObfuscatedExpansion | Self::DynamicGeneration | Self::DepthExceeded => false,
+        }
+    }
+
     pub fn message(&self) -> &'static str {
         match self {
             Self::InputTooLarge => "input exceeds size limit",
@@ -5070,5 +5085,26 @@ mod tests {
     #[test]
     fn fp_command_v_lookup() {
         assert_not_obfuscated("command -v rm");
+    }
+
+    // --- is_materializable classification (#299) ---
+
+    #[test]
+    fn materializable_reasons_are_classified_correctly() {
+        use super::BlockReason;
+        assert!(BlockReason::PipeToShell { wrapper: None }.is_materializable());
+        assert!(BlockReason::PipeToShell { wrapper: Some("env") }.is_materializable());
+        assert!(BlockReason::ParseError.is_materializable());
+        assert!(BlockReason::InputTooLarge.is_materializable());
+        assert!(BlockReason::TooManyTokens.is_materializable());
+        assert!(BlockReason::TooManySegments.is_materializable());
+    }
+
+    #[test]
+    fn non_materializable_reasons_are_classified_correctly() {
+        use super::BlockReason;
+        assert!(!BlockReason::ObfuscatedExpansion.is_materializable());
+        assert!(!BlockReason::DynamicGeneration.is_materializable());
+        assert!(!BlockReason::DepthExceeded.is_materializable());
     }
 }
