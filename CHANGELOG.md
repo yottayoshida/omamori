@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+**Summary**: Materialize structural blocks instead of hard-blocking (#299). Materializable block reasons (PipeToShell, ParseError, TooManyTokens, TooManySegments) now write the command to a staging file and audit-log the event instead of blocking. Non-materializable reasons (InputTooLarge, ObfuscatedExpansion, DynamicGeneration, DepthExceeded) remain hard-blocked. Configurable via `[structural] action = "materialize" | "block"` in config.toml (default: materialize). Degraded config (corrupt TOML, insecure permissions) fails closed.
+
+### Added
+
+- **`HookCheckResult::AllowMaterialize` variant** — Distinguishes materialize-allow from normal allow. Carries `wrapper_kind` for audit and optional `staging_path`. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **`resolve_structural_block()` policy router** — Loads config lazily (only for materializable reasons), checks `[structural] action`, writes staging file, and audit-logs. Supports `dry_run` mode for `omamori explain`. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **Staging file infrastructure** — `~/.local/share/omamori/staging/{epoch}_{pid}_{counter}.txt` with symlink defense, 0o600 permissions, O_CREAT|O_EXCL, and 1 MB size cap. Staging write failure is fail-open (warn + allow) by default, fail-closed in `audit.strict` mode. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **Materialize audit logging** — `action = "materialize"`, `result = "allow"`, `detection_layer = "layer2:materialize:{reason}"` with staging path in `unwrap_chain`. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **`ConfigLoadResult::degraded` field** — Distinguishes "config file not found" (legitimate default) from "config exists but broken" (corrupt TOML, insecure permissions). Degraded config with default Materialize action fails closed. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **`check_command_for_hook_dry_run()`** — Side-effect-free variant for `omamori explain`: classifies commands without writing staging files or audit entries. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **`[structural]` config section** — `action = "materialize"` (default) or `"block"` (legacy behavior). Parsed from `config.toml`. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **`BlockReason::is_materializable()`** — Classification method on the unwrap stack's block reasons. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **7 unit tests** — Covering default config materialize, non-materializable block, dry_run no-side-effects, config action=block, degraded config fail-closed, detection_layer variants, and staging size limit. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+
+### Changed
+
+- **46 hook integration test entries** — Changed from `Decision::Block` to `Decision::Allow` for materializable structural blocks (pipe-to-shell, redirect-axis, proc-sub families). Labels renamed from `-block` to `-materialize`. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **`omamori explain` uses dry-run hook check** — No longer creates staging files or audit entries as side effects of explain. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+- **`InputTooLarge` reclassified as non-materializable** — Moved from materializable to non-materializable (always blocked). The parser cannot reliably extract meaningful content from oversized inputs. ([#299](https://github.com/yottayoshida/omamori/issues/299))
+
+### Known Limitations
+
+- Staging directory does not verify permissions on existing directories (deferred to future release).
+- `sync_all()` on staging files could be relaxed to `sync_data()` for better performance (deferred to future release).
+
 ## [0.11.1] - 2026-06-06
 
 **Summary**: Add `omamori break-glass` — a time-limited, audited bypass for specific rules when false positives occur. Activation requires interactive human confirmation (AI agents are blocked by two independent gates: `guard_ai_config_modification()` and a DI-13 builtin rule). All bypass activations and passthroughs are HMAC audit-logged. DI-13 self-protection rules (7 `omamori-*` rules) are structurally excluded from bypass at both activation time and evaluation time.
