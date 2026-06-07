@@ -360,6 +360,7 @@ mod tests {
         let load_result = ConfigLoadResult {
             config: Config::default(),
             warnings: Vec::new(),
+            degraded: false,
         };
 
         let results = run_policy_tests(&load_result);

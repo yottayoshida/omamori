@@ -11,7 +11,7 @@ use crate::AppError;
 use crate::config::{self, ConfigLoadResult, load_config};
 use crate::context;
 use crate::engine::guard::guard_ai_config_modification;
-use crate::engine::hook::{HookCheckResult, check_command_for_hook};
+use crate::engine::hook::{HookCheckResult, check_command_for_hook_dry_run};
 use crate::rules::{CommandInvocation, match_rule};
 use crate::util::{USAGE_HINT, parse_config_flag};
 
@@ -132,6 +132,7 @@ fn evaluate_layer1(
             ConfigLoadResult {
                 config: config::Config::default(),
                 warnings: vec![],
+                degraded: true,
             }
         }
     };
@@ -198,7 +199,7 @@ fn evaluate_layer1(
 // ---------------------------------------------------------------------------
 
 fn evaluate_layer2(command_str: &str) -> Layer2Result {
-    match check_command_for_hook(command_str) {
+    match check_command_for_hook_dry_run(command_str) {
         HookCheckResult::Allow => Layer2Result {
             blocked: false,
             phase: "allow".to_string(),
@@ -211,6 +212,14 @@ fn evaluate_layer2(command_str: &str) -> Layer2Result {
             blocked: false,
             phase: format!("break-glass: {rule_name}"),
             detail: format!("bypassed (expires {expires_at})"),
+        },
+        HookCheckResult::AllowMaterialize { staging_path, .. } => Layer2Result {
+            blocked: false,
+            phase: "structural (materialized)".to_string(),
+            detail: match staging_path {
+                Some(p) => format!("materialized — staging file: {p}"),
+                None => "materialized — staging file write failed".to_string(),
+            },
         },
         HookCheckResult::BlockMeta { reason, .. } => Layer2Result {
             blocked: true,

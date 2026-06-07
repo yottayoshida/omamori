@@ -61,6 +61,11 @@ impl Default for Config {
 pub struct ConfigLoadResult {
     pub config: Config,
     pub warnings: Vec<String>,
+    /// True when the config file existed but could not be parsed or had
+    /// insecure permissions.  Callers that make security-sensitive decisions
+    /// (e.g. structural block policy) should treat a degraded load as
+    /// "user intent unknown" and fail-closed.
+    pub degraded: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +132,7 @@ pub const BLOCKED_DESTINATION_PREFIXES: &[&str] = &[
 pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
     let path = path.map(Path::to_path_buf).or_else(default_config_path);
     let mut warnings = Vec::new();
+    let mut degraded = false;
 
     let config = match path {
         Some(path) => {
@@ -139,6 +145,7 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
                 ));
                 Config::default()
             } else if !permissions_are_safe(&path)? {
+                degraded = true;
                 warnings.push(format!(
                     "config permissions are too open at {}\n  \
                      Built-in default rules are active for security.\n  \
@@ -152,6 +159,7 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
                 match toml::from_str::<UserConfig>(&content) {
                     Ok(user_config) => build_merged_config(user_config, &mut warnings),
                     Err(error) => {
+                        degraded = true;
                         warnings.push(format!(
                             "failed to parse config at {} ({error})\n  \
                              Built-in default rules are active for safety.\n  \
@@ -166,7 +174,11 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
         None => Config::default(),
     };
 
-    Ok(ConfigLoadResult { config, warnings })
+    Ok(ConfigLoadResult {
+        config,
+        warnings,
+        degraded,
+    })
 }
 
 // ---------------------------------------------------------------------------

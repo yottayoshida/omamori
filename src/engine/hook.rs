@@ -54,6 +54,14 @@ pub(crate) enum HookCheckResult {
         rule_name: String,
         expires_at: String,
     },
+    /// Command is allowed via materialize policy: the structural block is
+    /// materializable (PipeToShell, ParseError, TooManyTokens, TooManySegments)
+    /// and config `[structural] action = "materialize"`.
+    /// A staging file is written before allowing. #299.
+    AllowMaterialize {
+        wrapper_kind: Option<&'static str>,
+        staging_path: Option<String>,
+    },
     /// Command is blocked by the unwrap stack (structural block: pipe-to-shell, etc.).
     ///
     /// `wrapper_kind` carries the transparent-wrapper basename
@@ -238,13 +246,9 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
     None
 }
 
-/// Phase 1B (env tampering, PATH shim bypass) and the structural branch of
-/// Phase 2 (parse-error / pipe-to-shell). Returns `Err(verdict)` for any
-/// early-return case, or `Ok(invocations)` for the caller to apply rule
-/// matching against a chosen rule slice.
-type PrePhase2Ok = Vec<CommandInvocation>;
-
-fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
+/// Phase 1B: token-level env var tampering / PATH override bypass.
+/// Returns `Err(BlockMeta)` on detection, `Ok(())` otherwise.
+fn check_phase_1b(command: &str) -> Result<(), HookCheckResult> {
     let normalized = unwrap::normalize_compound_operators(command);
     if let Ok(tokens) = shell_words::split(&normalized) {
         if let Some(reason) = detect_env_var_tampering(&tokens) {
@@ -262,22 +266,102 @@ fn check_pre_phase_2(command: &str) -> Result<PrePhase2Ok, HookCheckResult> {
             });
         }
     }
+    Ok(())
+}
 
-    match unwrap::parse_command_string(command) {
-        unwrap::ParseResult::Block(reason) => {
-            let wrapper_kind = match &reason {
-                unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
-                unwrap::BlockReason::ObfuscatedExpansion => Some("__obfuscated_expansion__"),
-                _ => None,
-            };
-            Err(HookCheckResult::BlockStructural {
-                message: format!("omamori hook: blocked — {}", reason.message()),
-                wrapper_kind,
-                matched_pattern: None,
-                matched_position: None,
-            })
+/// Extract `wrapper_kind` from a `BlockReason` for audit `detection_layer`.
+fn block_reason_wrapper_kind(reason: &unwrap::BlockReason) -> Option<&'static str> {
+    match reason {
+        unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
+        unwrap::BlockReason::ObfuscatedExpansion => Some("__obfuscated_expansion__"),
+        _ => None,
+    }
+}
+
+/// Policy routing for structural blocks (#299).
+///
+/// Non-materializable reasons (InputTooLarge, ObfuscatedExpansion,
+/// DynamicGeneration, DepthExceeded) are always hard-blocked — config is
+/// never loaded.
+/// Materializable reasons consult `config.structural.action`:
+///   - `Materialize`: write staging file + audit log → AllowMaterialize
+///   - `Block`: BlockStructural (legacy behavior)
+fn resolve_structural_block(
+    command: &str,
+    reason: &unwrap::BlockReason,
+    provider: &str,
+    dry_run: bool,
+) -> HookCheckResult {
+    let wrapper_kind = block_reason_wrapper_kind(reason);
+
+    let block = || HookCheckResult::BlockStructural {
+        message: format!("omamori hook: blocked — {}", reason.message()),
+        wrapper_kind,
+        matched_pattern: None,
+        matched_position: None,
+    };
+
+    if !reason.is_materializable() {
+        return block();
+    }
+
+    // Lazy config load — first disk I/O for this code path.
+    let load_result = match load_config(None) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("omamori warning: config load failed ({e}), blocking structural command");
+            return block();
         }
-        unwrap::ParseResult::Commands(invocations) => Ok(invocations),
+    };
+
+    let action = load_result.config.structural.action;
+
+    // Degraded config (corrupt TOML, insecure permissions) with default
+    // Materialize: the user's actual intent is unknown, so fail-closed.
+    if load_result.degraded && action == config::StructuralAction::Materialize {
+        eprintln!("omamori warning: config is degraded, blocking structural command for safety");
+        return block();
+    }
+
+    if action == config::StructuralAction::Block {
+        return block();
+    }
+
+    // --- Materialize path: allow + staging + audit ---
+
+    if dry_run {
+        return HookCheckResult::AllowMaterialize {
+            wrapper_kind,
+            staging_path: None,
+        };
+    }
+
+    let staging_path = match write_staging_file(command) {
+        Ok(p) => Some(p.to_string_lossy().into_owned()),
+        Err(e) => {
+            eprintln!("omamori warning: staging file write failed: {e}");
+            if load_result.config.audit.strict {
+                eprintln!(
+                    "omamori error: audit strict mode — blocking because staging write is required"
+                );
+                return block();
+            }
+            None
+        }
+    };
+
+    audit_log_materialize(
+        command,
+        provider,
+        reason,
+        wrapper_kind,
+        staging_path.as_deref(),
+        &load_result.config,
+    );
+
+    HookCheckResult::AllowMaterialize {
+        wrapper_kind,
+        staging_path,
     }
 }
 
@@ -314,29 +398,52 @@ fn match_invocations_against_rules(
     HookCheckResult::Allow
 }
 
-/// Two-phase hook check, evaluating against rules loaded from on-disk
+/// Three-phase hook check, evaluating against rules loaded from on-disk
 /// config with a `Config::default()` fail-safe fallback.
 ///
 /// Phase 1B: Token-level env var tampering / PATH override bypass detection
-/// Phase 2: Token-level unwrap stack → rule matching
+/// Phase 2A: Structural block → policy routing (materialize or block)
+/// Phase 2B: Token-level unwrap stack → rule matching
 ///
-/// `load_config(None)` runs lazily — only when Phase 2 actually reaches
-/// the rule-matching arm. Phase 1B/structural short-circuits pay zero
-/// disk I/O.
+/// Config is loaded lazily:
+///   - Phase 1B: no config load
+///   - Phase 2A non-materializable: no config load (always blocked)
+///   - Phase 2A materializable: config loaded for structural.action
+///   - Phase 2B: config loaded for rule matching
 ///
 /// SECURITY (T8): The `Config::default()` fallback on `load_config` failure
 /// is intentional fail-safe behavior, not fail-open.
 pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
-    let invocations = match check_pre_phase_2(command) {
-        Ok(inv) => inv,
-        Err(verdict) => return verdict,
-    };
-    // Phase 2 reached — load on-disk config now (fail-safe fallback per T8).
-    let load_result = load_config(None).unwrap_or_else(|_| ConfigLoadResult {
-        config: config::Config::default(),
-        warnings: vec![],
-    });
-    match_invocations_against_rules(command, &invocations, &load_result.config.rules)
+    check_command_for_hook_inner(command, "unknown", false)
+}
+
+/// Dry-run variant: classifies the command without writing staging files or
+/// audit log entries. Used by `omamori explain` to avoid side effects.
+pub(crate) fn check_command_for_hook_dry_run(command: &str) -> HookCheckResult {
+    check_command_for_hook_inner(command, "unknown", true)
+}
+
+fn check_command_for_hook_inner(command: &str, provider: &str, dry_run: bool) -> HookCheckResult {
+    // Phase 1B
+    if let Err(verdict) = check_phase_1b(command) {
+        return verdict;
+    }
+
+    // Phase 2A: structural check + policy routing
+    match unwrap::parse_command_string(command) {
+        unwrap::ParseResult::Block(reason) => {
+            resolve_structural_block(command, &reason, provider, dry_run)
+        }
+        unwrap::ParseResult::Commands(invocations) => {
+            // Phase 2B: rule matching (lazy config load)
+            let load_result = load_config(None).unwrap_or_else(|_| ConfigLoadResult {
+                config: config::Config::default(),
+                warnings: vec![],
+                degraded: true,
+            });
+            match_invocations_against_rules(command, &invocations, &load_result.config.rules)
+        }
+    }
 }
 
 /// Three-phase hook check, evaluating Phase 2 rule matching against an
@@ -360,11 +467,24 @@ pub(crate) fn check_command_for_hook_with_rules(
     command: &str,
     rules: &[crate::rules::RuleConfig],
 ) -> HookCheckResult {
-    let invocations = match check_pre_phase_2(command) {
-        Ok(inv) => inv,
-        Err(verdict) => return verdict,
-    };
-    match_invocations_against_rules(command, &invocations, rules)
+    if let Err(verdict) = check_phase_1b(command) {
+        return verdict;
+    }
+    match unwrap::parse_command_string(command) {
+        unwrap::ParseResult::Block(reason) => {
+            // Test path: always block (no config to consult).
+            let wrapper_kind = block_reason_wrapper_kind(&reason);
+            HookCheckResult::BlockStructural {
+                message: format!("omamori hook: blocked — {}", reason.message()),
+                wrapper_kind,
+                matched_pattern: None,
+                matched_position: None,
+            }
+        }
+        unwrap::ParseResult::Commands(invocations) => {
+            match_invocations_against_rules(command, &invocations, rules)
+        }
+    }
 }
 
 /// Format the unwrap chain for display: "rm -rf / (via bash -c)"
@@ -496,14 +616,14 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     }
 }
 
-/// Evaluate a shell command through the two-phase hook check pipeline.
+/// Evaluate a shell command through the three-phase hook check pipeline.
 fn run_hook_check_command(
     command: &str,
     provider: &str,
     verbose: bool,
     json_error: bool,
 ) -> Result<i32, AppError> {
-    match check_command_for_hook(command) {
+    match check_command_for_hook_inner(command, provider, false) {
         HookCheckResult::Allow => {
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
@@ -541,6 +661,14 @@ fn run_hook_check_command(
             }
             print_hook_check_allow_response(
                 "omamori: break-glass bypass active — allowing command",
+            );
+            Ok(0)
+        }
+        HookCheckResult::AllowMaterialize { .. } => {
+            // Staging write + audit already done in resolve_structural_block.
+            // Silent on success per plan (AI agents parse stderr).
+            print_hook_check_allow_response(
+                "omamori: structural block materialized — allowing command",
             );
             Ok(0)
         }
@@ -909,6 +1037,140 @@ fn warn_audit_append_error(
 // SEC-8: detection_layer values come from a fixed taxonomy validated by
 // `is_valid_detection_layer`.
 
+// ---------------------------------------------------------------------------
+// Staging file write (#299, v0.11.2)
+// ---------------------------------------------------------------------------
+
+const MAX_STAGING_BYTES: usize = 1_048_576; // 1 MB (matches MAX_INPUT_BYTES)
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn staging_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join(".local")
+        .join("share")
+        .join("omamori")
+        .join("staging")
+}
+
+fn ensure_staging_dir(dir: &std::path::Path) -> Result<(), std::io::Error> {
+    if dir.exists() {
+        let meta = std::fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::other("staging directory is a symlink"));
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn write_staging_file(command: &str) -> Result<std::path::PathBuf, std::io::Error> {
+    let content = command.as_bytes();
+    if content.len() > MAX_STAGING_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "staging content exceeds 1 MB limit ({} bytes)",
+                content.len()
+            ),
+        ));
+    }
+
+    let dir = staging_dir();
+    ensure_staging_dir(&dir)?;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let counter = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let filename = format!("{nanos}_{pid}_{counter}.txt");
+    let path = dir.join(&filename);
+
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+
+    let mut file = opts.open(&path)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+
+    Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Materialize audit logging (#299, v0.11.2)
+// ---------------------------------------------------------------------------
+
+fn materialize_detection_layer(reason: &unwrap::BlockReason, wrapper_kind: Option<&str>) -> String {
+    match reason {
+        unwrap::BlockReason::PipeToShell { .. } => match wrapper_kind {
+            Some(w) => format!("layer2:materialize:pipe-to-shell:{w}"),
+            None => "layer2:materialize:pipe-to-shell".to_string(),
+        },
+        unwrap::BlockReason::ParseError => "layer2:materialize:parse-error".to_string(),
+        unwrap::BlockReason::TooManyTokens => "layer2:materialize:too-many-tokens".to_string(),
+        unwrap::BlockReason::TooManySegments => "layer2:materialize:too-many-segments".to_string(),
+        _ => unreachable!("non-materializable reason passed to materialize_detection_layer"),
+    }
+}
+
+fn audit_log_materialize(
+    command: &str,
+    provider: &str,
+    reason: &unwrap::BlockReason,
+    wrapper_kind: Option<&'static str>,
+    staging_path: Option<&str>,
+    merged_config: &config::Config,
+) {
+    let detection_layer = materialize_detection_layer(reason, wrapper_kind);
+    debug_assert!(
+        is_valid_detection_layer(&detection_layer),
+        "detection_layer value must come from VALID_DETECTION_LAYERS taxonomy: got {detection_layer:?}"
+    );
+
+    let logger = match AuditLogger::from_config(&merged_config.audit) {
+        Some(l) => l,
+        None => return, // audit disabled — staging file is the primary artifact
+    };
+
+    let invocation = CommandInvocation::new(command.to_string(), Vec::new());
+    let detectors = vec![provider.to_string()];
+    let outcome = crate::actions::ActionOutcome::PassedThrough { exit_code: 0 };
+
+    let mut event = logger.create_event(&invocation, None, &detectors, &outcome);
+    event.action = "materialize".to_string();
+    event.result = "allow".to_string();
+    event.detection_layer = Some(detection_layer);
+    if let Some(p) = staging_path {
+        event.unwrap_chain = Some(vec![format!("staging:{p}")]);
+    }
+
+    if let Err(e) = logger.append(event) {
+        warn_audit_append_error(
+            &e,
+            &format_args!("{command:?}"),
+            "materialize",
+            "omamori audit show --action materialize",
+        );
+    }
+}
+
 /// Static prefix entries for `detection_layer`. Pipe-to-shell wrapper kinds
 /// are validated separately against `unwrap::TRANSPARENT_WRAPPERS` (single
 /// source of truth) so adding a new wrapper there does not require updating
@@ -922,6 +1184,11 @@ const VALID_DETECTION_LAYERS_STATIC: &[&str] = &[
     "layer2:obfuscated-expansion",
     "layer2:input-validation",
     "layer2:file-protection",
+    "layer2:materialize",
+    "layer2:materialize:parse-error",
+    "layer2:materialize:too-many-tokens",
+    "layer2:materialize:too-many-segments",
+    "layer2:materialize:pipe-to-shell",
 ];
 
 /// Validate that `detection_layer` value falls within the v0.9.7 taxonomy.
@@ -932,6 +1199,9 @@ fn is_valid_detection_layer(s: &str) -> bool {
         return true;
     }
     if let Some(rest) = s.strip_prefix("layer2:pipe-to-shell:") {
+        return crate::unwrap::TRANSPARENT_WRAPPERS.contains(&rest);
+    }
+    if let Some(rest) = s.strip_prefix("layer2:materialize:pipe-to-shell:") {
         return crate::unwrap::TRANSPARENT_WRAPPERS.contains(&rest);
     }
     false
@@ -1050,6 +1320,10 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
             eprintln!(
                 "omamori cursor-hook: break-glass bypass for '{rule_name}' (expires {expires_at})"
             );
+            print_cursor_response(true, "allow", None, None);
+        }
+        HookCheckResult::AllowMaterialize { .. } => {
+            // Staging + audit already done in resolve_structural_block.
             print_cursor_response(true, "allow", None, None);
         }
         HookCheckResult::BlockMeta { reason, .. } => {
@@ -1511,7 +1785,9 @@ mod tests {
                 );
             }
             HookCheckResult::BlockMeta { .. } | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow | HookCheckResult::AllowByBreakGlass { .. } => {
+            HookCheckResult::Allow
+            | HookCheckResult::AllowByBreakGlass { .. }
+            | HookCheckResult::AllowMaterialize { .. } => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: rm -rf / was ALLOWED — fail-close fallback is broken");
             }
@@ -1569,6 +1845,7 @@ mod tests {
                             format!("BlockStructural({r})"),
                         HookCheckResult::AllowByBreakGlass { rule_name, .. } =>
                             format!("AllowByBreakGlass({rule_name})"),
+                        HookCheckResult::AllowMaterialize { .. } => "AllowMaterialize".to_string(),
                         HookCheckResult::Allow => unreachable!(),
                     }
                 );
@@ -1877,7 +2154,9 @@ mod tests {
         match check_command_for_hook("unset CLAUDECODE") {
             HookCheckResult::BlockMeta { .. } => {}
             HookCheckResult::BlockRule { .. } | HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow | HookCheckResult::AllowByBreakGlass { .. } => {
+            HookCheckResult::Allow
+            | HookCheckResult::AllowByBreakGlass { .. }
+            | HookCheckResult::AllowMaterialize { .. } => {
                 restore_config(old_xdg, old_home, dir);
                 panic!("SECURITY: 'unset CLAUDECODE' was ALLOWED — meta-pattern is broken");
             }
@@ -1950,6 +2229,7 @@ mod tests {
                     HookCheckResult::AllowByBreakGlass { rule_name, .. } => {
                         format!("AllowByBreakGlass({rule_name})")
                     }
+                    HookCheckResult::AllowMaterialize { .. } => "AllowMaterialize".to_string(),
                     HookCheckResult::Allow => unreachable!(),
                 };
                 restore_config(old_xdg, old_home, dir);

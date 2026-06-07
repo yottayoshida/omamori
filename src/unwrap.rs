@@ -83,10 +83,12 @@ impl BlockReason {
         match self {
             Self::PipeToShell { .. }
             | Self::ParseError
-            | Self::InputTooLarge
             | Self::TooManyTokens
             | Self::TooManySegments => true,
-            Self::ObfuscatedExpansion | Self::DynamicGeneration | Self::DepthExceeded => false,
+            Self::InputTooLarge
+            | Self::ObfuscatedExpansion
+            | Self::DynamicGeneration
+            | Self::DepthExceeded => false,
         }
     }
 
@@ -5100,7 +5102,6 @@ mod tests {
             .is_materializable()
         );
         assert!(BlockReason::ParseError.is_materializable());
-        assert!(BlockReason::InputTooLarge.is_materializable());
         assert!(BlockReason::TooManyTokens.is_materializable());
         assert!(BlockReason::TooManySegments.is_materializable());
     }
@@ -5108,6 +5109,7 @@ mod tests {
     #[test]
     fn non_materializable_reasons_are_classified_correctly() {
         use super::BlockReason;
+        assert!(!BlockReason::InputTooLarge.is_materializable());
         assert!(!BlockReason::ObfuscatedExpansion.is_materializable());
         assert!(!BlockReason::DynamicGeneration.is_materializable());
         assert!(!BlockReason::DepthExceeded.is_materializable());
