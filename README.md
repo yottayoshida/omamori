@@ -66,7 +66,16 @@ Bypass classes outside this coverage scope remain possible — this is inherent 
 
 </details>
 
-Layer 2 hooks additionally block evasion patterns such as pipe-to-shell (`curl URL | bash`), dynamic command generation (`bash -c "$(cmd)"`), static shell expansion obfuscation (`$'rm'`, `{rm,-rf,/}`), environment-variable tampering, PATH override attempts targeting shimmed commands, and self-modification commands (`config disable`, `uninstall`, etc.) via builtin rules.
+Layer 2 hooks defend against evasion patterns via builtin rules. Structural patterns are handled in two ways:
+
+| Category | Examples | Default action |
+|----------|----------|----------------|
+| Extractable | pipe-to-shell (`curl … \| bash`), parse edge cases | **allow** with audit-logged staging file |
+| Opaque | dynamic generation (`bash -c "$(cmd)"`), shell obfuscation (`$'rm'`, `{rm,-rf,/}`), oversized input | **block** |
+
+Environment-variable tampering, PATH override attempts, and self-modification commands (`config disable`, `uninstall`, etc.) are always blocked. See [SECURITY.md](SECURITY.md) for the full structural pattern taxonomy.
+
+> **v0.11.2+**: Extractable structural patterns are now allowed by default (with audit trail). To restore hard-block behavior for all structural patterns, set `[structural] action = "block"` in config.toml.
 
 All rules are customizable via TOML config. See [Configuration](#configuration) below.
 
@@ -237,6 +246,12 @@ retention_days = 90  # 0 = keep all (default). Minimum 7 days.
 ```toml
 [audit]
 strict = true  # default: false. Hook-only commands (ls, cat, etc.) are not affected.
+```
+
+**Control structural block behavior** (materialize vs hard-block):
+```toml
+[structural]
+action = "block"  # default: "materialize". Set to "block" to hard-block all structural patterns.
 ```
 
 **Notes**: config requires `chmod 600`. Destinations must be absolute paths on the same volume. System directories and symlinks are rejected.
