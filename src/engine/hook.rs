@@ -416,9 +416,7 @@ fn check_command_for_hook_inner(command: &str, provider: &str) -> HookCheckResul
 
     // Phase 2A: structural check + policy routing
     match unwrap::parse_command_string(command) {
-        unwrap::ParseResult::Block(reason) => {
-            return resolve_structural_block(command, &reason, provider);
-        }
+        unwrap::ParseResult::Block(reason) => resolve_structural_block(command, &reason, provider),
         unwrap::ParseResult::Commands(invocations) => {
             // Phase 2B: rule matching (lazy config load)
             let load_result = load_config(None).unwrap_or_else(|_| ConfigLoadResult {
@@ -1045,10 +1043,7 @@ fn ensure_staging_dir(dir: &std::path::Path) -> Result<(), std::io::Error> {
     if dir.exists() {
         let meta = std::fs::symlink_metadata(dir)?;
         if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "staging directory is a symlink",
-            ));
+            return Err(std::io::Error::other("staging directory is a symlink"));
         }
         return Ok(());
     }
@@ -1105,10 +1100,7 @@ fn write_staging_file(command: &str) -> Result<std::path::PathBuf, std::io::Erro
 // Materialize audit logging (#299, v0.11.2)
 // ---------------------------------------------------------------------------
 
-fn materialize_detection_layer(
-    reason: &unwrap::BlockReason,
-    wrapper_kind: Option<&str>,
-) -> String {
+fn materialize_detection_layer(reason: &unwrap::BlockReason, wrapper_kind: Option<&str>) -> String {
     match reason {
         unwrap::BlockReason::PipeToShell { .. } => match wrapper_kind {
             Some(w) => format!("layer2:materialize:pipe-to-shell:{w}"),
@@ -1836,8 +1828,7 @@ mod tests {
                             format!("BlockStructural({r})"),
                         HookCheckResult::AllowByBreakGlass { rule_name, .. } =>
                             format!("AllowByBreakGlass({rule_name})"),
-                        HookCheckResult::AllowMaterialize { .. } =>
-                            "AllowMaterialize".to_string(),
+                        HookCheckResult::AllowMaterialize { .. } => "AllowMaterialize".to_string(),
                         HookCheckResult::Allow => unreachable!(),
                     }
                 );
@@ -2221,9 +2212,7 @@ mod tests {
                     HookCheckResult::AllowByBreakGlass { rule_name, .. } => {
                         format!("AllowByBreakGlass({rule_name})")
                     }
-                    HookCheckResult::AllowMaterialize { .. } => {
-                        "AllowMaterialize".to_string()
-                    }
+                    HookCheckResult::AllowMaterialize { .. } => "AllowMaterialize".to_string(),
                     HookCheckResult::Allow => unreachable!(),
                 };
                 restore_config(old_xdg, old_home, dir);

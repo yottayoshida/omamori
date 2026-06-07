@@ -1965,9 +1965,8 @@ fn hook_check_json_error_blockrule_shape() {
 /// is now materializable (exit 0) under default config (#299).
 #[test]
 fn hook_check_json_error_blockstructural_shape() {
-    let (stdout, stderr, exit_code) = run_hook_check_json_error(&pretooluse_bash_json(
-        "$'rm' -rf /tmp",
-    ));
+    let (stdout, stderr, exit_code) =
+        run_hook_check_json_error(&pretooluse_bash_json("$'rm' -rf /tmp"));
     assert_eq!(exit_code, 2);
     assert!(stdout.is_empty());
     let json = parse_json_error_stderr(&stderr);
