@@ -1686,7 +1686,9 @@ action = "typo"
         let config = build_merged_config(user, &mut warnings);
         assert_eq!(config.structural.action, StructuralAction::Block);
         assert!(
-            warnings.iter().any(|w| w.contains("not a recognized value") && w.contains("typo")),
+            warnings
+                .iter()
+                .any(|w| w.contains("not a recognized value") && w.contains("typo")),
             "expected invalid-action warning, got: {warnings:?}"
         );
     }
@@ -1718,7 +1720,10 @@ message = "custom"
     #[test]
     fn config_template_roundtrip_has_structural() {
         let template = config_template();
-        assert!(template.contains("[structural]"), "template must include [structural] section");
+        assert!(
+            template.contains("[structural]"),
+            "template must include [structural] section"
+        );
         assert!(template.contains("action = \"materialize\""));
     }
 
@@ -1726,7 +1731,9 @@ message = "custom"
     fn config_default_toml_structural_matches_defaults() {
         let toml_str = include_str!("../config.default.toml");
         let user: UserConfig = toml::from_str(toml_str).unwrap();
-        let raw = user.structural.expect("config.default.toml must have [structural]");
+        let raw = user
+            .structural
+            .expect("config.default.toml must have [structural]");
         assert_eq!(raw.action, "materialize");
     }
 

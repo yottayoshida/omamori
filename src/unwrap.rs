@@ -5093,7 +5093,12 @@ mod tests {
     fn materializable_reasons_are_classified_correctly() {
         use super::BlockReason;
         assert!(BlockReason::PipeToShell { wrapper: None }.is_materializable());
-        assert!(BlockReason::PipeToShell { wrapper: Some("env") }.is_materializable());
+        assert!(
+            BlockReason::PipeToShell {
+                wrapper: Some("env")
+            }
+            .is_materializable()
+        );
         assert!(BlockReason::ParseError.is_materializable());
         assert!(BlockReason::InputTooLarge.is_materializable());
         assert!(BlockReason::TooManyTokens.is_materializable());
