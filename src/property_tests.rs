@@ -119,9 +119,9 @@ fn layer1_destructive(program: &str, args: &[String], rules: &[RuleConfig]) -> b
 }
 
 /// Layer 2 blocking verdict against an explicit rule slice (hermetic; does
-/// not read on-disk config). Returns true for any of the three blocking
-/// variants of `check_command_for_hook_with_rules` (phase-1b token,
-/// structural unwrap, rule match).
+/// not read on-disk config). Returns true for any blocking variant.
+/// Note: `check_command_for_hook_with_rules` never returns
+/// `AllowMaterialize` (test path has no config to consult).
 fn layer2_blocks(command: &str, rules: &[RuleConfig]) -> bool {
     matches!(
         check_command_for_hook_with_rules(command, rules),

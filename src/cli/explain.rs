@@ -132,6 +132,7 @@ fn evaluate_layer1(
             ConfigLoadResult {
                 config: config::Config::default(),
                 warnings: vec![],
+                degraded: true,
             }
         }
     };
@@ -211,6 +212,16 @@ fn evaluate_layer2(command_str: &str) -> Layer2Result {
             blocked: false,
             phase: format!("break-glass: {rule_name}"),
             detail: format!("bypassed (expires {expires_at})"),
+        },
+        HookCheckResult::AllowMaterialize {
+            staging_path, ..
+        } => Layer2Result {
+            blocked: false,
+            phase: "structural (materialized)".to_string(),
+            detail: match staging_path {
+                Some(p) => format!("materialized — staging file: {p}"),
+                None => "materialized — staging file write failed".to_string(),
+            },
         },
         HookCheckResult::BlockMeta { reason, .. } => Layer2Result {
             blocked: true,
