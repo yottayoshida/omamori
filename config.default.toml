@@ -176,6 +176,11 @@ regenerable_paths = ["target/", "node_modules/", ".next/", "dist/", "build/", "_
 enabled = true
 timeout_ms = 100
 
+# Materializable structural blocks only (heredocs, inline scripts, large inputs).
+# Obfuscated expansions / dynamic generation / depth exceeded are always hard-blocked.
+[structural]
+action = "materialize"  # "materialize" (default) | "block" (legacy hard-block)
+
 [audit]
 enabled = false
 # retention_days = 90  # 0 = unlimited (default). Minimum 7 days.

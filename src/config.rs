@@ -15,6 +15,20 @@ use crate::rules::{ActionKind, RuleConfig};
 // Public types
 // ---------------------------------------------------------------------------
 
+/// Resolved action for structural blocks (v0.11.2+, #299).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StructuralAction {
+    #[default]
+    Materialize,
+    Block,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StructuralConfig {
+    pub action: StructuralAction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_detectors")]
@@ -27,6 +41,8 @@ pub struct Config {
     /// None disables context evaluation; Some(_) activates built-in defaults.
     #[serde(default)]
     pub context: Option<ContextConfig>,
+    #[serde(skip)]
+    pub structural: StructuralConfig,
 }
 
 impl Default for Config {
@@ -36,6 +52,7 @@ impl Default for Config {
             rules: default_rules(),
             audit: AuditConfig::default(),
             context: Some(crate::context::ContextConfig::default()),
+            structural: StructuralConfig::default(),
         }
     }
 }
@@ -50,6 +67,18 @@ pub struct ConfigLoadResult {
 // User config (deserialized from TOML — all rule fields optional for merge)
 // ---------------------------------------------------------------------------
 
+/// Raw deserialization for [structural] section. Action is a string to allow
+/// validation with warning + fallback instead of parse failure.
+#[derive(Debug, Clone, Deserialize)]
+struct UserStructuralConfig {
+    #[serde(default = "default_structural_action_str")]
+    action: String,
+}
+
+fn default_structural_action_str() -> String {
+    "materialize".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct UserConfig {
     detectors: Option<Vec<DetectorConfig>>,
@@ -59,6 +88,8 @@ struct UserConfig {
     audit: AuditConfig,
     #[serde(default)]
     context: Option<ContextConfig>,
+    #[serde(default)]
+    structural: Option<UserStructuralConfig>,
     /// `[overrides]` section: `rule_name = false` allows disabling core rules.
     #[serde(default)]
     overrides: HashMap<String, bool>,
@@ -156,11 +187,41 @@ fn build_merged_config(user: UserConfig, warnings: &mut Vec<String>) -> Config {
     let (validated_audit, audit_warnings) = user.audit.validate();
     warnings.extend(audit_warnings);
 
+    let structural = validate_structural_config(user.structural.as_ref(), warnings);
+
     Config {
         detectors,
         rules,
         audit: validated_audit,
         context: user.context,
+        structural,
+    }
+}
+
+fn validate_structural_config(
+    raw: Option<&UserStructuralConfig>,
+    warnings: &mut Vec<String>,
+) -> StructuralConfig {
+    let Some(raw) = raw else {
+        return StructuralConfig::default();
+    };
+    match raw.action.as_str() {
+        "materialize" => StructuralConfig {
+            action: StructuralAction::Materialize,
+        },
+        "block" => StructuralConfig {
+            action: StructuralAction::Block,
+        },
+        other => {
+            warnings.push(format!(
+                "[structural] action = \"{}\" is not a recognized value \
+                 (expected \"materialize\" or \"block\"); falling back to \"block\" for safety",
+                other
+            ));
+            StructuralConfig {
+                action: StructuralAction::Block,
+            }
+        }
     }
 }
 
@@ -662,6 +723,17 @@ pub fn config_template() -> String {
          # destination = \"/tmp/omamori-quarantine/\"\n\
          # match_any = [\"-r\", \"-rf\", \"-fr\", \"--recursive\"]\n\
          # message = \"omamori moved targets to backup instead of deleting\"\n",
+    );
+    out.push_str(
+        "\n# --- Structural block handling (v0.11.2+) ---\n\
+         # Controls how materializable structural blocks are handled.\n\
+         # Affects: heredocs, inline scripts, large inputs, etc.\n\
+         # Does NOT affect: obfuscated expansions, dynamic generation, depth exceeded\n\
+         # (those are always hard-blocked regardless of this setting).\n\
+         # \"materialize\" (default): allow + audit trail + staging file\n\
+         # \"block\" (legacy): hard-block as in v0.11.1 and earlier\n\
+         [structural]\n\
+         action = \"materialize\"\n",
     );
     out.push_str(
         "\n# --- Context-aware evaluation (enabled by default) ---\n\
@@ -1567,6 +1639,102 @@ message = "moved to trash"
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Structural config (#299) ---
+
+    #[test]
+    fn structural_default_is_materialize() {
+        let config = Config::default();
+        assert_eq!(config.structural.action, StructuralAction::Materialize);
+    }
+
+    #[test]
+    fn structural_action_materialize_parsed() {
+        let toml_str = r#"
+[structural]
+action = "materialize"
+"#;
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.action, StructuralAction::Materialize);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn structural_action_block_parsed() {
+        let toml_str = r#"
+[structural]
+action = "block"
+"#;
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.action, StructuralAction::Block);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn structural_action_invalid_falls_back_to_block() {
+        let toml_str = r#"
+[structural]
+action = "typo"
+"#;
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.action, StructuralAction::Block);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("not a recognized value") && w.contains("typo")),
+            "expected invalid-action warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn structural_section_absent_defaults_to_materialize() {
+        let toml_str = r#"
+[[rules]]
+name = "git-push-force-block"
+message = "custom"
+"#;
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        assert!(user.structural.is_none());
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.action, StructuralAction::Materialize);
+    }
+
+    #[test]
+    fn structural_section_without_action_defaults_to_materialize() {
+        let toml_str = "[structural]\n";
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.action, StructuralAction::Materialize);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn config_template_roundtrip_has_structural() {
+        let template = config_template();
+        assert!(
+            template.contains("[structural]"),
+            "template must include [structural] section"
+        );
+        assert!(template.contains("action = \"materialize\""));
+    }
+
+    #[test]
+    fn config_default_toml_structural_matches_defaults() {
+        let toml_str = include_str!("../config.default.toml");
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let raw = user
+            .structural
+            .expect("config.default.toml must have [structural]");
+        assert_eq!(raw.action, "materialize");
     }
 
     #[test]
