@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [Unreleased]
+## [0.11.2] - 2026-06-07
 
 **Summary**: Materialize structural blocks instead of hard-blocking (#299). Materializable block reasons (PipeToShell, ParseError, TooManyTokens, TooManySegments) now write the command to a staging file and audit-log the event instead of blocking. Non-materializable reasons (InputTooLarge, ObfuscatedExpansion, DynamicGeneration, DepthExceeded) remain hard-blocked. Configurable via `[structural] action = "materialize" | "block"` in config.toml (default: materialize). Degraded config (corrupt TOML, insecure permissions) fails closed.
 
