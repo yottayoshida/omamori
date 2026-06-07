@@ -55,8 +55,8 @@ pub(crate) enum HookCheckResult {
         expires_at: String,
     },
     /// Command is allowed via materialize policy: the structural block is
-    /// materializable (PipeToShell, ParseError, InputTooLarge, TooManyTokens,
-    /// TooManySegments) and config `[structural] action = "materialize"`.
+    /// materializable (PipeToShell, ParseError, TooManyTokens, TooManySegments)
+    /// and config `[structural] action = "materialize"`.
     /// A staging file is written before allowing. #299.
     AllowMaterialize {
         wrapper_kind: Option<&'static str>,
@@ -280,8 +280,9 @@ fn block_reason_wrapper_kind(reason: &unwrap::BlockReason) -> Option<&'static st
 
 /// Policy routing for structural blocks (#299).
 ///
-/// Non-materializable reasons (ObfuscatedExpansion, DynamicGeneration,
-/// DepthExceeded) are always hard-blocked — config is never loaded.
+/// Non-materializable reasons (InputTooLarge, ObfuscatedExpansion,
+/// DynamicGeneration, DepthExceeded) are always hard-blocked — config is
+/// never loaded.
 /// Materializable reasons consult `config.structural.action`:
 ///   - `Materialize`: write staging file + audit log → AllowMaterialize
 ///   - `Block`: BlockStructural (legacy behavior)
@@ -289,6 +290,7 @@ fn resolve_structural_block(
     command: &str,
     reason: &unwrap::BlockReason,
     provider: &str,
+    dry_run: bool,
 ) -> HookCheckResult {
     let wrapper_kind = block_reason_wrapper_kind(reason);
 
@@ -326,6 +328,13 @@ fn resolve_structural_block(
     }
 
     // --- Materialize path: allow + staging + audit ---
+
+    if dry_run {
+        return HookCheckResult::AllowMaterialize {
+            wrapper_kind,
+            staging_path: None,
+        };
+    }
 
     let staging_path = match write_staging_file(command) {
         Ok(p) => Some(p.to_string_lossy().into_owned()),
@@ -405,10 +414,16 @@ fn match_invocations_against_rules(
 /// SECURITY (T8): The `Config::default()` fallback on `load_config` failure
 /// is intentional fail-safe behavior, not fail-open.
 pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
-    check_command_for_hook_inner(command, "unknown")
+    check_command_for_hook_inner(command, "unknown", false)
 }
 
-fn check_command_for_hook_inner(command: &str, provider: &str) -> HookCheckResult {
+/// Dry-run variant: classifies the command without writing staging files or
+/// audit log entries. Used by `omamori explain` to avoid side effects.
+pub(crate) fn check_command_for_hook_dry_run(command: &str) -> HookCheckResult {
+    check_command_for_hook_inner(command, "unknown", true)
+}
+
+fn check_command_for_hook_inner(command: &str, provider: &str, dry_run: bool) -> HookCheckResult {
     // Phase 1B
     if let Err(verdict) = check_phase_1b(command) {
         return verdict;
@@ -416,7 +431,9 @@ fn check_command_for_hook_inner(command: &str, provider: &str) -> HookCheckResul
 
     // Phase 2A: structural check + policy routing
     match unwrap::parse_command_string(command) {
-        unwrap::ParseResult::Block(reason) => resolve_structural_block(command, &reason, provider),
+        unwrap::ParseResult::Block(reason) => {
+            resolve_structural_block(command, &reason, provider, dry_run)
+        }
         unwrap::ParseResult::Commands(invocations) => {
             // Phase 2B: rule matching (lazy config load)
             let load_result = load_config(None).unwrap_or_else(|_| ConfigLoadResult {
@@ -606,7 +623,7 @@ fn run_hook_check_command(
     verbose: bool,
     json_error: bool,
 ) -> Result<i32, AppError> {
-    match check_command_for_hook_inner(command, provider) {
+    match check_command_for_hook_inner(command, provider, false) {
         HookCheckResult::Allow => {
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
@@ -1109,7 +1126,7 @@ fn materialize_detection_layer(reason: &unwrap::BlockReason, wrapper_kind: Optio
         unwrap::BlockReason::ParseError => "layer2:materialize:parse-error".to_string(),
         unwrap::BlockReason::TooManyTokens => "layer2:materialize:too-many-tokens".to_string(),
         unwrap::BlockReason::TooManySegments => "layer2:materialize:too-many-segments".to_string(),
-        _ => "layer2:materialize".to_string(),
+        _ => unreachable!("non-materializable reason passed to materialize_detection_layer"),
     }
 }
 
