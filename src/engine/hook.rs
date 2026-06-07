@@ -2596,25 +2596,29 @@ mod tests {
         restore_config(old_xdg, old_home, dir);
     }
 
-    /// Non-materializable reason (ObfuscatedExpansion) → always blocked,
-    /// regardless of config.
+    /// Non-materializable reasons are always hard-blocked, regardless of
+    /// config. One representative per non-materializable variant.
     #[test]
     #[serial_test::serial(home_env)]
     fn materialize_non_materializable_always_blocks() {
         let (old_xdg, old_home, dir) = isolate_config();
-        let result = check_command_for_hook("echo $(cat /etc/shadow | base64)");
-        match result {
-            HookCheckResult::BlockStructural { .. } => {}
-            HookCheckResult::Allow => {
-                // Some obfuscation commands may parse as safe — skip if Allow
-                restore_config(old_xdg, old_home, dir);
-                return;
-            }
-            other => {
-                restore_config(old_xdg, old_home, dir);
-                panic!("expected BlockStructural or Allow, got: {other:?}");
+
+        let cases: &[(&str, &str)] = &[
+            ("$'rm' -rf /tmp/x", "ObfuscatedExpansion"),
+            ("bash -c \"$(echo rm -rf /)\"", "DynamicGeneration"),
+        ];
+
+        for (cmd, label) in cases {
+            let result = check_command_for_hook(cmd);
+            match result {
+                HookCheckResult::BlockStructural { .. } => {}
+                other => {
+                    restore_config(old_xdg, old_home, dir);
+                    panic!("{label}: expected BlockStructural for {cmd:?}, got: {other:?}");
+                }
             }
         }
+
         restore_config(old_xdg, old_home, dir);
     }
 
