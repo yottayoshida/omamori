@@ -269,10 +269,18 @@ fn heartbeat_days_ago(path: &Path) -> Option<i64> {
 }
 
 fn print_heartbeat_line() {
-    let path = crate::engine::shim::heartbeat_path();
+    let path = match crate::engine::shim::heartbeat_path() {
+        Some(p) => p,
+        None => {
+            println!("    last active: awaiting first invocation");
+            return;
+        }
+    };
     match heartbeat_days_ago(&path) {
+        Some(days) if days < 0 => {
+            println!("    WARN  last active: future timestamp \u{2014} clock skew detected");
+        }
         Some(days) => {
-            let days = days.max(0);
             let label = match days {
                 0 => "today".to_string(),
                 1 => "yesterday".to_string(),
@@ -293,7 +301,15 @@ fn print_heartbeat_line() {
 }
 
 fn heartbeat_json_summary() -> serde_json::Value {
-    let path = crate::engine::shim::heartbeat_path();
+    let path = match crate::engine::shim::heartbeat_path() {
+        Some(p) => p,
+        None => {
+            return serde_json::json!({
+                "last_active_days_ago": null,
+                "status": "awaiting_first_invocation",
+            });
+        }
+    };
     match heartbeat_days_ago(&path) {
         Some(days) if days < 0 => {
             serde_json::json!({

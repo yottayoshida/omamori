@@ -65,18 +65,20 @@ pub(crate) fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError
 // Heartbeat — passive shim activity recording (once per UTC day)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn heartbeat_path() -> PathBuf {
-    let base = env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join(".local")
-        .join("share")
-        .join("omamori")
-        .join("heartbeat")
+pub(crate) fn heartbeat_path() -> Option<PathBuf> {
+    let base = env::var_os("HOME").map(PathBuf::from)?;
+    Some(
+        base.join(".local")
+            .join("share")
+            .join("omamori")
+            .join("heartbeat"),
+    )
 }
 
 fn touch_heartbeat() {
-    touch_heartbeat_at(&heartbeat_path());
+    if let Some(path) = heartbeat_path() {
+        touch_heartbeat_at(&path);
+    }
 }
 
 fn touch_heartbeat_at(path: &Path) {
@@ -143,7 +145,6 @@ fn write_heartbeat_file(path: &Path, now: &OffsetDateTime) -> Option<()> {
         .ok()?;
 
     file.write_all(content.as_bytes()).ok()?;
-    file.sync_all().ok()?;
     drop(file);
 
     std::fs::rename(&temp_path, path).ok()?;
@@ -1157,7 +1158,7 @@ mod tests {
 
     #[test]
     fn heartbeat_path_points_to_data_dir() {
-        let path = heartbeat_path();
+        let path = heartbeat_path().expect("HOME should be set in test environment");
         let home = env::var("HOME").unwrap();
         let expected_suffix = ".local/share/omamori/heartbeat";
         assert!(path.starts_with(&home), "heartbeat should be under HOME");
