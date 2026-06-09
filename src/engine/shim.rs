@@ -89,22 +89,19 @@ fn touch_heartbeat_inner(path: &Path) -> Option<()> {
     let now = OffsetDateTime::now_utc();
     let today_jd = now.date().to_julian_day();
 
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            if !meta.file_type().is_file() {
-                return None;
-            }
-            let mtime = meta.modified().ok()?;
-            let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-            let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
-                .ok()?
-                .date()
-                .to_julian_day();
-            if mtime_jd == today_jd {
-                return Some(());
-            }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return None;
         }
-        Err(_) => {}
+        let mtime = meta.modified().ok()?;
+        let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
+            .ok()?
+            .date()
+            .to_julian_day();
+        if mtime_jd == today_jd {
+            return Some(());
+        }
     }
 
     write_heartbeat_file(path, &now)
