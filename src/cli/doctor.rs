@@ -14,7 +14,9 @@ use crate::installer;
 use crate::integrity::{self, CheckItem, CheckStatus, Remediation};
 use crate::util::USAGE_HINT;
 
-use super::checks_display::group_by_section;
+use time::OffsetDateTime;
+
+use super::checks_display::{DoctorSection, group_by_section};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -112,6 +114,9 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         let all_ok = pass == total;
 
         println!("  {} {pass}/{total}", section.heading());
+        if *section == DoctorSection::Layer1 {
+            print_heartbeat_line();
+        }
         if all_ok {
             continue;
         }
@@ -241,6 +246,90 @@ fn print_break_glass_section() {
             entry.rule_id,
             crate::break_glass::format_remaining(remaining)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat display
+// ---------------------------------------------------------------------------
+
+fn heartbeat_days_ago(path: &Path) -> Option<i64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mtime = meta.modified().ok()?;
+    let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
+        .ok()?
+        .date()
+        .to_julian_day();
+    let today_jd = OffsetDateTime::now_utc().date().to_julian_day();
+    Some(i64::from(today_jd - mtime_jd))
+}
+
+fn print_heartbeat_line() {
+    let path = match crate::engine::shim::heartbeat_path() {
+        Some(p) => p,
+        None => {
+            println!("    last active: awaiting first invocation");
+            return;
+        }
+    };
+    match heartbeat_days_ago(&path) {
+        Some(days) if days < 0 => {
+            println!("    WARN  last active: future timestamp \u{2014} clock skew detected");
+        }
+        Some(days) => {
+            let label = match days {
+                0 => "today".to_string(),
+                1 => "yesterday".to_string(),
+                n => format!("{n} days ago"),
+            };
+            if days <= 3 {
+                println!("    last active: {label}");
+            } else {
+                println!(
+                    "    WARN  last active: {label} \u{2014} shims may not be in PATH for AI tools"
+                );
+            }
+        }
+        None => {
+            println!("    last active: awaiting first invocation");
+        }
+    }
+}
+
+fn heartbeat_json_summary() -> serde_json::Value {
+    let path = match crate::engine::shim::heartbeat_path() {
+        Some(p) => p,
+        None => {
+            return serde_json::json!({
+                "last_active_days_ago": null,
+                "status": "awaiting_first_invocation",
+            });
+        }
+    };
+    match heartbeat_days_ago(&path) {
+        Some(days) if days < 0 => {
+            serde_json::json!({
+                "last_active_days_ago": days,
+                "status": "clock_skew",
+            })
+        }
+        Some(days) => {
+            let status = if days <= 3 { "ok" } else { "warn" };
+            serde_json::json!({
+                "last_active_days_ago": days,
+                "status": status,
+            })
+        }
+        None => {
+            serde_json::json!({
+                "last_active_days_ago": null,
+                "status": "awaiting_first_invocation",
+            })
+        }
     }
 }
 
@@ -584,6 +673,7 @@ fn build_json_output(items: &[CheckItem], fix_mode: bool) -> serde_json::Value {
             "layer1": section_summary(&sections[0].1),
             "layer2": section_summary(&sections[1].1),
             "integrity": section_summary(&sections[2].1),
+            "shim_activity": heartbeat_json_summary(),
         },
         "items": json_items,
     })
@@ -918,5 +1008,145 @@ mod tests {
         // Top-level keys: version, mode, summary, items
         assert!(output.get("version").is_some());
         assert_eq!(output["mode"], "diagnose");
+    }
+
+    // --- Heartbeat display ---
+
+    #[test]
+    fn heartbeat_days_ago_missing_file() {
+        let path = PathBuf::from("/tmp/omamori-hb-nonexistent-file");
+        assert_eq!(heartbeat_days_ago(&path), None);
+    }
+
+    #[test]
+    fn heartbeat_days_ago_today() {
+        let dir = PathBuf::from(format!(
+            "/tmp/omamori-hb-doctor-today-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("heartbeat");
+        std::fs::write(&path, "test").unwrap();
+
+        let days = heartbeat_days_ago(&path);
+        assert_eq!(days, Some(0));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_days_ago_past() {
+        let dir = PathBuf::from(format!(
+            "/tmp/omamori-hb-doctor-past-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("heartbeat");
+        std::fs::write(&path, "test").unwrap();
+
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 5);
+        let times = std::fs::FileTimes::new().set_modified(past);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let days = heartbeat_days_ago(&path).unwrap();
+        assert!((4..=6).contains(&days), "expected ~5 days ago, got {days}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_threshold_boundary() {
+        let dir = PathBuf::from(format!(
+            "/tmp/omamori-hb-doctor-boundary-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("heartbeat");
+
+        // 3 days ago → ok (last day before warn)
+        std::fs::write(&path, "test").unwrap();
+        let three_days = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 3);
+        let times = std::fs::FileTimes::new().set_modified(three_days);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let days_3 = heartbeat_days_ago(&path).unwrap();
+        assert!(days_3 <= 3, "3 days ago should be <= 3, got {days_3}");
+
+        // 4 days ago → warn (first day of warn)
+        let four_days =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 4 + 3600);
+        let times = std::fs::FileTimes::new().set_modified(four_days);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let days_4 = heartbeat_days_ago(&path).unwrap();
+        assert!(days_4 >= 4, "4+ days ago should be >= 4, got {days_4}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_days_ago_rejects_symlink() {
+        let dir = PathBuf::from(format!("/tmp/omamori-hb-doctor-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, "x").unwrap();
+        let path = dir.join("heartbeat");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert_eq!(heartbeat_days_ago(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_days_ago_skips_directory() {
+        let dir = PathBuf::from(format!("/tmp/omamori-hb-doctor-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("heartbeat");
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert_eq!(heartbeat_days_ago(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_output_includes_shim_activity() {
+        let items = vec![CheckItem {
+            category: "Shims",
+            name: "rm".to_string(),
+            status: CheckStatus::Ok,
+            detail: "ok".to_string(),
+            remediation: None,
+        }];
+        let output = build_json_output(&items, false);
+        let activity = output["summary"].get("shim_activity");
+        assert!(activity.is_some(), "shim_activity must be in summary");
+        let activity = activity.unwrap();
+        assert!(
+            activity.get("status").is_some(),
+            "shim_activity must have status"
+        );
+        assert!(
+            activity.get("last_active_days_ago").is_some(),
+            "shim_activity must have last_active_days_ago"
+        );
+        let status = activity["status"].as_str().unwrap();
+        assert!(
+            ["ok", "warn", "clock_skew", "awaiting_first_invocation"].contains(&status),
+            "unexpected status: {status}"
+        );
     }
 }
