@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.11.3] - 2026-06-09
+
+**Summary**: Shim heartbeat liveness signal (#280). Every shim invocation touches a heartbeat file (at most once per UTC day), and `omamori doctor` displays last-active status under [Layer 1]. The write is fire-and-forget — filesystem failures never block command execution.
+
+### Added
+
+- **Heartbeat write in `run_shim()`** — `touch_heartbeat()` writes an RFC 3339 timestamp to `~/.local/share/omamori/heartbeat` via atomic temp-file + rename. Mtime-gated: only one write per UTC calendar day (~0.01ms stat on repeat invocations). O_NOFOLLOW + 0600 permissions + symlink rejection on both temp and final paths. ([#280](https://github.com/yottayoshida/omamori/issues/280))
+- **`omamori doctor` last-active sub-line** — Displays under [Layer 1]: "last active: today/yesterday/N days ago". 0–3 days = info, 4+ days = WARN, future mtime = WARN (clock skew), no file = "awaiting first invocation". ([#280](https://github.com/yottayoshida/omamori/issues/280))
+- **`omamori doctor --json` shim_activity field** — `last_active_days_ago` (integer or null) + `status` (ok/warn/clock_skew/awaiting_first_invocation). ([#280](https://github.com/yottayoshida/omamori/issues/280))
+- **`heartbeat_path()` returns `Option<PathBuf>`** — Silently skips heartbeat when HOME is unset (containers, some CI runners) instead of writing to a relative path. ([#280](https://github.com/yottayoshida/omamori/issues/280))
+- **16 unit tests** — Heartbeat write (create, permissions, skip-same-day, symlink rejection, future/old mtime overwrite, corrupt content, read-only dir, directory-at-path) + doctor display (missing, today, past, threshold boundary, symlink, directory, JSON output). ([#280](https://github.com/yottayoshida/omamori/issues/280))
+
 ## [0.11.2] - 2026-06-07
 
 **Summary**: Materialize structural blocks instead of hard-blocking (#299). Materializable block reasons (PipeToShell, ParseError, TooManyTokens, TooManySegments) now write the command to a staging file and audit-log the event instead of blocking. Non-materializable reasons (InputTooLarge, ObfuscatedExpansion, DynamicGeneration, DepthExceeded) remain hard-blocked. Configurable via `[structural] action = "materialize" | "block"` in config.toml (default: materialize). Degraded config (corrupt TOML, insecure permissions) fails closed.
