@@ -5,7 +5,7 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::AppError;
 use crate::actions::{self, ActionExecutor, ActionOutcome, SystemOps};
@@ -16,6 +16,8 @@ use crate::detector::evaluate_detectors;
 use crate::installer;
 use crate::integrity;
 use crate::rules::{self, CommandInvocation, RuleConfig, match_rule};
+use time::OffsetDateTime;
+
 use crate::util::{clone_lossy, resolve_real_command, should_block_for_sudo};
 
 // ---------------------------------------------------------------------------
@@ -29,6 +31,9 @@ pub(crate) fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError
     if let Some(warning) = integrity::canary(&base_dir, program) {
         eprintln!("omamori[health]: {warning}");
     }
+
+    // Step 1a: Heartbeat — record shim activity (at most once per UTC day)
+    touch_heartbeat();
 
     // Step 1b: v0.4 → v0.5 migration — create baseline if missing
     if !integrity::baseline_path(&base_dir).exists() && base_dir.join("shim").exists() {
@@ -54,6 +59,119 @@ pub(crate) fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError
 
     // Step 4: Run the actual command
     run_command(program.to_string(), args, None)
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat — passive shim activity recording (once per UTC day)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn heartbeat_path() -> PathBuf {
+    let base = env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(".local")
+        .join("share")
+        .join("omamori")
+        .join("heartbeat")
+}
+
+fn touch_heartbeat() {
+    touch_heartbeat_at(&heartbeat_path());
+}
+
+fn touch_heartbeat_at(path: &Path) {
+    let _ = touch_heartbeat_inner(path);
+}
+
+fn touch_heartbeat_inner(path: &Path) -> Option<()> {
+    let now = OffsetDateTime::now_utc();
+    let today_jd = now.date().to_julian_day();
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                return None;
+            }
+            let mtime = meta.modified().ok()?;
+            let secs = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
+                .ok()?
+                .date()
+                .to_julian_day();
+            if mtime_jd == today_jd {
+                return Some(());
+            }
+        }
+        Err(_) => {}
+    }
+
+    write_heartbeat_file(path, &now)
+}
+
+#[cfg(unix)]
+fn write_heartbeat_file(path: &Path, now: &OffsetDateTime) -> Option<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let parent = path.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+
+    let temp_name = format!(
+        ".heartbeat.{}.{}.tmp",
+        std::process::id(),
+        now.unix_timestamp()
+    );
+    let temp_path = parent.join(&temp_name);
+
+    if let Ok(m) = std::fs::symlink_metadata(&temp_path) {
+        if m.file_type().is_symlink() {
+            return None;
+        }
+    }
+
+    let content = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp_path)
+        .ok()?;
+
+    file.write_all(content.as_bytes()).ok()?;
+    file.sync_all().ok()?;
+    drop(file);
+
+    std::fs::rename(&temp_path, path).ok()?;
+    Some(())
+}
+
+#[cfg(not(unix))]
+fn write_heartbeat_file(path: &Path, now: &OffsetDateTime) -> Option<()> {
+    let parent = path.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+
+    let temp_name = format!(
+        ".heartbeat.{}.{}.tmp",
+        std::process::id(),
+        now.unix_timestamp()
+    );
+    let temp_path = parent.join(&temp_name);
+
+    let content = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()?;
+
+    std::fs::write(&temp_path, content.as_bytes()).ok()?;
+    std::fs::rename(&temp_path, path).ok()?;
+    Some(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,5 +1147,217 @@ mod tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Heartbeat ---
+
+    fn heartbeat_test_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-hb-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn heartbeat_path_points_to_data_dir() {
+        let path = heartbeat_path();
+        let home = env::var("HOME").unwrap();
+        let expected_suffix = ".local/share/omamori/heartbeat";
+        assert!(
+            path.starts_with(&home),
+            "heartbeat should be under HOME"
+        );
+        assert!(
+            path.ends_with(expected_suffix),
+            "heartbeat path should end with {expected_suffix}, got {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn heartbeat_creates_file_with_permissions() {
+        let dir = heartbeat_test_dir("create");
+        let path = dir.join("heartbeat");
+
+        touch_heartbeat_at(&path);
+
+        assert!(path.exists(), "heartbeat file should be created");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "heartbeat should have 0600 permissions");
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed = time::OffsetDateTime::parse(
+            &content,
+            &time::format_description::well_known::Rfc3339,
+        );
+        assert!(parsed.is_ok(), "content must be valid RFC 3339: {content}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_skips_same_utc_day() {
+        let dir = heartbeat_test_dir("skip");
+        let path = dir.join("heartbeat");
+
+        touch_heartbeat_at(&path);
+        let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        touch_heartbeat_at(&path);
+        let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert_eq!(mtime1, mtime2, "mtime should not change on same UTC day");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_rejects_symlink() {
+        let dir = heartbeat_test_dir("symlink");
+        let target = dir.join("decoy");
+        std::fs::write(&target, "original").unwrap();
+        let path = dir.join("heartbeat");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        touch_heartbeat_at(&path);
+
+        assert!(
+            path.symlink_metadata().unwrap().file_type().is_symlink(),
+            "symlink must still exist (not replaced by regular file)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "symlink target must not be overwritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_overwrites_future_mtime() {
+        use std::fs::FileTimes;
+
+        let dir = heartbeat_test_dir("future");
+        let path = dir.join("heartbeat");
+
+        touch_heartbeat_at(&path);
+
+        let future = std::time::SystemTime::now()
+            + std::time::Duration::from_secs(86400 * 365 * 10);
+        let times = FileTimes::new().set_modified(future);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        touch_heartbeat_at(&path);
+
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_ne!(
+            mtime_before, mtime_after,
+            "future mtime should trigger overwrite"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_overwrites_old_mtime() {
+        use std::fs::FileTimes;
+
+        let dir = heartbeat_test_dir("old");
+        let path = dir.join("heartbeat");
+
+        touch_heartbeat_at(&path);
+
+        let past = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(86400 * 5);
+        let times = FileTimes::new().set_modified(past);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        touch_heartbeat_at(&path);
+
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_ne!(
+            mtime_before, mtime_after,
+            "old mtime should trigger overwrite"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_silent_on_read_only_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = heartbeat_test_dir("readonly");
+        let ro_dir = dir.join("ro");
+        std::fs::create_dir_all(&ro_dir).unwrap();
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let path = ro_dir.join("heartbeat");
+        touch_heartbeat_at(&path);
+
+        assert!(!path.exists(), "should not create file in read-only dir");
+
+        std::fs::set_permissions(&ro_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_skips_directory_at_path() {
+        let dir = heartbeat_test_dir("isdir");
+        let path = dir.join("heartbeat");
+        std::fs::create_dir_all(&path).unwrap();
+
+        touch_heartbeat_at(&path);
+
+        assert!(path.is_dir(), "directory should remain a directory");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_handles_corrupt_content() {
+        let dir = heartbeat_test_dir("corrupt");
+        let path = dir.join("heartbeat");
+
+        std::fs::create_dir_all(dir.as_path()).unwrap();
+        std::fs::write(&path, "not-a-date").unwrap();
+
+        let past = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(86400 * 2);
+        let times = std::fs::FileTimes::new().set_modified(past);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        touch_heartbeat_at(&path);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("T"),
+            "corrupt content with old mtime should be overwritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
