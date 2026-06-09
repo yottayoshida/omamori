@@ -93,10 +93,7 @@ fn touch_heartbeat_inner(path: &Path) -> Option<()> {
                 return None;
             }
             let mtime = meta.modified().ok()?;
-            let secs = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs();
+            let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
             let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
                 .ok()?
                 .date()
@@ -126,10 +123,10 @@ fn write_heartbeat_file(path: &Path, now: &OffsetDateTime) -> Option<()> {
     );
     let temp_path = parent.join(&temp_name);
 
-    if let Ok(m) = std::fs::symlink_metadata(&temp_path) {
-        if m.file_type().is_symlink() {
-            return None;
-        }
+    if let Ok(m) = std::fs::symlink_metadata(&temp_path)
+        && m.file_type().is_symlink()
+    {
+        return None;
     }
 
     let content = now
@@ -1152,10 +1149,7 @@ mod tests {
     // --- Heartbeat ---
 
     fn heartbeat_test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "omamori-hb-{label}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("omamori-hb-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1166,10 +1160,7 @@ mod tests {
         let path = heartbeat_path();
         let home = env::var("HOME").unwrap();
         let expected_suffix = ".local/share/omamori/heartbeat";
-        assert!(
-            path.starts_with(&home),
-            "heartbeat should be under HOME"
-        );
+        assert!(path.starts_with(&home), "heartbeat should be under HOME");
         assert!(
             path.ends_with(expected_suffix),
             "heartbeat path should end with {expected_suffix}, got {}",
@@ -1194,10 +1185,8 @@ mod tests {
         }
 
         let content = std::fs::read_to_string(&path).unwrap();
-        let parsed = time::OffsetDateTime::parse(
-            &content,
-            &time::format_description::well_known::Rfc3339,
-        );
+        let parsed =
+            time::OffsetDateTime::parse(&content, &time::format_description::well_known::Rfc3339);
         assert!(parsed.is_ok(), "content must be valid RFC 3339: {content}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1254,8 +1243,8 @@ mod tests {
 
         touch_heartbeat_at(&path);
 
-        let future = std::time::SystemTime::now()
-            + std::time::Duration::from_secs(86400 * 365 * 10);
+        let future =
+            std::time::SystemTime::now() + std::time::Duration::from_secs(86400 * 365 * 10);
         let times = FileTimes::new().set_modified(future);
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(times).unwrap();
@@ -1283,8 +1272,7 @@ mod tests {
 
         touch_heartbeat_at(&path);
 
-        let past = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(86400 * 5);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 5);
         let times = FileTimes::new().set_modified(past);
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(times).unwrap();
@@ -1343,8 +1331,7 @@ mod tests {
         std::fs::create_dir_all(dir.as_path()).unwrap();
         std::fs::write(&path, "not-a-date").unwrap();
 
-        let past = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(86400 * 2);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 2);
         let times = std::fs::FileTimes::new().set_modified(past);
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(times).unwrap();

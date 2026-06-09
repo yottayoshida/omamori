@@ -259,10 +259,7 @@ fn heartbeat_days_ago(path: &Path) -> Option<i64> {
         return None;
     }
     let mtime = meta.modified().ok()?;
-    let secs = mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
+    let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
         .ok()?
         .date()
@@ -1033,15 +1030,14 @@ mod tests {
         let path = dir.join("heartbeat");
         std::fs::write(&path, "test").unwrap();
 
-        let past = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(86400 * 5);
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 5);
         let times = std::fs::FileTimes::new().set_modified(past);
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(times).unwrap();
         drop(file);
 
         let days = heartbeat_days_ago(&path).unwrap();
-        assert!(days >= 4 && days <= 6, "expected ~5 days ago, got {days}");
+        assert!((4..=6).contains(&days), "expected ~5 days ago, got {days}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1058,8 +1054,7 @@ mod tests {
 
         // 3 days ago → ok (last day before warn)
         std::fs::write(&path, "test").unwrap();
-        let three_days = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(86400 * 3);
+        let three_days = std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 3);
         let times = std::fs::FileTimes::new().set_modified(three_days);
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(times).unwrap();
@@ -1069,8 +1064,8 @@ mod tests {
         assert!(days_3 <= 3, "3 days ago should be <= 3, got {days_3}");
 
         // 4 days ago → warn (first day of warn)
-        let four_days = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(86400 * 4 + 3600);
+        let four_days =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(86400 * 4 + 3600);
         let times = std::fs::FileTimes::new().set_modified(four_days);
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(times).unwrap();
@@ -1085,10 +1080,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn heartbeat_days_ago_rejects_symlink() {
-        let dir = PathBuf::from(format!(
-            "/tmp/omamori-hb-doctor-sym-{}",
-            std::process::id()
-        ));
+        let dir = PathBuf::from(format!("/tmp/omamori-hb-doctor-sym-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("target");
@@ -1103,10 +1095,7 @@ mod tests {
 
     #[test]
     fn heartbeat_days_ago_skips_directory() {
-        let dir = PathBuf::from(format!(
-            "/tmp/omamori-hb-doctor-dir-{}",
-            std::process::id()
-        ));
+        let dir = PathBuf::from(format!("/tmp/omamori-hb-doctor-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("heartbeat");
