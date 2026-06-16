@@ -3204,7 +3204,11 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .collect();
-        assert_eq!(remaining.len(), 4, "pre-write reservation should leave room for 1 new file");
+        assert_eq!(
+            remaining.len(),
+            4,
+            "pre-write reservation should leave room for 1 new file"
+        );
         assert!(
             !dir.join("0_1_0.txt").exists(),
             "oldest pruned to make room"
