@@ -180,6 +180,8 @@ timeout_ms = 100
 # Obfuscated expansions / dynamic generation / depth exceeded are always hard-blocked.
 [structural]
 action = "materialize"  # "materialize" (default) | "block" (legacy hard-block)
+retention_days = 7      # auto-prune staging files older than N days. 0 = disabled.
+max_files = 500         # cap on staging file count. Oldest deleted first. 0 = disabled.
 
 [audit]
 enabled = false

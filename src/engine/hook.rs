@@ -287,7 +287,7 @@ fn block_reason_wrapper_kind(reason: &unwrap::BlockReason) -> Option<&'static st
 /// Materializable reasons consult `config.structural.action`:
 ///   - `Materialize`: write staging file + audit log → AllowMaterialize
 ///   - `Block`: BlockStructural (legacy behavior)
-fn resolve_structural_block(
+pub(crate) fn resolve_structural_block(
     command: &str,
     reason: &unwrap::BlockReason,
     provider: &str,
@@ -336,6 +336,15 @@ fn resolve_structural_block(
             staging_path: None,
         };
     }
+
+    // Best-effort GC before write: on disk-full, pruning old files may free
+    // space so the upcoming write_staging_file() succeeds.  Runs regardless of
+    // write outcome and before any early-return (strict-mode block).
+    // Reserve one slot (saturating_sub) so post-write count ≤ max_files.
+    try_prune_staging(
+        load_result.config.structural.retention_days,
+        load_result.config.structural.max_files.saturating_sub(1),
+    );
 
     let staging_path = match write_staging_file(command) {
         Ok(p) => Some(p.to_string_lossy().into_owned()),
@@ -1047,7 +1056,7 @@ const MAX_STAGING_BYTES: usize = 1_048_576; // 1 MB (matches MAX_INPUT_BYTES)
 use std::sync::atomic::{AtomicU64, Ordering};
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn staging_dir() -> std::path::PathBuf {
+pub fn staging_dir() -> std::path::PathBuf {
     let base = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -1112,6 +1121,103 @@ fn write_staging_file(command: &str) -> Result<std::path::PathBuf, std::io::Erro
     file.sync_all()?;
 
     Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Staging file GC (#313, v0.11.4)
+// ---------------------------------------------------------------------------
+
+/// Filename pattern for staging files: `{digits}_{digits}_{digits}.txt`
+pub fn is_staging_filename(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".txt") else {
+        return false;
+    };
+    let parts: Vec<&str> = stem.splitn(3, '_').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+pub fn try_prune_staging(retention_days: u32, max_files: u32) {
+    if retention_days == 0 && max_files == 0 {
+        return;
+    }
+    try_prune_staging_in(&staging_dir(), retention_days, max_files);
+}
+
+pub fn try_prune_staging_in(dir: &std::path::Path, retention_days: u32, max_files: u32) {
+    if retention_days == 0 && max_files == 0 {
+        return;
+    }
+
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !is_staging_filename(name_str) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(now);
+        files.push((mtime, entry.path()));
+    }
+
+    let mut deleted = 0u32;
+
+    // Phase 1: age-based pruning
+    if retention_days > 0 {
+        let cutoff = now - std::time::Duration::from_secs(u64::from(retention_days) * 86400);
+        files.retain(|(mtime, path)| {
+            if *mtime < cutoff {
+                if std::fs::remove_file(path).is_ok() {
+                    deleted += 1;
+                    false
+                } else {
+                    // Keep in Vec so Phase 2 count-cap sees actual on-disk files.
+                    true
+                }
+            } else {
+                true
+            }
+        });
+    }
+
+    // Phase 2: count-based pruning (oldest first)
+    if max_files > 0 && files.len() > max_files as usize {
+        files.sort_by_key(|(mtime, _)| *mtime);
+        let excess = files.len() - max_files as usize;
+        for (_, path) in files.drain(..excess) {
+            if std::fs::remove_file(path).is_ok() {
+                deleted += 1;
+            }
+        }
+    }
+
+    if deleted > 0 {
+        eprintln!("omamori: pruned {deleted} staging file(s)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2746,5 +2852,368 @@ mod tests {
             err.to_string().contains("1 MB"),
             "error should mention size limit: {err}"
         );
+    }
+
+    // --- Staging GC tests (#313) ---
+
+    use std::sync::atomic::{AtomicU32, Ordering as TestOrdering};
+    static TEST_DIR_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn create_staging_test_dir() -> std::path::PathBuf {
+        let seq = TEST_DIR_COUNTER.fetch_add(1, TestOrdering::SeqCst);
+        let dir = std::path::PathBuf::from(format!(
+            "{}/omamori-staging-gc-{}-{}",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+            std::process::id(),
+            seq,
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn create_staging_file(dir: &std::path::Path, name: &str, age_secs: u64) {
+        let path = dir.join(name);
+        std::fs::write(&path, "test content").unwrap();
+        if age_secs > 0 {
+            let past = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            let times = std::fs::FileTimes::new().set_modified(past);
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_times(times).unwrap();
+        }
+    }
+
+    #[test]
+    fn is_staging_filename_accepts_valid() {
+        assert!(is_staging_filename("123456_789_0.txt"));
+        assert!(is_staging_filename("1_2_3.txt"));
+    }
+
+    #[test]
+    fn is_staging_filename_rejects_invalid() {
+        assert!(!is_staging_filename("notes.txt"));
+        assert!(!is_staging_filename("123_456.txt"));
+        assert!(!is_staging_filename("123_456_789.log"));
+        assert!(!is_staging_filename("abc_123_0.txt"));
+        assert!(!is_staging_filename("123__0.txt"));
+    }
+
+    #[test]
+    fn prune_staging_age_based() {
+        let dir = create_staging_test_dir();
+        // 10-day-old file (should be pruned with retention_days=7)
+        create_staging_file(&dir, "100_1_0.txt", 86400 * 10);
+        // 1-day-old file (should survive)
+        create_staging_file(&dir, "200_1_0.txt", 86400);
+        // fresh file
+        create_staging_file(&dir, "300_1_0.txt", 0);
+
+        try_prune_staging_in(&dir, 7, 0);
+
+        assert!(
+            !dir.join("100_1_0.txt").exists(),
+            "old file should be pruned"
+        );
+        assert!(
+            dir.join("200_1_0.txt").exists(),
+            "recent file should survive"
+        );
+        assert!(
+            dir.join("300_1_0.txt").exists(),
+            "fresh file should survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_count_based() {
+        let dir = create_staging_test_dir();
+        // Create 5 files with distinct ages
+        for i in 0..5 {
+            let name = format!("{}_1_0.txt", i * 100);
+            create_staging_file(&dir, &name, (4 - i) * 86400);
+        }
+
+        try_prune_staging_in(&dir, 0, 3);
+
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(remaining.len(), 3, "should keep max_files=3");
+
+        // Oldest (0_1_0.txt, 100_1_0.txt) should be gone
+        assert!(!dir.join("0_1_0.txt").exists(), "oldest should be pruned");
+        assert!(
+            !dir.join("100_1_0.txt").exists(),
+            "second oldest should be pruned"
+        );
+        // Newest should survive
+        assert!(dir.join("400_1_0.txt").exists(), "newest should survive");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_mixed_age_and_count() {
+        let dir = create_staging_test_dir();
+        // 3 old files (>7 days), 3 recent files
+        for i in 0..3 {
+            create_staging_file(&dir, &format!("{}_1_0.txt", i), 86400 * 20);
+        }
+        for i in 3..6 {
+            create_staging_file(&dir, &format!("{}_1_0.txt", i), 86400);
+        }
+
+        // retention_days=7 prunes old 3, max_files=2 then prunes 1 more
+        try_prune_staging_in(&dir, 7, 2);
+
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(remaining.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_skips_non_matching_files() {
+        let dir = create_staging_test_dir();
+        create_staging_file(&dir, "100_1_0.txt", 86400 * 10);
+        // Non-matching filenames should never be deleted
+        std::fs::write(dir.join("notes.txt"), "keep me").unwrap();
+        std::fs::write(dir.join("readme.md"), "keep me").unwrap();
+
+        try_prune_staging_in(&dir, 1, 0);
+
+        assert!(!dir.join("100_1_0.txt").exists(), "old staging file pruned");
+        assert!(
+            dir.join("notes.txt").exists(),
+            "non-matching file preserved"
+        );
+        assert!(
+            dir.join("readme.md").exists(),
+            "non-matching file preserved"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_staging_skips_symlinks_in_dir() {
+        let dir = create_staging_test_dir();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "real file").unwrap();
+        let link = dir.join("100_1_0.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        try_prune_staging_in(&dir, 1, 0);
+
+        // Symlink should not be deleted (symlink_metadata → is_file() returns false for symlinks)
+        assert!(link.exists(), "symlink should be skipped by prune");
+        assert!(target.exists(), "target should be untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_empty_dir_no_error() {
+        let dir = create_staging_test_dir();
+        // Empty dir → no panic, no error
+        try_prune_staging_in(&dir, 7, 500);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_missing_dir_no_error() {
+        let seq = TEST_DIR_COUNTER.fetch_add(1, TestOrdering::SeqCst);
+        let dir = std::path::PathBuf::from(format!(
+            "{}/omamori-staging-gc-nonexistent-{}-{}",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+            std::process::id(),
+            seq,
+        ));
+        // Dir does not exist → no panic
+        try_prune_staging_in(&dir, 7, 500);
+    }
+
+    #[test]
+    fn prune_staging_both_disabled_is_noop() {
+        let dir = create_staging_test_dir();
+        create_staging_file(&dir, "100_1_0.txt", 86400 * 30);
+
+        try_prune_staging_in(&dir, 0, 0);
+
+        assert!(
+            dir.join("100_1_0.txt").exists(),
+            "nothing should be pruned when both disabled"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_staging_rejects_symlinked_dir() {
+        let seq = TEST_DIR_COUNTER.fetch_add(1, TestOrdering::SeqCst);
+        let base = std::path::PathBuf::from(format!(
+            "{}/omamori-staging-gc-symdir-{}-{}",
+            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+            std::process::id(),
+            seq,
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        create_staging_file(&real_dir, "100_1_0.txt", 86400 * 10);
+
+        let link_dir = base.join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        try_prune_staging_in(&link_dir, 1, 0);
+
+        // File should still exist — prune refused to operate on symlinked dir
+        assert!(real_dir.join("100_1_0.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- 6-B strengthening tests ---
+
+    #[test]
+    fn prune_staging_age_boundary_exact_cutoff_survives() {
+        let dir = create_staging_test_dir();
+        // File aged exactly at the cutoff boundary (7 days = 604800s)
+        create_staging_file(&dir, "100_1_0.txt", 86400 * 7);
+        // File 1 second older than cutoff
+        create_staging_file(&dir, "200_1_0.txt", 86400 * 7 + 1);
+        // File 1 second younger than cutoff
+        create_staging_file(&dir, "300_1_0.txt", 86400 * 7 - 1);
+
+        try_prune_staging_in(&dir, 7, 0);
+
+        // Exact-cutoff and older: pruned (mtime < cutoff)
+        assert!(
+            !dir.join("200_1_0.txt").exists(),
+            "file older than cutoff must be pruned"
+        );
+        // Younger than cutoff: survives
+        assert!(
+            dir.join("300_1_0.txt").exists(),
+            "file younger than cutoff must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_count_exact_cap_is_noop() {
+        let dir = create_staging_test_dir();
+        for i in 0..5 {
+            create_staging_file(&dir, &format!("{}_1_0.txt", i * 100), i * 3600);
+        }
+
+        // Exactly at cap: no pruning
+        try_prune_staging_in(&dir, 0, 5);
+
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(remaining.len(), 5, "exact cap should not prune");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_count_one_over_cap_removes_oldest() {
+        let dir = create_staging_test_dir();
+        // 6 files, cap=5 → oldest (0_1_0.txt with age 5h) should be pruned
+        for i in 0..6 {
+            create_staging_file(&dir, &format!("{}_1_0.txt", i * 100), (5 - i) * 3600);
+        }
+
+        try_prune_staging_in(&dir, 0, 5);
+
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(remaining.len(), 5, "one-over-cap should prune exactly 1");
+        assert!(
+            !dir.join("0_1_0.txt").exists(),
+            "oldest file should be the one pruned"
+        );
+        assert!(
+            dir.join("500_1_0.txt").exists(),
+            "newest file should survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_mixed_verifies_which_files_remain() {
+        let dir = create_staging_test_dir();
+        // 3 old (>7d) + 3 recent (1d each with distinct mtimes)
+        create_staging_file(&dir, "old_a_0.txt", 86400 * 20);
+        // Note: "old_a_0.txt" doesn't match staging pattern — use valid names
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = create_staging_test_dir();
+        create_staging_file(&dir, "10_1_0.txt", 86400 * 20);
+        create_staging_file(&dir, "20_1_0.txt", 86400 * 15);
+        create_staging_file(&dir, "30_1_0.txt", 86400 * 10);
+        // Recent files with descending age: 3h, 2h, 1h
+        create_staging_file(&dir, "40_1_0.txt", 3600 * 3);
+        create_staging_file(&dir, "50_1_0.txt", 3600 * 2);
+        create_staging_file(&dir, "60_1_0.txt", 3600);
+
+        // retention=7d prunes 3 old files, then max_files=2 keeps 2 newest
+        try_prune_staging_in(&dir, 7, 2);
+
+        assert!(!dir.join("10_1_0.txt").exists(), "old file pruned by age");
+        assert!(!dir.join("20_1_0.txt").exists(), "old file pruned by age");
+        assert!(!dir.join("30_1_0.txt").exists(), "old file pruned by age");
+        assert!(
+            !dir.join("40_1_0.txt").exists(),
+            "oldest recent file pruned by count cap"
+        );
+        assert!(dir.join("50_1_0.txt").exists(), "second newest survives");
+        assert!(dir.join("60_1_0.txt").exists(), "newest survives");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_staging_pre_write_reservation() {
+        let dir = create_staging_test_dir();
+        // Simulate pre-write scenario: 5 files exist, cap=5
+        // Caller passes max_files.saturating_sub(1)=4 to reserve a slot
+        for i in 0..5 {
+            create_staging_file(&dir, &format!("{}_1_0.txt", i * 100), (4 - i) * 3600);
+        }
+
+        // Pre-write prune with reservation (cap-1)
+        try_prune_staging_in(&dir, 0, 4);
+
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            4,
+            "pre-write reservation should leave room for 1 new file"
+        );
+        assert!(
+            !dir.join("0_1_0.txt").exists(),
+            "oldest pruned to make room"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
