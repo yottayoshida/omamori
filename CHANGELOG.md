@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.11.4] - 2026-06-16
+
+**Summary**: Staging file retention/GC (#313). Prune-on-write garbage collection for staging files created by the materialize feature, preventing unbounded disk growth. Files are pruned by age (default 7 days) and count cap (default 500). `omamori doctor` now surfaces staging usage for operational visibility.
+
+### Added
+
+- **Prune-on-write GC for staging files** — `try_prune_staging()` runs before every `write_staging_file()` call. Two-phase algorithm: Phase 1 deletes files older than `retention_days`, Phase 2 enforces `max_files` count cap (oldest first). Pre-write position handles strict-mode early returns and frees disk space before the upcoming write. `saturating_sub(1)` reserves a slot so post-write count never exceeds `max_files`. ([#313](https://github.com/yottayoshida/omamori/issues/313))
+- **`[structural]` config: `retention_days` and `max_files`** — `retention_days = 7` (0 = disabled, clamped 1–3650) and `max_files = 500` (0 = disabled, clamped 10–100000). Added to `config.default.toml` with comments. ([#313](https://github.com/yottayoshida/omamori/issues/313))
+- **`omamori doctor` staging section** — New `[Staging]` informational block: file count, total size, oldest file age. WARN thresholds: count > max_files, or oldest > 2× retention_days. ([#313](https://github.com/yottayoshida/omamori/issues/313))
+- **`omamori doctor --json` staging field** — `file_count`, `total_bytes`, `oldest_days_ago`, `status` (ok/warn/error), `retention_days`, `max_files`. Returns `status: "error"` with null config fields on config load failure. ([#313](https://github.com/yottayoshida/omamori/issues/313))
+- **27 new tests** — Age pruning (exact cutoff boundary), count cap (exact cap noop, one-over-cap), mixed age+count (verifies specific surviving files), pre-write reservation (saturating_sub), non-matching filenames/symlinks/empty dir skip, config validation (defaults, clamping, 0=disabled), doctor text + JSON output. ([#313](https://github.com/yottayoshida/omamori/issues/313))
+
+### Fixed
+
+- **retain failed-delete undercount** — Phase 1 age pruning now keeps files in the Vec when `remove_file` fails, so Phase 2 count-cap sees the actual on-disk file count. Previously, failed deletes were unconditionally dropped from the Vec, causing Phase 2 to undercount and skip necessary pruning. ([#313](https://github.com/yottayoshida/omamori/issues/313))
+
 ## [0.11.3] - 2026-06-09
 
 **Summary**: Shim heartbeat liveness signal (#280). Every shim invocation touches a heartbeat file (at most once per UTC day), and `omamori doctor` displays last-active status under [Layer 1]. The write is fire-and-forget — filesystem failures never block command execution.

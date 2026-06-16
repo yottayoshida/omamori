@@ -252,7 +252,9 @@ strict = true  # default: false. Hook-only commands (ls, cat, etc.) are not affe
 **Control structural block behavior** (materialize vs hard-block):
 ```toml
 [structural]
-action = "block"  # default: "materialize". Set to "block" to hard-block all structural patterns.
+action = "block"     # default: "materialize". Set to "block" to hard-block all structural patterns.
+retention_days = 7   # auto-prune staging files older than N days. 0 = disabled.
+max_files = 500      # cap on staging file count; oldest deleted first. 0 = disabled.
 ```
 
 **Notes**: config requires `chmod 600`. Destinations must be absolute paths on the same volume. System directories and symlinks are rejected.
