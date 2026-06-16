@@ -24,10 +24,27 @@ pub enum StructuralAction {
     Block,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StructuralConfig {
     pub action: StructuralAction,
+    /// Days to retain staging files. 0 = disabled (no age-based pruning).
+    pub retention_days: u32,
+    /// Maximum number of staging files to keep. 0 = disabled (no count limit).
+    pub max_files: u32,
 }
+
+impl Default for StructuralConfig {
+    fn default() -> Self {
+        Self {
+            action: StructuralAction::Materialize,
+            retention_days: DEFAULT_STAGING_RETENTION_DAYS,
+            max_files: DEFAULT_STAGING_MAX_FILES,
+        }
+    }
+}
+
+pub const DEFAULT_STAGING_RETENTION_DAYS: u32 = 7;
+pub const DEFAULT_STAGING_MAX_FILES: u32 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -78,6 +95,8 @@ pub struct ConfigLoadResult {
 struct UserStructuralConfig {
     #[serde(default = "default_structural_action_str")]
     action: String,
+    retention_days: Option<u32>,
+    max_files: Option<u32>,
 }
 
 fn default_structural_action_str() -> String {
@@ -217,23 +236,56 @@ fn validate_structural_config(
     let Some(raw) = raw else {
         return StructuralConfig::default();
     };
-    match raw.action.as_str() {
-        "materialize" => StructuralConfig {
-            action: StructuralAction::Materialize,
-        },
-        "block" => StructuralConfig {
-            action: StructuralAction::Block,
-        },
+    let action = match raw.action.as_str() {
+        "materialize" => StructuralAction::Materialize,
+        "block" => StructuralAction::Block,
         other => {
             warnings.push(format!(
                 "[structural] action = \"{}\" is not a recognized value \
                  (expected \"materialize\" or \"block\"); falling back to \"block\" for safety",
                 other
             ));
-            StructuralConfig {
-                action: StructuralAction::Block,
-            }
+            StructuralAction::Block
         }
+    };
+
+    let retention_days = match raw.retention_days {
+        None => DEFAULT_STAGING_RETENTION_DAYS,
+        Some(0) => 0,
+        Some(v) if v > 3650 => {
+            warnings.push(format!(
+                "[structural] retention_days = {} exceeds maximum 3650; clamped to 3650",
+                v
+            ));
+            3650
+        }
+        Some(v) => v,
+    };
+
+    let max_files = match raw.max_files {
+        None => DEFAULT_STAGING_MAX_FILES,
+        Some(0) => 0,
+        Some(v) if v < 10 => {
+            warnings.push(format!(
+                "[structural] max_files = {} is below minimum 10; clamped to 10",
+                v
+            ));
+            10
+        }
+        Some(v) if v > 100_000 => {
+            warnings.push(format!(
+                "[structural] max_files = {} exceeds maximum 100000; clamped to 100000",
+                v
+            ));
+            100_000
+        }
+        Some(v) => v,
+    };
+
+    StructuralConfig {
+        action,
+        retention_days,
+        max_files,
     }
 }
 
@@ -745,7 +797,12 @@ pub fn config_template() -> String {
          # \"materialize\" (default): allow + audit trail + staging file\n\
          # \"block\" (legacy): hard-block as in v0.11.1 and earlier\n\
          [structural]\n\
-         action = \"materialize\"\n",
+         action = \"materialize\"\n\
+         # Staging file retention (v0.11.4+, #313)\n\
+         # retention_days: auto-prune staging files older than N days. 0 = disabled.\n\
+         retention_days = 7\n\
+         # max_files: cap on staging file count. Oldest deleted first. 0 = disabled.\n\
+         max_files = 500\n",
     );
     out.push_str(
         "\n# --- Context-aware evaluation (enabled by default) ---\n\
@@ -1747,6 +1804,8 @@ message = "custom"
             .structural
             .expect("config.default.toml must have [structural]");
         assert_eq!(raw.action, "materialize");
+        assert_eq!(raw.retention_days, Some(DEFAULT_STAGING_RETENTION_DAYS));
+        assert_eq!(raw.max_files, Some(DEFAULT_STAGING_MAX_FILES));
     }
 
     #[test]
@@ -1773,5 +1832,97 @@ message = "custom"
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- Staging GC config (#313) ---
+
+    #[test]
+    fn structural_defaults_include_retention_and_max_files() {
+        let config = Config::default();
+        assert_eq!(
+            config.structural.retention_days,
+            DEFAULT_STAGING_RETENTION_DAYS
+        );
+        assert_eq!(config.structural.max_files, DEFAULT_STAGING_MAX_FILES);
+    }
+
+    #[test]
+    fn structural_defaults_are_spec_values() {
+        assert_eq!(DEFAULT_STAGING_RETENTION_DAYS, 7);
+        assert_eq!(DEFAULT_STAGING_MAX_FILES, 500);
+    }
+
+    #[test]
+    fn structural_retention_days_zero_disables() {
+        let toml_str = "[structural]\nretention_days = 0\n";
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.retention_days, 0);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn structural_max_files_zero_disables() {
+        let toml_str = "[structural]\nmax_files = 0\n";
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.max_files, 0);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn structural_max_files_below_min_clamps_to_10() {
+        let toml_str = "[structural]\nmax_files = 3\n";
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.max_files, 10);
+        assert!(warnings.iter().any(|w| w.contains("below minimum 10")));
+    }
+
+    #[test]
+    fn structural_max_files_above_max_clamps() {
+        let toml_str = "[structural]\nmax_files = 200000\n";
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.max_files, 100_000);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("exceeds maximum 100000"))
+        );
+    }
+
+    #[test]
+    fn structural_retention_days_above_max_clamps() {
+        let toml_str = "[structural]\nretention_days = 5000\n";
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(config.structural.retention_days, 3650);
+        assert!(warnings.iter().any(|w| w.contains("exceeds maximum 3650")));
+    }
+
+    #[test]
+    fn structural_absent_section_uses_retention_defaults() {
+        let toml_str = "# no structural section\n";
+        let user: UserConfig = toml::from_str(toml_str).unwrap();
+        let mut warnings = Vec::new();
+        let config = build_merged_config(user, &mut warnings);
+        assert_eq!(
+            config.structural.retention_days,
+            DEFAULT_STAGING_RETENTION_DAYS
+        );
+        assert_eq!(config.structural.max_files, DEFAULT_STAGING_MAX_FILES);
+    }
+
+    #[test]
+    fn config_template_roundtrip_has_retention_fields() {
+        let template = config_template();
+        assert!(template.contains("retention_days = 7"));
+        assert!(template.contains("max_files = 500"));
     }
 }

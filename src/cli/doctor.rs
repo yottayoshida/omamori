@@ -150,6 +150,9 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     // Section 5: Break-glass status
     print_break_glass_section();
 
+    // Section 6: Staging usage (#313)
+    print_staging_section();
+
     println!();
 
     let problems: Vec<_> = items
@@ -247,6 +250,166 @@ fn print_break_glass_section() {
             crate::break_glass::format_remaining(remaining)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Staging display (#313)
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct StagingInfo {
+    file_count: u64,
+    total_bytes: u64,
+    oldest_days_ago: Option<i64>,
+}
+
+fn gather_staging_info() -> StagingInfo {
+    let dir = crate::engine::hook::staging_dir();
+
+    let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+        return StagingInfo::default();
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return StagingInfo::default();
+    }
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return StagingInfo::default();
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    let mut oldest_mtime: Option<std::time::SystemTime> = None;
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let Ok(m) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !m.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        if !crate::engine::hook::is_staging_filename(&name.to_string_lossy()) {
+            continue;
+        }
+        count += 1;
+        bytes += m.len();
+        let mtime = m.modified().unwrap_or(now);
+        oldest_mtime = Some(match oldest_mtime {
+            Some(prev) if prev < mtime => prev,
+            _ => mtime,
+        });
+    }
+
+    let oldest_days_ago = oldest_mtime.and_then(|mt| {
+        let secs = mt.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+        let mt_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
+            .ok()?
+            .date()
+            .to_julian_day();
+        let today_jd = OffsetDateTime::now_utc().date().to_julian_day();
+        Some(i64::from(today_jd - mt_jd))
+    });
+
+    StagingInfo {
+        file_count: count,
+        total_bytes: bytes,
+        oldest_days_ago,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{} MB", bytes / (1024 * 1024))
+    }
+}
+
+fn print_staging_section() {
+    let info = gather_staging_info();
+
+    if info.file_count == 0 {
+        println!("  [Staging] empty");
+        return;
+    }
+
+    let oldest_label = match info.oldest_days_ago {
+        Some(0) => "today".to_string(),
+        Some(1) => "1 day".to_string(),
+        Some(n) => format!("{n} days"),
+        None => "unknown".to_string(),
+    };
+    println!(
+        "  [Staging] {} file(s), {}, oldest: {}",
+        info.file_count,
+        format_bytes(info.total_bytes),
+        oldest_label,
+    );
+
+    let Ok(load_result) = crate::config::load_config(None) else {
+        return;
+    };
+    let cfg = &load_result.config.structural;
+
+    if cfg.max_files > 0 && info.file_count > u64::from(cfg.max_files) {
+        println!("    WARN  file count exceeds max_files ({})", cfg.max_files);
+    }
+    if cfg.retention_days > 0
+        && info
+            .oldest_days_ago
+            .is_some_and(|days| days > i64::from(cfg.retention_days) * 2)
+    {
+        println!(
+            "    WARN  oldest file exceeds 2\u{00d7} retention_days ({})",
+            cfg.retention_days
+        );
+    }
+}
+
+fn staging_json_summary() -> serde_json::Value {
+    let info = gather_staging_info();
+
+    let Ok(load_result) = crate::config::load_config(None) else {
+        return serde_json::json!({
+            "file_count": info.file_count,
+            "total_bytes": info.total_bytes,
+            "oldest_days_ago": info.oldest_days_ago,
+            "status": "error",
+            "retention_days": null,
+            "max_files": null,
+        });
+    };
+    let retention_days = load_result.config.structural.retention_days;
+    let max_files = load_result.config.structural.max_files;
+
+    let status = if info.file_count == 0 {
+        "ok"
+    } else {
+        let count_exceeded = max_files > 0 && info.file_count > u64::from(max_files);
+        let age_exceeded = retention_days > 0
+            && info
+                .oldest_days_ago
+                .is_some_and(|d| d > i64::from(retention_days) * 2);
+        if count_exceeded || age_exceeded {
+            "warn"
+        } else {
+            "ok"
+        }
+    };
+
+    serde_json::json!({
+        "file_count": info.file_count,
+        "total_bytes": info.total_bytes,
+        "oldest_days_ago": info.oldest_days_ago,
+        "status": status,
+        "retention_days": retention_days,
+        "max_files": max_files,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +837,7 @@ fn build_json_output(items: &[CheckItem], fix_mode: bool) -> serde_json::Value {
             "layer2": section_summary(&sections[1].1),
             "integrity": section_summary(&sections[2].1),
             "shim_activity": heartbeat_json_summary(),
+            "staging": staging_json_summary(),
         },
         "items": json_items,
     })
@@ -1148,5 +1312,49 @@ mod tests {
             ["ok", "warn", "clock_skew", "awaiting_first_invocation"].contains(&status),
             "unexpected status: {status}"
         );
+    }
+
+    // --- Staging section (#313) ---
+
+    #[test]
+    fn json_output_includes_staging() {
+        let items = vec![CheckItem {
+            category: "Shims",
+            name: "rm".to_string(),
+            status: CheckStatus::Ok,
+            detail: "ok".to_string(),
+            remediation: None,
+        }];
+        let output = build_json_output(&items, false);
+        let staging = output["summary"].get("staging");
+        assert!(staging.is_some(), "staging must be in summary");
+        let staging = staging.unwrap();
+        assert!(staging.get("file_count").is_some());
+        assert!(staging.get("total_bytes").is_some());
+        assert!(staging.get("oldest_days_ago").is_some());
+        assert!(staging.get("status").is_some());
+        assert!(staging.get("retention_days").is_some());
+        assert!(staging.get("max_files").is_some());
+        let status = staging["status"].as_str().unwrap();
+        assert!(
+            ["ok", "warn"].contains(&status),
+            "unexpected staging status: {status}"
+        );
+    }
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(49152), "48 KB");
+        assert_eq!(format_bytes(1048576), "1 MB");
+        assert_eq!(format_bytes(5242880), "5 MB");
+    }
+
+    #[test]
+    fn gather_staging_info_does_not_panic() {
+        // May or may not have files depending on system state, but should not panic
+        let _info = gather_staging_info();
     }
 }
