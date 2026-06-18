@@ -282,10 +282,10 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 
 ### Claude Code Hooks
 
-The generated PreToolUse hook script is a thin wrapper that delegates to `omamori hook-check`:
+The generated PreToolUse hook script is a thin wrapper that delegates to the omamori binary via its absolute path (resolved via `resolve_stable_exe_path()` at install and hook regeneration time):
 
 ```sh
-cat | omamori hook-check --provider claude-code
+cat | /usr/local/bin/omamori hook-check --provider claude-code
 exit $?
 ```
 

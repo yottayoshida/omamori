@@ -109,7 +109,7 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         fs::create_dir_all(&hooks_dir)?;
 
         let script_path = hooks_dir.join("claude-pretooluse.sh");
-        atomic_write(&script_path, &render_hook_script())?;
+        atomic_write(&script_path, &render_hook_script(&options.source_exe))?;
 
         #[cfg(unix)]
         {
@@ -397,8 +397,22 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
     let hooks_dir = base_dir.join("hooks");
     fs::create_dir_all(&hooks_dir)?;
 
+    // Resolve exe path once, shared by Claude/Cursor/Codex hooks.
+    // Fail-close: if resolution fails, skip all hook regeneration rather than
+    // falling back to bare `omamori` which would reintroduce PATH vulnerability (#315).
+    let stable_exe = match resolved_current_omamori_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!(
+                "omamori warning: failed to resolve current exe ({}); hooks not regenerated",
+                e
+            );
+            return Ok(());
+        }
+    };
+
     let script_path = hooks_dir.join("claude-pretooluse.sh");
-    atomic_write(&script_path, &render_hook_script())?;
+    atomic_write(&script_path, &render_hook_script(&stable_exe))?;
 
     #[cfg(unix)]
     {
@@ -411,48 +425,53 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
     let snippet_path = hooks_dir.join("claude-settings.snippet.json");
     atomic_write(&snippet_path, &render_settings_snippet(&script_path))?;
 
-    // Cursor hooks: resolve to stable Homebrew path to survive brew upgrade (#56)
-    if let Ok(exe) = std::env::current_exe() {
-        let stable_exe = resolve_stable_exe_path(&exe);
-        let cursor_path = hooks_dir.join("cursor-hooks.snippet.json");
-        atomic_write(&cursor_path, &render_cursor_hooks_snippet(&stable_exe))?;
+    // Cursor hooks
+    let cursor_path = hooks_dir.join("cursor-hooks.snippet.json");
+    atomic_write(&cursor_path, &render_cursor_hooks_snippet(&stable_exe))?;
 
-        // Codex hooks: regenerate wrapper + re-merge hooks.json
-        let codex_wrapper = hooks_dir.join("codex-pretooluse.sh");
-        if codex_wrapper.exists() {
-            atomic_write(&codex_wrapper, &render_codex_pretooluse_script(&stable_exe))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&codex_wrapper)?.permissions();
-                perms.set_mode(0o755);
-                fs::set_permissions(&codex_wrapper, perms)?;
-            }
-            let codex_dir = codex_home_dir();
-            if is_real_directory(&codex_dir) {
-                let _ = merge_codex_hooks(&codex_dir, &codex_wrapper);
-            }
+    // Codex hooks: regenerate wrapper + re-merge hooks.json
+    let codex_wrapper = hooks_dir.join("codex-pretooluse.sh");
+    if codex_wrapper.exists() {
+        atomic_write(&codex_wrapper, &render_codex_pretooluse_script(&stable_exe))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&codex_wrapper)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&codex_wrapper, perms)?;
         }
-    } else {
-        eprintln!(
-            "omamori warning: failed to resolve current exe; cursor/codex hooks not regenerated"
-        );
+        let codex_dir = codex_home_dir();
+        if is_real_directory(&codex_dir) {
+            let _ = merge_codex_hooks(&codex_dir, &codex_wrapper);
+        }
     }
 
     Ok(())
 }
 
-pub fn render_hook_script() -> String {
+pub fn render_hook_script(omamori_exe: &Path) -> String {
+    let exe_str = omamori_exe.display().to_string();
+    let quoted = shell_words::quote(&exe_str);
     format!(
         r#"#!/bin/sh
 # omamori hook v{version}
 # Thin wrapper: delegates all detection to `omamori hook-check`
 set -eu
-cat | omamori hook-check --provider claude-code
+cat | {exe} hook-check --provider claude-code
 exit $?
 "#,
-        version = env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION"),
+        exe = quoted,
     )
+}
+
+/// Resolve the current omamori binary to a stable path.
+///
+/// Used by `regenerate_hooks()`, integrity checks, and shim verification
+/// to ensure identical exe path resolution across generation and verification.
+pub fn resolved_current_omamori_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(resolve_stable_exe_path(&exe))
 }
 
 /// Protected AI environment detector variables.
@@ -1300,17 +1319,62 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    const TEST_EXE: &str = "/usr/local/bin/omamori";
+
     #[test]
     fn hook_script_is_thin_wrapper() {
-        let script = render_hook_script();
+        let script = render_hook_script(Path::new(TEST_EXE));
         assert!(
-            script.contains("omamori hook-check"),
-            "hook script should delegate to omamori hook-check"
+            script.contains(&format!("| {TEST_EXE} hook-check --provider claude-code")),
+            "hook script must pipe stdin through absolute exe path + hook-check"
         );
-        // Thin wrapper should NOT contain case statements
+        assert!(
+            !script.contains("| omamori hook-check"),
+            "hook script must use absolute path, not bare omamori"
+        );
         assert!(
             !script.contains("case \"$INPUT\""),
             "hook script should not contain case statements (now a thin wrapper)"
+        );
+    }
+
+    #[test]
+    fn hook_script_quotes_path_with_spaces() {
+        let exe = "/Users/my user/bin/omamori";
+        let script = render_hook_script(Path::new(exe));
+        // shell_words::quote wraps entire path in single quotes
+        assert!(
+            script.contains(&format!("| '{exe}' hook-check --provider claude-code")),
+            "path with spaces must be single-quoted in the pipe command"
+        );
+    }
+
+    #[test]
+    fn hook_script_quotes_path_with_apostrophe() {
+        let exe = "/Users/o'brien/bin/omamori";
+        let script = render_hook_script(Path::new(exe));
+        assert!(
+            script.contains("hook-check --provider claude-code"),
+            "hook script must contain hook-check invocation"
+        );
+        let quoted = shell_words::quote(exe);
+        assert!(
+            script.contains(&*quoted),
+            "path with apostrophe must be shell-safe: {quoted}"
+        );
+    }
+
+    #[test]
+    fn hook_script_quotes_path_with_dollar() {
+        let exe = "/tmp/$HOME/bin/omamori";
+        let script = render_hook_script(Path::new(exe));
+        assert!(
+            script.contains("hook-check --provider claude-code"),
+            "hook script must contain hook-check invocation"
+        );
+        assert!(
+            !script.contains("| /tmp/$HOME/bin/omamori"),
+            "path with $ must be quoted to prevent shell expansion"
         );
     }
 
@@ -1378,7 +1442,7 @@ mod tests {
 
     #[test]
     fn hook_script_contains_version_comment() {
-        let script = render_hook_script();
+        let script = render_hook_script(Path::new(TEST_EXE));
         let version = env!("CARGO_PKG_VERSION");
         assert!(
             script.contains(&format!("# omamori hook v{version}")),
@@ -1388,7 +1452,7 @@ mod tests {
 
     #[test]
     fn parse_hook_version_extracts_version() {
-        let script = render_hook_script();
+        let script = render_hook_script(Path::new(TEST_EXE));
         let version = parse_hook_version(&script);
         assert_eq!(version, Some(env!("CARGO_PKG_VERSION")));
     }
@@ -1503,8 +1567,8 @@ mod tests {
 
     #[test]
     fn render_hook_script_produces_stable_hash() {
-        let script1 = render_hook_script();
-        let script2 = render_hook_script();
+        let script1 = render_hook_script(Path::new(TEST_EXE));
+        let script2 = render_hook_script(Path::new(TEST_EXE));
         let hash1 = hook_content_hash(&script1);
         let hash2 = hook_content_hash(&script2);
         assert_eq!(hash1, hash2, "render_hook_script() should be deterministic");
@@ -1512,11 +1576,11 @@ mod tests {
 
     #[test]
     fn t2_attack_version_preserved_content_changed_hash_differs() {
-        let original = render_hook_script();
+        let original = render_hook_script(Path::new(TEST_EXE));
         let original_hash = hook_content_hash(&original);
 
         // Simulate T2 attack: keep version comment but bypass hook-check
-        let tampered = original.replace("omamori hook-check", "true");
+        let tampered = original.replace("hook-check", "true");
         let tampered_hash = hook_content_hash(&tampered);
 
         assert_ne!(
