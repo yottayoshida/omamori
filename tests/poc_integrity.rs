@@ -7,7 +7,10 @@
 
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::symlink;
+use std::path::Path;
 use std::time::Instant;
+
+const TEST_EXE: &str = "/usr/local/bin/omamori";
 
 /// PoC-1: render_hook_script() determinism
 ///
@@ -15,8 +18,8 @@ use std::time::Instant;
 /// always show "mismatch" and trigger unnecessary regeneration.
 #[test]
 fn poc1_render_hook_script_is_deterministic() {
-    let output1 = omamori::installer::render_hook_script();
-    let output2 = omamori::installer::render_hook_script();
+    let output1 = omamori::installer::render_hook_script(Path::new(TEST_EXE));
+    let output2 = omamori::installer::render_hook_script(Path::new(TEST_EXE));
 
     // Same content
     assert_eq!(
@@ -41,7 +44,7 @@ fn poc1_render_hook_script_is_deterministic() {
 /// PoC-1b: render_hook_script() contains version but nothing else dynamic
 #[test]
 fn poc1b_render_hook_script_only_dynamic_is_version() {
-    let output = omamori::installer::render_hook_script();
+    let output = omamori::installer::render_hook_script(Path::new(TEST_EXE));
 
     // Should contain version
     let version = env!("CARGO_PKG_VERSION");
@@ -52,7 +55,8 @@ fn poc1b_render_hook_script_only_dynamic_is_version() {
 
     // Replace version with placeholder and check it's still deterministic
     let normalized1 = output.replace(version, "VERSION");
-    let normalized2 = omamori::installer::render_hook_script().replace(version, "VERSION");
+    let normalized2 =
+        omamori::installer::render_hook_script(Path::new(TEST_EXE)).replace(version, "VERSION");
     assert_eq!(normalized1, normalized2);
 
     println!("PoC-1b PASS: only dynamic content is version ({})", version);
@@ -140,7 +144,7 @@ fn poc3_hook_regen_then_hash_check_no_false_positive() {
     .unwrap();
 
     // Verify they DON'T match before regen
-    let expected = omamori::installer::render_hook_script();
+    let expected = omamori::installer::render_hook_script(Path::new(TEST_EXE));
     let expected_hash = sha256_hex(&expected);
     let actual_before = std::fs::read_to_string(&hook_path).unwrap();
     let actual_hash_before = sha256_hex(&actual_before);
@@ -172,11 +176,11 @@ fn poc3_hook_regen_then_hash_check_no_false_positive() {
 /// PoC-3b: Tampered hook (version preserved, content changed) is detected
 #[test]
 fn poc3b_tampered_hook_detected_by_hash() {
-    let expected = omamori::installer::render_hook_script();
+    let expected = omamori::installer::render_hook_script(Path::new(TEST_EXE));
     let expected_hash = sha256_hex(&expected);
 
     // Simulate T2 attack: keep version comment, bypass hook-check
-    let tampered = expected.replace("omamori hook-check", "true");
+    let tampered = expected.replace("hook-check", "true");
     let tampered_hash = sha256_hex(&tampered);
 
     // Version comment is preserved

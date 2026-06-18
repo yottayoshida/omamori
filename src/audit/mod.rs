@@ -781,6 +781,39 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #314 baseline: tail truncation is NOT detected by verify_chain().
+    ///
+    /// Forward-only chain walk has no external sequence anchor, so removing
+    /// the last K entries produces a valid (shorter) chain. This test
+    /// documents the structural limitation. If future work adds detection
+    /// (e.g. high-water-mark), update this test to assert detection.
+    #[test]
+    fn chain_tail_truncation_not_detected() {
+        let dir = test_dir("chain-tail-truncation");
+        let logger = test_logger(&dir);
+
+        for i in 0..5 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 5);
+
+        let truncated = format!("{}\n{}\n{}\n", lines[0], lines[1], lines[2]);
+        fs::write(&logger.path, truncated).unwrap();
+
+        let verify_result = verify::verify_chain(&verify_config(&dir))
+            .expect("verify_chain must succeed on truncated chain");
+        assert!(
+            verify_result.broken_at.is_none(),
+            "tail truncation is a structural limitation: verify_chain cannot detect it \
+             (forward-only walk sees a valid shorter chain). broken_at should be None."
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// PR #187 item 4 / PR #186 proxy R4 P3-5 deferred.
     ///
     /// Tamper class: overwrite `prev_hash` on the genesis event (seq=0).

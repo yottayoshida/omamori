@@ -219,7 +219,14 @@ pub(crate) fn ensure_hooks_current_at(base_dir: &Path) -> bool {
     }
 
     // Level 2: content hash check (T2 attack detection)
-    let expected = installer::render_hook_script();
+    let omamori_exe = match installer::resolved_current_omamori_exe() {
+        Ok(exe) => exe,
+        Err(_) => {
+            // Cannot resolve exe — skip hash check rather than falling back to bare name
+            return false;
+        }
+    };
+    let expected = installer::render_hook_script(&omamori_exe);
     let expected_hash = installer::hook_content_hash(&expected);
     let actual_hash = installer::hook_content_hash(&content);
 
@@ -710,7 +717,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let hooks_dir = setup_hooks_dir(&dir);
 
-        let expected = installer::render_hook_script();
+        let omamori_exe = installer::resolved_current_omamori_exe().unwrap();
+        let expected = installer::render_hook_script(&omamori_exe);
         std::fs::write(hooks_dir.join("claude-pretooluse.sh"), expected).unwrap();
 
         let result = ensure_hooks_current_at(&dir);
@@ -787,7 +795,8 @@ mod tests {
             );
 
             let content = std::fs::read_to_string(&hook_path).unwrap();
-            let expected = installer::render_hook_script();
+            let omamori_exe = installer::resolved_current_omamori_exe().unwrap();
+            let expected = installer::render_hook_script(&omamori_exe);
             assert_eq!(
                 installer::hook_content_hash(&content),
                 installer::hook_content_hash(&expected),

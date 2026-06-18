@@ -529,7 +529,19 @@ fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
             };
         }
     };
-    let expected_hash = installer::hook_content_hash(&installer::render_hook_script());
+    let omamori_exe = match installer::resolved_current_omamori_exe() {
+        Ok(exe) => exe,
+        Err(_) => {
+            return CheckItem {
+                category,
+                name,
+                status: CheckStatus::Warn,
+                detail: "(cannot resolve omamori exe — hash check skipped)".to_string(),
+                remediation: Some(Remediation::RunInstall),
+            };
+        }
+    };
+    let expected_hash = installer::hook_content_hash(&installer::render_hook_script(&omamori_exe));
     let actual_hash = installer::hook_content_hash(&actual);
     if actual_hash != expected_hash {
         return CheckItem {
@@ -627,36 +639,50 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     let hooks_dir = base_dir.join("hooks");
     let hook_path = hooks_dir.join("claude-pretooluse.sh");
     if hook_path.exists() {
-        let expected = installer::render_hook_script();
-        let expected_hash = installer::hook_content_hash(&expected);
-        match fs::read_to_string(&hook_path) {
-            Ok(actual) => {
-                let actual_hash = installer::hook_content_hash(&actual);
-                if expected_hash == actual_hash {
-                    items.push(CheckItem {
-                        category: "Hooks",
-                        name: "claude-pretooluse.sh".to_string(),
-                        status: CheckStatus::Ok,
-                        detail: "(hash match)".to_string(),
-                        remediation: None,
-                    });
-                } else {
-                    items.push(CheckItem {
-                        category: "Hooks",
-                        name: "claude-pretooluse.sh".to_string(),
-                        status: CheckStatus::Fail,
-                        detail: "(hash MISMATCH — run `omamori install --hooks`)".to_string(),
-                        remediation: Some(Remediation::RegenerateHooks),
-                    });
+        match installer::resolved_current_omamori_exe() {
+            Ok(omamori_exe) => {
+                let expected = installer::render_hook_script(&omamori_exe);
+                let expected_hash = installer::hook_content_hash(&expected);
+                match fs::read_to_string(&hook_path) {
+                    Ok(actual) => {
+                        let actual_hash = installer::hook_content_hash(&actual);
+                        if expected_hash == actual_hash {
+                            items.push(CheckItem {
+                                category: "Hooks",
+                                name: "claude-pretooluse.sh".to_string(),
+                                status: CheckStatus::Ok,
+                                detail: "(hash match)".to_string(),
+                                remediation: None,
+                            });
+                        } else {
+                            items.push(CheckItem {
+                                category: "Hooks",
+                                name: "claude-pretooluse.sh".to_string(),
+                                status: CheckStatus::Fail,
+                                detail: "(hash MISMATCH — run `omamori install --hooks`)"
+                                    .to_string(),
+                                remediation: Some(Remediation::RegenerateHooks),
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        items.push(CheckItem {
+                            category: "Hooks",
+                            name: "claude-pretooluse.sh".to_string(),
+                            status: CheckStatus::Fail,
+                            detail: "(unreadable)".to_string(),
+                            remediation: Some(Remediation::RegenerateHooks),
+                        });
+                    }
                 }
             }
             Err(_) => {
                 items.push(CheckItem {
                     category: "Hooks",
                     name: "claude-pretooluse.sh".to_string(),
-                    status: CheckStatus::Fail,
-                    detail: "(unreadable)".to_string(),
-                    remediation: Some(Remediation::RegenerateHooks),
+                    status: CheckStatus::Warn,
+                    detail: "(cannot resolve omamori exe — hash check skipped)".to_string(),
+                    remediation: Some(Remediation::RunInstall),
                 });
             }
         }
@@ -1532,7 +1558,11 @@ mod tests {
         let omamori_hooks = dir.join(".omamori").join("hooks");
         fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
-        fs::write(&script, installer::render_hook_script()).unwrap();
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
 
         let stale = serde_json::json!({
             "hooks": {
@@ -1581,7 +1611,11 @@ mod tests {
         let omamori_hooks = dir.join(".omamori").join("hooks");
         fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
-        fs::write(&script, installer::render_hook_script()).unwrap();
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
 
         let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
         let hybrid_only = serde_json::json!({
@@ -1632,7 +1666,11 @@ mod tests {
         let omamori_hooks = dir.join(".omamori").join("hooks");
         fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
-        fs::write(&script, installer::render_hook_script()).unwrap();
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
         // Non-executable mode (0o600 — read+write only)
         fs::set_permissions(&script, fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -1684,7 +1722,11 @@ mod tests {
         let omamori_hooks = dir.join(".omamori").join("hooks");
         fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
-        fs::write(&script, installer::render_hook_script()).unwrap();
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
         // P1-4: ok-state requires the script to be executable
         #[cfg(unix)]
         {
@@ -1732,7 +1774,11 @@ mod tests {
         let omamori_hooks = dir.join(".omamori").join("hooks");
         fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
-        fs::write(&script, installer::render_hook_script()).unwrap();
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1795,7 +1841,11 @@ mod tests {
         let omamori_hooks = dir.join(".omamori").join("hooks");
         fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
-        fs::write(&script, installer::render_hook_script()).unwrap();
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -143,8 +143,16 @@ else
         echo "FAIL [invariant #7b]: render_hook_script function must exist in $ih"
         ih_fail=1
     else
-        if ! printf '%s\n' "$fn_body" | grep -qF 'cat | omamori hook-check'; then
-            echo "FAIL [invariant #7c]: render_hook_script must pipe stdin through omamori hook-check"
+        if ! printf '%s\n' "$fn_body" | grep -qF 'hook-check --provider claude-code'; then
+            echo "FAIL [invariant #7c]: render_hook_script must invoke hook-check --provider claude-code"
+            ih_fail=1
+        fi
+        if printf '%s\n' "$fn_body" | grep -qF '| omamori hook-check'; then
+            echo "FAIL [invariant #7f]: render_hook_script must NOT use bare omamori (PATH vulnerability)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'omamori_exe'; then
+            echo "FAIL [invariant #7g]: render_hook_script must accept omamori_exe parameter"
             ih_fail=1
         fi
         if ! printf '%s\n' "$fn_body" | grep -qF 'set -eu'; then
