@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.11.5] - 2026-06-18
+
+**Summary**: Hook script absolute path hardening (#315) + audit chain documentation accuracy (#314). Generated Claude Code PreToolUse hook now embeds the resolved absolute binary path instead of bare `omamori`, closing PATH-based binary substitution. SECURITY.md accurately distinguishes mid-chain deletion (detected) from tail truncation (structural limitation).
+
+### Fixed
+
+- **Hook script embeds absolute omamori path** — `render_hook_script()` now takes `omamori_exe: &Path` and embeds the resolved absolute path via `shell_words::quote()`, closing PATH-based binary substitution attacks. New `resolved_current_omamori_exe()` helper unifies exe resolution across all generation and verification call sites (`install`, `regenerate_hooks`, `integrity`, `shim`). Fail-close on `current_exe()` failure: skip hook regeneration (preserving stale absolute-path hook) rather than falling back to bare name. ([#315](https://github.com/yottayoshida/omamori/issues/315))
+- **`full_check()` no longer early-returns on exe resolution failure** — Previously, `resolved_current_omamori_exe()` failure caused `full_check()` to return immediately, silently skipping Config, Core Policy, and PATH checks that don't need exe resolution. Now pushes a Warn for the hook hash check only and continues with remaining checks. (Found by /code-review 8-angle scan)
+
+### Changed
+
+- **SECURITY.md audit chain defense table** — Split single "deletes/truncates" row into two: mid-chain deletion/reorder (detected by `verify_chain()`) vs tail truncation (structural limitation, not detected). ([#314](https://github.com/yottayoshida/omamori/issues/314))
+- **CI invariants #7f, #7g** — `check-invariants.sh` now asserts `render_hook_script` does NOT use bare `omamori` (#7f negative assertion) and accepts `omamori_exe` parameter (#7g). ([#315](https://github.com/yottayoshida/omamori/issues/315))
+
+### Added
+
+- **`chain_tail_truncation_not_detected` baseline test** — Documents that `verify_chain()` returns `broken_at = None` on a truncated chain (structural limitation). ([#314](https://github.com/yottayoshida/omamori/issues/314))
+- **Shell metacharacter tests** — `hook_script_quotes_path_with_spaces`, `hook_script_quotes_path_with_apostrophe`, `hook_script_quotes_path_with_dollar` verify `shell_words::quote()` produces safe output. ([#315](https://github.com/yottayoshida/omamori/issues/315))
+
 ## [0.11.4] - 2026-06-16
 
 **Summary**: Staging file retention/GC (#313). Prune-on-write garbage collection for staging files created by the materialize feature, preventing unbounded disk growth. Files are pruned by age (default 7 days) and count cap (default 500). `omamori doctor` now surfaces staging usage for operational visibility.
