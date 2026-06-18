@@ -639,8 +639,43 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     let hooks_dir = base_dir.join("hooks");
     let hook_path = hooks_dir.join("claude-pretooluse.sh");
     if hook_path.exists() {
-        let omamori_exe = match installer::resolved_current_omamori_exe() {
-            Ok(exe) => exe,
+        match installer::resolved_current_omamori_exe() {
+            Ok(omamori_exe) => {
+                let expected = installer::render_hook_script(&omamori_exe);
+                let expected_hash = installer::hook_content_hash(&expected);
+                match fs::read_to_string(&hook_path) {
+                    Ok(actual) => {
+                        let actual_hash = installer::hook_content_hash(&actual);
+                        if expected_hash == actual_hash {
+                            items.push(CheckItem {
+                                category: "Hooks",
+                                name: "claude-pretooluse.sh".to_string(),
+                                status: CheckStatus::Ok,
+                                detail: "(hash match)".to_string(),
+                                remediation: None,
+                            });
+                        } else {
+                            items.push(CheckItem {
+                                category: "Hooks",
+                                name: "claude-pretooluse.sh".to_string(),
+                                status: CheckStatus::Fail,
+                                detail: "(hash MISMATCH — run `omamori install --hooks`)"
+                                    .to_string(),
+                                remediation: Some(Remediation::RegenerateHooks),
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        items.push(CheckItem {
+                            category: "Hooks",
+                            name: "claude-pretooluse.sh".to_string(),
+                            status: CheckStatus::Fail,
+                            detail: "(unreadable)".to_string(),
+                            remediation: Some(Remediation::RegenerateHooks),
+                        });
+                    }
+                }
+            }
             Err(_) => {
                 items.push(CheckItem {
                     category: "Hooks",
@@ -648,41 +683,6 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                     status: CheckStatus::Warn,
                     detail: "(cannot resolve omamori exe — hash check skipped)".to_string(),
                     remediation: Some(Remediation::RunInstall),
-                });
-                // Skip remaining hook checks — cannot compute expected hash
-                return IntegrityReport { items };
-            }
-        };
-        let expected = installer::render_hook_script(&omamori_exe);
-        let expected_hash = installer::hook_content_hash(&expected);
-        match fs::read_to_string(&hook_path) {
-            Ok(actual) => {
-                let actual_hash = installer::hook_content_hash(&actual);
-                if expected_hash == actual_hash {
-                    items.push(CheckItem {
-                        category: "Hooks",
-                        name: "claude-pretooluse.sh".to_string(),
-                        status: CheckStatus::Ok,
-                        detail: "(hash match)".to_string(),
-                        remediation: None,
-                    });
-                } else {
-                    items.push(CheckItem {
-                        category: "Hooks",
-                        name: "claude-pretooluse.sh".to_string(),
-                        status: CheckStatus::Fail,
-                        detail: "(hash MISMATCH — run `omamori install --hooks`)".to_string(),
-                        remediation: Some(Remediation::RegenerateHooks),
-                    });
-                }
-            }
-            Err(_) => {
-                items.push(CheckItem {
-                    category: "Hooks",
-                    name: "claude-pretooluse.sh".to_string(),
-                    status: CheckStatus::Fail,
-                    detail: "(unreadable)".to_string(),
-                    remediation: Some(Remediation::RegenerateHooks),
                 });
             }
         }
