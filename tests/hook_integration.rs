@@ -1298,10 +1298,9 @@ fn hook_script_block_exit_code_is_exactly_two() {
     );
 }
 
-/// Pin the generated hook script's fail-safe primitives. If a refactor ever
-/// strips `set -eu` or changes `exit $?` to `exit 0`, this test fails before
-/// corpus-level behavior tests (which might silently pass because Allow
-/// cases still exit 0). Complements `check-invariants.sh` landing in PR2b.
+/// Pin the generated hook script's fail-safe primitives. The hook must
+/// fail-close (exit 2 on any non-zero) and contain `set -eu`.
+/// Complements `check-invariants.sh` landing in PR2b.
 #[test]
 fn hook_script_wrapper_has_required_invariants() {
     let (base, hook_path, _) = setup_hook_env("wrapper-invariant");
@@ -1309,12 +1308,20 @@ fn hook_script_wrapper_has_required_invariants() {
         std::fs::read_to_string(&hook_path).expect("hook script must be readable after install");
     let _ = std::fs::remove_dir_all(&base);
     assert!(
-        content.contains("set -eu"),
-        "hook script must contain `set -eu` for fail-fast"
+        content.contains("set -u"),
+        "hook script must contain `set -u` for undefined variable check"
     );
     assert!(
-        content.contains("exit $?"),
-        "hook script must propagate hook-check exit code via `exit $?`"
+        !content.contains("set -eu"),
+        "hook script must NOT use `set -e` (prevents STATUS=$? capture)"
+    );
+    assert!(
+        content.contains("else exit 2; fi"),
+        "hook script must have `else exit 2; fi` control flow (not just in comments)"
+    );
+    assert!(
+        !content.contains("exit $?"),
+        "hook script must NOT use exit $? (fail-open on exit 1)"
     );
 }
 

@@ -364,24 +364,99 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
 // Audit append helper
 // ---------------------------------------------------------------------------
 
+fn audit_warn_sentinel_path() -> Option<PathBuf> {
+    let base = env::var_os("HOME").map(PathBuf::from)?;
+    Some(
+        base.join(".local")
+            .join("share")
+            .join("omamori")
+            .join("audit-warn-throttle"),
+    )
+}
+
+fn should_emit_audit_warning() -> bool {
+    match audit_warn_sentinel_path() {
+        Some(p) => should_emit_audit_warning_at(&p),
+        None => true,
+    }
+}
+
+fn should_emit_audit_warning_at(path: &Path) -> bool {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return true;
+        }
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(elapsed) = mtime.elapsed() {
+                if elapsed.as_secs() < 300 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    touch_audit_warn_sentinel(path);
+    true
+}
+
+fn touch_audit_warn_sentinel(path: &Path) {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return,
+    };
+    let _ = std::fs::create_dir_all(parent);
+
+    let temp_path = parent.join(format!(".audit-warn.{}.tmp", std::process::id()));
+
+    if let Ok(m) = std::fs::symlink_metadata(&temp_path) {
+        if m.file_type().is_symlink() {
+            return;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp_path)
+        {
+            drop(f);
+            let _ = std::fs::rename(&temp_path, path);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Ok(f) = std::fs::File::create(&temp_path) {
+            drop(f);
+            let _ = std::fs::rename(&temp_path, path);
+        }
+    }
+}
+
 /// Attempt to append an audit event. On failure:
-/// - Always emits a WARNING to stderr
-/// - In strict mode, returns `Some(1)` to signal the caller should exit
-/// - In non-strict mode, returns `None` (command execution is not affected)
+/// - In strict mode, always emits error + returns `Some(1)` to block
+/// - In non-strict mode, emits a 1-line warning at most once per 5 minutes
 pub(crate) fn try_audit_append(
     logger: &AuditLogger,
     event: crate::audit::AuditEvent,
     strict: bool,
 ) -> Option<i32> {
     if let Err(e) = logger.append(event) {
-        eprintln!("omamori warning: audit log write failed: {e}");
-        eprintln!("  Command execution was not affected — this is a logging issue only.");
-        eprintln!(
-            "  To fix: check permissions on ~/.local/share/omamori/ or run omamori install --hooks"
-        );
         if strict {
             eprintln!("omamori error: audit strict mode — blocking because audit log is required");
+            eprintln!("  audit log write failed: {e}");
             return Some(1);
+        }
+        if should_emit_audit_warning() {
+            eprintln!(
+                "omamori warning: audit log write failed — run 'omamori doctor' to diagnose"
+            );
         }
     }
     None
@@ -854,6 +929,68 @@ mod tests {
                 "non-strict mode should return None on append failure"
             );
         }
+    }
+
+    // --- Audit warning throttle tests (#334) ---
+
+    #[test]
+    fn should_emit_first_call_returns_true() {
+        let dir = std::env::temp_dir()
+            .join(format!("omamori-throttle-first-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("audit-warn-throttle");
+
+        assert!(
+            should_emit_audit_warning_at(&sentinel),
+            "first call should return true (no sentinel)"
+        );
+        assert!(sentinel.exists(), "sentinel should be created after first call");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_emit_second_call_within_window_returns_false() {
+        let dir = std::env::temp_dir()
+            .join(format!("omamori-throttle-second-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("audit-warn-throttle");
+
+        let first = should_emit_audit_warning_at(&sentinel);
+        assert!(first, "first call should emit");
+
+        let second = should_emit_audit_warning_at(&sentinel);
+        assert!(!second, "second call within 5min window should be suppressed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn throttle_sentinel_symlink_degrades_open() {
+        let dir = std::env::temp_dir()
+            .join(format!("omamori-throttle-sym-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sentinel = dir.join("audit-warn-throttle");
+        let target = dir.join("evil-target");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &sentinel).unwrap();
+            assert!(
+                should_emit_audit_warning_at(&sentinel),
+                "symlink sentinel must degrade-open (return true = emit warning)"
+            );
+            assert!(
+                !target.exists(),
+                "symlink attack: target file must not be created"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------------------------------------------------------------------

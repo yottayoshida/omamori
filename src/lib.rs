@@ -73,6 +73,13 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         .unwrap_or_else(|| OsString::from("omamori"));
     let argv0_name = binary_name(&argv0);
 
+    // Defense-in-depth: route hook-check even when invoked via shim (#333)
+    if argv0_name != "omamori"
+        && args.get(1).and_then(|a| a.to_str()) == Some("hook-check")
+    {
+        return run_hook_check(args);
+    }
+
     if argv0_name != "omamori" {
         return run_shim(&argv0_name, &args[1..]);
     }
@@ -163,5 +170,41 @@ mod tests {
         let args = vec![OsString::from("omamori"), OsString::from("--version")];
         let code = run(&args).expect("--version should succeed");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn shim_argv0_with_hook_check_does_not_enter_shim_mode() {
+        // Defense-in-depth: when argv0 is a shim name (e.g. "git") but
+        // the subcommand is "hook-check", route to run_hook_check instead
+        // of run_shim. run_hook_check reads from stdin; with empty stdin
+        // it should return exit 2 (malformed input = fail-close).
+        let args = vec![
+            OsString::from("git"),
+            OsString::from("hook-check"),
+            OsString::from("--provider"),
+            OsString::from("claude-code"),
+        ];
+        let code = run(&args).expect("hook-check via shim argv0 should not error");
+        assert_eq!(code, 2, "empty stdin hook-check should fail-close with exit 2");
+    }
+
+    #[test]
+    fn shim_argv0_without_hook_check_still_enters_shim() {
+        // Mutation resistance: when argv0 is a shim name but subcommand
+        // is NOT hook-check, must enter shim mode (not omamori dispatch).
+        // "git status" via shim should not hit "unknown subcommand" error.
+        let args = vec![
+            OsString::from("git"),
+            OsString::from("status"),
+        ];
+        let result = run(&args);
+        // run_shim will try to execute real git; the important thing is
+        // it does NOT return AppError::Usage("unknown subcommand: status")
+        match &result {
+            Err(AppError::Usage(msg)) => {
+                panic!("shim argv0 with non-hook-check arg must not hit usage error: {msg}");
+            }
+            _ => {} // any other result (Ok or non-Usage error) is fine
+        }
     }
 }
