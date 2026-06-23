@@ -91,11 +91,10 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
     let shim_dir = options.base_dir.join("shim");
     fs::create_dir_all(&shim_dir)?;
 
-    // Use the source path as-is (do not canonicalize). When installed via
-    // Homebrew, the source path is a stable symlink like /opt/homebrew/bin/omamori.
-    // Canonicalizing resolves it to /opt/homebrew/Cellar/omamori/<version>/bin/omamori,
-    // which breaks after `brew upgrade` + `brew cleanup` removes the old version (#42).
-    let source_exe = options.source_exe.clone();
+    // Resolve shim paths but do NOT canonicalize — Homebrew stable symlinks
+    // like /opt/homebrew/bin/omamori must stay as-is (#42).
+    let source_exe = shim_to_real_exe(&options.source_exe)
+        .unwrap_or_else(|| options.source_exe.clone());
     let mut linked_commands = Vec::new();
 
     for command in SHIM_COMMANDS {
@@ -109,7 +108,7 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         fs::create_dir_all(&hooks_dir)?;
 
         let script_path = hooks_dir.join("claude-pretooluse.sh");
-        atomic_write(&script_path, &render_hook_script(&options.source_exe))?;
+        atomic_write(&script_path, &render_hook_script(&source_exe))?;
 
         #[cfg(unix)]
         {
@@ -132,10 +131,9 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
     let cursor_hook_snippet = if options.generate_hooks {
         let hooks_dir = options.base_dir.join("hooks");
         let cursor_snippet_path = hooks_dir.join("cursor-hooks.snippet.json");
-        let omamori_exe = options.source_exe.clone();
         atomic_write(
             &cursor_snippet_path,
-            &render_cursor_hooks_snippet(&omamori_exe),
+            &render_cursor_hooks_snippet(&source_exe),
         )?;
         Some(cursor_snippet_path)
     } else {
@@ -164,7 +162,7 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
 
     // Generate Codex CLI hook (wrapper → hooks.json → config.toml)
     let (codex_wrapper, codex_hooks_outcome, codex_config_outcome) = if options.generate_hooks {
-        setup_codex_hooks(&options.base_dir, &options.source_exe)
+        setup_codex_hooks(&options.base_dir, &source_exe)
     } else {
         (None, None, None)
     };
@@ -389,6 +387,7 @@ pub fn parse_hook_version(content: &str) -> Option<&str> {
         .lines()
         .find(|line| line.starts_with("# omamori hook v"))
         .and_then(|line| line.strip_prefix("# omamori hook v"))
+        .map(|rest| rest.split([' ', '\t']).next().unwrap_or(rest))
 }
 
 /// Regenerate hooks only (no shim recreation, no config touch).
@@ -454,11 +453,13 @@ pub fn render_hook_script(omamori_exe: &Path) -> String {
     let quoted = shell_words::quote(&exe_str);
     format!(
         r#"#!/bin/sh
-# omamori hook v{version}
-# Thin wrapper: delegates all detection to `omamori hook-check`
-set -eu
+# omamori hook v{version} — Claude Code fail-close wrapper
+# Claude Code: exit 0 = allow, exit 2 = block, exit 1 = allow (fail-open!)
+# This wrapper maps all non-zero exits to exit 2 for fail-close safety.
+set -u
 cat | {exe} hook-check --provider claude-code
-exit $?
+STATUS=$?
+if [ "$STATUS" -eq 0 ]; then exit 0; else exit 2; fi
 "#,
         version = env!("CARGO_PKG_VERSION"),
         exe = quoted,
@@ -498,16 +499,46 @@ fn cellar_to_stable_path(exe: &Path) -> Option<PathBuf> {
     (!binary.is_empty()).then(|| PathBuf::from(format!("{prefix}/bin/{binary}")))
 }
 
+/// Resolve a shim symlink to the real omamori executable.
+/// Returns `None` for non-shim paths or if resolution fails.
+///
+/// Pattern: `*/shim/<command>` where the symlink target's basename is `omamori`.
+/// Uses `read_link` for symlinks, `canonicalize` fallback for non-symlink shims.
+fn shim_to_real_exe(exe: &Path) -> Option<PathBuf> {
+    let parent = exe.parent()?;
+    if parent.file_name()?.to_str()? != "shim" {
+        return None;
+    }
+
+    if let Ok(target) = fs::read_link(exe) {
+        let resolved = if target.is_relative() {
+            parent.join(&target)
+        } else {
+            target
+        };
+        let canonical = resolved.canonicalize().ok()?;
+        if canonical.file_name()?.to_str()? != "omamori" {
+            return None;
+        }
+        return Some(resolved);
+    }
+
+    let canonical = exe.canonicalize().ok()?;
+    (canonical.file_name()?.to_str()? == "omamori").then_some(canonical)
+}
+
 /// Resolve a stable executable path for generated config files.
 ///
-/// On Homebrew installs, `std::env::current_exe()` resolves symlinks to the versioned
-/// Cellar path, which breaks after `brew upgrade` + `brew cleanup`. This function
-/// converts it to the stable symlink path. See: #42 (shim fix), #56 (cursor hooks fix).
+/// Handles two resolution layers:
+/// 1. Shim paths (`~/.omamori/shim/<cmd>`) — follow symlink to real binary (#333/#315)
+/// 2. Cellar paths (`/opt/homebrew/Cellar/...`) — convert to stable link (#42/#56)
 ///
 /// The `exists()` check has a TOCTOU window; this is acceptable because the worst case
 /// is writing a Cellar path — the same as pre-fix behavior, caught by `omamori status`.
 pub(crate) fn resolve_stable_exe_path(exe: &Path) -> PathBuf {
-    if let Some(stable) = cellar_to_stable_path(exe) {
+    let resolved = shim_to_real_exe(exe).unwrap_or_else(|| exe.to_path_buf());
+
+    if let Some(stable) = cellar_to_stable_path(&resolved) {
         if stable.exists() {
             return stable;
         }
@@ -517,7 +548,7 @@ pub(crate) fn resolve_stable_exe_path(exe: &Path) -> PathBuf {
             stable.display()
         );
     }
-    exe.to_path_buf()
+    resolved
 }
 
 pub(crate) fn render_cursor_hooks_snippet(omamori_exe: &Path) -> String {
@@ -1698,6 +1729,257 @@ mod tests {
         assert_eq!(resolve_stable_exe_path(&cellar), expected);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- Shim path resolution tests (#333, #315) ---
+
+    #[test]
+    fn shim_to_real_exe_non_shim_returns_none() {
+        assert!(shim_to_real_exe(Path::new("/usr/local/bin/omamori")).is_none());
+        assert!(shim_to_real_exe(Path::new("/Users/dev/.cargo/bin/omamori")).is_none());
+    }
+
+    #[test]
+    fn shim_to_real_exe_with_symlink() {
+        let dir = std::env::temp_dir().join(format!("omamori-shim-sym-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        let real_bin = dir.join("omamori");
+        fs::write(&real_bin, "binary").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_bin, shim_dir.join("git")).unwrap();
+            let result = shim_to_real_exe(&shim_dir.join("git"));
+            assert!(result.is_some(), "should resolve shim symlink");
+            let resolved = result.unwrap();
+            assert_eq!(resolved, real_bin, "must return exact symlink target path");
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shim_to_real_exe_rejects_non_omamori_target() {
+        let dir = std::env::temp_dir()
+            .join(format!("omamori-shim-reject-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        let evil_bin = dir.join("evil");
+        fs::write(&evil_bin, "binary").unwrap();
+        std::os::unix::fs::symlink(&evil_bin, shim_dir.join("git")).unwrap();
+
+        assert!(
+            shim_to_real_exe(&shim_dir.join("git")).is_none(),
+            "must reject shim pointing to non-omamori binary"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shim_to_real_resolves_nested_homebrew_symlinks() {
+        let dir = std::env::temp_dir()
+            .join(format!("omamori-shim-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let cellar_dir = dir.join("Cellar/omamori/1.0/bin");
+        fs::create_dir_all(&cellar_dir).unwrap();
+        fs::write(cellar_dir.join("omamori"), "binary").unwrap();
+
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink(
+            cellar_dir.join("omamori"),
+            bin_dir.join("omamori"),
+        )
+        .unwrap();
+
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        std::os::unix::fs::symlink(bin_dir.join("omamori"), shim_dir.join("git"))
+            .unwrap();
+
+        let resolved = resolve_stable_exe_path(&shim_dir.join("git"));
+        assert_eq!(
+            resolved,
+            bin_dir.join("omamori"),
+            "nested shim→stable→Cellar must resolve to stable path"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shim_to_real_exe_with_relative_symlink() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-rel-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        let real_bin = dir.join("omamori");
+        fs::write(&real_bin, "binary").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                Path::new("../omamori"),
+                shim_dir.join("npm"),
+            )
+            .unwrap();
+            let result = shim_to_real_exe(&shim_dir.join("npm"));
+            assert!(result.is_some(), "should resolve relative shim symlink");
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shim_to_real_exe_non_symlink_returns_none() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-nosym-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        fs::write(shim_dir.join("git"), "not a symlink").unwrap();
+        let result = shim_to_real_exe(&shim_dir.join("git"));
+        assert!(result.is_none(), "non-symlink shim with no canonicalize target");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_stable_resolves_shim_path() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-resolve-shim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        let real_bin = dir.join("omamori");
+        fs::write(&real_bin, "binary").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real_bin, shim_dir.join("git")).unwrap();
+            let resolved = resolve_stable_exe_path(&shim_dir.join("git"));
+            assert!(
+                !resolved.to_string_lossy().contains("/shim/"),
+                "resolved path must not contain /shim/: {}",
+                resolved.display()
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hook_script_never_contains_shim_path() {
+        let script = render_hook_script(Path::new(TEST_EXE));
+        assert!(
+            !script.contains("/shim/"),
+            "hook script must not embed a shim path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_with_shim_source_normalizes_hook_paths() {
+        let dir = std::env::temp_dir()
+            .join(format!("omamori-install-shim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        let real_bin = dir.join("omamori");
+        fs::write(&real_bin, "binary").unwrap();
+        std::os::unix::fs::symlink(&real_bin, shim_dir.join("git")).unwrap();
+
+        let base = dir.join("base");
+        let result = install(&InstallOptions {
+            base_dir: base.clone(),
+            source_exe: shim_dir.join("git"),
+            generate_hooks: true,
+        })
+        .unwrap();
+
+        let hook_content =
+            fs::read_to_string(result.hook_script.unwrap()).unwrap();
+        assert!(
+            !hook_content.contains("/shim/"),
+            "install with shim source_exe must not embed shim path in Claude hook"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_wrapper_remaps_exit_1_to_exit_2() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir()
+            .join(format!("omamori-failclose-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let fake_exe = dir.join("omamori");
+        fs::write(
+            &fake_exe,
+            "#!/bin/sh\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_script = render_hook_script(&fake_exe);
+        let hook_path = dir.join("hook.sh");
+        fs::write(&hook_path, &hook_script).unwrap();
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&hook_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .unwrap();
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "hook wrapper must remap exit 1 → exit 2 (fail-close)"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hook_script_contains_fail_close() {
+        let script = render_hook_script(Path::new(TEST_EXE));
+        assert!(
+            script.contains("else exit 2; fi"),
+            "Claude Code hook must have `else exit 2; fi` control flow (not just in comments)"
+        );
+        assert!(
+            !script.contains("exit $?"),
+            "Claude Code hook must not use exit $? (fail-open on exit 1)"
+        );
+        assert!(
+            !script.contains("set -eu"),
+            "Claude Code hook must use set -u (not set -eu) to allow STATUS=$? capture"
+        );
+        assert!(
+            script.contains("set -u\n"),
+            "Claude Code hook must contain set -u (standalone, not set -eu)"
+        );
     }
 
     // --- Codex CLI hook tests (#66) ---
