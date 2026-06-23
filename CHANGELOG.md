@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.11.6] - 2026-06-23
+
+**Summary**: Shim routing fix + fail-close hook + audit throttle (#333, #315, #334). Hook scripts now resolve shim symlinks to the real omamori binary, closing a critical bypass where `~/.omamori/shim/git hook-check` entered shim mode instead of Layer 2 inspection. Claude Code PreToolUse hook now fails closed (exit 2 on any non-zero) instead of the previous fail-open `exit $?`. Non-strict audit warnings throttled to one line every 5 minutes.
+
+### Fixed
+
+- **Shim path resolution in hook scripts** — New `shim_to_real_exe()` function detects `*/shim/<cmd>` paths, follows the symlink back to the real omamori binary, and resolves relative symlink targets against the parent directory. `resolve_stable_exe_path()` now checks shim paths before Cellar paths. `install()` normalizes `source_exe` so all three hook generation call sites (Claude Code, Cursor, Codex) embed the correct binary path. ([#333](https://github.com/yottayoshida/omamori/issues/333), [#315](https://github.com/yottayoshida/omamori/issues/315))
+- **Claude Code hook fail-close** — `render_hook_script()` template changed from `set -eu` + `exit $?` to `set -u` + explicit `STATUS=$?; if [ "$STATUS" -eq 0 ]; then exit 0; else exit 2; fi`. The previous `set -e` caused the shell to exit immediately on non-zero, making `STATUS=$?` unreachable. Claude Code treats exit 1 as "allow" (fail-open), so the old pattern silently disabled Layer 2 on any hook-check error. ([#333](https://github.com/yottayoshida/omamori/issues/333))
+- **`parse_hook_version()` truncation** — Now splits at first whitespace, so hook comment lines like `# omamori hook v0.11.6 — description` correctly parse as version `0.11.6` instead of the full suffix. ([#333](https://github.com/yottayoshida/omamori/issues/333))
+
+### Added
+
+- **Defense-in-depth shim routing** — `run()` in `lib.rs` intercepts `hook-check` subcommand even when argv0 is a shim name (e.g. `git`), routing to `run_hook_check()` instead of `run_shim()`. Prevents future regressions where the shim-embedded binary path somehow recurs. ([#333](https://github.com/yottayoshida/omamori/issues/333))
+- **Audit warning throttle** — Non-strict audit write failures now emit a single-line warning (`omamori warning: audit log write failed — run 'omamori doctor' to diagnose`) at most once per 5 minutes via a file-based sentinel at `~/.local/share/omamori/audit-warn-throttle`. Atomic write via temp+rename, symlink-safe (O_NOFOLLOW), degrade-open on sentinel failure. Strict mode bypasses throttle entirely. ([#334](https://github.com/yottayoshida/omamori/issues/334))
+- **20+ new tests** — Shim symlink resolution (absolute, relative, non-symlink, non-omamori rejection, nested Homebrew chains), install source normalization, behavioral fail-close verification (fake exe exits 1 → wrapper exits 2), hook integration assertions (no `set -eu`, no `exit $?`, requires `exit 2`), audit throttle (first-call/window/symlink-degrade), defense-in-depth routing (shim argv0 + hook-check, mutation resistance). ([#333](https://github.com/yottayoshida/omamori/issues/333), [#315](https://github.com/yottayoshida/omamori/issues/315), [#334](https://github.com/yottayoshida/omamori/issues/334))
+
 ## [0.11.5] - 2026-06-18
 
 **Summary**: Hook script absolute path hardening (#315) + audit chain documentation accuracy (#314). Generated Claude Code PreToolUse hook now embeds the resolved absolute binary path instead of bare `omamori`, closing PATH-based binary substitution. SECURITY.md accurately distinguishes mid-chain deletion (detected) from tail truncation (structural limitation).
