@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.11.7] - 2026-06-24
+
+**Summary**: HWM audit-chain closure + config validate + report by-rule (#314, #318, #317, #316). Tail truncation of the audit log is now detected via a seq high-water-mark file, closing the last structural gap in chain integrity verification. New `config validate` subcommand catches config errors before runtime. `report` output now includes per-rule breakdown for single-command false-positive triage. SECURITY.md defense boundary matrix updated to document the Write/Edit coverage gap honestly.
+
+### Added
+
+- **Seq high-water-mark (HWM) tail-truncation detection** — `append()` writes the highest seen seq to `<audit-log>.hwm` (e.g. `audit.jsonl.hwm`) under the same flock. `verify_chain()` compares the chain's max seq against the HWM; if entries are missing, it reports truncation (new exit code 3). `try_prune()` resets the HWM to the max retained non-prune-point seq after successful prune, preventing false positives. HWM file is chmod 600, O_NOFOLLOW, and protected by `PROTECTED_FILE_PATTERNS` (`.jsonl.hwm` suffix). Pre-HWM chains bootstrap silently on first verify. ([#314](https://github.com/yottayoshida/omamori/issues/314))
+- **`omamori config validate [PATH]`** — Standalone config linter that reuses `load_config()` and `reject_symlink_public()`. Exit 0 = valid, 1 = degraded/invalid (with warnings), 2 = not found. No AI environment guard (read-only command). ([#317](https://github.com/yottayoshida/omamori/issues/317))
+- **`report --by-rule` breakdown** — `omamori report` now shows per-rule block counts in both human and JSON output. `by_rule` field added to `ReportAggregate` (SEC-R2 revised from 7 to 8 fields). Events with no `rule_id` map to `"unknown"`. ([#316](https://github.com/yottayoshida/omamori/issues/316))
+- **`ChainStatus::Truncated` variant** — Report and doctor now distinguish truncation from corruption. Doctor treats truncation as a risk signal alongside chain breakage. ([#314](https://github.com/yottayoshida/omamori/issues/314))
+- **Write/Edit coverage gap in SECURITY.md** — Defense boundary matrix now documents that native AI editor-tool writes (Write/Edit) are outside the command-guard interception layer. ([#318](https://github.com/yottayoshida/omamori/issues/318))
+
+### Fixed
+
+- **Clippy 1.96 compliance** — Collapsed nested `if` statements, replaced `map_or` with `is_none_or`, converted single-arm `match` to `if let`.
+- **Invariants check script** — Updated `check-invariants.sh` to match actual `render_hook_script` contract: `set -u` (not `set -eu`) and fail-close if/else pattern (not bare `exit $?`). Out of sync since v0.11.5.
+
 ## [0.11.6] - 2026-06-23
 
 **Summary**: Shim routing fix + fail-close hook + audit throttle (#333, #315, #334). Hook scripts now resolve shim symlinks to the real omamori binary, closing a critical bypass where `~/.omamori/shim/git hook-check` entered shim mode instead of Layer 2 inspection. Claude Code PreToolUse hook now fails closed (exit 2 on any non-zero) instead of the previous fail-open `exit $?`. Non-strict audit warnings throttled to one line every 5 minutes.
