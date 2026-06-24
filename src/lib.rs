@@ -74,9 +74,7 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
     let argv0_name = binary_name(&argv0);
 
     // Defense-in-depth: route hook-check even when invoked via shim (#333)
-    if argv0_name != "omamori"
-        && args.get(1).and_then(|a| a.to_str()) == Some("hook-check")
-    {
+    if argv0_name != "omamori" && args.get(1).and_then(|a| a.to_str()) == Some("hook-check") {
         return run_hook_check(args);
     }
 
@@ -185,7 +183,10 @@ mod tests {
             OsString::from("claude-code"),
         ];
         let code = run(&args).expect("hook-check via shim argv0 should not error");
-        assert_eq!(code, 2, "empty stdin hook-check should fail-close with exit 2");
+        assert_eq!(
+            code, 2,
+            "empty stdin hook-check should fail-close with exit 2"
+        );
     }
 
     #[test]
@@ -193,18 +194,12 @@ mod tests {
         // Mutation resistance: when argv0 is a shim name but subcommand
         // is NOT hook-check, must enter shim mode (not omamori dispatch).
         // "git status" via shim should not hit "unknown subcommand" error.
-        let args = vec![
-            OsString::from("git"),
-            OsString::from("status"),
-        ];
+        let args = vec![OsString::from("git"), OsString::from("status")];
         let result = run(&args);
         // run_shim will try to execute real git; the important thing is
         // it does NOT return AppError::Usage("unknown subcommand: status")
-        match &result {
-            Err(AppError::Usage(msg)) => {
-                panic!("shim argv0 with non-hook-check arg must not hit usage error: {msg}");
-            }
-            _ => {} // any other result (Ok or non-Usage error) is fine
+        if let Err(AppError::Usage(msg)) = &result {
+            panic!("shim argv0 with non-hook-check arg must not hit usage error: {msg}");
         }
     }
 }

@@ -386,12 +386,11 @@ fn should_emit_audit_warning_at(path: &Path) -> bool {
         if !meta.file_type().is_file() {
             return true;
         }
-        if let Ok(mtime) = meta.modified() {
-            if let Ok(elapsed) = mtime.elapsed() {
-                if elapsed.as_secs() < 300 {
-                    return false;
-                }
-            }
+        if let Ok(mtime) = meta.modified()
+            && let Ok(elapsed) = mtime.elapsed()
+            && elapsed.as_secs() < 300
+        {
+            return false;
         }
     }
 
@@ -408,10 +407,10 @@ fn touch_audit_warn_sentinel(path: &Path) {
 
     let temp_path = parent.join(format!(".audit-warn.{}.tmp", std::process::id()));
 
-    if let Ok(m) = std::fs::symlink_metadata(&temp_path) {
-        if m.file_type().is_symlink() {
-            return;
-        }
+    if let Ok(m) = std::fs::symlink_metadata(&temp_path)
+        && m.file_type().is_symlink()
+    {
+        return;
     }
 
     #[cfg(unix)]
@@ -454,9 +453,7 @@ pub(crate) fn try_audit_append(
             return Some(1);
         }
         if should_emit_audit_warning() {
-            eprintln!(
-                "omamori warning: audit log write failed — run 'omamori doctor' to diagnose"
-            );
+            eprintln!("omamori warning: audit log write failed — run 'omamori doctor' to diagnose");
         }
     }
     None
@@ -935,8 +932,8 @@ mod tests {
 
     #[test]
     fn should_emit_first_call_returns_true() {
-        let dir = std::env::temp_dir()
-            .join(format!("omamori-throttle-first-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-throttle-first-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sentinel = dir.join("audit-warn-throttle");
@@ -945,15 +942,18 @@ mod tests {
             should_emit_audit_warning_at(&sentinel),
             "first call should return true (no sentinel)"
         );
-        assert!(sentinel.exists(), "sentinel should be created after first call");
+        assert!(
+            sentinel.exists(),
+            "sentinel should be created after first call"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn should_emit_second_call_within_window_returns_false() {
-        let dir = std::env::temp_dir()
-            .join(format!("omamori-throttle-second-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-throttle-second-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sentinel = dir.join("audit-warn-throttle");
@@ -962,15 +962,17 @@ mod tests {
         assert!(first, "first call should emit");
 
         let second = should_emit_audit_warning_at(&sentinel);
-        assert!(!second, "second call within 5min window should be suppressed");
+        assert!(
+            !second,
+            "second call within 5min window should be suppressed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn throttle_sentinel_symlink_degrades_open() {
-        let dir = std::env::temp_dir()
-            .join(format!("omamori-throttle-sym-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-throttle-sym-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 

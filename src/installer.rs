@@ -93,8 +93,8 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
 
     // Resolve shim paths but do NOT canonicalize — Homebrew stable symlinks
     // like /opt/homebrew/bin/omamori must stay as-is (#42).
-    let source_exe = shim_to_real_exe(&options.source_exe)
-        .unwrap_or_else(|| options.source_exe.clone());
+    let source_exe =
+        shim_to_real_exe(&options.source_exe).unwrap_or_else(|| options.source_exe.clone());
     let mut linked_commands = Vec::new();
 
     for command in SHIM_COMMANDS {
@@ -1764,8 +1764,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shim_to_real_exe_rejects_non_omamori_target() {
-        let dir = std::env::temp_dir()
-            .join(format!("omamori-shim-reject-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-shim-reject-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let shim_dir = dir.join("shim");
         fs::create_dir_all(&shim_dir).unwrap();
@@ -1785,8 +1784,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shim_to_real_resolves_nested_homebrew_symlinks() {
-        let dir = std::env::temp_dir()
-            .join(format!("omamori-shim-nested-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-shim-nested-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
 
         let cellar_dir = dir.join("Cellar/omamori/1.0/bin");
@@ -1795,16 +1793,11 @@ mod tests {
 
         let bin_dir = dir.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        std::os::unix::fs::symlink(
-            cellar_dir.join("omamori"),
-            bin_dir.join("omamori"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(cellar_dir.join("omamori"), bin_dir.join("omamori")).unwrap();
 
         let shim_dir = dir.join("shim");
         fs::create_dir_all(&shim_dir).unwrap();
-        std::os::unix::fs::symlink(bin_dir.join("omamori"), shim_dir.join("git"))
-            .unwrap();
+        std::os::unix::fs::symlink(bin_dir.join("omamori"), shim_dir.join("git")).unwrap();
 
         let resolved = resolve_stable_exe_path(&shim_dir.join("git"));
         assert_eq!(
@@ -1818,8 +1811,7 @@ mod tests {
 
     #[test]
     fn shim_to_real_exe_with_relative_symlink() {
-        let dir =
-            std::env::temp_dir().join(format!("omamori-shim-rel-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-shim-rel-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let shim_dir = dir.join("shim");
         fs::create_dir_all(&shim_dir).unwrap();
@@ -1829,11 +1821,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink(
-                Path::new("../omamori"),
-                shim_dir.join("npm"),
-            )
-            .unwrap();
+            std::os::unix::fs::symlink(Path::new("../omamori"), shim_dir.join("npm")).unwrap();
             let result = shim_to_real_exe(&shim_dir.join("npm"));
             assert!(result.is_some(), "should resolve relative shim symlink");
         }
@@ -1843,23 +1831,24 @@ mod tests {
 
     #[test]
     fn shim_to_real_exe_non_symlink_returns_none() {
-        let dir =
-            std::env::temp_dir().join(format!("omamori-shim-nosym-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-shim-nosym-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let shim_dir = dir.join("shim");
         fs::create_dir_all(&shim_dir).unwrap();
 
         fs::write(shim_dir.join("git"), "not a symlink").unwrap();
         let result = shim_to_real_exe(&shim_dir.join("git"));
-        assert!(result.is_none(), "non-symlink shim with no canonicalize target");
+        assert!(
+            result.is_none(),
+            "non-symlink shim with no canonicalize target"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn resolve_stable_resolves_shim_path() {
-        let dir =
-            std::env::temp_dir().join(format!("omamori-resolve-shim-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-resolve-shim-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let shim_dir = dir.join("shim");
         fs::create_dir_all(&shim_dir).unwrap();
@@ -1893,8 +1882,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn install_with_shim_source_normalizes_hook_paths() {
-        let dir = std::env::temp_dir()
-            .join(format!("omamori-install-shim-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-install-shim-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let shim_dir = dir.join("shim");
         fs::create_dir_all(&shim_dir).unwrap();
@@ -1911,8 +1899,7 @@ mod tests {
         })
         .unwrap();
 
-        let hook_content =
-            fs::read_to_string(result.hook_script.unwrap()).unwrap();
+        let hook_content = fs::read_to_string(result.hook_script.unwrap()).unwrap();
         assert!(
             !hook_content.contains("/shim/"),
             "install with shim source_exe must not embed shim path in Claude hook"
@@ -1926,17 +1913,12 @@ mod tests {
     fn hook_wrapper_remaps_exit_1_to_exit_2() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir()
-            .join(format!("omamori-failclose-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("omamori-failclose-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
         let fake_exe = dir.join("omamori");
-        fs::write(
-            &fake_exe,
-            "#!/bin/sh\nexit 1\n",
-        )
-        .unwrap();
+        fs::write(&fake_exe, "#!/bin/sh\nexit 1\n").unwrap();
         fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
 
         let hook_script = render_hook_script(&fake_exe);

@@ -199,11 +199,31 @@ impl AuditLogger {
         writeln!(file)?;
         file.flush()?;
 
+        // HWM update: detect truncation on append + advance high-water-mark
+        let hwm_file = hwm_path_for(&self.path);
+        let current_hwm = read_hwm(&hwm_file);
+        if let Some(h) = current_hwm
+            && seq < h
+        {
+            eprintln!(
+                "omamori warning: audit log tail may have been truncated \
+                 (seq {seq} < high-water-mark {h})"
+            );
+        }
+        if current_hwm.is_none_or(|h| seq > h) {
+            let _ = write_hwm(&hwm_file, seq);
+        }
+
         // Auto-prune under the same flock (no extra I/O when not triggered)
         if self.retention_days > 0
             && seq > 0
             && seq % PRUNE_CHECK_INTERVAL == 0
-            && let Err(e) = try_prune(&mut file, self.secret.as_ref(), self.retention_days)
+            && let Err(e) = try_prune(
+                &mut file,
+                self.secret.as_ref(),
+                self.retention_days,
+                Some(&self.path),
+            )
         {
             eprintln!("omamori warning: audit prune failed: {e}");
         }
@@ -244,6 +264,37 @@ pub struct AuditEvent {
     pub key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_hash: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// High-water-mark (HWM) helpers
+// ---------------------------------------------------------------------------
+
+/// Derive HWM file path from the audit log path.
+/// e.g. `~/.local/share/omamori/audit.jsonl` → `~/.local/share/omamori/audit.jsonl.hwm`
+pub(crate) fn hwm_path_for(audit_path: &std::path::Path) -> PathBuf {
+    let mut hwm = audit_path.as_os_str().to_owned();
+    hwm.push(".hwm");
+    PathBuf::from(hwm)
+}
+
+fn read_hwm(hwm_path: &std::path::Path) -> Option<u64> {
+    let content = fs::read_to_string(hwm_path).ok()?;
+    content.trim().parse::<u64>().ok()
+}
+
+fn write_hwm(hwm_path: &std::path::Path, seq: u64) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(hwm_path)?;
+    use std::io::Write as _;
+    write!(file, "{seq}")?;
+    file.flush()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -786,20 +837,28 @@ mod tests {
     /// Forward-only chain walk has no external sequence anchor, so removing
     /// the last K entries produces a valid (shorter) chain. This test
     /// documents the structural limitation. If future work adds detection
-    /// (e.g. high-water-mark), update this test to assert detection.
+    /// High-water-mark detects tail truncation: the chain itself is valid
+    /// (forward-only walk sees a valid shorter chain) but HWM reveals
+    /// that higher seq entries once existed.
     #[test]
-    fn chain_tail_truncation_not_detected() {
-        let dir = test_dir("chain-tail-truncation");
+    fn chain_tail_truncation_detected_by_hwm() {
+        let dir = test_dir("chain-tail-truncation-hwm");
         let logger = test_logger(&dir);
 
         for i in 0..5 {
             logger.append(make_event(&format!("cmd{i}"))).unwrap();
         }
 
+        // HWM should be at seq 4 after appending 5 entries
+        let hwm_file = hwm_path_for(&logger.path);
+        assert!(hwm_file.exists(), "HWM file should exist after appends");
+        let hwm_val = read_hwm(&hwm_file).expect("HWM should be readable");
+        assert_eq!(hwm_val, 4, "HWM should be 4 after 5 entries (seq 0-4)");
+
+        // Truncate: keep only first 3 entries (seq 0-2)
         let content = fs::read_to_string(&logger.path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 5);
-
         let truncated = format!("{}\n{}\n{}\n", lines[0], lines[1], lines[2]);
         fs::write(&logger.path, truncated).unwrap();
 
@@ -807,8 +866,11 @@ mod tests {
             .expect("verify_chain must succeed on truncated chain");
         assert!(
             verify_result.broken_at.is_none(),
-            "tail truncation is a structural limitation: verify_chain cannot detect it \
-             (forward-only walk sees a valid shorter chain). broken_at should be None."
+            "chain itself is valid (forward-only walk succeeds)"
+        );
+        assert!(
+            verify_result.tail_truncated,
+            "HWM detects that entries are missing (chain ends at seq 2, HWM is 4)"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -1585,7 +1647,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
         assert_eq!(pruned, 100, "should prune 100 old entries");
 
         drop(file);
@@ -1615,7 +1677,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
         assert_eq!(pruned, 0, "nothing should be pruned");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1643,7 +1705,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
         assert_eq!(pruned, 0, "min retain should prevent prune");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1664,7 +1726,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 36500).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 36500, None).unwrap();
         assert_eq!(pruned, 0);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1692,7 +1754,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
         assert_eq!(pruned, 100);
         drop(file);
 
@@ -1762,7 +1824,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
         drop(file);
 
         let content = fs::read_to_string(&path).unwrap();
@@ -1812,7 +1874,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned1 = try_prune(&mut file, Some(&TEST_SECRET), 90).unwrap();
+        let pruned1 = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
         assert_eq!(pruned1, 100, "should prune 50 old + 50 mid");
         drop(file);
 
@@ -1829,7 +1891,7 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned2 = try_prune(&mut file, Some(&TEST_SECRET), 1).unwrap();
+        let pruned2 = try_prune(&mut file, Some(&TEST_SECRET), 1, None).unwrap();
         assert!(pruned2 <= 100, "second prune should respect min retain");
         drop(file);
 
@@ -2274,5 +2336,62 @@ mod tests {
             This WILL break verify_chain on all existing audit.jsonl files. \
             If this is intentional (new chain_version), update this test and bump CHAIN_VERSION."
         );
+    }
+
+    #[test]
+    fn hwm_bootstrap_on_pre_hwm_chain() {
+        let dir = test_dir("hwm-bootstrap");
+        let logger = test_logger(&dir);
+
+        for i in 0..3 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+
+        // Remove HWM to simulate a pre-HWM chain
+        let hwm_file = hwm_path_for(&logger.path);
+        let _ = fs::remove_file(&hwm_file);
+        assert!(!hwm_file.exists());
+
+        let result = verify::verify_chain(&verify_config(&dir)).expect("verify must succeed");
+        assert!(!result.tail_truncated, "no truncation on bootstrap");
+        assert!(result.hwm_missing, "hwm_missing flag should be set");
+
+        // HWM should be bootstrapped
+        assert!(hwm_file.exists(), "HWM bootstrapped by verify");
+        let hwm = read_hwm(&hwm_file).unwrap();
+        assert_eq!(hwm, 2, "bootstrapped to max seq");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hwm_malformed_treated_as_missing() {
+        let dir = test_dir("hwm-malformed");
+        let logger = test_logger(&dir);
+
+        for i in 0..3 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+
+        let hwm_file = hwm_path_for(&logger.path);
+        fs::write(&hwm_file, "not-a-number").unwrap();
+
+        let result = verify::verify_chain(&verify_config(&dir)).expect("verify must succeed");
+        assert!(!result.tail_truncated);
+        assert!(result.hwm_missing, "malformed HWM treated as missing");
+
+        // HWM should be re-bootstrapped
+        let hwm = read_hwm(&hwm_file).unwrap();
+        assert_eq!(hwm, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_status_truncated_serialization() {
+        let status = crate::audit::report::ChainStatus::Truncated;
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["status"], "truncated");
+        assert_eq!(status.as_str(), "truncated");
     }
 }

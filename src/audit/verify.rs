@@ -9,6 +9,7 @@ use super::secret::{
     secret_path_for,
 };
 use super::{AuditConfig, AuditEvent};
+use super::{hwm_path_for, read_hwm, write_hwm};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -48,6 +49,8 @@ pub struct VerifyResult {
     pub broken_at: Option<u64>,
     pub pruned: bool,
     pub pruned_count: Option<u64>,
+    pub tail_truncated: bool,
+    pub hwm_missing: bool,
 }
 
 pub struct ShowOptions {
@@ -113,6 +116,8 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         broken_at: None,
         pruned: false,
         pruned_count: None,
+        tail_truncated: false,
+        hwm_missing: false,
     };
     let mut expected_prev = genesis;
     let mut expected_seq: u64 = 0;
@@ -216,6 +221,23 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         expected_prev = recorded_hash.to_string();
         expected_seq = seq + 1;
         result.chain_entries += 1;
+    }
+
+    // HWM check: detect tail truncation
+    if result.broken_at.is_none() && result.chain_entries > 0 {
+        let hwm_file = hwm_path_for(&path);
+        let max_verified_seq = expected_seq.saturating_sub(1);
+        match read_hwm(&hwm_file) {
+            Some(hwm) if max_verified_seq < hwm => {
+                result.tail_truncated = true;
+            }
+            Some(_) => {}
+            None => {
+                // Bootstrap: first verify on a chain without HWM
+                result.hwm_missing = true;
+                let _ = write_hwm(&hwm_file, max_verified_seq);
+            }
+        }
     }
 
     Ok(result)
