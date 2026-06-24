@@ -59,6 +59,7 @@ What is caught, what is not, and why. Status values: **supported** (tested, expe
 |---------|--------|-----------|
 | Interpreter commands (`python -c "shutil.rmtree(...)"`) | Zero real-world incidents in target tools; protocol-level enforcement (MCP) is the right layer | [#74](https://github.com/yottayoshida/omamori/issues/74) |
 | Commands outside the curated rule set | omamori guards a narrow set of known destructive patterns, not arbitrary commands | [Security Model](#security-model) |
+| AI overwrites/destroys user source files via native Write/Edit tools | Command-guard scope: omamori observes Bash commands and protects its own files only; native editor-tool writes are outside the interception layer | Git hygiene (`git diff` before commit), AI tool file sandbox |
 
 #### Not caught — structural limit
 
@@ -599,7 +600,7 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 | AI modifies log via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
 | AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
 | AI deletes/reorders entries mid-chain | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` |
-| AI truncates log tail (removes last K entries) | None (forward-only chain has no external sequence anchor) | **Not detected** (structural limitation) |
+| AI truncates log tail (removes last K entries) | Seq high-water-mark file (`<audit-log>.hwm`, e.g. `audit.jsonl.hwm`) | Detected by `omamori audit verify` (exit 3). Same-user attacker who rewrites the `.hwm` file can bypass — structural limitation |
 | AI accesses secret via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
 | AI Edit/Write to protected files (config, audit, hooks, settings.json) | `is_protected_file_path` + `PROTECTED_FILE_PATTERNS` | **Blocked** (v0.8.0 #110) |
 | AI directly operates on files via OS (bypassing hook layer) | None (same OS user) | **Not protected** (structural limitation) |
@@ -621,7 +622,7 @@ Operators who treat AI tool usage itself as confidential should run AI tools und
 
 **Design boundaries**:
 - Duration window is capped at 90 days (SEC-R4). Longer history is available via `audit show --all`.
-- `--json` output is limited to 7 fields (SEC-R2): `period_days`, `actual_window_days`, `total_blocks`, `by_layer`, `by_provider`, `chain_status`, `unknown_tool_fail_opens`. Per-rule breakdowns are not included in `report` output (human or JSON) to avoid exposing attack optimization information; use `audit show --rule <name>` for per-rule investigation.
+- `--json` output is limited to 8 fields (SEC-R2): `period_days`, `actual_window_days`, `total_blocks`, `by_layer`, `by_provider`, `by_rule`, `chain_status`, `unknown_tool_fail_opens`. Per-rule counts are included because `audit show` already exposes the same data — the report adds convenience, not new information surface.
 - Provider aggregation uses the `provider` field (e.g. `claude-code`, `codex-cli`), not internal wrapper names (channel separation maintained per v0.9.5 invariant).
 - Unknown-tool shapes are reported as counts only; detailed tool names require `audit unknown` (SEC-R7).
 

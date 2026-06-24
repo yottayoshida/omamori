@@ -63,6 +63,19 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     msg.push_str(&format!(" ({} torn lines skipped)", result.torn_lines));
                 }
                 println!("{msg}");
+                if result.tail_truncated {
+                    eprintln!(
+                        "  WARNING: audit log tail may have been truncated \
+                         (chain ends before high-water-mark)."
+                    );
+                    eprintln!("  Inspect: omamori audit show --last 20");
+                    return Ok(3);
+                }
+                if result.hwm_missing {
+                    eprintln!(
+                        "  Note: high-water-mark bootstrapped to current chain end."
+                    );
+                }
                 Ok(0)
             }
         }

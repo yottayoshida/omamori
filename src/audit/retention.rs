@@ -10,6 +10,7 @@ use time::OffsetDateTime;
 
 use super::AuditEvent;
 use super::chain::{CHAIN_VERSION, compute_entry_hash, hmac_bytes, prune_genesis_hash};
+use super::{hwm_path_for, write_hwm};
 
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
 pub(super) const MIN_RETENTION_DAYS: u32 = 7;
@@ -25,6 +26,7 @@ pub(super) fn try_prune(
     file: &mut fs::File,
     secret: Option<&[u8; 32]>,
     retention_days: u32,
+    audit_path: Option<&std::path::Path>,
 ) -> Result<u64, std::io::Error> {
     use time::format_description::well_known::Rfc3339;
 
@@ -105,6 +107,28 @@ pub(super) fn try_prune(
     file.write_all(new_content.as_bytes())?;
     file.set_len(new_content.len() as u64)?;
     file.flush()?;
+
+    // Reset HWM to max retained non-prune-point seq
+    if let Some(audit_path) = audit_path {
+        let mut max_seq: Option<u64> = None;
+        for line in &lines[retain_from..] {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if val.get("command").and_then(|v| v.as_str()) == Some(PRUNE_COMMAND) {
+                    continue;
+                }
+                if let Some(s) = val.get("seq").and_then(|v| v.as_u64()) {
+                    max_seq = Some(max_seq.map_or(s, |m: u64| m.max(s)));
+                }
+            }
+        }
+        if let Some(s) = max_seq {
+            let _ = write_hwm(&hwm_path_for(audit_path), s);
+        }
+    }
 
     eprintln!("omamori: pruned {prune_count} audit entries older than {retention_days}d");
     Ok(prune_count)

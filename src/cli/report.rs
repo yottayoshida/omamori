@@ -105,6 +105,7 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
         println!("  Block events: {}", report.total_blocks);
         print_breakdown("    by layer", &report.by_layer);
         print_breakdown("    by provider", &report.by_provider);
+        print_breakdown("    by rule", &report.by_rule);
     }
 
     // Unknown tool fail-opens (SEC-R7: count only)
@@ -125,6 +126,7 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
                 println!("  Audit log: broken");
             }
         }
+        ChainStatus::Truncated => println!("  Audit log: truncated (entries may have been removed)"),
         ChainStatus::Unavailable => println!("  Audit log: unavailable"),
     }
 
@@ -133,7 +135,7 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
     if report.unknown_tool_fail_opens > 0 {
         follow_ups.push("review unknown tools: omamori audit unknown");
     }
-    if matches!(report.chain_status, ChainStatus::Broken { .. }) {
+    if matches!(report.chain_status, ChainStatus::Broken { .. } | ChainStatus::Truncated) {
         follow_ups.push("verify chain: omamori audit verify");
     }
     if !follow_ups.is_empty() {
@@ -199,25 +201,27 @@ mod tests {
     }
 
     #[test]
-    fn json_output_has_seven_fields() {
+    fn json_output_has_eight_fields() {
         let report = ReportAggregate {
             period_days: 7,
             actual_window_days: 7,
             total_blocks: 3,
             by_layer: HashMap::from([("layer1".to_string(), 2), ("layer2".to_string(), 1)]),
             by_provider: HashMap::from([("claude-code".to_string(), 3)]),
+            by_rule: HashMap::from([("rm-rf".to_string(), 2), ("mv-slash".to_string(), 1)]),
             chain_status: ChainStatus::Intact,
             unknown_tool_fail_opens: 1,
         };
         let json: serde_json::Value = serde_json::to_value(&report).unwrap();
         let obj = json.as_object().unwrap();
 
-        assert_eq!(obj.len(), 7, "SEC-R2: exactly 7 fields");
+        assert_eq!(obj.len(), 8, "SEC-R2: exactly 8 fields");
         assert!(obj.contains_key("period_days"));
         assert!(obj.contains_key("actual_window_days"));
         assert!(obj.contains_key("total_blocks"));
         assert!(obj.contains_key("by_layer"));
         assert!(obj.contains_key("by_provider"));
+        assert!(obj.contains_key("by_rule"));
         assert!(obj.contains_key("chain_status"));
         assert!(obj.contains_key("unknown_tool_fail_opens"));
     }
@@ -228,7 +232,7 @@ mod tests {
         let json: serde_json::Value = serde_json::to_value(&report).unwrap();
         let obj = json.as_object().unwrap();
 
-        assert_eq!(obj.len(), 7);
+        assert_eq!(obj.len(), 8);
         assert_eq!(json["total_blocks"], 0);
         assert_eq!(json["unknown_tool_fail_opens"], 0);
         assert_eq!(json["chain_status"]["status"], "unavailable");
@@ -285,6 +289,9 @@ mod tests {
         let broken = serde_json::to_value(ChainStatus::Broken { at_seq: 42 }).unwrap();
         assert_eq!(broken["status"], "broken");
         assert!(broken.get("at_seq").is_none(), "SEC-R8: at_seq not in JSON");
+
+        let truncated = serde_json::to_value(ChainStatus::Truncated).unwrap();
+        assert_eq!(truncated["status"], "truncated");
 
         let unavail = serde_json::to_value(ChainStatus::Unavailable).unwrap();
         assert_eq!(unavail["status"], "unavailable");

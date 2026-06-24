@@ -22,6 +22,7 @@ use crate::util::USAGE_HINT;
 pub(crate) fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(2).and_then(|item| item.to_str()) {
         Some("list") => run_config_list(),
+        Some("validate") => run_config_validate(args.get(3).and_then(|item| item.to_str())),
         Some("disable") => {
             let rule_name = args.get(3).and_then(|item| item.to_str()).ok_or_else(|| {
                 AppError::Usage("config disable requires a rule name".to_string())
@@ -487,6 +488,62 @@ fn run_config_list() -> Result<i32, AppError> {
     }
 
     println!();
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// config validate
+// ---------------------------------------------------------------------------
+
+fn run_config_validate(explicit_path: Option<&str>) -> Result<i32, AppError> {
+    let path = match explicit_path {
+        Some(p) => {
+            let path = std::path::PathBuf::from(p);
+            if !path.exists() {
+                eprintln!("omamori config validate: not found: {}", path.display());
+                return Ok(2);
+            }
+            config::reject_symlink_public(&path, "config path")?;
+            Some(path)
+        }
+        None => {
+            let default = config::default_config_path();
+            if let Some(ref p) = default {
+                if !p.exists() {
+                    eprintln!("omamori config validate: not found: {}", p.display());
+                    return Ok(2);
+                }
+            } else {
+                eprintln!("omamori config validate: cannot determine config path");
+                return Ok(2);
+            }
+            default
+        }
+    };
+
+    let load_result = load_config(path.as_deref())?;
+
+    if load_result.degraded {
+        eprintln!("omamori config validate: invalid");
+        for w in &load_result.warnings {
+            eprintln!("  {w}");
+        }
+        return Ok(1);
+    }
+
+    if !load_result.warnings.is_empty() {
+        eprintln!("omamori config validate: valid (with warnings)");
+        for w in &load_result.warnings {
+            eprintln!("  {w}");
+        }
+        return Ok(0);
+    }
+
+    let path_display = path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(default)".to_string());
+    eprintln!("omamori config validate: valid — {path_display}");
     Ok(0)
 }
 

@@ -28,6 +28,7 @@ pub enum ChainStatus {
         #[serde(skip_serializing)]
         at_seq: u64,
     },
+    Truncated,
     Unavailable,
 }
 
@@ -36,6 +37,7 @@ impl ChainStatus {
         match self {
             Self::Intact => "intact",
             Self::Broken { .. } => "broken",
+            Self::Truncated => "truncated",
             Self::Unavailable => "unavailable",
         }
     }
@@ -43,9 +45,9 @@ impl ChainStatus {
 
 /// Aggregated report data for `omamori report` output.
 ///
-/// JSON output is limited to 7 fields per SEC-R2:
+/// JSON output has 8 fields per SEC-R2:
 /// period_days, actual_window_days, total_blocks, by_layer, by_provider,
-/// chain_status, unknown_tool_fail_opens
+/// by_rule, chain_status, unknown_tool_fail_opens
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportAggregate {
     pub period_days: u32,
@@ -53,6 +55,7 @@ pub struct ReportAggregate {
     pub total_blocks: u64,
     pub by_layer: HashMap<String, u64>,
     pub by_provider: HashMap<String, u64>,
+    pub by_rule: HashMap<String, u64>,
     pub chain_status: ChainStatus,
     pub unknown_tool_fail_opens: u64,
 }
@@ -65,6 +68,7 @@ impl Default for ReportAggregate {
             total_blocks: 0,
             by_layer: HashMap::new(),
             by_provider: HashMap::new(),
+            by_rule: HashMap::new(),
             chain_status: ChainStatus::Unavailable,
             unknown_tool_fail_opens: 0,
         }
@@ -99,10 +103,15 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
 
     // Chain status via existing verify_chain (SEC-R11: shared reader)
     result.chain_status = match verify_chain(config) {
-        Ok(verify_result) => match verify_result.broken_at {
-            Some(at_seq) => ChainStatus::Broken { at_seq },
-            None => ChainStatus::Intact,
-        },
+        Ok(verify_result) => {
+            if let Some(at_seq) = verify_result.broken_at {
+                ChainStatus::Broken { at_seq }
+            } else if verify_result.tail_truncated {
+                ChainStatus::Truncated
+            } else {
+                ChainStatus::Intact
+            }
+        }
         Err(_) => ChainStatus::Unavailable,
     };
 
@@ -116,6 +125,7 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
         result.total_blocks = stats.total_blocks;
         result.by_layer = stats.by_layer;
         result.by_provider = stats.by_provider;
+        result.by_rule = stats.by_rule;
         result.unknown_tool_fail_opens = stats.unknown_tool_fail_opens;
 
         // Refine actual_window_days based on oldest event in window
@@ -133,6 +143,7 @@ struct EventStats {
     total_blocks: u64,
     by_layer: HashMap<String, u64>,
     by_provider: HashMap<String, u64>,
+    by_rule: HashMap<String, u64>,
     unknown_tool_fail_opens: u64,
     oldest_event_days: Option<u32>,
 }
@@ -148,6 +159,7 @@ fn aggregate_events(path: &Path, days: u32) -> Option<EventStats> {
         total_blocks: 0,
         by_layer: HashMap::new(),
         by_provider: HashMap::new(),
+        by_rule: HashMap::new(),
         unknown_tool_fail_opens: 0,
         oldest_event_days: None,
     };
@@ -204,6 +216,14 @@ fn aggregate_events(path: &Path, days: u32) -> Option<EventStats> {
                 event.provider.clone()
             };
             *stats.by_provider.entry(provider).or_insert(0) += 1;
+
+            // by_rule: aggregate by rule_id
+            let rule = event
+                .rule_id
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+            *stats.by_rule.entry(rule).or_insert(0) += 1;
         }
     }
 
@@ -254,6 +274,7 @@ mod tests {
     fn test_chain_status_as_str() {
         assert_eq!(ChainStatus::Intact.as_str(), "intact");
         assert_eq!(ChainStatus::Broken { at_seq: 42 }.as_str(), "broken");
+        assert_eq!(ChainStatus::Truncated.as_str(), "truncated");
         assert_eq!(ChainStatus::Unavailable.as_str(), "unavailable");
     }
 
@@ -264,6 +285,7 @@ mod tests {
         assert_eq!(report.total_blocks, 0);
         assert!(report.by_layer.is_empty());
         assert!(report.by_provider.is_empty());
+        assert!(report.by_rule.is_empty());
         assert_eq!(report.chain_status, ChainStatus::Unavailable);
     }
 
@@ -281,6 +303,28 @@ mod tests {
         };
         format!(
             r#"{{"timestamp":"{ts_str}","provider":"{provider}","command":"test","rule_id":null,"action":"{action}","result":"done","target_count":0,"target_hash":"","detection_layer":{dl}}}"#,
+        )
+    }
+
+    fn make_event_line_with_rule(
+        action: &str,
+        provider: &str,
+        detection_layer: Option<&str>,
+        rule_id: Option<&str>,
+        minutes_ago: i64,
+    ) -> String {
+        let ts = OffsetDateTime::now_utc() - time::Duration::minutes(minutes_ago);
+        let ts_str = ts.format(&Rfc3339).unwrap();
+        let dl = match detection_layer {
+            Some(v) => format!("\"{v}\""),
+            None => "null".to_string(),
+        };
+        let rid = match rule_id {
+            Some(v) => format!("\"{v}\""),
+            None => "null".to_string(),
+        };
+        format!(
+            r#"{{"timestamp":"{ts_str}","provider":"{provider}","command":"test","rule_id":{rid},"action":"{action}","result":"done","target_count":0,"target_hash":"","detection_layer":{dl}}}"#,
         )
     }
 
@@ -349,6 +393,35 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(stats.total_blocks, 1);
+    }
+
+    #[test]
+    fn test_by_rule_aggregation() {
+        let lines = vec![
+            make_event_line_with_rule("block", "claude-code", Some("layer1"), Some("rm-rf"), 10),
+            make_event_line_with_rule("block", "claude-code", Some("layer1"), Some("rm-rf"), 20),
+            make_event_line_with_rule("block", "claude-code", Some("layer2:rule"), Some("mv-slash"), 30),
+        ];
+        let path = write_temp_audit(&lines, "by-rule");
+        let stats = aggregate_events(&path, 1).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(stats.total_blocks, 3);
+        assert_eq!(*stats.by_rule.get("rm-rf").unwrap_or(&0), 2);
+        assert_eq!(*stats.by_rule.get("mv-slash").unwrap_or(&0), 1);
+    }
+
+    #[test]
+    fn test_by_rule_none_maps_to_unknown() {
+        let lines = vec![
+            make_event_line("block", "claude-code", Some("layer1"), 10),
+        ];
+        let path = write_temp_audit(&lines, "by-rule-none");
+        let stats = aggregate_events(&path, 1).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(*stats.by_rule.get("unknown").unwrap_or(&0), 1);
+        assert!(!stats.by_rule.contains_key(""));
     }
 
     #[test]

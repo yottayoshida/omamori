@@ -714,6 +714,84 @@ fn config_disable_core_rule_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ---------------------------------------------------------------------------
+// config validate tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_validate_valid_exits_0() {
+    let dir = unique_dir("cfg-validate-ok");
+
+    let mut init_cmd = Command::new(binary());
+    clean_ai_env(&mut init_cmd);
+    init_cmd
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["config", "validate", config_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "valid config should exit 0, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("valid"), "should say valid: {stderr}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn config_validate_broken_toml_exits_1() {
+    let path = unique_path("cfg-validate-broken");
+    fs::write(&path, "[[rules]\nname = ").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["config", "validate", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    let _ = fs::remove_file(&path);
+    let code = output.status.code().unwrap();
+    assert_eq!(code, 1, "broken TOML should exit 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid"), "should say invalid: {stderr}");
+}
+
+#[test]
+fn config_validate_missing_exits_2() {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["config", "validate", "/tmp/nonexistent-omamori-config.toml"])
+        .output()
+        .unwrap();
+
+    let code = output.status.code().unwrap();
+    assert_eq!(code, 2, "missing config should exit 2");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found"),
+        "should say not found: {stderr}"
+    );
+}
+
 #[test]
 fn override_disable_core_rule_works() {
     let dir = unique_dir("override-allow");

@@ -1493,6 +1493,7 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, &str)] = &[
     (".integrity.json", "integrity baseline"),
     ("audit-secret", "audit HMAC secret"),
     ("audit.jsonl", "audit log"),
+    (".jsonl.hwm", "audit high-water-mark"),
     (".local/share/omamori", "omamori data directory"),
     ("claude-pretooluse.sh", "omamori hook script"),
     ("codex-pretooluse.sh", "omamori Codex hook script"),

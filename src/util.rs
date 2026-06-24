@@ -31,7 +31,7 @@ DIAGNOSTICS
   break-glass --clear [--rule <id>]               Revoke bypass(es)
 
 CONFIGURATION
-  config <list|disable|enable> [rule]             Rule management
+  config <list|disable|enable|validate> [rule|path] Rule management
   override <disable|enable> <rule>                Disable/restore core safety rules
   init [--force] [--stdout]                       Generate starter config template
   install [--base-dir PATH] [--source PATH] [--hooks]  Install PATH shims (and hooks)
@@ -62,7 +62,7 @@ DIAGNOSTICS
   break-glass --clear [--rule <id>]               Revoke bypass(es)
 
 CONFIGURATION
-  config <list|disable|enable> [rule]             Rule management
+  config <list|disable|enable|validate> [rule|path] Rule management
   override <disable|enable> <rule>                Disable/restore core safety rules
   init [--force] [--stdout]                       Generate starter config template
   install [--base-dir PATH] [--source PATH] [--hooks]  Install PATH shims (and hooks)
