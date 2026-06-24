@@ -284,6 +284,7 @@ omamori audit show --relaxed             # Filter to relaxed allows (legacy data
 omamori config list                      # Show rules with status
 omamori config disable <rule>            # Disable a rule
 omamori config enable <rule>             # Re-enable a rule
+omamori config validate [PATH]           # Validate config (exit 0/1/2)
 omamori override disable <rule>          # Override a core safety rule
 omamori override enable <rule>           # Restore a core safety rule
 
