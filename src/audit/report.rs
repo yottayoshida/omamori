@@ -218,11 +218,7 @@ fn aggregate_events(path: &Path, days: u32) -> Option<EventStats> {
             *stats.by_provider.entry(provider).or_insert(0) += 1;
 
             // by_rule: aggregate by rule_id
-            let rule = event
-                .rule_id
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_string();
+            let rule = event.rule_id.as_deref().unwrap_or("unknown").to_string();
             *stats.by_rule.entry(rule).or_insert(0) += 1;
         }
     }
@@ -400,7 +396,13 @@ mod tests {
         let lines = vec![
             make_event_line_with_rule("block", "claude-code", Some("layer1"), Some("rm-rf"), 10),
             make_event_line_with_rule("block", "claude-code", Some("layer1"), Some("rm-rf"), 20),
-            make_event_line_with_rule("block", "claude-code", Some("layer2:rule"), Some("mv-slash"), 30),
+            make_event_line_with_rule(
+                "block",
+                "claude-code",
+                Some("layer2:rule"),
+                Some("mv-slash"),
+                30,
+            ),
         ];
         let path = write_temp_audit(&lines, "by-rule");
         let stats = aggregate_events(&path, 1).unwrap();
@@ -413,9 +415,7 @@ mod tests {
 
     #[test]
     fn test_by_rule_none_maps_to_unknown() {
-        let lines = vec![
-            make_event_line("block", "claude-code", Some("layer1"), 10),
-        ];
+        let lines = vec![make_event_line("block", "claude-code", Some("layer1"), 10)];
         let path = write_temp_audit(&lines, "by-rule-none");
         let stats = aggregate_events(&path, 1).unwrap();
         std::fs::remove_file(&path).ok();

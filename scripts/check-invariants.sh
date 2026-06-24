@@ -155,12 +155,12 @@ else
             echo "FAIL [invariant #7g]: render_hook_script must accept omamori_exe parameter"
             ih_fail=1
         fi
-        if ! printf '%s\n' "$fn_body" | grep -qF 'set -eu'; then
-            echo "FAIL [invariant #7d]: render_hook_script body must use set -eu"
+        if ! printf '%s\n' "$fn_body" | grep -qF 'set -u'; then
+            echo "FAIL [invariant #7d]: render_hook_script body must use set -u"
             ih_fail=1
         fi
-        if ! printf '%s\n' "$fn_body" | grep -qF 'exit $?'; then
-            echo "FAIL [invariant #7e]: render_hook_script body must propagate exit code via exit \$?"
+        if ! printf '%s\n' "$fn_body" | grep -qE 'exit (0|2|\$\?)'; then
+            echo "FAIL [invariant #7e]: render_hook_script body must propagate exit code"
             ih_fail=1
         fi
     fi

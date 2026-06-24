@@ -2,7 +2,6 @@
 
 use std::io::{BufRead, Write};
 
-use super::{hwm_path_for, read_hwm, write_hwm};
 use super::chain::{compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash};
 use super::retention::is_prune_point;
 use super::secret::{
@@ -10,6 +9,7 @@ use super::secret::{
     secret_path_for,
 };
 use super::{AuditConfig, AuditEvent};
+use super::{hwm_path_for, read_hwm, write_hwm};
 
 // ---------------------------------------------------------------------------
 // Error type

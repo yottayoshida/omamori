@@ -202,7 +202,10 @@ fn print_risk_signals_section(ai_env: bool) {
 
     let has_blocks = report.total_blocks > 0;
     let has_unknown = report.unknown_tool_fail_opens > 0;
-    let chain_broken = matches!(report.chain_status, ChainStatus::Broken { .. } | ChainStatus::Truncated);
+    let chain_broken = matches!(
+        report.chain_status,
+        ChainStatus::Broken { .. } | ChainStatus::Truncated
+    );
 
     if !has_blocks && !has_unknown && !chain_broken {
         println!("  [Risk signals] Last 30 days: quiet");

@@ -72,9 +72,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     return Ok(3);
                 }
                 if result.hwm_missing {
-                    eprintln!(
-                        "  Note: high-water-mark bootstrapped to current chain end."
-                    );
+                    eprintln!("  Note: high-water-mark bootstrapped to current chain end.");
                 }
                 Ok(0)
             }

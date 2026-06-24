@@ -202,15 +202,15 @@ impl AuditLogger {
         // HWM update: detect truncation on append + advance high-water-mark
         let hwm_file = hwm_path_for(&self.path);
         let current_hwm = read_hwm(&hwm_file);
-        if let Some(h) = current_hwm {
-            if seq < h {
-                eprintln!(
-                    "omamori warning: audit log tail may have been truncated \
-                     (seq {seq} < high-water-mark {h})"
-                );
-            }
+        if let Some(h) = current_hwm
+            && seq < h
+        {
+            eprintln!(
+                "omamori warning: audit log tail may have been truncated \
+                 (seq {seq} < high-water-mark {h})"
+            );
         }
-        if current_hwm.map_or(true, |h| seq > h) {
+        if current_hwm.is_none_or(|h| seq > h) {
             let _ = write_hwm(&hwm_file, seq);
         }
 
@@ -218,7 +218,12 @@ impl AuditLogger {
         if self.retention_days > 0
             && seq > 0
             && seq % PRUNE_CHECK_INTERVAL == 0
-            && let Err(e) = try_prune(&mut file, self.secret.as_ref(), self.retention_days, Some(&self.path))
+            && let Err(e) = try_prune(
+                &mut file,
+                self.secret.as_ref(),
+                self.retention_days,
+                Some(&self.path),
+            )
         {
             eprintln!("omamori warning: audit prune failed: {e}");
         }
@@ -2347,8 +2352,7 @@ mod tests {
         let _ = fs::remove_file(&hwm_file);
         assert!(!hwm_file.exists());
 
-        let result = verify::verify_chain(&verify_config(&dir))
-            .expect("verify must succeed");
+        let result = verify::verify_chain(&verify_config(&dir)).expect("verify must succeed");
         assert!(!result.tail_truncated, "no truncation on bootstrap");
         assert!(result.hwm_missing, "hwm_missing flag should be set");
 
@@ -2372,8 +2376,7 @@ mod tests {
         let hwm_file = hwm_path_for(&logger.path);
         fs::write(&hwm_file, "not-a-number").unwrap();
 
-        let result = verify::verify_chain(&verify_config(&dir))
-            .expect("verify must succeed");
+        let result = verify::verify_chain(&verify_config(&dir)).expect("verify must succeed");
         assert!(!result.tail_truncated);
         assert!(result.hwm_missing, "malformed HWM treated as missing");
 

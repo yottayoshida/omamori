@@ -126,7 +126,9 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
                 println!("  Audit log: broken");
             }
         }
-        ChainStatus::Truncated => println!("  Audit log: truncated (entries may have been removed)"),
+        ChainStatus::Truncated => {
+            println!("  Audit log: truncated (entries may have been removed)")
+        }
         ChainStatus::Unavailable => println!("  Audit log: unavailable"),
     }
 
@@ -135,7 +137,10 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
     if report.unknown_tool_fail_opens > 0 {
         follow_ups.push("review unknown tools: omamori audit unknown");
     }
-    if matches!(report.chain_status, ChainStatus::Broken { .. } | ChainStatus::Truncated) {
+    if matches!(
+        report.chain_status,
+        ChainStatus::Broken { .. } | ChainStatus::Truncated
+    ) {
         follow_ups.push("verify chain: omamori audit verify");
     }
     if !follow_ups.is_empty() {
