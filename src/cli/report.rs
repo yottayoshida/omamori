@@ -216,11 +216,16 @@ mod tests {
             by_rule: HashMap::from([("rm-rf".to_string(), 2), ("mv-slash".to_string(), 1)]),
             chain_status: ChainStatus::Intact,
             unknown_tool_fail_opens: 1,
+            hwm_tampered: false,
         };
         let json: serde_json::Value = serde_json::to_value(&report).unwrap();
         let obj = json.as_object().unwrap();
 
-        assert_eq!(obj.len(), 8, "SEC-R2: exactly 8 fields");
+        assert_eq!(
+            obj.len(),
+            8,
+            "SEC-R2: exactly 8 fields (hwm_tampered is #[serde(skip)], internal-only)"
+        );
         assert!(obj.contains_key("period_days"));
         assert!(obj.contains_key("actual_window_days"));
         assert!(obj.contains_key("total_blocks"));

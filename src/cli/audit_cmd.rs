@@ -71,6 +71,17 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     eprintln!("  Inspect: omamori audit show --last 20");
                     return Ok(3);
                 }
+                if result.hwm_tampered {
+                    eprintln!(
+                        "  WARNING: high-water-mark file was unreadable or tampered with \
+                         (expected a plain integer, found a symlink or invalid content)."
+                    );
+                    eprintln!(
+                        "  It has been reset to the current chain end, but this may indicate \
+                         an attempt to defeat tail-truncation detection."
+                    );
+                    return Ok(3);
+                }
                 if result.hwm_missing {
                     eprintln!("  Note: high-water-mark bootstrapped to current chain end.");
                 }

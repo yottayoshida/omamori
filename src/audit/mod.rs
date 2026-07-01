@@ -201,17 +201,29 @@ impl AuditLogger {
 
         // HWM update: detect truncation on append + advance high-water-mark
         let hwm_file = hwm_path_for(&self.path);
-        let current_hwm = read_hwm(&hwm_file);
-        if let Some(h) = current_hwm
-            && seq < h
-        {
-            eprintln!(
-                "omamori warning: audit log tail may have been truncated \
-                 (seq {seq} < high-water-mark {h})"
-            );
-        }
-        if current_hwm.is_none_or(|h| seq > h) {
-            let _ = write_hwm(&hwm_file, seq);
+        let advance_hwm = match read_hwm(&hwm_file) {
+            HwmState::Valid(h) if seq < h => {
+                eprintln!(
+                    "omamori warning: audit log tail may have been truncated \
+                     (seq {seq} < high-water-mark {h})"
+                );
+                false
+            }
+            HwmState::Valid(h) => seq > h,
+            HwmState::Missing => true,
+            HwmState::Tampered => {
+                // Same-user tamper on the tamper-evidence sidecar itself: don't
+                // silently re-bootstrap as if this were a fresh install.
+                eprintln!(
+                    "omamori warning: audit high-water-mark is unreadable or has been \
+                     tampered with (expected a plain integer, found a symlink or \
+                     invalid content). Run `omamori audit verify` to investigate."
+                );
+                true
+            }
+        };
+        if advance_hwm && let Err(e) = write_hwm(&hwm_file, seq) {
+            eprintln!("omamori warning: failed to update audit high-water-mark: {e}");
         }
 
         // Auto-prune under the same flock (no extra I/O when not triggered)
@@ -278,22 +290,79 @@ pub(crate) fn hwm_path_for(audit_path: &std::path::Path) -> PathBuf {
     PathBuf::from(hwm)
 }
 
-fn read_hwm(hwm_path: &std::path::Path) -> Option<u64> {
-    let content = fs::read_to_string(hwm_path).ok()?;
-    content.trim().parse::<u64>().ok()
+/// Result of reading the HWM sidecar file.
+///
+/// `Missing` (genuinely absent, e.g. first run) is distinct from `Tampered`
+/// (a filesystem entry exists at the path but is a symlink or does not
+/// contain a valid sequence number) so callers can avoid silently treating
+/// tamper evidence as a fresh install.
+pub(crate) enum HwmState {
+    Valid(u64),
+    Missing,
+    Tampered,
+}
+
+fn read_hwm(hwm_path: &std::path::Path) -> HwmState {
+    match fs::symlink_metadata(hwm_path) {
+        Err(_) => return HwmState::Missing,
+        Ok(meta) if meta.file_type().is_symlink() => return HwmState::Tampered,
+        Ok(_) => {}
+    }
+    match fs::read_to_string(hwm_path) {
+        Err(_) => HwmState::Tampered,
+        Ok(content) => match content.trim().parse::<u64>() {
+            Ok(v) => HwmState::Valid(v),
+            Err(_) => HwmState::Tampered,
+        },
+    }
 }
 
 fn write_hwm(hwm_path: &std::path::Path, seq: u64) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(hwm_path)?;
     use std::io::Write as _;
-    write!(file, "{seq}")?;
-    file.flush()?;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Rejects a symlinked path in a single stat call; returns whether a
+    // (non-symlink) file exists there so callers don't need a second stat
+    // just to check existence.
+    let reject_symlink = |path: &std::path::Path, which: &str| -> Result<bool, std::io::Error> {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "HWM {which} path `{}` is a symlink; refusing to write",
+                    path.display()
+                ),
+            )),
+            Ok(_) => Ok(true),
+            Err(_) => Ok(false),
+        }
+    };
+    reject_symlink(hwm_path, "final")?;
+
+    let mut temp_path = hwm_path.as_os_str().to_owned();
+    temp_path.push(".tmp");
+    let temp_path = PathBuf::from(temp_path);
+    if reject_symlink(&temp_path, "temp")? {
+        // Stale temp file from a prior crash between create and rename.
+        fs::remove_file(&temp_path)?;
+    }
+
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp_path)?;
+        write!(file, "{seq}")?;
+        file.sync_all()?;
+    }
+    fs::rename(&temp_path, hwm_path)?;
+    if let Some(dir) = hwm_path.parent()
+        && let Ok(dir_file) = fs::File::open(dir)
+    {
+        let _ = dir_file.sync_all();
+    }
     Ok(())
 }
 
@@ -337,6 +406,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Unwraps a `Valid` HWM read, panicking with the actual state otherwise.
+    fn expect_hwm(hwm_path: &Path) -> u64 {
+        match read_hwm(hwm_path) {
+            HwmState::Valid(v) => v,
+            HwmState::Missing => panic!("expected HWM to be Valid, but it was Missing"),
+            HwmState::Tampered => panic!("expected HWM to be Valid, but it was Tampered"),
+        }
     }
 
     fn make_event(command: &str) -> AuditEvent {
@@ -852,7 +930,7 @@ mod tests {
         // HWM should be at seq 4 after appending 5 entries
         let hwm_file = hwm_path_for(&logger.path);
         assert!(hwm_file.exists(), "HWM file should exist after appends");
-        let hwm_val = read_hwm(&hwm_file).expect("HWM should be readable");
+        let hwm_val = expect_hwm(&hwm_file);
         assert_eq!(hwm_val, 4, "HWM should be 4 after 5 entries (seq 0-4)");
 
         // Truncate: keep only first 3 entries (seq 0-2)
@@ -2358,14 +2436,18 @@ mod tests {
 
         // HWM should be bootstrapped
         assert!(hwm_file.exists(), "HWM bootstrapped by verify");
-        let hwm = read_hwm(&hwm_file).unwrap();
+        let hwm = expect_hwm(&hwm_file);
         assert_eq!(hwm, 2, "bootstrapped to max seq");
 
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Malformed HWM content is tamper evidence, not a fresh install — it
+    /// must NOT be collapsed into the same `hwm_missing` bucket as a
+    /// genuinely absent HWM file. The chain is still re-bootstrapped so the
+    /// tool keeps functioning, but the distinction is surfaced separately.
     #[test]
-    fn hwm_malformed_treated_as_missing() {
+    fn hwm_malformed_treated_as_tampered() {
         let dir = test_dir("hwm-malformed");
         let logger = test_logger(&dir);
 
@@ -2378,11 +2460,148 @@ mod tests {
 
         let result = verify::verify_chain(&verify_config(&dir)).expect("verify must succeed");
         assert!(!result.tail_truncated);
-        assert!(result.hwm_missing, "malformed HWM treated as missing");
+        assert!(
+            !result.hwm_missing,
+            "malformed HWM is tamper evidence, not a fresh install"
+        );
+        assert!(
+            result.hwm_tampered,
+            "malformed HWM should be flagged as tampered"
+        );
 
-        // HWM should be re-bootstrapped
-        let hwm = read_hwm(&hwm_file).unwrap();
+        // Still re-bootstrapped so the tool keeps functioning.
+        let hwm = expect_hwm(&hwm_file);
         assert_eq!(hwm, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked HWM path must be rejected on write, not followed — an
+    /// attacker-controlled symlink target must never be truncated/written.
+    /// The append() path must distinguish tampered HWM from missing HWM,
+    /// not just verify()'s self-heal — both call sites route through the
+    /// same read_hwm(), so both must handle all three states.
+    #[test]
+    fn append_treats_malformed_hwm_as_tampered_and_rebootstraps() {
+        let dir = test_dir("append-hwm-tampered");
+        let logger = test_logger(&dir);
+
+        logger.append(make_event("cmd0")).unwrap();
+
+        let hwm_file = hwm_path_for(&logger.path);
+        fs::write(&hwm_file, "not-a-number").unwrap();
+        assert!(matches!(read_hwm(&hwm_file), HwmState::Tampered));
+
+        // A subsequent append must re-bootstrap the HWM rather than error
+        // or leave it tampered.
+        logger.append(make_event("cmd1")).unwrap();
+
+        match read_hwm(&hwm_file) {
+            HwmState::Valid(v) => assert_eq!(v, 1, "HWM should advance to the new seq"),
+            HwmState::Missing => panic!("HWM should not be Missing after append re-bootstraps it"),
+            HwmState::Tampered => {
+                panic!("HWM should not still be Tampered after append re-bootstraps it")
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_hwm_rejects_symlink() {
+        let dir = test_dir("write-hwm-symlink");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("attacker-target");
+        fs::write(&target, "do-not-touch").unwrap();
+        let hwm_file = dir.join("audit.jsonl.hwm");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &hwm_file).unwrap();
+
+        let err = write_hwm(&hwm_file, 99).expect_err("write_hwm must reject a symlinked path");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "do-not-touch",
+            "symlink target must not be modified"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reading a symlinked HWM must report `Tampered`, not follow the link
+    /// and return whatever value the attacker placed at the target.
+    #[test]
+    fn read_hwm_symlink_is_tampered() {
+        let dir = test_dir("read-hwm-symlink");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("forged-value");
+        fs::write(&target, "999").unwrap();
+        let hwm_file = dir.join("audit.jsonl.hwm");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &hwm_file).unwrap();
+
+        assert!(matches!(read_hwm(&hwm_file), HwmState::Tampered));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A stale `.tmp` file left over from a prior crash (create-then-crash
+    /// before rename) must not permanently block future HWM writes.
+    #[test]
+    fn write_hwm_removes_stale_temp() {
+        let dir = test_dir("write-hwm-stale-temp");
+        fs::create_dir_all(&dir).unwrap();
+        let hwm_file = dir.join("audit.jsonl.hwm");
+        let temp_file = dir.join("audit.jsonl.hwm.tmp");
+        fs::write(&temp_file, "leftover-from-a-crash").unwrap();
+
+        write_hwm(&hwm_file, 7).expect("stale temp must not block a fresh write");
+        assert!(matches!(read_hwm(&hwm_file), HwmState::Valid(7)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The HWM file must keep 0600 permissions through the temp+rename path.
+    #[cfg(unix)]
+    #[test]
+    fn write_hwm_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("write-hwm-permissions");
+        fs::create_dir_all(&dir).unwrap();
+        let hwm_file = dir.join("audit.jsonl.hwm");
+
+        write_hwm(&hwm_file, 1).unwrap();
+        let mode = fs::metadata(&hwm_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A torn write (crash between create and rename) must never leave an
+    /// empty or partial HWM in place of a previously-valid one — the old
+    /// value survives untouched because rename is atomic.
+    #[test]
+    fn write_hwm_atomic_no_partial_state() {
+        let dir = test_dir("write-hwm-atomic");
+        fs::create_dir_all(&dir).unwrap();
+        let hwm_file = dir.join("audit.jsonl.hwm");
+
+        write_hwm(&hwm_file, 1).unwrap();
+        assert!(matches!(read_hwm(&hwm_file), HwmState::Valid(1)));
+
+        // Simulate a crash after the temp file is created but before rename:
+        // the temp exists, the real HWM path is untouched.
+        let temp_file = dir.join("audit.jsonl.hwm.tmp");
+        fs::write(&temp_file, "2").unwrap();
+        assert!(
+            matches!(read_hwm(&hwm_file), HwmState::Valid(1)),
+            "old value must survive an interrupted write"
+        );
+
+        // A subsequent successful write cleans up the stale temp and publishes atomically.
+        write_hwm(&hwm_file, 2).unwrap();
+        assert!(matches!(read_hwm(&hwm_file), HwmState::Valid(2)));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Fixed
+
+- **Audit HWM (high-water-mark) hardened against symlinks and torn writes** — `write_hwm()` now rejects a symlinked final/temp path and writes via create_new temp file + `O_NOFOLLOW` + `sync_all` + atomic `rename`, matching the pattern already used by `config::write_new_config()` / `integrity::write_baseline()`. Previously it wrote in place with `truncate(true)`, which could follow a symlink or leave an empty file if interrupted between truncate and write. `read_hwm()` now distinguishes a genuinely missing HWM (fresh install, silently bootstrapped) from one that is unreadable or symlinked (tamper evidence, surfaced as a new `hwm_tampered` signal in `omamori audit verify` and `omamori doctor` instead of being silently re-bootstrapped as if nothing happened). Corrects the [0.11.7] changelog entry below, which stated the HWM file already used `O_NOFOLLOW` — it did not; `chmod 600` and `PROTECTED_FILE_PATTERNS` coverage were accurate. ([#339](https://github.com/yottayoshida/omamori/issues/339))
+
 ## [0.11.7] - 2026-06-24
 
 **Summary**: HWM audit-chain closure + config validate + report by-rule (#314, #318, #317, #316). Tail truncation of the audit log is now detected via a seq high-water-mark file, closing the last structural gap in chain integrity verification. New `config validate` subcommand catches config errors before runtime. `report` output now includes per-rule breakdown for single-command false-positive triage. SECURITY.md defense boundary matrix updated to document the Write/Edit coverage gap honestly.

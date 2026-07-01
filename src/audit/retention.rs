@@ -125,8 +125,10 @@ pub(super) fn try_prune(
                 }
             }
         }
-        if let Some(s) = max_seq {
-            let _ = write_hwm(&hwm_path_for(audit_path), s);
+        if let Some(s) = max_seq
+            && let Err(e) = write_hwm(&hwm_path_for(audit_path), s)
+        {
+            eprintln!("omamori warning: failed to update audit high-water-mark after prune: {e}");
         }
     }
 

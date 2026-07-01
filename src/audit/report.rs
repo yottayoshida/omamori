@@ -58,6 +58,13 @@ pub struct ReportAggregate {
     pub by_rule: HashMap<String, u64>,
     pub chain_status: ChainStatus,
     pub unknown_tool_fail_opens: u64,
+    /// True when the audit high-water-mark sidecar was unreadable or
+    /// symlinked (tamper evidence) rather than genuinely absent. Not part
+    /// of the JSON output (SEC-R2: exactly 8 fields) — for `doctor`'s
+    /// internal use only, reusing the `verify_chain()` call already made
+    /// below instead of re-reading the HWM file a second time.
+    #[serde(skip)]
+    pub hwm_tampered: bool,
 }
 
 impl Default for ReportAggregate {
@@ -71,6 +78,7 @@ impl Default for ReportAggregate {
             by_rule: HashMap::new(),
             chain_status: ChainStatus::Unavailable,
             unknown_tool_fail_opens: 0,
+            hwm_tampered: false,
         }
     }
 }
@@ -104,6 +112,7 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
     // Chain status via existing verify_chain (SEC-R11: shared reader)
     result.chain_status = match verify_chain(config) {
         Ok(verify_result) => {
+            result.hwm_tampered = verify_result.hwm_tampered;
             if let Some(at_seq) = verify_result.broken_at {
                 ChainStatus::Broken { at_seq }
             } else if verify_result.tail_truncated {
@@ -245,6 +254,7 @@ fn classify_layer(detection_layer: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditLogger;
 
     #[test]
     fn test_classify_layer() {
@@ -436,5 +446,68 @@ mod tests {
         assert_eq!(report.period_days, 7);
         assert_eq!(report.total_blocks, 0);
         assert_eq!(report.chain_status, ChainStatus::Unavailable);
+    }
+
+    /// `hwm_tampered` must be threaded through from the same `verify_chain()`
+    /// call `chain_status` already comes from — no second read of the HWM
+    /// file (this is what `doctor` relies on instead of a standalone check).
+    #[test]
+    fn test_aggregate_report_surfaces_hwm_tampered() {
+        use super::super::{hwm_path_for, write_hwm};
+
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-report-hwm-tampered-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        // No audit log / HWM yet: not tampered.
+        let report = aggregate_report(&config, 7);
+        assert!(!report.hwm_tampered);
+
+        // Append one entry so verify_chain() has a chain to walk, then
+        // corrupt the HWM the same way append() would have written it.
+        let logger = AuditLogger::from_config(&config).expect("audit enabled");
+        logger
+            .append(AuditEvent {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                provider: "test".to_string(),
+                command: "cmd0".to_string(),
+                rule_id: None,
+                action: "block".to_string(),
+                result: "blocked".to_string(),
+                target_count: 1,
+                target_hash: String::new(),
+                detection_layer: None,
+                unwrap_chain: None,
+                raw_input_hash: None,
+                chain_version: None,
+                seq: None,
+                prev_hash: None,
+                key_id: None,
+                entry_hash: None,
+            })
+            .unwrap();
+        let hwm_file = hwm_path_for(&audit_path);
+        write_hwm(&hwm_file, 0).unwrap();
+        std::fs::write(&hwm_file, "not-a-number").unwrap();
+
+        let report = aggregate_report(&config, 7);
+        assert!(
+            report.hwm_tampered,
+            "tampered HWM must surface on ReportAggregate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
