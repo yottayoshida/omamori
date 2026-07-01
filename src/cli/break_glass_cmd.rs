@@ -1,7 +1,7 @@
 //! CLI handler for `omamori break-glass`.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crate::AppError;
 use crate::audit::AuditLogger;
@@ -45,6 +45,19 @@ fn run_activate(
     reason: Option<String>,
 ) -> Result<i32, AppError> {
     guard_ai_config_modification("break-glass")?;
+
+    // Confirmation must come from a real interactive terminal. Piping an
+    // answer in would let an AI agent self-approve a bypass without a human
+    // ever seeing the prompt. Checked before any file I/O, state change, or
+    // audit logging (mirrors setup.rs's "fail before any file I/O" discipline).
+    if !io::stdin().is_terminal() {
+        eprintln!("error: break-glass requires an interactive terminal.");
+        eprintln!("  Confirmation cannot be read from a pipe or script — this is a");
+        eprintln!("  deliberate safety gate so an AI agent cannot self-approve a bypass.");
+        eprintln!("  Run this command directly in your terminal (not via AI, pipe, or script).");
+        log_denied_activation(rule_id);
+        return Ok(1);
+    }
 
     let duration_secs = match duration_str {
         Some(s) => break_glass::parse_duration(s).map_err(AppError::Config)?,
@@ -160,6 +173,64 @@ fn run_status() -> Result<i32, AppError> {
 // ---------------------------------------------------------------------------
 // Audit event helpers
 // ---------------------------------------------------------------------------
+
+/// Records a denied non-interactive activation attempt so the refusal is a
+/// forensically observable event rather than a silent stderr-only message.
+fn log_denied_activation(rule_id: &str) {
+    if let Some(logger) = config::load_config(None)
+        .ok()
+        .and_then(|r| AuditLogger::from_config(&r.config.audit))
+    {
+        let event = create_denied_activation_event(rule_id);
+        if let Err(e) = logger.append(event) {
+            eprintln!("omamori warning: failed to audit-log denied activation: {e}");
+        }
+    }
+}
+
+/// Shared field layout for break-glass audit events; only `provider`,
+/// `action`, and `result` vary per event kind.
+fn build_break_glass_event(
+    rule_id: &str,
+    provider: &str,
+    command: String,
+    action: &str,
+    result: String,
+) -> crate::audit::AuditEvent {
+    crate::audit::AuditEvent {
+        timestamp: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+        provider: provider.to_string(),
+        command,
+        rule_id: Some(rule_id.to_string()),
+        action: action.to_string(),
+        result,
+        target_count: 0,
+        target_hash: String::new(),
+        detection_layer: Some("break-glass".to_string()),
+        unwrap_chain: None,
+        raw_input_hash: None,
+        chain_version: None,
+        seq: None,
+        prev_hash: None,
+        key_id: None,
+        entry_hash: None,
+    }
+}
+
+/// Distinct from `create_activation_event`'s `provider: "human"` — a denied
+/// non-interactive attempt must never be attributed to a human confirmation
+/// that never happened.
+fn create_denied_activation_event(rule_id: &str) -> crate::audit::AuditEvent {
+    build_break_glass_event(
+        rule_id,
+        "non-interactive",
+        format!("break-glass --rule {rule_id}"),
+        "break-glass-activate-denied",
+        "denied (non-interactive stdin)".to_string(),
+    )
+}
 
 fn create_activation_event(rule_id: &str, expires_at: &str) -> crate::audit::AuditEvent {
     crate::audit::AuditEvent {

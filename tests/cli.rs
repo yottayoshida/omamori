@@ -2603,3 +2603,116 @@ fn setup_unknown_flag_errors() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown setup flag"), "stderr: {stderr}");
 }
+
+// ---------------------------------------------------------------------------
+// break-glass TTY tests (#319)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn break_glass_activate_rejects_piped_stdin() {
+    let home = unique_dir("break-glass-pipe-home");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let mut child = cmd
+        .args(["break-glass", "--rule", "rm-rf"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn break-glass");
+
+    // Reproduce the exact bypass attempt from issue #319:
+    // `printf 'y\n' | omamori break-glass --rule <r>`.
+    use std::io::Write as _;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"y\n")
+        .expect("failed to write to stdin");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait on break-glass");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "piped 'y' must not activate break-glass; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("requires an interactive terminal"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--yes") && !stderr.contains("--non-interactive"),
+        "refusal must not advertise a bypass flag; stderr: {stderr}"
+    );
+
+    // Confirm the piped attempt did not actually activate anything.
+    let mut status_cmd = Command::new(binary());
+    clean_ai_env(&mut status_cmd);
+    let status_output = status_cmd
+        .args(["break-glass", "--status"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run break-glass --status");
+    let status_stderr = String::from_utf8_lossy(&status_output.stderr);
+    assert!(
+        status_stderr.contains("No active break-glass bypasses"),
+        "stderr: {status_stderr}"
+    );
+
+    // The refusal must still be forensically observable: the denied
+    // activation attempt is audit-logged with a provider distinct from
+    // "human" (which is reserved for genuine, confirmed activations).
+    let audit_log = home.join(".local/share/omamori/audit.jsonl");
+    let audit_content = fs::read_to_string(&audit_log).unwrap_or_else(|e| {
+        panic!("expected denied activation to be audit-logged at {audit_log:?}: {e}")
+    });
+    assert!(
+        audit_content.contains("\"action\":\"break-glass-activate-denied\""),
+        "audit log missing denied-activation event: {audit_content}"
+    );
+    assert!(
+        audit_content.contains("\"provider\":\"non-interactive\""),
+        "denied event must not be attributed to provider \"human\": {audit_content}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn break_glass_status_and_clear_unaffected_by_tty_check() {
+    let home = unique_dir("break-glass-status-home");
+
+    for args in [["break-glass", "--status"], ["break-glass", "--clear"]] {
+        let mut cmd = Command::new(binary());
+        clean_ai_env(&mut cmd);
+        let output = cmd
+            .args(args)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|_| panic!("failed to run {args:?}"));
+        assert!(
+            output.status.success(),
+            "{args:?} should succeed without a TTY; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let _ = fs::remove_dir_all(&home);
+}
