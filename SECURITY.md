@@ -600,7 +600,7 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 | AI modifies log via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
 | AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
 | AI deletes/reorders entries mid-chain | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` |
-| AI truncates log tail (removes last K entries) | Seq high-water-mark file (`<audit-log>.hwm`, e.g. `audit.jsonl.hwm`) | Detected by `omamori audit verify` (exit 3). Same-user attacker who rewrites the `.hwm` file can bypass — structural limitation |
+| AI truncates log tail (removes last K entries) | Seq high-water-mark file (`<audit-log>.hwm`, e.g. `audit.jsonl.hwm`), symlink-safe atomic write/read | Detected by `omamori audit verify` (exit 3). Symlink swap and torn writes are rejected. A same-user attacker who directly overwrites the `.hwm` file's content (not via symlink) can still defeat detection — structural limitation, same as row below |
 | AI accesses secret via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
 | AI Edit/Write to protected files (config, audit, hooks, settings.json) | `is_protected_file_path` + `PROTECTED_FILE_PATTERNS` | **Blocked** (v0.8.0 #110) |
 | AI directly operates on files via OS (bypassing hook layer) | None (same OS user) | **Not protected** (structural limitation) |
@@ -665,7 +665,7 @@ strict = true  # default: false
 
 All audit file operations use `O_NOFOLLOW` to reject symlinks at the kernel level. This prevents symlink attacks where an attacker replaces `audit.jsonl` or `audit-secret` with a symlink to `/dev/null` or a controlled location.
 
-**Protected operations** (6 total):
+**Symlink-protected operations** (8 total — 6 via `O_NOFOLLOW`, 2 via `lstat`/atomic-rename, see Note below):
 
 | Operation | File | Effect on symlink |
 |-----------|------|-------------------|
@@ -675,6 +675,10 @@ All audit file operations use `O_NOFOLLOW` to reject symlinks at the kernel leve
 | `verify_chain()` | audit.jsonl | `ELOOP` error, verify fails |
 | `show_entries()` | audit.jsonl | `ELOOP` error, show fails |
 | `audit_summary()` | audit.jsonl | `ELOOP` error, count returns 0 |
+| `write_hwm()` | audit.jsonl.hwm | Refuses to write; final/temp symlink rejected before open |
+| `read_hwm()` | audit.jsonl.hwm | Symlink treated as tampered, not followed |
+
+*Note: the HWM sidecar's mechanism differs slightly from the six operations above — `read_hwm()` detects a symlink via `symlink_metadata` (lstat) rather than an `O_NOFOLLOW` open, and `write_hwm()` publishes the final file via atomic `rename` (which cannot land on a symlink at the destination) rather than an `O_NOFOLLOW` open of the final path directly. `O_NOFOLLOW` is still used for the temp file during write.*
 
 **Limitations**:
 

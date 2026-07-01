@@ -9,7 +9,7 @@ use super::secret::{
     secret_path_for,
 };
 use super::{AuditConfig, AuditEvent};
-use super::{hwm_path_for, read_hwm, write_hwm};
+use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -51,6 +51,7 @@ pub struct VerifyResult {
     pub pruned_count: Option<u64>,
     pub tail_truncated: bool,
     pub hwm_missing: bool,
+    pub hwm_tampered: bool,
 }
 
 pub struct ShowOptions {
@@ -118,6 +119,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         pruned_count: None,
         tail_truncated: false,
         hwm_missing: false,
+        hwm_tampered: false,
     };
     let mut expected_prev = genesis;
     let mut expected_seq: u64 = 0;
@@ -228,13 +230,20 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         let hwm_file = hwm_path_for(&path);
         let max_verified_seq = expected_seq.saturating_sub(1);
         match read_hwm(&hwm_file) {
-            Some(hwm) if max_verified_seq < hwm => {
+            HwmState::Valid(hwm) if max_verified_seq < hwm => {
                 result.tail_truncated = true;
             }
-            Some(_) => {}
-            None => {
+            HwmState::Valid(_) => {}
+            HwmState::Missing => {
                 // Bootstrap: first verify on a chain without HWM
                 result.hwm_missing = true;
+                let _ = write_hwm(&hwm_file, max_verified_seq);
+            }
+            HwmState::Tampered => {
+                // The HWM itself is unreadable or symlinked — this is tamper
+                // evidence, not a fresh install. Surface it distinctly instead
+                // of silently re-bootstrapping as if nothing happened.
+                result.hwm_tampered = true;
                 let _ = write_hwm(&hwm_file, max_verified_seq);
             }
         }

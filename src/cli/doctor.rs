@@ -207,7 +207,7 @@ fn print_risk_signals_section(ai_env: bool) {
         ChainStatus::Broken { .. } | ChainStatus::Truncated
     );
 
-    if !has_blocks && !has_unknown && !chain_broken {
+    if !has_blocks && !has_unknown && !chain_broken && !report.hwm_tampered {
         println!("  [Risk signals] Last 30 days: quiet");
         return;
     }
@@ -245,6 +245,15 @@ fn print_risk_signals_section(ai_env: bool) {
             }
         }
         _ => {}
+    }
+    if report.hwm_tampered {
+        if ai_env {
+            println!("    audit high-water-mark: unreadable/tampered");
+        } else {
+            println!(
+                "    audit high-water-mark: unreadable or tampered — run omamori audit verify"
+            );
+        }
     }
 }
 
