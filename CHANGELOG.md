@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [Unreleased]
+## [0.11.8] - 2026-07-01
+
+**Summary**: Audit HWM tamper hardening + break-glass TTY gate (#339, #319). The audit high-water-mark sidecar now uses the same symlink-safe atomic-write discipline as the rest of the audit subsystem, closing a gap where a same-user process could defeat tail-truncation detection via a symlink swap or an interrupted write. break-glass activation now requires a real interactive terminal, closing a gap where the confirmation prompt could be satisfied non-interactively without a human ever seeing it. Both fixes restore design intent already documented but not fully implemented (O_NOFOLLOW claimed but missing for HWM; no-bypass-flag intent drifted for break-glass).
 
 ### Fixed
 
