@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -819,12 +818,13 @@ pub fn config_template() -> String {
     out
 }
 
-/// Write the default config template to the given path.
+/// Write the default config template to the given path, via
+/// `atomic_file::{atomic_create_new, atomic_write_with_mode}` (#307 PR2).
 ///
 /// Safety features:
 /// - Refuses to write to symlinks (`O_NOFOLLOW` + `symlink_metadata` check)
-/// - `force=false`: uses `create_new(true)` to prevent TOCTOU races
-/// - `force=true`: atomic write via temp file + rename + fsync
+/// - `force=false`: `atomic_create_new` (TOCTOU-safe no-clobber contract)
+/// - `force=true`: `atomic_write_with_mode` (temp file + rename + fsync)
 /// - Sets directory permissions to 700, file permissions to 600
 pub fn write_default_config(path: &Path, force: bool) -> Result<WriteConfigResult, AppError> {
     let dir = path
@@ -859,28 +859,12 @@ pub fn write_default_config(path: &Path, force: bool) -> Result<WriteConfigResul
     let content = config_template();
 
     if force && path.exists() {
-        // Atomic write: temp file → fsync → rename
-        let temp_path = path.with_extension("toml.tmp");
-        // P1 fix: reject symlink at temp path too
-        if temp_path.symlink_metadata().is_ok() {
-            reject_symlink(&temp_path, "temp config path")?;
-            // Remove stale temp file (non-symlink) if it exists
-            let _ = fs::remove_file(&temp_path);
-        }
-        write_new_config(&temp_path, &content)?;
-        // fsync the file
-        let file = fs::File::open(&temp_path)?;
-        file.sync_all()?;
-        drop(file);
-        // Atomic rename
-        fs::rename(&temp_path, path)?;
-        // fsync the parent directory
-        if let Ok(dir_file) = fs::File::open(dir) {
-            let _ = dir_file.sync_all();
-        }
+        // Replacing an existing config: rename-based, via the shared helper.
+        crate::atomic_file::atomic_write_with_mode(path, content.as_bytes(), 0o600)?;
     } else {
-        // New file: use O_NOFOLLOW + create_new for TOCTOU safety
-        write_new_config(path, &content)?;
+        // Fresh file: no-clobber contract (TOCTOU-safe create_new), via the
+        // shared helper's dedicated entry point for this shape (#307 PR2).
+        crate::atomic_file::atomic_create_new(path, content.as_bytes(), 0o600)?;
     }
 
     Ok(WriteConfigResult {
@@ -894,36 +878,18 @@ pub fn reject_symlink_public(path: &Path, label: &str) -> Result<(), AppError> {
     reject_symlink(path, label)
 }
 
+/// Thin adapter over `atomic_file::is_symlink` (#311): this function's
+/// signature (and its `pub` re-export `reject_symlink_public`) stays fixed
+/// so none of its many call sites need to change; the shared boolean check
+/// moved to `atomic_file` so it isn't duplicated wherever a caller-side
+/// target-symlink guard is needed.
 fn reject_symlink(path: &Path, label: &str) -> Result<(), AppError> {
-    if let Ok(meta) = fs::symlink_metadata(path)
-        && meta.file_type().is_symlink()
-    {
+    if crate::atomic_file::is_symlink(path) {
         return Err(AppError::Config(format!(
             "{label} `{}` is a symlink; refusing to write for security",
             path.display()
         )));
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_new_config(path: &Path, content: &str) -> Result<(), AppError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_new_config(path: &Path, content: &str) -> Result<(), AppError> {
-    fs::write(path, content)?;
     Ok(())
 }
 

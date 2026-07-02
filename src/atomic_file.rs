@@ -1,20 +1,25 @@
 //! Canonical atomic file write helper (#307, #311, #322).
 //!
-//! [`atomic_write_with_mode`] — temp file + rename, for sites where an
-//! existing target may legitimately be replaced — unconditionally enforces
-//! `create_new` (`O_EXCL`) + `O_NOFOLLOW` + creation-time mode + `fsync` +
-//! CSPRNG temp names, with no caller-facing knob able to weaken any of it. A
-//! second entry point for no-clobber contracts (direct `create_new` on the
-//! target, no rename) lands alongside the call site that needs it; see
-//! `docs/adr/0001-atomic-file-canonical-helper.md` for the full two-entry-point
-//! design.
+//! Two entry points, both enforcing `create_new` (`O_EXCL`) + `O_NOFOLLOW` +
+//! creation-time mode + `fsync` + CSPRNG temp names — unconditionally, with
+//! no caller-facing knob able to weaken any of it:
 //!
-//! `atomic_write_with_mode` does not check whether `target` itself is a
-//! symlink: `rename` replaces whatever directory entry sits at the
-//! destination without following it. A caller that wants a friendlier,
+//! - [`atomic_write_with_mode`] — temp file + rename, for sites where an
+//!   existing target may legitimately be replaced.
+//! - [`atomic_create_new`] — direct `create_new` on the target, no rename,
+//!   for sites with a no-clobber contract (fail if the target already
+//!   exists).
+//!
+//! See `docs/adr/0001-atomic-file-canonical-helper.md`.
+//!
+//! Neither entry point checks whether `target` itself is a symlink: `rename`
+//! replaces whatever directory entry sits at the destination without
+//! following it, and `create_new` fails outright if anything (including a
+//! symlink) already exists there. A caller that wants a friendlier,
 //! context-specific error message when `target` is a pre-existing symlink
 //! must check before calling — that check stays caller-side by design so the
 //! message can name the call site (e.g. "config path", "integrity baseline").
+//! [`is_symlink`] is the shared primitive for that caller-side check (#311).
 
 use std::io;
 use std::path::Path;
@@ -61,11 +66,59 @@ pub(crate) fn atomic_write_with_mode(target: &Path, content: &[u8], _mode: u32) 
     ))
 }
 
-// Note: an `atomic_create_new` entry point (direct `create_new` on `target`,
-// no rename — for the no-clobber contract in `config::write_new_config`'s
-// fresh-create branch) lands in the PR that migrates that call site (#307
-// PR2), not here. Adding it now, unused, would be dead code under
-// `-D warnings`.
+/// Direct `create_new` on `target` — no rename, fails if `target` already
+/// exists.
+///
+/// For call sites where "never overwrite an existing file" is the contract
+/// itself (e.g. first-time config creation): routing this through the
+/// rename-based path would turn a fail-closed race (`AlreadyExists`) into a
+/// silent fail-open clobber, since `rename` cannot distinguish "target
+/// appeared after my existence check" from "target was always absent".
+///
+/// Unlike [`atomic_write_with_mode`], there is no temp file and therefore no
+/// `TempGuard`: if `write_all`/`sync_all` fails after `target` was already
+/// created, a partial file is left at `target` (matching the pre-#307
+/// behavior of `config::write_new_config`, which this replaces — not a
+/// regression, but also not newly hardened).
+#[cfg(unix)]
+pub(crate) fn atomic_create_new(target: &Path, content: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(target)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    drop(file);
+    fsync_parent(target);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn atomic_create_new(target: &Path, content: &[u8], _mode: u32) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    file.write_all(content)?;
+    Ok(())
+}
+
+/// Shared symlink-check primitive (#311). `false` on any I/O error (path
+/// doesn't exist, permission denied, etc.) — callers that need fail-closed
+/// behavior on error should not rely on this alone; it answers exactly one
+/// question: "does a symlink sit at this path right now".
+pub(crate) fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
 
 // ---------------------------------------------------------------------------
 // Internals (Unix)
@@ -253,6 +306,22 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    // -----------------------------------------------------------------
+    // random_hex_suffix: the actual generator every production caller uses
+    // (the collision-handling tests below inject a mock closure instead, to
+    // deterministically force collisions — this test covers the generator
+    // itself, which those tests don't exercise)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn random_hex_suffix_produces_distinct_16_char_hex_strings() {
+        let a = random_hex_suffix().unwrap();
+        let b = random_hex_suffix().unwrap();
+        assert_eq!(a.len(), 16, "8 bytes hex-encoded = 16 chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two consecutive calls must not collide");
     }
 
     // -----------------------------------------------------------------
@@ -583,6 +652,57 @@ mod tests {
             !just_over.exists(),
             "a temp file 1s older than the threshold must be GC'd"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // atomic_create_new: no-clobber contract
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn create_new_creates_file_with_mode() {
+        let dir = test_dir("create-new");
+        let target = dir.join("config.toml");
+
+        atomic_create_new(&target, b"[rules]\n", 0o600).unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"[rules]\n");
+        assert_eq!(mode_of(&target), 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_new_fails_closed_when_target_already_exists() {
+        let dir = test_dir("create-new-exists");
+        let target = dir.join("config.toml");
+        std::fs::write(&target, b"original").unwrap();
+
+        let result = atomic_create_new(&target, b"attacker-payload", 0o600);
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "no-clobber contract: existing content must survive a failed create_new"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_new_fails_closed_when_target_is_a_symlink() {
+        let dir = test_dir("create-new-symlink");
+        let decoy = dir.join("decoy");
+        std::fs::write(&decoy, b"decoy").unwrap();
+        let target = dir.join("config.toml");
+        std::os::unix::fs::symlink(&decoy, &target).unwrap();
+
+        let result = atomic_create_new(&target, b"attacker-payload", 0o600);
+
+        assert!(
+            result.is_err(),
+            "create_new must not follow a symlinked target"
+        );
+        assert_eq!(std::fs::read(&decoy).unwrap(), b"decoy");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -108,16 +107,7 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         fs::create_dir_all(&hooks_dir)?;
 
         let script_path = hooks_dir.join("claude-pretooluse.sh");
-        atomic_write(&script_path, &render_hook_script(&source_exe))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut perms = fs::metadata(&script_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms)?;
-        }
+        atomic_write_script(&script_path, &render_hook_script(&source_exe))?;
 
         let snippet_path = hooks_dir.join("claude-settings.snippet.json");
         atomic_write(&snippet_path, &render_settings_snippet(&script_path))?;
@@ -267,118 +257,23 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Atomic write: write to temp file → flush → rename over target.
-/// Prevents partial writes if the process is interrupted.
+/// Atomic write via the canonical `atomic_file::atomic_write_with_mode`
+/// helper (#307 PR2). Fixed at `0o600` — every data-file call site in this
+/// module already used this mode, either explicitly (the removed
+/// `legacy_atomic_write_with_mode(.., 0o600)`) or, before this migration,
+/// implicitly via umask (a user-visible permissions tightening for the
+/// handful of sites that only ever called the mode-less `atomic_write`).
 fn atomic_write(target: &Path, content: &str) -> Result<(), std::io::Error> {
-    let dir = target.parent().unwrap_or(Path::new("."));
-    let mut tmp = tempfile_in(dir)?;
-    tmp.write_all(content.as_bytes())?;
-    tmp.flush()?;
-    let tmp_path = tmp.into_path();
-    fs::rename(&tmp_path, target)?;
-    Ok(())
+    crate::atomic_file::atomic_write_with_mode(target, content.as_bytes(), 0o600)
 }
 
-/// Atomic write with explicit Unix file mode.
-///
-/// SEC-3: ensures `~/.claude/settings.json` is written with explicit `0o600`
-/// (owner read/write only), independent of the caller's umask. The mode is set
-/// at file creation via `OpenOptions::mode()`, so there is no TOCTOU window
-/// where the file exists with a wider permission bit set.
-///
-/// On non-Unix platforms, `mode` is ignored and behavior matches `atomic_write`.
-///
-/// Named `legacy_*` (#307 PR1) to avoid sharing a name with the hardened
-/// `atomic_file::atomic_write_with_mode` (fsync, CSPRNG temp names) during the
-/// interim window before PR2 migrates this module onto it and deletes this
-/// function.
-fn legacy_atomic_write_with_mode(
-    target: &Path,
-    content: &str,
-    mode: u32,
-) -> Result<(), std::io::Error> {
-    let dir = target.parent().unwrap_or(Path::new("."));
-    let mut tmp = tempfile_in_with_mode(dir, mode)?;
-    tmp.write_all(content.as_bytes())?;
-    tmp.flush()?;
-    let tmp_path = tmp.into_path();
-    fs::rename(&tmp_path, target)?;
-    Ok(())
-}
-
-/// Create a named temp file in the given directory.
-/// Uses O_EXCL (create_new) for exclusive creation + O_NOFOLLOW on Unix to prevent
-/// symlink-following attacks. AtomicU64 counter ensures uniqueness within a process.
-/// See: #56, #82, T7.
-fn tempfile_in(dir: &Path) -> Result<AtomicTempFile, std::io::Error> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!(".omamori-tmp-{}-{}", std::process::id(), seq));
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?
-    };
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    Ok(AtomicTempFile { file, path })
-}
-
-/// Variant of `tempfile_in` that sets the file mode at creation time
-/// (Unix only). On non-Unix platforms `mode` is ignored.
-fn tempfile_in_with_mode(dir: &Path, mode: u32) -> Result<AtomicTempFile, std::io::Error> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!(".omamori-tmp-{}-{}", std::process::id(), seq));
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .mode(mode)
-            .open(&path)?
-    };
-    #[cfg(not(unix))]
-    let _ = mode;
-    #[cfg(not(unix))]
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    Ok(AtomicTempFile { file, path })
-}
-
-struct AtomicTempFile {
-    file: fs::File,
-    path: PathBuf,
-}
-
-impl AtomicTempFile {
-    fn into_path(self) -> PathBuf {
-        self.path
-    }
-}
-
-impl Write for AtomicTempFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
-    }
+/// Same as [`atomic_write`] but with executable (`0o755`) permissions, for
+/// generated shell scripts (hook wrappers). Setting the mode at creation
+/// time removes the window the old rename-then-`chmod` dance left open,
+/// where the script briefly existed with default, non-executable
+/// permissions.
+fn atomic_write_script(target: &Path, content: &str) -> Result<(), std::io::Error> {
+    crate::atomic_file::atomic_write_with_mode(target, content.as_bytes(), 0o755)
 }
 
 /// Compute SHA-256 hash of the given content and return as hex string.
@@ -420,15 +315,7 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
     };
 
     let script_path = hooks_dir.join("claude-pretooluse.sh");
-    atomic_write(&script_path, &render_hook_script(&stable_exe))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script_path, perms)?;
-    }
+    atomic_write_script(&script_path, &render_hook_script(&stable_exe))?;
 
     let snippet_path = hooks_dir.join("claude-settings.snippet.json");
     atomic_write(&snippet_path, &render_settings_snippet(&script_path))?;
@@ -440,14 +327,7 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
     // Codex hooks: regenerate wrapper + re-merge hooks.json
     let codex_wrapper = hooks_dir.join("codex-pretooluse.sh");
     if codex_wrapper.exists() {
-        atomic_write(&codex_wrapper, &render_codex_pretooluse_script(&stable_exe))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&codex_wrapper)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&codex_wrapper, perms)?;
-        }
+        atomic_write_script(&codex_wrapper, &render_codex_pretooluse_script(&stable_exe))?;
         let codex_dir = codex_home_dir();
         if is_real_directory(&codex_dir) {
             let _ = merge_codex_hooks(&codex_dir, &codex_wrapper);
@@ -654,7 +534,7 @@ pub(crate) fn claude_home_dir() -> PathBuf {
 /// - `AlreadyPresent` when canonical entry already exists and no stale
 ///   entries were cleaned.
 ///
-/// All writes use `legacy_atomic_write_with_mode(.., 0o600)` (SEC-3).
+/// All writes use `atomic_write` (0o600, SEC-3).
 pub(crate) fn merge_claude_settings(
     claude_dir: &Path,
     script_path: &Path,
@@ -667,11 +547,7 @@ pub(crate) fn merge_claude_settings(
         let doc = serde_json::json!({
             "hooks": { "PreToolUse": [entry] }
         });
-        legacy_atomic_write_with_mode(
-            &settings_path,
-            &serde_json::to_string_pretty(&doc).unwrap(),
-            0o600,
-        )?;
+        atomic_write(&settings_path, &serde_json::to_string_pretty(&doc).unwrap())?;
         return Ok(ClaudeSettingsOutcome::Created);
     }
 
@@ -791,11 +667,7 @@ pub(crate) fn merge_claude_settings(
     if kept_canonical {
         // Canonical entry was already present and kept. Any stale siblings removed.
         if stale_count > 0 {
-            legacy_atomic_write_with_mode(
-                &settings_path,
-                &serde_json::to_string_pretty(&doc).unwrap(),
-                0o600,
-            )?;
+            atomic_write(&settings_path, &serde_json::to_string_pretty(&doc).unwrap())?;
             return Ok(ClaudeSettingsOutcome::StaleEntriesCleaned(stale_count));
         }
         return Ok(ClaudeSettingsOutcome::AlreadyPresent);
@@ -803,11 +675,7 @@ pub(crate) fn merge_claude_settings(
 
     // Canonical entry not present → push new
     arr.push(entry);
-    legacy_atomic_write_with_mode(
-        &settings_path,
-        &serde_json::to_string_pretty(&doc).unwrap(),
-        0o600,
-    )?;
+    atomic_write(&settings_path, &serde_json::to_string_pretty(&doc).unwrap())?;
 
     if had_legacy_matcher {
         return Ok(ClaudeSettingsOutcome::MatcherMigrated);
@@ -1111,11 +979,7 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
     }
 
     if modified {
-        legacy_atomic_write_with_mode(
-            &settings_path,
-            &serde_json::to_string_pretty(&doc).unwrap(),
-            0o600,
-        )?;
+        atomic_write(&settings_path, &serde_json::to_string_pretty(&doc).unwrap())?;
     }
     Ok(())
 }
@@ -1220,17 +1084,10 @@ fn setup_codex_hooks(
     let wrapper_path = hooks_dir.join("codex-pretooluse.sh");
 
     // Step 1: wrapper script (must exist before hooks.json references it)
-    if let Err(e) = atomic_write(&wrapper_path, &render_codex_pretooluse_script(source_exe)) {
+    if let Err(e) = atomic_write_script(&wrapper_path, &render_codex_pretooluse_script(source_exe))
+    {
         eprintln!("omamori: warning — Codex wrapper: {e}");
         return (None, None, None);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(mut perms) = fs::metadata(&wrapper_path).map(|m| m.permissions()) {
-            perms.set_mode(0o755);
-            let _ = fs::set_permissions(&wrapper_path, perms);
-        }
     }
 
     // Step 2: hooks.json
@@ -1353,8 +1210,20 @@ mod tests {
         .unwrap();
 
         assert!(result.shim_dir.join("rm").exists());
-        assert!(result.hook_script.unwrap().exists());
+        let hook_script = result.hook_script.unwrap();
+        assert!(hook_script.exists());
         assert!(result.settings_snippet.unwrap().exists());
+
+        // #307 PR2: hook scripts are written via `atomic_write_script` (mode set at
+        // creation), replacing the old rename-then-`chmod(0o755)` dance. Assert the
+        // resulting mode directly rather than only `.exists()` — a regression here
+        // would silently disable Layer 2 (non-executable hook script).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&hook_script).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "hook script must be executable (0o755)");
+        }
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1519,6 +1388,16 @@ mod tests {
         let hook_path = root.join("hooks/claude-pretooluse.sh");
         assert!(hook_path.exists(), "hook script should be created");
 
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&hook_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o755,
+                "regenerated hook script must be executable (0o755)"
+            );
+        }
+
         let content = fs::read_to_string(&hook_path).unwrap();
         assert_eq!(
             parse_hook_version(&content),
@@ -1545,45 +1424,13 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn tempfile_in_generates_unique_paths() {
-        let dir = std::env::temp_dir().join(format!("omamori-tmpuniq-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-
-        let tmp1 = tempfile_in(&dir).unwrap();
-        let tmp2 = tempfile_in(&dir).unwrap();
-        assert_ne!(
-            tmp1.path, tmp2.path,
-            "sequential tempfile_in must produce different paths"
-        );
-
-        // Cleanup
-        let _ = fs::remove_file(&tmp1.path);
-        let _ = fs::remove_file(&tmp2.path);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tempfile_in_uses_exclusive_creation() {
-        let dir = std::env::temp_dir().join(format!("omamori-tmpexcl-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-
-        // Create a file that would collide if tempfile_in used deterministic naming
-        let tmp = tempfile_in(&dir).unwrap();
-        let path = tmp.path.clone();
-        drop(tmp); // close file handle, but don't delete
-
-        // The file still exists — a second call with the SAME name would fail on create_new
-        // But since we use a counter, the next call gets a different name and succeeds
-        let tmp2 = tempfile_in(&dir).unwrap();
-        assert_ne!(path, tmp2.path);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(&tmp2.path);
-        let _ = fs::remove_dir_all(&dir);
-    }
+    // `tempfile_in`/`tempfile_in_with_mode`/`AtomicTempFile` were removed in
+    // #307 PR2 (migrated onto `atomic_file::atomic_write_with_mode`). Coverage
+    // moved to `atomic_file`'s own test suite: uniqueness/exclusivity of the
+    // actual production suffix generator is `random_hex_suffix_produces_distinct_16_char_hex_strings`;
+    // collision-retry logic (injecting a mock suffix generator to force
+    // deterministic collisions) is `write_via_temp_retries_past_a_colliding_suffix`
+    // / `write_via_temp_fails_closed_when_every_suffix_collides`.
 
     // --- Hook content hash tests (T2 attack detection) ---
 
@@ -3361,6 +3208,7 @@ mod tests {
     /// `x-omamori-version` tag must be stripped. A second merge must NOT
     /// delete the remaining user hook.
     #[test]
+    #[serial_test::serial(home_env)]
     fn merge_claude_hybrid_extraction_preserves_user_hook_on_rerun() {
         let dir = fresh_test_dir("p0-hybrid-rerun");
         let script = fake_script(&dir);
@@ -3453,6 +3301,7 @@ mod tests {
     /// Negative test: a user entry without tag and outside base_dir must
     /// survive merge even if it uses a similar filename.
     #[test]
+    #[serial_test::serial(home_env)]
     fn merge_claude_does_not_delete_untagged_user_entry() {
         let dir = fresh_test_dir("no-del-user");
         let script = fake_script(&dir);
