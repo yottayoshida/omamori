@@ -5,7 +5,6 @@
 //! - **Full check** (`omamori status`): all shims, hook content hash, config perms + hash, PATH order.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -178,7 +177,11 @@ pub fn generate_baseline(base_dir: &Path) -> Result<IntegrityBaseline, AppError>
     })
 }
 
-/// Write baseline to `.integrity.json` using hardened write (chmod 600, O_NOFOLLOW).
+/// Write baseline to `.integrity.json` via `atomic_file::atomic_write_with_mode`
+/// (chmod 600, O_NOFOLLOW, fsync). `atomic_write_with_mode` always replaces
+/// `path` via temp+rename regardless of whether it already exists, so the
+/// former fresh-vs-existing branch (each hand-rolling its own temp+rename
+/// around `write_new_file`) collapses to a single call.
 pub fn write_baseline(base_dir: &Path, baseline: &IntegrityBaseline) -> Result<(), AppError> {
     let path = baseline_path(base_dir);
     let content =
@@ -189,28 +192,7 @@ pub fn write_baseline(base_dir: &Path, baseline: &IntegrityBaseline) -> Result<(
         crate::config::reject_symlink_public(&path, "integrity baseline")?;
     }
 
-    if path.exists() {
-        // Atomic update: temp → fsync → rename
-        let temp_path = path.with_extension("json.tmp");
-        if temp_path.symlink_metadata().is_ok() {
-            crate::config::reject_symlink_public(&temp_path, "integrity temp")?;
-            let _ = fs::remove_file(&temp_path);
-        }
-        write_new_file(&temp_path, &content)?;
-        let file = fs::File::open(&temp_path)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp_path, &path)?;
-        if let Some(dir) = path.parent()
-            && let Ok(dir_file) = fs::File::open(dir)
-        {
-            let _ = dir_file.sync_all();
-        }
-    } else {
-        write_new_file(&path, &content)?;
-    }
-
-    Ok(())
+    write_new_file(&path, &content)
 }
 
 /// Read existing baseline from disk.
@@ -949,25 +931,12 @@ fn file_mode(_path: &Path) -> u32 {
     0
 }
 
-#[cfg(unix)]
+/// Shared by `write_baseline` and `config_cmd::mutate_config`. Before #307
+/// this opened `path` directly with `create(true).truncate(true)` — the same
+/// predictable-target, no-atomic-replace shape as the other #322-class sites
+/// (mode never applied to a pre-existing file, no rename indirection).
 pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), AppError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    file.write_all(content.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), AppError> {
-    fs::write(path, content)?;
+    crate::atomic_file::atomic_write_with_mode(path, content.as_bytes(), 0o600)?;
     Ok(())
 }
 

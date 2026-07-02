@@ -199,21 +199,12 @@ where
             "config mutation would create invalid TOML; aborting".to_string(),
         ));
     }
-    // Hardened write: atomic (temp → fsync → rename) with O_NOFOLLOW (#102)
+    // Hardened write: atomic (temp → fsync → rename) with O_NOFOLLOW (#102, #307).
+    // `write_new_file` uses a CSPRNG-random temp name, so the old "reject if the
+    // fixed temp path is a symlink" pre-check is moot — nothing predictable to
+    // plant a symlink at.
     config::reject_symlink_public(config_path, "config path")?;
-    let temp_path = config_path.with_extension("toml.tmp");
-    if temp_path.symlink_metadata().is_ok() {
-        config::reject_symlink_public(&temp_path, "config temp")?;
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    integrity::write_new_file(&temp_path, &new_content)?;
-    std::fs::File::open(&temp_path)?.sync_all()?;
-    std::fs::rename(&temp_path, config_path)?;
-    if let Some(dir) = config_path.parent()
-        && let Ok(f) = std::fs::File::open(dir)
-    {
-        let _ = f.sync_all();
-    }
+    integrity::write_new_file(config_path, &new_content)?;
     update_baseline_silent(&default_base_dir());
     Ok(())
 }
@@ -612,6 +603,43 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(false),
             "mutation should have set audit.enabled = false"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutate_config_rejects_symlink_target() {
+        let dir = std::env::temp_dir().join(format!("omamori-gr005-3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let real_file = dir.join("real.toml");
+        std::fs::write(&real_file, "[rules]\n").unwrap();
+        let config_path = dir.join("config.toml");
+        std::os::unix::fs::symlink(&real_file, &config_path).unwrap();
+
+        let result = mutate_config(&config_path, |doc| {
+            doc["audit"]["enabled"] = toml_edit::value(false);
+            Ok(())
+        });
+
+        assert!(
+            result.is_err(),
+            "mutate_config must refuse a symlinked config path"
+        );
+        assert!(
+            config_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink must still exist (not replaced by a regular file)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_file).unwrap(),
+            "[rules]\n",
+            "symlink target must not be overwritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

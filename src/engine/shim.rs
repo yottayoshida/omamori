@@ -107,66 +107,20 @@ fn touch_heartbeat_inner(path: &Path) -> Option<()> {
     write_heartbeat_file(path, &now)
 }
 
-#[cfg(unix)]
+/// Writes via `atomic_file::atomic_write_with_mode` (#322: closes the
+/// pre-creation race the old predictable-temp-name + `create(true)`
+/// implementation had). The caller (`touch_heartbeat_inner`) already checked
+/// that `path` isn't a non-regular-file entry before reaching here, so no
+/// symlink check is duplicated at this layer.
 fn write_heartbeat_file(path: &Path, now: &OffsetDateTime) -> Option<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
     let parent = path.parent()?;
     std::fs::create_dir_all(parent).ok()?;
-
-    let temp_name = format!(
-        ".heartbeat.{}.{}.tmp",
-        std::process::id(),
-        now.unix_timestamp()
-    );
-    let temp_path = parent.join(&temp_name);
-
-    if let Ok(m) = std::fs::symlink_metadata(&temp_path)
-        && m.file_type().is_symlink()
-    {
-        return None;
-    }
 
     let content = now
         .format(&time::format_description::well_known::Rfc3339)
         .ok()?;
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp_path)
-        .ok()?;
-
-    file.write_all(content.as_bytes()).ok()?;
-    drop(file);
-
-    std::fs::rename(&temp_path, path).ok()?;
-    Some(())
-}
-
-#[cfg(not(unix))]
-fn write_heartbeat_file(path: &Path, now: &OffsetDateTime) -> Option<()> {
-    let parent = path.parent()?;
-    std::fs::create_dir_all(parent).ok()?;
-
-    let temp_name = format!(
-        ".heartbeat.{}.{}.tmp",
-        std::process::id(),
-        now.unix_timestamp()
-    );
-    let temp_path = parent.join(&temp_name);
-
-    let content = now
-        .format(&time::format_description::well_known::Rfc3339)
-        .ok()?;
-
-    std::fs::write(&temp_path, content.as_bytes()).ok()?;
-    std::fs::rename(&temp_path, path).ok()?;
-    Some(())
+    crate::atomic_file::atomic_write_with_mode(path, content.as_bytes(), 0o600).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -398,44 +352,16 @@ fn should_emit_audit_warning_at(path: &Path) -> bool {
     true
 }
 
+/// Writes via `atomic_file::atomic_write_with_mode` (#322-class: this sentinel
+/// had the same predictable-temp-name + `create(true)` race as the heartbeat
+/// writer before #307). Content is empty — only the mtime matters
+/// (`should_emit_audit_warning_at` reads it, never the bytes).
 fn touch_audit_warn_sentinel(path: &Path) {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return,
+    let Some(parent) = path.parent() else {
+        return;
     };
     let _ = std::fs::create_dir_all(parent);
-
-    let temp_path = parent.join(format!(".audit-warn.{}.tmp", std::process::id()));
-
-    if let Ok(m) = std::fs::symlink_metadata(&temp_path)
-        && m.file_type().is_symlink()
-    {
-        return;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp_path)
-        {
-            drop(f);
-            let _ = std::fs::rename(&temp_path, path);
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        if let Ok(f) = std::fs::File::create(&temp_path) {
-            drop(f);
-            let _ = std::fs::rename(&temp_path, path);
-        }
-    }
+    let _ = crate::atomic_file::atomic_write_with_mode(path, b"", 0o600);
 }
 
 /// Attempt to append an audit event. On failure:
