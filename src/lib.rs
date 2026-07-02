@@ -1,4 +1,5 @@
 pub mod actions;
+pub(crate) mod atomic_file;
 pub mod audit;
 pub(crate) mod break_glass;
 mod cli;

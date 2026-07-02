@@ -4,7 +4,6 @@
 //! Already protected from AI writes by PROTECTED_FILE_PATTERNS.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -171,46 +170,23 @@ pub(crate) fn read_active_entries() -> Vec<BreakGlassEntry> {
         .unwrap_or_default()
 }
 
-/// Atomic write: tmp file + fsync + rename, 0o600 permissions.
+/// Atomic write via `atomic_file::atomic_write_with_mode`. Before #307 this
+/// hand-rolled a fixed-name temp file with no `O_NOFOLLOW` and set
+/// permissions *after* opening — the only one of the atomic-write sites
+/// lacking both protections. Both close here: mode is set at creation, and
+/// the random temp name makes the old "reject if tmp path is a symlink"
+/// pre-check moot (an attacker can no longer predict the path to plant a
+/// symlink at).
 pub(crate) fn write_state(state: &BreakGlassState) -> Result<(), std::io::Error> {
     let path = state_file_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension("tmp");
+    let mut content = serde_json::to_vec_pretty(state)?;
+    content.push(b'\n');
 
-    // Reject if tmp path is a symlink
-    if fs::symlink_metadata(&tmp_path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "break-glass temp file is a symlink",
-        ));
-    }
-
-    {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-
-        serde_json::to_writer_pretty(&mut file, state)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-    }
-
-    fs::rename(&tmp_path, &path)?;
-    Ok(())
+    crate::atomic_file::atomic_write_with_mode(&path, &content, 0o600)
 }
 
 pub(crate) fn remove_state_file() -> Result<(), std::io::Error> {

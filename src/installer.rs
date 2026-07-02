@@ -287,7 +287,16 @@ fn atomic_write(target: &Path, content: &str) -> Result<(), std::io::Error> {
 /// where the file exists with a wider permission bit set.
 ///
 /// On non-Unix platforms, `mode` is ignored and behavior matches `atomic_write`.
-fn atomic_write_with_mode(target: &Path, content: &str, mode: u32) -> Result<(), std::io::Error> {
+///
+/// Named `legacy_*` (#307 PR1) to avoid sharing a name with the hardened
+/// `atomic_file::atomic_write_with_mode` (fsync, CSPRNG temp names) during the
+/// interim window before PR2 migrates this module onto it and deletes this
+/// function.
+fn legacy_atomic_write_with_mode(
+    target: &Path,
+    content: &str,
+    mode: u32,
+) -> Result<(), std::io::Error> {
     let dir = target.parent().unwrap_or(Path::new("."));
     let mut tmp = tempfile_in_with_mode(dir, mode)?;
     tmp.write_all(content.as_bytes())?;
@@ -645,7 +654,7 @@ pub(crate) fn claude_home_dir() -> PathBuf {
 /// - `AlreadyPresent` when canonical entry already exists and no stale
 ///   entries were cleaned.
 ///
-/// All writes use `atomic_write_with_mode(.., 0o600)` (SEC-3).
+/// All writes use `legacy_atomic_write_with_mode(.., 0o600)` (SEC-3).
 pub(crate) fn merge_claude_settings(
     claude_dir: &Path,
     script_path: &Path,
@@ -658,7 +667,7 @@ pub(crate) fn merge_claude_settings(
         let doc = serde_json::json!({
             "hooks": { "PreToolUse": [entry] }
         });
-        atomic_write_with_mode(
+        legacy_atomic_write_with_mode(
             &settings_path,
             &serde_json::to_string_pretty(&doc).unwrap(),
             0o600,
@@ -782,7 +791,7 @@ pub(crate) fn merge_claude_settings(
     if kept_canonical {
         // Canonical entry was already present and kept. Any stale siblings removed.
         if stale_count > 0 {
-            atomic_write_with_mode(
+            legacy_atomic_write_with_mode(
                 &settings_path,
                 &serde_json::to_string_pretty(&doc).unwrap(),
                 0o600,
@@ -794,7 +803,7 @@ pub(crate) fn merge_claude_settings(
 
     // Canonical entry not present → push new
     arr.push(entry);
-    atomic_write_with_mode(
+    legacy_atomic_write_with_mode(
         &settings_path,
         &serde_json::to_string_pretty(&doc).unwrap(),
         0o600,
@@ -1102,7 +1111,7 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
     }
 
     if modified {
-        atomic_write_with_mode(
+        legacy_atomic_write_with_mode(
             &settings_path,
             &serde_json::to_string_pretty(&doc).unwrap(),
             0o600,
