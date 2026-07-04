@@ -28,13 +28,29 @@ pub(super) fn try_prune(
     retention_days: u32,
     audit_path: Option<&std::path::Path>,
 ) -> Result<u64, std::io::Error> {
+    try_prune_at(
+        file,
+        secret,
+        retention_days,
+        audit_path,
+        OffsetDateTime::now_utc(),
+    )
+}
+
+pub(super) fn try_prune_at(
+    file: &mut fs::File,
+    secret: Option<&[u8; 32]>,
+    retention_days: u32,
+    audit_path: Option<&std::path::Path>,
+    now: OffsetDateTime,
+) -> Result<u64, std::io::Error> {
     use time::format_description::well_known::Rfc3339;
 
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
 
-    let cutoff = OffsetDateTime::now_utc() - time::Duration::days(i64::from(retention_days));
+    let cutoff = now - time::Duration::days(i64::from(retention_days));
 
     // Partition lines: find the first line whose timestamp >= cutoff.
     // Also capture the first retained entry's hash (for prune-bind) in a single pass.

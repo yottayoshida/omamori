@@ -380,7 +380,7 @@ mod tests {
 
     // Also import submodule internals needed by tests
     use chain::{HashableEvent, genesis_hash, prune_genesis_hash};
-    use retention::{MIN_RETENTION_DAYS, build_prune_point, try_prune};
+    use retention::{MIN_RETENTION_DAYS, build_prune_point, try_prune_at};
     use secret::{create_secret, decode_hex_secret, flock_exclusive, read_secret};
     use verify::{AuditError, display_timestamp};
 
@@ -1665,6 +1665,10 @@ mod tests {
         }
     }
 
+    fn retention_test_now() -> OffsetDateTime {
+        OffsetDateTime::parse("2026-04-04T12:00:00Z", &Rfc3339).unwrap()
+    }
+
     /// Write chain entries directly with given timestamps (bypass append to control timestamps).
     fn write_chain_entries(path: &Path, secret: &[u8; 32], entries: &[(&str, &str)]) {
         let genesis = genesis_hash(Some(secret));
@@ -1725,7 +1729,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
+        let pruned = try_prune_at(
+            &mut file,
+            Some(&TEST_SECRET),
+            90,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned, 100, "should prune 100 old entries");
 
         drop(file);
@@ -1755,7 +1766,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
+        let pruned = try_prune_at(
+            &mut file,
+            Some(&TEST_SECRET),
+            90,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned, 0, "nothing should be pruned");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1783,7 +1801,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
+        let pruned = try_prune_at(
+            &mut file,
+            Some(&TEST_SECRET),
+            90,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned, 0, "min retain should prevent prune");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1804,7 +1829,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 36500, None).unwrap();
+        let pruned = try_prune_at(
+            &mut file,
+            Some(&TEST_SECRET),
+            36500,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned, 0);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1832,7 +1864,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
+        let pruned = try_prune_at(
+            &mut file,
+            Some(&TEST_SECRET),
+            90,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned, 100);
         drop(file);
 
@@ -1902,7 +1941,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
+        try_prune_at(
+            &mut file,
+            Some(&TEST_SECRET),
+            90,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         drop(file);
 
         let content = fs::read_to_string(&path).unwrap();
@@ -1952,7 +1998,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned1 = try_prune(&mut file, Some(&TEST_SECRET), 90, None).unwrap();
+        let pruned1 = try_prune_at(
+            &mut file,
+            Some(&TEST_SECRET),
+            90,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned1, 100, "should prune 50 old + 50 mid");
         drop(file);
 
@@ -1969,7 +2022,8 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned2 = try_prune(&mut file, Some(&TEST_SECRET), 1, None).unwrap();
+        let pruned2 =
+            try_prune_at(&mut file, Some(&TEST_SECRET), 1, None, retention_test_now()).unwrap();
         assert!(pruned2 <= 100, "second prune should respect min retain");
         drop(file);
 
