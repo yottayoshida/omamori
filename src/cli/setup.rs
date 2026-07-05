@@ -96,6 +96,7 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
         base_dir: base_dir.clone(),
         source_exe,
         generate_hooks: true,
+        ..Default::default()
     })?;
 
     println!(

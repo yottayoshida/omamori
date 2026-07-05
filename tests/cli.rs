@@ -1028,6 +1028,10 @@ fn install_generates_integrity_baseline() {
     let dir = unique_dir("install-baseline");
     let fake_bin = dir.join("omamori");
     fs::write(&fake_bin, "binary").unwrap();
+    // #210: without a pinned HOME, this subprocess resolves the developer's
+    // real ~/.claude and ~/.codex and merges a dead hook path (this `dir`
+    // is removed at test end) into the real settings.
+    let home = unique_dir("install-baseline-home");
 
     let output = Command::new(binary())
         .arg("install")
@@ -1036,6 +1040,7 @@ fn install_generates_integrity_baseline() {
         .arg("--source")
         .arg(fake_bin.to_str().unwrap())
         .arg("--hooks")
+        .env("HOME", &home)
         .output()
         .expect("failed to run omamori install");
     assert!(
@@ -1057,6 +1062,7 @@ fn install_generates_integrity_baseline() {
     assert!(baseline.get("hooks").is_some());
 
     let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&home);
 }
 
 // ---------------------------------------------------------------------------

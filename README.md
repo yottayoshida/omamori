@@ -299,6 +299,26 @@ omamori cursor-hook                      # Cursor hook handler
 omamori --version                        # Show version
 ```
 
+## Troubleshooting
+
+### Claude Code blocks every Bash command with a "hook error" / "No such file or directory"
+
+This means the hook script registered in `~/.claude/settings.json` points at a path that no longer exists (e.g. a Homebrew Cellar path from a removed version, or a build directory that was cleaned up). omamori's hooks are fail-close by design, so a missing hook script blocks everything rather than silently allowing it.
+
+**Fix**: in a plain terminal (not through an AI agent), run:
+
+```bash
+omamori install --hooks
+```
+
+This regenerates the hook script at the canonical path and re-merges the entry into `~/.claude/settings.json`. `omamori doctor --fix` diagnoses the same class of problem in more detail.
+
+If the above doesn't fix it, check for a **project-level** `.claude/settings.json` (in the repository you're working in, not `~/.claude/settings.json`). A `PreToolUse` entry tagged `x-omamori-version` there can also point at a stale path — remove that entry manually, since `omamori install --hooks` only manages the user-level `~/.claude/settings.json`.
+
+### Contributing to omamori: `cargo test` and your real `~/.claude` / `~/.codex`
+
+omamori's test suite pins `HOME` to a throwaway directory for every subprocess/in-process test that touches settings merge (#210). If you add a new test that calls `install`/`uninstall` or spawns the `omamori` binary, inject an isolated `HOME` (see existing tests in `tests/integration.rs`) — otherwise the test can merge a dead hook path into your real `~/.claude/settings.json` or `~/.codex/hooks.json`.
+
 ## Scope and Limitations
 
 ### Sandbox complementarity

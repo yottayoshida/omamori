@@ -227,7 +227,9 @@ fn ensure_settings_current() -> bool {
 /// not installed" all return `false` — recovery is the install command's
 /// responsibility, not the shim's.
 pub(crate) fn ensure_settings_current_at(base_dir: &Path) -> bool {
-    let claude_dir = installer::claude_home_dir();
+    let Some(claude_dir) = installer::claude_home_dir() else {
+        return false; // HOME unset — Claude Code not detected
+    };
     ensure_settings_current_for(base_dir, &claude_dir)
 }
 

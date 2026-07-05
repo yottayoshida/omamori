@@ -19,10 +19,24 @@ fn unique_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("omamori-{name}-{nanos}"))
 }
 
+/// A throwaway `$HOME` for subprocess install/uninstall tests (#210).
+///
+/// Without pinning `HOME` here, the child process resolves the *developer's
+/// real* `~/.claude` and `~/.codex` via `claude_home_dir()`/`codex_home_dir()`
+/// and merges a hook entry pointing at this test's `--base-dir` — which is
+/// deleted at the end of the test, leaving a dangling command path in the
+/// developer's real settings.json/hooks.json.
+fn isolated_home(name: &str) -> std::path::PathBuf {
+    let dir = unique_dir(name);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[test]
 fn install_creates_shims_without_touching_shell_config() {
     let binary = env!("CARGO_BIN_EXE_omamori");
     let base_dir = unique_dir("install");
+    let home = isolated_home("install-home");
 
     let output = Command::new(binary)
         .arg("install")
@@ -31,6 +45,7 @@ fn install_creates_shims_without_touching_shell_config() {
         .arg("--source")
         .arg(binary)
         .arg("--hooks")
+        .env("HOME", &home)
         .output()
         .expect("failed to run install");
 
@@ -52,12 +67,22 @@ fn install_creates_shims_without_touching_shell_config() {
     assert!(stdout.contains("Cursor"), "stdout: {stdout}");
 
     let _ = fs::remove_dir_all(base_dir);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn uninstall_removes_generated_artifacts() {
     let binary = env!("CARGO_BIN_EXE_omamori");
     let base_dir = unique_dir("uninstall");
+    // Shared across install+uninstall: uninstall's remove_claude_settings_entry
+    // must find (and only remove) the entry this test's install created —
+    // not the developer's real canonical entry (#210 delete-path variant).
+    // `.claude` is pre-created (unlike other isolated_home() uses) so the
+    // merge/remove logic is actually exercised rather than short-circuiting
+    // on "Claude Code not detected".
+    let home = isolated_home("uninstall-home");
+    let claude_dir = home.join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
 
     let install_status = Command::new(binary)
         .arg("install")
@@ -66,9 +91,14 @@ fn uninstall_removes_generated_artifacts() {
         .arg("--source")
         .arg(binary)
         .arg("--hooks")
+        .env("HOME", &home)
         .status()
         .expect("failed to run install");
     assert!(install_status.success());
+    assert!(
+        claude_dir.join("settings.json").exists(),
+        "install should have merged an entry into the isolated claude_dir"
+    );
 
     let mut uninstall_cmd = Command::new(binary);
     clean_ai_env(&mut uninstall_cmd);
@@ -76,6 +106,7 @@ fn uninstall_removes_generated_artifacts() {
         .arg("uninstall")
         .arg("--base-dir")
         .arg(&base_dir)
+        .env("HOME", &home)
         .output()
         .expect("failed to run uninstall");
 
@@ -86,6 +117,14 @@ fn uninstall_removes_generated_artifacts() {
     );
     assert!(!base_dir.join("shim/rm").exists());
     assert!(!base_dir.exists());
+
+    let settings_content = fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+    assert!(
+        !settings_content.contains("x-omamori-version"),
+        "uninstall should have removed the omamori entry from the isolated claude_dir: {settings_content}"
+    );
+
+    let _ = fs::remove_dir_all(home);
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +136,13 @@ fn install_auto_creates_config_when_missing() {
     let binary = env!("CARGO_BIN_EXE_omamori");
     let base_dir = unique_dir("install-autoconfig");
     let config_dir = unique_dir("install-autoconfig-xdg");
+    // #210: this test's intent is "config resolution honors XDG_CONFIG_HOME",
+    // not "behavior when HOME is unset". `env_remove("HOME")` previously hit
+    // the `.` fallback in claude_home_dir()/codex_home_dir() and merged a
+    // dead hook path into this process's CWD-relative `./.claude`. Pin HOME
+    // to a throwaway dir instead — XDG_CONFIG_HOME still takes precedence
+    // for config resolution (config.rs), so the assertion below is unaffected.
+    let home = isolated_home("install-autoconfig-home");
 
     let output = Command::new(binary)
         .arg("install")
@@ -106,7 +152,7 @@ fn install_auto_creates_config_when_missing() {
         .arg(binary)
         .arg("--hooks")
         .env("XDG_CONFIG_HOME", &config_dir)
-        .env_remove("HOME")
+        .env("HOME", &home)
         .output()
         .expect("failed to run install");
 
@@ -128,6 +174,7 @@ fn install_auto_creates_config_when_missing() {
 
     let _ = fs::remove_dir_all(base_dir);
     let _ = fs::remove_dir_all(config_dir);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
@@ -144,6 +191,9 @@ fn install_skips_existing_config() {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
     }
+    // #210: see install_auto_creates_config_when_missing for why HOME is
+    // pinned rather than removed.
+    let home = isolated_home("install-skipconfig-home");
 
     let output = Command::new(binary)
         .arg("install")
@@ -153,7 +203,7 @@ fn install_skips_existing_config() {
         .arg(binary)
         .arg("--hooks")
         .env("XDG_CONFIG_HOME", &config_dir)
-        .env_remove("HOME")
+        .env("HOME", &home)
         .output()
         .expect("failed to run install");
 
@@ -170,6 +220,7 @@ fn install_skips_existing_config() {
 
     let _ = fs::remove_dir_all(base_dir);
     let _ = fs::remove_dir_all(config_dir);
+    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
@@ -177,6 +228,9 @@ fn install_runs_auto_test() {
     let binary = env!("CARGO_BIN_EXE_omamori");
     let base_dir = unique_dir("install-autotest");
     let config_dir = unique_dir("install-autotest-xdg");
+    // #210: see install_auto_creates_config_when_missing for why HOME is
+    // pinned rather than removed.
+    let home = isolated_home("install-autotest-home");
 
     let output = Command::new(binary)
         .arg("install")
@@ -186,7 +240,7 @@ fn install_runs_auto_test() {
         .arg(binary)
         .arg("--hooks")
         .env("XDG_CONFIG_HOME", &config_dir)
-        .env_remove("HOME")
+        .env("HOME", &home)
         .output()
         .expect("failed to run install");
 
@@ -199,6 +253,7 @@ fn install_runs_auto_test() {
 
     let _ = fs::remove_dir_all(base_dir);
     let _ = fs::remove_dir_all(config_dir);
+    let _ = fs::remove_dir_all(home);
 }
 
 // ---------------------------------------------------------------------------
