@@ -351,7 +351,15 @@ fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
     let name = "claude-code-settings".to_string();
     let category = "Hooks";
 
-    let claude_dir = installer::claude_home_dir();
+    let Some(claude_dir) = installer::claude_home_dir() else {
+        return CheckItem {
+            category,
+            name,
+            status: CheckStatus::Warn,
+            detail: "(HOME unset — Claude Code not detected)".to_string(),
+            remediation: Some(Remediation::RunInstall),
+        };
+    };
     let settings_path = claude_dir.join("settings.json");
 
     if !settings_path.exists() {
@@ -1495,6 +1503,30 @@ mod tests {
     // ---------------------------------------------------------------------
     // check_claude_settings_integration tests (#196 Bonus)
     // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn check_claude_settings_warns_when_home_unset() {
+        // #210: doctor must not panic when HOME is unset — it must fall
+        // through to the same Warn outcome as "Claude Code not configured",
+        // not `.unwrap()` the `Option<PathBuf>` from `claude_home_dir()`.
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+
+        let item = check_claude_settings_integration(Path::new("/tmp/omamori-test-nonexistent"));
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(
+            item.detail.contains("HOME unset"),
+            "detail: {}",
+            item.detail
+        );
+    }
 
     #[test]
     #[serial_test::serial(home_env)]

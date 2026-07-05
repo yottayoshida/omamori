@@ -11,13 +11,20 @@ const CODEX_STATUS_MESSAGE: &str = "omamori: checking command safety";
 
 pub const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InstallOptions {
     pub base_dir: PathBuf,
     /// Path to the omamori binary. Must be a stable path (not a versioned Cellar path).
     /// Callers should pass the result of `resolve_stable_exe_path()` when using `current_exe()`.
     pub source_exe: PathBuf,
     pub generate_hooks: bool,
+    /// Override for the resolved `$HOME` used to locate `~/.claude` and
+    /// `~/.codex`. `None` means production: resolve via `home_dir()`.
+    /// `Some(dir)` pins both merge targets explicitly — used by in-process
+    /// tests to guarantee the real `$HOME` is never reached (#210). This is
+    /// a distinct `Option` layer from `home_dir()`'s own `None` (HOME unset)
+    /// — field `None` defers resolution, env `None` means "not detected".
+    pub home_override: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,16 +142,22 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
     // as a real directory). Mirrors the Codex CLI detection pattern below.
     let claude_settings_outcome = match (options.generate_hooks, hook_script.as_ref()) {
         (true, Some(script_path)) => {
-            let claude_dir = claude_home_dir();
-            if is_real_directory(&claude_dir) {
-                Some(
+            let claude_dir = options
+                .home_override
+                .clone()
+                .map(|h| h.join(".claude"))
+                .or_else(claude_home_dir);
+            match claude_dir {
+                Some(claude_dir) if is_real_directory(&claude_dir) => Some(
                     merge_claude_settings(&claude_dir, script_path)
                         .unwrap_or_else(|e| ClaudeSettingsOutcome::Skipped(format!("I/O: {e}"))),
-                )
-            } else {
-                Some(ClaudeSettingsOutcome::Skipped(
+                ),
+                Some(_) => Some(ClaudeSettingsOutcome::Skipped(
                     "Claude Code not detected (~/.claude not a directory)".into(),
-                ))
+                )),
+                None => Some(ClaudeSettingsOutcome::Skipped(
+                    "HOME unset — Claude Code not detected".into(),
+                )),
             }
         }
         _ => None,
@@ -152,7 +165,11 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
 
     // Generate Codex CLI hook (wrapper → hooks.json → config.toml)
     let (codex_wrapper, codex_hooks_outcome, codex_config_outcome) = if options.generate_hooks {
-        setup_codex_hooks(&options.base_dir, &source_exe)
+        setup_codex_hooks(
+            &options.base_dir,
+            &source_exe,
+            options.home_override.clone(),
+        )
     } else {
         (None, None, None)
     };
@@ -328,8 +345,9 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
     let codex_wrapper = hooks_dir.join("codex-pretooluse.sh");
     if codex_wrapper.exists() {
         atomic_write_script(&codex_wrapper, &render_codex_pretooluse_script(&stable_exe))?;
-        let codex_dir = codex_home_dir();
-        if is_real_directory(&codex_dir) {
+        if let Some(codex_dir) = codex_home_dir()
+            && is_real_directory(&codex_dir)
+        {
             let _ = merge_codex_hooks(&codex_dir, &codex_wrapper);
         }
     }
@@ -503,12 +521,21 @@ fn render_settings_snippet(script_path: &Path) -> String {
 // Claude Code settings.json merge support (#196)
 // ---------------------------------------------------------------------------
 
-/// Default Claude Code config directory (`~/.claude`).
-pub(crate) fn claude_home_dir() -> PathBuf {
+/// Resolves `$HOME`. Returns `None` when unset or empty — callers MUST
+/// treat this as "not detected" and never fall back to a CWD-relative path
+/// (#210: a `.` fallback here previously let test runs merge dead hook
+/// paths into whatever `./.claude`/`./.codex` happened to exist in the
+/// current working directory).
+fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
+}
+
+/// Default Claude Code config directory (`~/.claude`). See `home_dir` for
+/// the `None` contract.
+pub(crate) fn claude_home_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".claude"))
 }
 
 /// In-place merge of omamori's PreToolUse hook entry into
@@ -780,12 +807,10 @@ fn is_legacy_matcher(matcher: &str) -> bool {
 // Codex CLI hook support (#66)
 // ---------------------------------------------------------------------------
 
-/// Default Codex CLI config directory.
-fn codex_home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codex")
+/// Default Codex CLI config directory (`~/.codex`). See `home_dir` for the
+/// `None` contract.
+fn codex_home_dir() -> Option<PathBuf> {
+    home_dir().map(|h| h.join(".codex"))
 }
 
 /// True only if `path` is a real directory (not a symlink to one).
@@ -920,7 +945,10 @@ pub(crate) fn merge_codex_hooks(
 /// `entry_is_omamori_managed(e, base_dir)`. Symlinks and parse errors
 /// are skipped silently — the user can clean up manually if needed.
 fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
-    let settings_path = claude_home_dir().join("settings.json");
+    let Some(claude_dir) = claude_home_dir() else {
+        return Ok(()); // HOME unset — nothing to clean up
+    };
+    let settings_path = claude_dir.join("settings.json");
     if !settings_path.exists() {
         return Ok(());
     }
@@ -986,7 +1014,10 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
 
 /// Remove omamori's entry from `~/.codex/hooks.json` during uninstall.
 fn remove_codex_hooks_entry() -> Result<(), std::io::Error> {
-    let hooks_path = codex_home_dir().join("hooks.json");
+    let Some(codex_dir) = codex_home_dir() else {
+        return Ok(()); // HOME unset — nothing to clean up
+    };
+    let hooks_path = codex_dir.join("hooks.json");
     if !hooks_path.exists() {
         return Ok(());
     }
@@ -1070,12 +1101,19 @@ pub(crate) fn update_codex_config(codex_dir: &Path) -> Result<CodexConfigOutcome
 fn setup_codex_hooks(
     base_dir: &Path,
     source_exe: &Path,
+    home_override: Option<PathBuf>,
 ) -> (
     Option<PathBuf>,
     Option<CodexHooksOutcome>,
     Option<CodexConfigOutcome>,
 ) {
-    let codex_dir = codex_home_dir();
+    let codex_dir = match home_override
+        .map(|h| h.join(".codex"))
+        .or_else(codex_home_dir)
+    {
+        Some(dir) => dir,
+        None => return (None, None, None), // HOME unset — Codex not detected
+    };
     if !is_real_directory(&codex_dir) {
         return (None, None, None); // Codex not installed
     }
@@ -1133,7 +1171,9 @@ pub fn auto_setup_codex_if_needed(base_dir: &Path) -> bool {
         Err(_) => return false,
     };
 
-    let codex_dir = codex_home_dir();
+    let Some(codex_dir) = codex_home_dir() else {
+        return false; // HOME unset — Codex not detected
+    };
     if !is_real_directory(&codex_dir) {
         return false;
     }
@@ -1146,7 +1186,7 @@ pub fn auto_setup_codex_if_needed(base_dir: &Path) -> bool {
         return false;
     }
 
-    let (wrapper, hooks_out, config_out) = setup_codex_hooks(base_dir, &source_exe);
+    let (wrapper, hooks_out, config_out) = setup_codex_hooks(base_dir, &source_exe, None);
 
     if let Some(ref path) = wrapper {
         eprintln!("omamori: [done] {} (created)", path.display());
@@ -1203,12 +1243,18 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, "binary").unwrap();
 
-        let result = with_test_home(&root, || {
-            install(&InstallOptions {
-                base_dir: root.clone(),
-                source_exe: source.clone(),
-                generate_hooks: true,
-            })
+        // #210: home_override pins the merge targets to a throwaway temp dir
+        // instead of resolving the real $HOME. Without this, this in-process
+        // test would merge dead hook paths into the developer's real
+        // ~/.claude/settings.json and ~/.codex/hooks.json.
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+
+        let result = install(&InstallOptions {
+            base_dir: root.clone(),
+            source_exe: source.clone(),
+            generate_hooks: true,
+            home_override: Some(root.clone()),
         })
         .unwrap();
 
@@ -1216,6 +1262,14 @@ mod tests {
         let hook_script = result.hook_script.unwrap();
         assert!(hook_script.exists());
         assert!(result.settings_snippet.unwrap().exists());
+        assert!(
+            root.join(".claude/settings.json").exists(),
+            "merge should target the injected home_override, not the real $HOME"
+        );
+        assert!(
+            root.join(".codex/hooks.json").exists(),
+            "merge should target the injected home_override, not the real $HOME"
+        );
 
         // #307 PR2: hook scripts are written via `atomic_write_script` (mode set at
         // creation), replacing the old rename-then-`chmod(0o755)` dance. Assert the
@@ -1752,12 +1806,11 @@ mod tests {
         std::os::unix::fs::symlink(&real_bin, shim_dir.join("git")).unwrap();
 
         let base = dir.join("base");
-        let result = with_test_home(&dir, || {
-            install(&InstallOptions {
-                base_dir: base.clone(),
-                source_exe: shim_dir.join("git"),
-                generate_hooks: true,
-            })
+        let result = install(&InstallOptions {
+            base_dir: base.clone(),
+            source_exe: shim_dir.join("git"),
+            generate_hooks: true,
+            home_override: Some(dir.clone()),
         })
         .unwrap();
 
@@ -2187,37 +2240,141 @@ mod tests {
         script
     }
 
-    /// Compute the omamori prefix that `merge_claude_settings` expects.
-    /// We point HOME-derived prefix at our test dir by passing the right script
-    /// path. The merge function builds prefix from `HOME` env var, so for tests
-    /// we ensure the script lives under `<HOME>/.omamori/...`.
-    struct EnvVarGuard {
-        key: &'static str,
+    /// RAII guard that temporarily overrides `HOME`, restoring the original
+    /// value (or absence) on drop — including when the guarded code panics,
+    /// unlike a manual save/restore pair. Pass `None` to unset `HOME`
+    /// entirely, or `Some("")` for the empty-string edge case. Callers must
+    /// use `#[serial_test::serial(home_env)]` — no synchronization here.
+    pub(crate) struct HomeGuard {
         saved: Option<std::ffi::OsString>,
     }
 
-    impl EnvVarGuard {
-        fn set_path(key: &'static str, value: &Path) -> Self {
-            let saved = std::env::var_os(key);
-            // SAFETY: callers are serialized with #[serial_test::serial(home_env)].
-            unsafe { std::env::set_var(key, value) };
-            Self { key, saved }
+    impl HomeGuard {
+        pub(crate) fn set(home: Option<&std::ffi::OsStr>) -> Self {
+            let saved = std::env::var_os("HOME");
+            // SAFETY: serial_test ensures no parallel test mutates HOME concurrently.
+            match home {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+            Self { saved }
         }
     }
 
-    impl Drop for EnvVarGuard {
+    impl Drop for HomeGuard {
         fn drop(&mut self) {
-            // SAFETY: callers are serialized with #[serial_test::serial(home_env)].
             match &self.saved {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
             }
         }
     }
 
+    /// Compute the omamori prefix that `merge_claude_settings` expects.
+    /// We point HOME-derived prefix at our test dir by passing the right script
+    /// path. The merge function builds prefix from `HOME` env var, so for tests
+    /// we ensure the script lives under `<HOME>/.omamori/...`.
     fn with_test_home<R>(home: &Path, f: impl FnOnce() -> R) -> R {
-        let _guard = EnvVarGuard::set_path("HOME", home);
+        let _guard = HomeGuard::set(Some(home.as_os_str()));
         f()
+    }
+
+    // ---------------------------------------------------------------------
+    // claude_home_dir / codex_home_dir Option<PathBuf> contract (#210)
+    //
+    // HOME unset or empty must resolve to None — never a `.` (CWD-relative)
+    // fallback, which previously let test runs merge dead hook paths into
+    // whatever `./.claude` happened to exist in the process's CWD.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn claude_home_dir_is_none_when_home_unset() {
+        let _guard = HomeGuard::set(None);
+
+        assert_eq!(claude_home_dir(), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn claude_home_dir_is_none_when_home_empty() {
+        let _guard = HomeGuard::set(Some(std::ffi::OsStr::new("")));
+
+        assert_eq!(
+            claude_home_dir(),
+            None,
+            "HOME=\"\" must normalize to the same None as HOME unset, not a relative './.claude'"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn codex_home_dir_is_none_when_home_unset() {
+        let _guard = HomeGuard::set(None);
+
+        assert_eq!(codex_home_dir(), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn codex_home_dir_is_none_when_home_empty() {
+        let _guard = HomeGuard::set(Some(std::ffi::OsStr::new("")));
+
+        assert_eq!(codex_home_dir(), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn install_with_home_unset_succeeds_without_cwd_fallback() {
+        let root =
+            std::env::temp_dir().join(format!("omamori-install-nohome-{}", std::process::id()));
+        let source = root.join("omamori");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, "binary").unwrap();
+
+        let cwd_claude = std::env::current_dir().unwrap().join(".claude");
+        let cwd_claude_existed_before = cwd_claude.exists();
+
+        let result = {
+            let _guard = HomeGuard::set(None);
+            install(&InstallOptions {
+                base_dir: root.clone(),
+                source_exe: source.clone(),
+                generate_hooks: true,
+                home_override: None,
+            })
+        };
+
+        let result = result.expect("install must succeed even when HOME is unset");
+        assert!(matches!(
+            result.claude_settings_outcome,
+            Some(ClaudeSettingsOutcome::Skipped(_))
+        ));
+        assert_eq!(
+            cwd_claude.exists(),
+            cwd_claude_existed_before,
+            "install with HOME unset must not create a CWD-relative ./.claude (#210 `.` fallback)"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn uninstall_succeeds_when_home_unset() {
+        let root =
+            std::env::temp_dir().join(format!("omamori-uninstall-nohome-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+
+        let result = {
+            let _guard = HomeGuard::set(None);
+            uninstall(&root)
+        };
+
+        assert!(
+            result.is_ok(),
+            "uninstall must succeed (not panic) even when HOME is unset: {result:?}"
+        );
     }
 
     #[test]

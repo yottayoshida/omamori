@@ -50,6 +50,7 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         base_dir,
         source_exe,
         generate_hooks,
+        ..Default::default()
     })?;
 
     // --- Summary banner ---

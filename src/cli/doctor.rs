@@ -733,6 +733,7 @@ fn run_install_repair(base_dir: &Path) -> Result<(), AppError> {
         base_dir: base_dir.to_path_buf(),
         source_exe,
         generate_hooks: true,
+        ..Default::default()
     };
     installer::install(&options)?;
     Ok(())
