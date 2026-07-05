@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.12.0] - 2026-07-05
+
+**Summary**: Test-suite HOME isolation + audit retention determinism (#210, #344). omamori's own `cargo test` was corrupting the maintainer's real `~/.claude/settings.json` and `~/.codex/hooks.json` on two consecutive days — install/uninstall tests resolved their settings-merge target against the real `$HOME` instead of a throwaway test directory, and a `.` (CWD-relative) fallback let a second path corrupt the repository's own `./.claude/settings.json`. Separately, three `audit` retention tests were non-deterministic due to a process-global `HOME` race with unrelated tests. Both are closed now.
+
+### Breaking
+
+- **`InstallOptions` gains a `home_override: Option<PathBuf>` field** — any external code constructing `InstallOptions` via a full struct literal (rather than `..Default::default()`) must add this field. `None` preserves existing production behavior (resolves `$HOME` from the environment). ([#210](https://github.com/yottayoshida/omamori/issues/210))
+
+### Fixed
+
+- **Test-induced corruption of real `~/.claude`/`~/.codex` settings eliminated** — `InstallOptions.home_override` gives in-process tests compile-time DI isolation instead of relying on env-var discipline (which had already been forgotten twice in this codebase's history). `claude_home_dir()`/`codex_home_dir()` now return `Option<PathBuf>`, dropping the `.` (CWD-relative) fallback for `HOME` unset/empty. 6 subprocess tests now pin `HOME` to a throwaway directory instead of leaving it untouched or removing it. A new `HomeGuard` RAII helper makes `HOME` save/restore panic-safe across all HOME-mutating tests. See `docs/adr/0002-no-cwd-fallback-for-global-settings-paths.md` for the design rationale and rejected alternatives (heuristic temp-path guard, runtime sentinel env var). ([#210](https://github.com/yottayoshida/omamori/issues/210), [#350](https://github.com/yottayoshida/omamori/pull/350))
+- **Audit retention tests made deterministic** — pruning tests now inject an internal clock instead of relying on `OffsetDateTime::now_utc()`, closing a process-global `HOME` race between `merge_claude_*` tests and un-serialized install tests that caused intermittent `audit::tests::*` failures. Production pruning behavior is unchanged. ([#344](https://github.com/yottayoshida/omamori/issues/344), [#347](https://github.com/yottayoshida/omamori/pull/347))
+
+### Added
+
+- **README Troubleshooting section** — documents recovery from the fail-close hook-error deadlock this bug caused (`omamori install --hooks` in a plain terminal), and how to spot a stale project-level `.claude/settings.json` entry left over from before this fix.
+
 ## [0.11.9] - 2026-07-02
 
 **Summary**: Atomic-write consolidation + symlink-rejection unification (#307, #311, #322). All content-replacement writes across the codebase now go through a single hardened helper instead of eight independent hand-rolled implementations. Investigation while fixing the heartbeat pre-creation race originally reported in #322 found the identical defect in four other sites, and found that `break_glass::write_state` — gating break-glass bypass state, one of the highest-value files in the codebase — was the weakest of the eight, lacking `O_NOFOLLOW` entirely and setting permissions after opening rather than at creation. All of that is closed now, uniformly.
