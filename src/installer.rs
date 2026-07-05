@@ -1196,16 +1196,19 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn install_creates_shims_and_hook_templates() {
         let root = std::env::temp_dir().join(format!("omamori-install-{}", std::process::id()));
         let source = root.join("omamori");
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, "binary").unwrap();
 
-        let result = install(&InstallOptions {
-            base_dir: root.clone(),
-            source_exe: source.clone(),
-            generate_hooks: true,
+        let result = with_test_home(&root, || {
+            install(&InstallOptions {
+                base_dir: root.clone(),
+                source_exe: source.clone(),
+                generate_hooks: true,
+            })
         })
         .unwrap();
 
@@ -1737,6 +1740,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(home_env)]
     fn install_with_shim_source_normalizes_hook_paths() {
         let dir = std::env::temp_dir().join(format!("omamori-install-shim-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -1748,10 +1752,12 @@ mod tests {
         std::os::unix::fs::symlink(&real_bin, shim_dir.join("git")).unwrap();
 
         let base = dir.join("base");
-        let result = install(&InstallOptions {
-            base_dir: base.clone(),
-            source_exe: shim_dir.join("git"),
-            generate_hooks: true,
+        let result = with_test_home(&dir, || {
+            install(&InstallOptions {
+                base_dir: base.clone(),
+                source_exe: shim_dir.join("git"),
+                generate_hooks: true,
+            })
         })
         .unwrap();
 
@@ -2185,17 +2191,33 @@ mod tests {
     /// We point HOME-derived prefix at our test dir by passing the right script
     /// path. The merge function builds prefix from `HOME` env var, so for tests
     /// we ensure the script lives under `<HOME>/.omamori/...`.
-    fn with_test_home<R>(home: &Path, f: impl FnOnce() -> R) -> R {
-        let saved = std::env::var_os("HOME");
-        // SAFETY: serial_test ensures no parallel test mutates HOME concurrently.
-        unsafe { std::env::set_var("HOME", home) };
-        let result = f();
-        // Restore
-        match saved {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
+    struct EnvVarGuard {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let saved = std::env::var_os(key);
+            // SAFETY: callers are serialized with #[serial_test::serial(home_env)].
+            unsafe { std::env::set_var(key, value) };
+            Self { key, saved }
         }
-        result
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers are serialized with #[serial_test::serial(home_env)].
+            match &self.saved {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn with_test_home<R>(home: &Path, f: impl FnOnce() -> R) -> R {
+        let _guard = EnvVarGuard::set_path("HOME", home);
+        f()
     }
 
     #[test]
