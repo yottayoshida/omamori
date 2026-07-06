@@ -191,6 +191,12 @@ omamori verifies that its own defense layers are intact. This addresses the ques
 
 Using implementation-derived content as source of truth (not stored baseline) eliminates baseline tampering as an attack vector for hook verification.
 
+### Hook Exec Path Contract Verification (#349, liveness only — accepted limitation)
+
+Before persisting a resolved exec path into a hook script (`regenerate_hooks()`'s background self-repair, `install --hooks`), omamori spawns that path directly and confirms it actually satisfies the `hook-check --provider <provider>` CLI contract with a known-benign payload, in an environment isolated from the real user's `HOME`/`XDG_CONFIG_HOME` (so the probe's outcome doesn't depend on the user's own rules). This closes the class of bug where a stale/incompatible binary (e.g. a `cargo build` dev artifact resolved mid-session) gets silently baked into a hook, causing every subsequent Bash call to fail-close.
+
+**This is a liveness check, not an authenticity check.** It confirms the resolved binary runs and responds to the expected CLI surface — it does not confirm the binary is the genuine, unmodified omamori release. A binary crafted to always return an ALLOW decision regardless of input would pass this verification unchanged. Detecting that class of tampering requires provenance/signature verification of the resolved binary, which is a separate, not-yet-implemented layer (tracked in #354). The exec-path resolution itself is also still subject to the TOCTOU window described below — verification narrows it but cannot close it, since the resolved path could in principle be swapped between the probe and the subsequent write (this requires write access to the resolved binary's path, which already implies the attacker controls what omamori itself would execute — a root-of-trust compromise, not a new privilege).
+
 ### TOCTOU Risk (accepted)
 
 Canary checks point-in-time state. Tampering between checks is not detected until the next shim invocation. This is a structural limitation of the no-daemon design. A filesystem watcher or daemon would eliminate this gap but contradicts omamori's zero-daemon philosophy.

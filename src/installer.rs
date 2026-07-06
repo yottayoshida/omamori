@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -25,6 +26,11 @@ pub struct InstallOptions {
     /// a distinct `Option` layer from `home_dir()`'s own `None` (HOME unset)
     /// — field `None` defers resolution, env `None` means "not detected".
     pub home_override: Option<PathBuf>,
+    /// Override for hook-contract verification (#349). `None` means
+    /// production: verify by actually spawning `source_exe`. `Some(fn)` lets
+    /// in-process tests substitute a fixed status without spawning a real
+    /// binary (the test process's own exe is never a genuine omamori binary).
+    pub verify_override: Option<HookVerifier>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,19 +100,52 @@ pub struct UninstallResult {
 }
 
 pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
-    let shim_dir = options.base_dir.join("shim");
-    fs::create_dir_all(&shim_dir)?;
-
     // Resolve shim paths but do NOT canonicalize — Homebrew stable symlinks
     // like /opt/homebrew/bin/omamori must stay as-is (#42).
     let source_exe =
         shim_to_real_exe(&options.source_exe).unwrap_or_else(|| options.source_exe.clone());
+
+    // Layer 1 (PATH shims) has no dependency on hook verification — link it
+    // unconditionally so a hook-contract failure below can't also block
+    // shim repair (#349 code review: `install()` previously gated shim
+    // creation on hook verification, so `omamori setup`'s first run and
+    // `doctor --fix`'s shim-only RunInstall repairs would fail completely —
+    // losing even Layer 1 protection — whenever verification failed for a
+    // reason unrelated to shims).
+    let shim_dir = options.base_dir.join("shim");
+    fs::create_dir_all(&shim_dir)?;
+
     let mut linked_commands = Vec::new();
 
     for command in SHIM_COMMANDS {
         let link_path = shim_dir.join(command);
         recreate_symlink(&source_exe, &link_path)?;
         linked_commands.push((*command).to_string());
+    }
+
+    // #349: verify the resolved exe actually satisfies the hook-check contract
+    // before writing any hook artifact. Unlike `regenerate_hooks()` (a silent
+    // background self-repair), `install --hooks` is both an explicit command
+    // and the documented recovery path from a fail-close lockout — silently
+    // keeping old hooks while reporting success would mean the recovery
+    // command lies about having recovered. Fail loud instead: no hook file is
+    // written, so existing hooks (if any) are untouched and protection
+    // continues under the previously installed binary. This gate is scoped to
+    // hook artifacts only — it runs after Layer 1 is already linked above, so
+    // a hook-contract failure never prevents shim repair.
+    if options.generate_hooks {
+        let verify = options.verify_override.unwrap_or(verify_hook_contract);
+        match verify(&source_exe, HOOK_CONTRACT_TIMEOUT) {
+            HookContractStatus::Ok => {}
+            status => {
+                return Err(AppError::Config(format!(
+                    "could not update hooks — resolved binary at {} failed the hook-check contract ({status:?})\n\
+                     Layer 1 (PATH shims) was still updated; existing hooks are kept and protection remains active with the previously installed binary\n\
+                     if you ran this to recover from a blocked state, the currently running omamori binary may itself be the broken one — verify omamori is installed at a stable path, then retry",
+                    source_exe.display()
+                )));
+            }
+        }
     }
 
     let (hook_script, settings_snippet) = if options.generate_hooks {
@@ -311,9 +350,46 @@ pub fn parse_hook_version(content: &str) -> Option<&str> {
         .map(|rest| rest.split([' ', '\t']).next().unwrap_or(rest))
 }
 
+/// Whether `regenerate_hooks_with_verifier` actually rewrote the hook
+/// scripts, or left the existing ones in place because the resolved exe
+/// couldn't be trusted (#349). A bare `Result<(), io::Error>` conflates
+/// "wrote" and "verification failed, kept the old file" — both are `Ok(())`
+/// — forcing every caller that cares about the distinction to re-derive it
+/// by re-reading and re-hashing the file. Returning it directly here removes
+/// that duplication at all three call sites (`ensure_hooks_current_at`'s two
+/// branches, `doctor`'s `RegenerateHooks` fix-loop).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HookOutcome {
+    Written,
+    KeptExisting(HookKeptReason),
+}
+
+/// Why `regenerate_hooks_with_verifier` kept the existing hook instead of
+/// writing a new one — two unrelated causes that callers must not conflate
+/// into one message (#349 code review): resolving the current exe can fail
+/// for reasons that have nothing to do with the hook-check contract (e.g.
+/// `std::env::current_exe()` failing in a restrictive container), in which
+/// case the binary was never even probed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HookKeptReason {
+    ExeResolutionFailed,
+    VerificationFailed(HookContractStatus),
+}
+
 /// Regenerate hooks only (no shim recreation, no config touch).
 /// Called from shim when version mismatch detected.
 pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
+    regenerate_hooks_with_verifier(base_dir, verify_hook_contract).map(|_| ())
+}
+
+/// `regenerate_hooks()` with an injectable contract verifier, so tests can
+/// substitute a fixed `HookContractStatus` instead of spawning a real binary
+/// (the test process's own exe is never a genuine omamori binary, so the
+/// production verifier would always reject it — see `regenerate_hooks_creates_files`).
+pub(crate) fn regenerate_hooks_with_verifier(
+    base_dir: &Path,
+    verify: HookVerifier,
+) -> Result<HookOutcome, std::io::Error> {
     let hooks_dir = base_dir.join("hooks");
     fs::create_dir_all(&hooks_dir)?;
 
@@ -327,9 +403,29 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
                 "omamori warning: failed to resolve current exe ({}); hooks not regenerated",
                 e
             );
-            return Ok(());
+            return Ok(HookOutcome::KeptExisting(
+                HookKeptReason::ExeResolutionFailed,
+            ));
         }
     };
+
+    // #349: a resolved path that exists is not necessarily a working omamori
+    // binary (e.g. a stale dev build from a `cargo build` mid-session). Verify
+    // the hook-check contract actually works before persisting the path —
+    // otherwise the hook silently repoints to a binary that fails at hook-run
+    // time, fail-closing every subsequent Bash call.
+    match verify(&stable_exe, HOOK_CONTRACT_TIMEOUT) {
+        HookContractStatus::Ok => {}
+        status => {
+            eprintln!(
+                "omamori warning: resolved exe {} failed hook-check contract verification ({status:?}); hooks not regenerated. Run: omamori install --hooks",
+                stable_exe.display()
+            );
+            return Ok(HookOutcome::KeptExisting(
+                HookKeptReason::VerificationFailed(status),
+            ));
+        }
+    }
 
     let script_path = hooks_dir.join("claude-pretooluse.sh");
     atomic_write_script(&script_path, &render_hook_script(&stable_exe))?;
@@ -352,7 +448,7 @@ pub fn regenerate_hooks(base_dir: &Path) -> Result<(), std::io::Error> {
         }
     }
 
-    Ok(())
+    Ok(HookOutcome::Written)
 }
 
 pub fn render_hook_script(omamori_exe: &Path) -> String {
@@ -371,6 +467,133 @@ if [ "$STATUS" -eq 0 ]; then exit 0; else exit 2; fi
         version = env!("CARGO_PKG_VERSION"),
         exe = quoted,
     )
+}
+
+/// Outcome of probing whether an exe is a genuine, contract-compatible
+/// omamori binary (#349). Distinguishes failure modes so callers can produce
+/// useful diagnostics instead of a bare pass/fail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookContractStatus {
+    Ok,
+    NotFound,
+    PermissionDenied,
+    ExitNonZero(i32),
+    Timeout,
+    SpawnError(String),
+}
+
+/// Signature shared by `verify_hook_contract` and its test doubles. Spelled
+/// out once here rather than at each of its 4 call sites (`InstallOptions`,
+/// `regenerate_hooks_with_verifier`, `ensure_hooks_current_at_with_verifier`,
+/// `check_claude_settings_integration_with_verifier`) so a signature change
+/// is a one-site edit.
+pub(crate) type HookVerifier = fn(&Path, Duration) -> HookContractStatus;
+
+/// Stdin payload for the hook-check contract probe. Identical to the
+/// guaranteed-ALLOW fixture used in `tests/cli.rs` (`pretooluse_bash_json`) —
+/// reusing a real, test-verified payload avoids the false-fail risk of a
+/// hand-rolled minimal payload (an empty/malformed payload can fail-close
+/// even a correct binary).
+const HOOK_CONTRACT_PROBE_PAYLOAD: &str =
+    r#"{"tool_name":"Bash","tool_input":{"command":"ls /tmp"}}"#;
+
+/// `hook-check` runs in well under 100ms normally; 2s leaves headroom for
+/// cold-start/disk I/O without letting a hung probe stall the caller long.
+pub(crate) const HOOK_CONTRACT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Best-effort random suffix for the probe's isolated HOME directory name
+/// (defense in depth against path prediction — see `verify_hook_contract`).
+/// Reuses `atomic_file`'s CSPRNG generator on unix; falls back to a fixed
+/// suffix elsewhere rather than failing (the PID component still keeps the
+/// path different per-process, and the config-permission/ownership checks
+/// are the primary defense regardless).
+#[cfg(unix)]
+fn random_isolation_suffix() -> String {
+    crate::atomic_file::random_hex_suffix().unwrap_or_default()
+}
+
+#[cfg(not(unix))]
+fn random_isolation_suffix() -> String {
+    String::new()
+}
+
+/// Verify that `exe` is a genuine, contract-compatible omamori binary by
+/// actually invoking its hook-check contract with a known-benign payload.
+/// A binary that merely exists and runs is not enough — an older/incompatible
+/// binary can still accept `--version` while rejecting the `--provider` flag
+/// the hook wrapper depends on, so the probe must exercise the real contract.
+///
+/// Spawns `exe` directly (never via shim, to avoid re-entrant regeneration).
+/// No stdout/stderr pipes are opened, so there is nothing to drain and no
+/// pipe-deadlock risk; timeout is enforced via `try_wait` polling + kill + reap.
+pub(crate) fn verify_hook_contract(exe: &Path, timeout: Duration) -> HookContractStatus {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    // `hook-check` loads the real user's config and matches the probe command
+    // against their live rules — a rule that happens to block `ls`/`/tmp`
+    // would fail-close a perfectly good binary and misreport it as broken.
+    // Point HOME/XDG_CONFIG_HOME at an isolated, nonexistent directory so
+    // config loading falls back to built-in defaults (which allow this
+    // fixture — it's the same payload `tests/cli.rs` asserts ALLOW for)
+    // regardless of the real user's rules. This also keeps the probe from
+    // writing audit-log entries into the user's real `~/.omamori`.
+    //
+    // A random suffix (reusing atomic_file's existing generator) is layered
+    // on top of the PID so the path isn't purely predictable — defense in
+    // depth against another same-user process pre-seeding a hostile config
+    // at this path, on top of the config-permission/ownership checks that
+    // already close that class of attack (see SECURITY.md).
+    let isolated_home = std::env::temp_dir().join(format!(
+        "omamori-hook-verify-home-{}-{}",
+        std::process::id(),
+        random_isolation_suffix()
+    ));
+
+    let mut cmd = Command::new(exe);
+    cmd.args(["hook-check", "--provider", "claude-code"])
+        .env("HOME", &isolated_home)
+        .env("XDG_CONFIG_HOME", isolated_home.join(".config"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return match e.kind() {
+                std::io::ErrorKind::NotFound => HookContractStatus::NotFound,
+                std::io::ErrorKind::PermissionDenied => HookContractStatus::PermissionDenied,
+                _ => HookContractStatus::SpawnError(e.to_string()),
+            };
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(HOOK_CONTRACT_PROBE_PAYLOAD.as_bytes());
+        // stdin dropped here, closing the pipe so the child sees EOF.
+    }
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return match status.code() {
+                    Some(0) => HookContractStatus::Ok,
+                    Some(code) => HookContractStatus::ExitNonZero(code),
+                    None => HookContractStatus::ExitNonZero(-1), // terminated by signal
+                };
+            }
+            Ok(None) if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait(); // reap
+                return HookContractStatus::Timeout;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => return HookContractStatus::SpawnError(format!("wait failed: {e}")),
+        }
+    }
 }
 
 /// Resolve the current omamori binary to a stable path.
@@ -1255,6 +1478,7 @@ mod tests {
             source_exe: source.clone(),
             generate_hooks: true,
             home_override: Some(root.clone()),
+            verify_override: Some(|_, _| HookContractStatus::Ok),
         })
         .unwrap();
 
@@ -1440,7 +1664,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
-        regenerate_hooks(&root).unwrap();
+        // Uses the DI seam, not the public `regenerate_hooks()`: the test
+        // binary's own exe is never a genuine omamori binary, so the
+        // production verifier would always reject it (#349).
+        let outcome = regenerate_hooks_with_verifier(&root, |_, _| HookContractStatus::Ok).unwrap();
+        assert_eq!(outcome, HookOutcome::Written);
 
         let hook_path = root.join("hooks/claude-pretooluse.sh");
         assert!(hook_path.exists(), "hook script should be created");
@@ -1465,6 +1693,176 @@ mod tests {
         assert!(snippet_path.exists(), "settings snippet should be created");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regenerate_hooks_keeps_existing_hook_on_verification_failure() {
+        let root =
+            std::env::temp_dir().join(format!("omamori-regen-verifyfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let hooks_dir = root.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("claude-pretooluse.sh");
+        let existing_content = "#!/bin/sh\n# omamori hook v0.0.1 (pre-existing)\nexit 0\n";
+        fs::write(&hook_path, existing_content).unwrap();
+
+        let result =
+            regenerate_hooks_with_verifier(&root, |_, _| HookContractStatus::ExitNonZero(1));
+        assert_eq!(
+            result.unwrap(),
+            HookOutcome::KeptExisting(HookKeptReason::VerificationFailed(
+                HookContractStatus::ExitNonZero(1)
+            )),
+            "verification failure must be reported as KeptExisting with the specific reason, not surfaced as an Err, from the background self-repair path"
+        );
+
+        let content_after = fs::read_to_string(&hook_path).unwrap();
+        assert_eq!(
+            content_after, existing_content,
+            "existing hook must be left untouched when the resolved exe fails verification"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- verify_hook_contract tests (#349) ---
+
+    #[test]
+    fn verify_hook_contract_ok_on_exit_zero() {
+        // `/usr/bin/true` ignores stdin/args and always exits 0 — this tests
+        // the exit-code-0 -> Ok mapping without needing a real omamori binary.
+        let status = verify_hook_contract(Path::new("/usr/bin/true"), Duration::from_secs(2));
+        assert_eq!(status, HookContractStatus::Ok);
+    }
+
+    #[test]
+    fn verify_hook_contract_exit_nonzero_on_exit_one() {
+        // `/usr/bin/false` ignores stdin/args and always exits 1.
+        let status = verify_hook_contract(Path::new("/usr/bin/false"), Duration::from_secs(2));
+        assert_eq!(status, HookContractStatus::ExitNonZero(1));
+    }
+
+    #[test]
+    fn verify_hook_contract_not_found_for_missing_path() {
+        let status = verify_hook_contract(
+            Path::new("/nonexistent/omamori-does-not-exist"),
+            Duration::from_secs(2),
+        );
+        assert_eq!(status, HookContractStatus::NotFound);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verify_hook_contract_permission_denied_for_non_executable() {
+        let path =
+            std::env::temp_dir().join(format!("omamori-verify-noexec-{}", std::process::id()));
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let status = verify_hook_contract(&path, Duration::from_secs(2));
+        assert_eq!(status, HookContractStatus::PermissionDenied);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verify_hook_contract_rejects_binary_reproducing_the_reported_349_symptom() {
+        // #349 Codex Round 3 test review: the other verify_hook_contract
+        // tests only prove the exit-code mapping works against a generic
+        // exit-0/exit-1 binary — they don't prove the *actual reported bug*
+        // is caught. This fixture reproduces it directly: an "old/dev-build"
+        // binary that doesn't understand `--provider` and errors out the way
+        // the original issue reported (`Unrecognized option: 'provider'`).
+        let path =
+            std::env::temp_dir().join(format!("omamori-verify-oldbinary-{}", std::process::id()));
+        fs::write(
+            &path,
+            "#!/bin/sh\ncat >/dev/null\necho \"Unrecognized option: 'provider'\" >&2\nexit 2\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let status = verify_hook_contract(&path, Duration::from_secs(2));
+        assert_eq!(
+            status,
+            HookContractStatus::ExitNonZero(2),
+            "a binary reproducing the exact reported #349 symptom must fail verification"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn verify_hook_contract_times_out_on_hung_binary() {
+        let path = std::env::temp_dir().join(format!("omamori-verify-hang-{}", std::process::id()));
+        fs::write(&path, "#!/bin/sh\nsleep 5\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        let status = verify_hook_contract(&path, Duration::from_millis(100));
+        assert_eq!(status, HookContractStatus::Timeout);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "timeout must not wait for the full sleep duration"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // Note: a test exercising `verify_hook_contract` against a hostile real
+    // user config (#349 Codex Round 1 P0) needs a genuine, working omamori
+    // binary to spawn — `std::env::current_exe()` inside a `--lib` unit test
+    // resolves to the test harness, not the CLI. See
+    // `tests/cli.rs::install_hooks_ignores_hostile_user_config_during_verification`,
+    // which uses `env!("CARGO_BIN_EXE_omamori")` (only available to
+    // integration tests) to cover this.
+
+    #[test]
+    #[cfg(unix)]
+    fn verify_hook_contract_invokes_exe_directly_once() {
+        // Regression guard for #349 V-005: the probe must invoke the resolved
+        // path directly as argv0 (Command::new never shells out), not via a
+        // shell wrapper — direct exec means there is no indirection through
+        // which the omamori shim's own regeneration logic could re-enter.
+        let dir =
+            std::env::temp_dir().join(format!("omamori-verify-direct-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.sh");
+        let marker = dir.join("invoked");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\necho x >> \"{}\"\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let status = verify_hook_contract(&path, Duration::from_secs(2));
+        assert_eq!(status, HookContractStatus::Ok);
+        let invocations = fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            invocations.lines().count(),
+            1,
+            "probe script must be invoked exactly once, not recursively"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1811,6 +2209,7 @@ mod tests {
             source_exe: shim_dir.join("git"),
             generate_hooks: true,
             home_override: Some(dir.clone()),
+            verify_override: Some(|_, _| HookContractStatus::Ok),
         })
         .unwrap();
 
@@ -2342,6 +2741,7 @@ mod tests {
                 source_exe: source.clone(),
                 generate_hooks: true,
                 home_override: None,
+                verify_override: Some(|_, _| HookContractStatus::Ok),
             })
         };
 
@@ -2355,6 +2755,91 @@ mod tests {
             cwd_claude_existed_before,
             "install with HOME unset must not create a CWD-relative ./.claude (#210 `.` fallback)"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- install() hook-contract verification tests (#349) ---
+
+    #[test]
+    fn install_fails_loudly_on_hooks_but_still_links_shims_when_verification_fails() {
+        // #349 code review: Layer 1 (shims) has no dependency on hook
+        // verification. A hook-contract failure must still fail the overall
+        // command loudly (install --hooks doubles as the fail-close recovery
+        // path and must not silently claim success), but it must not also
+        // block Layer 1 repair — `omamori setup`'s first run and
+        // `doctor --fix`'s shim-only RunInstall repairs depend on shims being
+        // linked regardless of hook verification outcome.
+        let root =
+            std::env::temp_dir().join(format!("omamori-install-verifyfail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("omamori");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, "binary").unwrap();
+
+        let result = install(&InstallOptions {
+            base_dir: root.clone(),
+            source_exe: source.clone(),
+            generate_hooks: true,
+            home_override: Some(root.clone()),
+            verify_override: Some(|_, _| HookContractStatus::ExitNonZero(1)),
+        });
+
+        let err = result.expect_err("install must fail loudly when verification fails");
+        let message = err.to_string();
+        assert!(
+            message.contains("could not update hooks"),
+            "message should explain what happened: {message}"
+        );
+        assert!(
+            message.contains("Layer 1 (PATH shims) was still updated"),
+            "message should state that shim repair was not blocked: {message}"
+        );
+        assert!(
+            message.contains("existing hooks are kept"),
+            "message should state the current safe state for hooks: {message}"
+        );
+        assert!(
+            message.contains("verify omamori is installed at a stable path"),
+            "message should say what to do next: {message}"
+        );
+
+        // Shims must be linked despite the hook-contract failure...
+        assert!(
+            root.join("shim").join("rm").exists(),
+            "shim must still be linked when only hook-contract verification fails"
+        );
+        // ...but no hook artifact should be written.
+        assert!(
+            !root.join("hooks").join("claude-pretooluse.sh").exists(),
+            "hook script must not be created when hook-contract verification fails"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_skips_verification_when_hooks_not_requested() {
+        // generate_hooks: false must not spawn a probe at all — a broken
+        // verify_override here would fail the test if it were ever called.
+        let root =
+            std::env::temp_dir().join(format!("omamori-install-noverify-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("omamori");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, "binary").unwrap();
+
+        let result = install(&InstallOptions {
+            base_dir: root.clone(),
+            source_exe: source.clone(),
+            generate_hooks: false,
+            home_override: Some(root.clone()),
+            verify_override: Some(|_, _| {
+                panic!("verifier must not be called when generate_hooks is false")
+            }),
+        });
+
+        assert!(result.is_ok(), "install without --hooks must not verify");
 
         let _ = fs::remove_dir_all(root);
     }

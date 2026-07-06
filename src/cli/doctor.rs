@@ -1,7 +1,11 @@
 //! `omamori doctor [--fix] [--verbose] [--json]` subcommand.
 //!
 //! Diagnose installation health and optionally auto-repair issues.
-//! Read-only by default (no AI guard); `--fix` requires non-AI environment (DI-7).
+//! Writes nothing to disk by default (no AI guard); `--fix` requires
+//! non-AI environment (DI-7). Note: since #349, the diagnose path can spawn
+//! a short-lived probe subprocess (to verify a hook's embedded exe path
+//! still satisfies the hook-check contract) — "read-only" here means no
+//! filesystem mutation, not "no subprocess execution".
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -84,7 +88,7 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnose mode (read-only)
+// Diagnose mode (no filesystem writes; may spawn a probe subprocess — #349)
 // ---------------------------------------------------------------------------
 
 fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
@@ -589,10 +593,26 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
     // 2. RegenerateHooks (only if install wasn't needed)
     if needs_regen_hooks {
         print!("  [Layer 2] regenerating hook scripts...");
-        match installer::regenerate_hooks(base_dir) {
-            Ok(()) => {
+        match installer::regenerate_hooks_with_verifier(base_dir, installer::verify_hook_contract) {
+            Ok(installer::HookOutcome::Written) => {
                 println!(" [fixed]");
                 fixed += 1;
+            }
+            Ok(installer::HookOutcome::KeptExisting(
+                installer::HookKeptReason::VerificationFailed(status),
+            )) => {
+                println!(
+                    " [FAILED] resolved binary failed the hook-check contract ({status:?}); existing hook kept — try `omamori install --hooks`"
+                );
+                failed += 1;
+            }
+            Ok(installer::HookOutcome::KeptExisting(
+                installer::HookKeptReason::ExeResolutionFailed,
+            )) => {
+                println!(
+                    " [FAILED] could not resolve the current omamori binary; existing hook kept — try `omamori install --hooks`"
+                );
+                failed += 1;
             }
             Err(e) => {
                 println!(" [FAILED] {e}");
@@ -710,7 +730,14 @@ fn run_fix_silent(items: &[CheckItem], base_dir: &Path) -> Result<(), AppError> 
         let _ = run_install_repair(base_dir);
     }
     if needs_regen_hooks {
-        let _ = installer::regenerate_hooks(base_dir);
+        // #349 code review: use the same `_with_verifier` entry point as
+        // `run_fix` (not the old `regenerate_hooks()` wrapper) for
+        // consistency, even though the outcome is discarded here too — the
+        // actual JSON exit code for this path comes from the fresh
+        // `full_check()` re-scan the caller runs afterward, whose
+        // `check_claude_settings_integration` independently re-verifies.
+        let _ =
+            installer::regenerate_hooks_with_verifier(base_dir, installer::verify_hook_contract);
     }
     for path in &chmod_targets {
         let _ = chmod_600(path);
@@ -897,6 +924,12 @@ fn remediation_to_str(rem: &Remediation) -> &'static str {
 mod tests {
     use super::*;
 
+    // hook_script_is_current was removed in favor of
+    // `regenerate_hooks_with_verifier` returning `HookOutcome` directly
+    // (#349 /simplify) — see `installer::tests::regenerate_hooks_creates_files`
+    // and `regenerate_hooks_keeps_existing_hook_on_verification_failure` for
+    // the equivalent Written/KeptExisting coverage.
+
     #[test]
     fn remediation_hint_non_ai() {
         assert_eq!(
@@ -1024,6 +1057,36 @@ mod tests {
         let base_dir = PathBuf::from("/tmp/nonexistent");
         let code = run_fix(&items, &base_dir, false).unwrap();
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn fix_regenerate_hooks_reports_failed_when_verification_keeps_existing() {
+        // #349 QA gap: this is the exact re-derivation of Codex Round 1's P0
+        // ("doctor --fix reports [fixed] for a silent no-op"). In a test
+        // process, `resolved_current_omamori_exe()` resolves to the test
+        // harness binary — never a genuine omamori binary — so the
+        // production verifier naturally rejects it here, driving
+        // `regenerate_hooks_with_verifier` to `KeptExisting` without any
+        // stub injection. `run_fix` has no verifier-DI seam of its own, so
+        // this is the only way to exercise its `KeptExisting` branch.
+        let items = vec![CheckItem {
+            category: "Hooks",
+            name: "claude-pretooluse.sh".to_string(),
+            status: CheckStatus::Fail,
+            detail: "mismatch".to_string(),
+            remediation: Some(Remediation::RegenerateHooks),
+        }];
+        let base_dir =
+            std::env::temp_dir().join(format!("omamori-doctor-fix-regen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base_dir);
+
+        let code = run_fix(&items, &base_dir, false).unwrap();
+        assert_eq!(
+            code, 1,
+            "run_fix must report a failed exit code, not [fixed], when verification keeps the existing hook"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 
     #[test]

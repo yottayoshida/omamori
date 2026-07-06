@@ -1026,8 +1026,10 @@ fn status_refresh_creates_baseline() {
 #[test]
 fn install_generates_integrity_baseline() {
     let dir = unique_dir("install-baseline");
-    let fake_bin = dir.join("omamori");
-    fs::write(&fake_bin, "binary").unwrap();
+    // #349: `--hooks` now verifies the source binary actually satisfies the
+    // hook-check contract before persisting it, so a fake non-executable
+    // stand-in (previously just `fs::write(&fake_bin, "binary")`) no longer
+    // passes install — use the real compiled binary as the source instead.
     // #210: without a pinned HOME, this subprocess resolves the developer's
     // real ~/.claude and ~/.codex and merges a dead hook path (this `dir`
     // is removed at test end) into the real settings.
@@ -1038,7 +1040,7 @@ fn install_generates_integrity_baseline() {
         .arg("--base-dir")
         .arg(dir.to_str().unwrap())
         .arg("--source")
-        .arg(fake_bin.to_str().unwrap())
+        .arg(binary())
         .arg("--hooks")
         .env("HOME", &home)
         .output()
@@ -2720,5 +2722,96 @@ fn break_glass_status_and_clear_unaffected_by_tty_check() {
         );
     }
 
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #349 Codex Round 1 P0: `verify_hook_contract`'s probe (run internally by
+/// `install --hooks`) must not be affected by the real user's rules — a
+/// config that blocks `ls` targeting `/tmp` must not fail-close a perfectly
+/// good binary. This can only be exercised against a genuine, working
+/// omamori binary (unlike `src/installer.rs`'s unit tests, which resolve to
+/// the test harness via `current_exe()`, not the real CLI), hence living
+/// here where `CARGO_BIN_EXE_omamori` is available.
+#[test]
+fn install_hooks_ignores_hostile_user_config_during_verification() {
+    let base_dir = unique_dir("install-hostile-base");
+    let home = unique_dir("install-hostile-home");
+    let config_dir = home.join(".config").join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        r#"[[rules]]
+name = "block-ls-tmp-test"
+command = "ls"
+action = "block"
+match_any = ["/tmp"]
+message = "test: blocking ls /tmp"
+"#,
+    )
+    .unwrap();
+    // Config loading rejects world/group-readable config files as insecure
+    // and silently falls back to defaults (see
+    // `config::tests::load_config_rejects_insecure_permissions`) — without
+    // this, the fixture below is not actually hostile and both the control
+    // and the real assertion pass for the wrong reason.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // Control: prove the fixture is actually hostile before trusting the
+    // real test below (Codex Round 3 test review). A plain `hook-check`
+    // using this exact HOME/XDG_CONFIG_HOME must BLOCK the probe payload —
+    // otherwise "install still succeeds" would be true for the wrong reason
+    // (a no-op config), not because verification's env isolation worked.
+    let mut control = Command::new(binary());
+    clean_ai_env(&mut control);
+    let mut control_child = control
+        .arg("hook-check")
+        .arg("--provider")
+        .arg("claude-code")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn control hook-check");
+    control_child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(pretooluse_bash_json("ls /tmp").as_bytes())
+        .unwrap();
+    let control_status = control_child.wait().expect("control hook-check failed");
+    assert_eq!(
+        control_status.code(),
+        Some(2),
+        "control: the hostile config fixture must actually block `ls /tmp` for this test to be meaningful"
+    );
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .arg("install")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .arg("--source")
+        .arg(binary())
+        .arg("--hooks")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("failed to run omamori install");
+
+    assert!(
+        output.status.success(),
+        "install must succeed even when the real user config would block the probe payload; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&base_dir);
     let _ = fs::remove_dir_all(&home);
 }

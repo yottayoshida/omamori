@@ -256,6 +256,18 @@ pub fn canary(base_dir: &Path, program: &str) -> Option<String> {
 // Full check (omamori status)
 // ---------------------------------------------------------------------------
 
+/// Extract the omamori exe path embedded in a Claude/Codex hook wrapper
+/// script's `cat | <exe> hook-check ...` line (#349). Mirrors
+/// `cursor_snippet_exe_path()`'s use of `shell_words::split`, adapted for the
+/// shell-script format rather than the Cursor JSON snippet format.
+fn hook_script_exe_path(content: &str) -> Option<PathBuf> {
+    let line = content.lines().find(|l| l.contains("hook-check"))?;
+    let words = shell_words::split(line).ok()?;
+    let pipe_idx = words.iter().position(|w| w == "|")?;
+    let exe = words.get(pipe_idx + 1)?;
+    (!exe.is_empty()).then(|| PathBuf::from(exe))
+}
+
 /// Extract the omamori exe path embedded in a cursor hooks snippet.
 fn cursor_snippet_exe_path(content: &str) -> Option<PathBuf> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
@@ -348,6 +360,16 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
 /// Closes the "doctor 12/12 green but Layer 2 dormant" gap from #196:
 /// a green doctor report now guarantees Layer 2 is active.
 fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
+    check_claude_settings_integration_with_verifier(base_dir, installer::verify_hook_contract)
+}
+
+/// `check_claude_settings_integration()` with an injectable contract verifier
+/// (#349), so tests can exercise the hash-match "wired up" path without the
+/// production verifier rejecting the test binary as a non-omamori exe.
+fn check_claude_settings_integration_with_verifier(
+    base_dir: &Path,
+    verify: installer::HookVerifier,
+) -> CheckItem {
     let name = "claude-code-settings".to_string();
     let category = "Hooks";
 
@@ -541,6 +563,36 @@ fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
             detail: "(script content hash mismatch — possible tampering)".to_string(),
             remediation: Some(Remediation::RegenerateHooks),
         };
+    }
+
+    // #349: hash match only proves the on-disk script mirrors what we'd
+    // render for *some* previously-resolved exe — it says nothing about
+    // whether that exe still works. A fresh re-resolution here (this doctor
+    // process) would usually come out fine even when the file was written
+    // with a since-vanished dev-build path, so we must probe the path
+    // actually embedded in the file, not `omamori_exe` above.
+    if let Some(embedded_exe) = hook_script_exe_path(&actual) {
+        match verify(&embedded_exe, installer::HOOK_CONTRACT_TIMEOUT) {
+            installer::HookContractStatus::Ok => {}
+            status => {
+                return CheckItem {
+                    category,
+                    name,
+                    status: CheckStatus::Fail,
+                    detail: format!(
+                        "(hook points to {} but it fails the hook-check contract ({status:?}) — run: omamori install --hooks)",
+                        embedded_exe.display()
+                    ),
+                    // RunInstall (not RegenerateHooks): `install()` fails
+                    // loudly with a diagnostic message when verification
+                    // fails, whereas `regenerate_hooks()` silently keeps the
+                    // old hook (correct for its own background-self-repair
+                    // caller, but doctor's --fix should surface the failure
+                    // to the user, not report a silent no-op as "[fixed]").
+                    remediation: Some(Remediation::RunInstall),
+                };
+            }
+        }
     }
 
     CheckItem {
@@ -1093,6 +1145,46 @@ mod tests {
     fn cursor_snippet_exe_path_returns_none_for_empty_command() {
         let json = r#"{"hooks":{"beforeShellExecution":[{"command":""}]}}"#;
         assert!(cursor_snippet_exe_path(json).is_none());
+    }
+
+    // --- hook_script_exe_path tests (#349) ---
+
+    #[test]
+    fn hook_script_exe_path_extracts_path_from_claude_script() {
+        let script = installer::render_hook_script(Path::new("/opt/homebrew/bin/omamori"));
+        let exe = hook_script_exe_path(&script).unwrap();
+        assert_eq!(exe, PathBuf::from("/opt/homebrew/bin/omamori"));
+    }
+
+    #[test]
+    fn hook_script_exe_path_extracts_path_from_codex_script() {
+        let script =
+            installer::render_codex_pretooluse_script(Path::new("/opt/homebrew/bin/omamori"));
+        let exe = hook_script_exe_path(&script).unwrap();
+        assert_eq!(exe, PathBuf::from("/opt/homebrew/bin/omamori"));
+    }
+
+    #[test]
+    fn hook_script_exe_path_handles_spaces_in_path() {
+        let script = installer::render_hook_script(Path::new("/Users/my user/bin/omamori"));
+        let exe = hook_script_exe_path(&script).unwrap();
+        assert_eq!(exe, PathBuf::from("/Users/my user/bin/omamori"));
+    }
+
+    #[test]
+    fn hook_script_exe_path_returns_none_for_missing_hook_check_line() {
+        let script = "#!/bin/sh\nset -eu\necho no hook-check here\n";
+        assert!(hook_script_exe_path(script).is_none());
+        assert!(hook_script_exe_path("").is_none());
+    }
+
+    #[test]
+    fn hook_script_exe_path_returns_none_when_no_pipe_present() {
+        let script = "#!/bin/sh\n/opt/homebrew/bin/omamori hook-check --provider claude-code\n";
+        assert!(
+            hook_script_exe_path(script).is_none(),
+            "line without a `|` doesn't match the expected `cat | <exe> hook-check` shape"
+        );
     }
 
     #[test]
@@ -1754,8 +1846,93 @@ mod tests {
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &dir) };
 
-        let item = check_claude_settings_integration(&dir.join(".omamori"));
+        // #349: the test binary is never a genuine omamori binary, so the
+        // production verifier would always reject the embedded exe path —
+        // inject a passing stub to exercise the hash-match "wired up" path.
+        let item =
+            check_claude_settings_integration_with_verifier(&dir.join(".omamori"), |_, _| {
+                installer::HookContractStatus::Ok
+            });
         assert_eq!(item.status, CheckStatus::Ok, "details: {}", item.detail);
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn check_claude_settings_fails_when_embedded_exe_broken() {
+        // #349: even when the on-disk script's content hash matches what we'd
+        // render today (no tampering), the exe path baked into that content
+        // may no longer be a working omamori binary (e.g. a since-vanished
+        // dev build). This must be caught by probing the embedded path
+        // directly — a fresh re-resolution inside this check would not
+        // reproduce the staleness.
+        let dir =
+            std::env::temp_dir().join(format!("omamori-int-brokenexe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let current = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item =
+            check_claude_settings_integration_with_verifier(&dir.join(".omamori"), |_, _| {
+                installer::HookContractStatus::ExitNonZero(1)
+            });
+        assert_eq!(item.status, CheckStatus::Fail, "details: {}", item.detail);
+        assert!(
+            item.detail.contains("hook-check contract"),
+            "detail should explain the contract failure: {}",
+            item.detail
+        );
+        assert!(
+            item.detail.contains("omamori install --hooks"),
+            "detail should point at the recovery command: {}",
+            item.detail
+        );
+        // #349 Codex Round 1 P0: must route through the loud `install()` path
+        // (RunInstall), not the silent `regenerate_hooks()` path
+        // (RegenerateHooks) — the latter would let `doctor --fix` report
+        // "[fixed]" even though nothing was actually written.
+        assert_eq!(
+            item.remediation,
+            Some(Remediation::RunInstall),
+            "must remediate via RunInstall, not RegenerateHooks"
+        );
 
         match saved {
             Some(v) => unsafe { std::env::set_var("HOME", v) },
