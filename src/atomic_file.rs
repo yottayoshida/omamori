@@ -185,7 +185,7 @@ fn write_via_temp(
 }
 
 #[cfg(unix)]
-fn random_hex_suffix() -> io::Result<String> {
+pub(crate) fn random_hex_suffix() -> io::Result<String> {
     use std::io::Read as _;
 
     let mut buf = [0u8; 8];

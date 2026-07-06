@@ -138,6 +138,44 @@ fn ensure_hooks_current() -> bool {
 /// 1. Version mismatch → regenerate
 /// 2. Version match but content hash mismatch → regenerate (T2 attack detection)
 pub(crate) fn ensure_hooks_current_at(base_dir: &Path) -> bool {
+    ensure_hooks_current_at_with_verifier(base_dir, installer::verify_hook_contract)
+}
+
+/// Sentinel used to throttle repeated hook regeneration attempts (#349 code
+/// review): `run_shim()` calls `ensure_hooks_current_at()` on every single
+/// shimmed command, and without this, a persistently-failing resolved exe
+/// would make every `rm`/`git`/etc. re-spawn the contract probe (up to
+/// `HOOK_CONTRACT_TIMEOUT`, 2s) indefinitely until the user runs
+/// `install --hooks`. Mirrors `should_emit_audit_warning_at`'s mtime-sentinel
+/// pattern below.
+fn hook_verify_throttle_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(".hook_verify_failed_at")
+}
+
+fn hook_verify_recently_failed_at(path: &Path) -> bool {
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.file_type().is_file()
+        && let Ok(mtime) = meta.modified()
+        && let Ok(elapsed) = mtime.elapsed()
+    {
+        return elapsed.as_secs() < 300;
+    }
+    false
+}
+
+fn touch_hook_verify_throttle(base_dir: &Path) {
+    let path = hook_verify_throttle_path(base_dir);
+    let _ = crate::atomic_file::atomic_write_with_mode(&path, b"", 0o600);
+}
+
+fn clear_hook_verify_throttle(base_dir: &Path) {
+    let _ = std::fs::remove_file(hook_verify_throttle_path(base_dir));
+}
+
+/// `ensure_hooks_current_at()` with an injectable contract verifier (#349),
+/// so tests can exercise the version/hash-mismatch → regen path without the
+/// production verifier rejecting the test binary as a non-omamori exe.
+fn ensure_hooks_current_at_with_verifier(base_dir: &Path, verify: installer::HookVerifier) -> bool {
     let hook_path = base_dir.join("hooks/claude-pretooluse.sh");
 
     let content = match std::fs::read_to_string(&hook_path) {
@@ -149,12 +187,17 @@ pub(crate) fn ensure_hooks_current_at(base_dir: &Path) -> bool {
     let version_matches = hook_version == Some(env!("CARGO_PKG_VERSION"));
 
     if !version_matches {
+        if hook_verify_recently_failed_at(&hook_verify_throttle_path(base_dir)) {
+            return false;
+        }
+
         let current = hook_version
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
-        match installer::regenerate_hooks(base_dir) {
-            Ok(()) => {
+        match installer::regenerate_hooks_with_verifier(base_dir, verify) {
+            Ok(installer::HookOutcome::Written) => {
+                clear_hook_verify_throttle(base_dir);
                 eprintln!(
                     "omamori: hooks updated ({} → {})",
                     current,
@@ -162,7 +205,13 @@ pub(crate) fn ensure_hooks_current_at(base_dir: &Path) -> bool {
                 );
                 return true;
             }
+            Ok(installer::HookOutcome::KeptExisting(_)) => {
+                // regenerate_hooks_with_verifier already printed a warning
+                // distinguishing the specific reason; nothing more to say here.
+                touch_hook_verify_throttle(base_dir);
+            }
             Err(e) => {
+                touch_hook_verify_throttle(base_dir);
                 eprintln!(
                     "omamori: failed to update hooks ({}). Run: omamori install --hooks",
                     e
@@ -185,12 +234,23 @@ pub(crate) fn ensure_hooks_current_at(base_dir: &Path) -> bool {
     let actual_hash = installer::hook_content_hash(&content);
 
     if expected_hash != actual_hash {
-        match installer::regenerate_hooks(base_dir) {
-            Ok(()) => {
+        if hook_verify_recently_failed_at(&hook_verify_throttle_path(base_dir)) {
+            return false;
+        }
+
+        match installer::regenerate_hooks_with_verifier(base_dir, verify) {
+            Ok(installer::HookOutcome::Written) => {
+                clear_hook_verify_throttle(base_dir);
                 eprintln!("omamori: hooks content mismatch detected — regenerated");
                 return true;
             }
+            Ok(installer::HookOutcome::KeptExisting(_)) => {
+                // regenerate_hooks_with_verifier already printed a warning
+                // distinguishing the specific reason; nothing more to say here.
+                touch_hook_verify_throttle(base_dir);
+            }
             Err(e) => {
+                touch_hook_verify_throttle(base_dir);
                 eprintln!(
                     "omamori: failed to regenerate hooks ({}). Run: omamori install --hooks",
                     e
@@ -681,13 +741,92 @@ mod tests {
         let old_hook = "#!/bin/sh\n# omamori hook v0.0.1\nset -eu\nexit 0\n";
         std::fs::write(hooks_dir.join("claude-pretooluse.sh"), old_hook).unwrap();
 
-        let result = ensure_hooks_current_at(&dir);
+        // #349: the test binary is never a genuine omamori binary, so the
+        // production verifier would always reject it — inject a passing stub
+        // to exercise the version-mismatch → regen path in isolation.
+        let result =
+            ensure_hooks_current_at_with_verifier(&dir, |_, _| installer::HookContractStatus::Ok);
         assert!(result, "should regenerate hooks for old version");
 
         let content = std::fs::read_to_string(hooks_dir.join("claude-pretooluse.sh")).unwrap();
         assert_eq!(
             installer::parse_hook_version(&content),
             Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_old_version_not_reported_as_updated_when_verification_fails() {
+        // #349 Codex Round 1 P0: `regenerate_hooks_with_verifier`'s `Ok(())`
+        // covers both "regenerated" and "verification failed, kept the old
+        // hook" — this must not be reported as a successful update.
+        let dir = std::env::temp_dir().join(format!("omamori-hooks-g02-1b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        let old_hook = "#!/bin/sh\n# omamori hook v0.0.1\nset -eu\nexit 0\n";
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), old_hook).unwrap();
+
+        let result = ensure_hooks_current_at_with_verifier(&dir, |_, _| {
+            installer::HookContractStatus::ExitNonZero(1)
+        });
+        assert!(
+            !result,
+            "must not report success when the resolved exe fails verification"
+        );
+
+        let content = std::fs::read_to_string(hooks_dir.join("claude-pretooluse.sh")).unwrap();
+        assert_eq!(
+            content, old_hook,
+            "old hook must be left untouched when verification fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_throttles_repeated_verification_after_recent_failure() {
+        // #349 code review: a persistently-failing resolved exe must not
+        // force every subsequent shimmed command to re-pay the probe's cost.
+        // A verifier that increments a counter on every call lets us assert
+        // the second `ensure_hooks_current_at_with_verifier` call within the
+        // throttle window skips the expensive path entirely.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn counting_failing_verifier(
+            _exe: &Path,
+            _timeout: std::time::Duration,
+        ) -> installer::HookContractStatus {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            installer::HookContractStatus::ExitNonZero(1)
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("omamori-hooks-throttle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+        let old_hook = "#!/bin/sh\n# omamori hook v0.0.1\nset -eu\nexit 0\n";
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), old_hook).unwrap();
+
+        assert!(!ensure_hooks_current_at_with_verifier(
+            &dir,
+            counting_failing_verifier
+        ));
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first call must invoke the verifier"
+        );
+
+        assert!(!ensure_hooks_current_at_with_verifier(
+            &dir,
+            counting_failing_verifier
+        ));
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second call within the throttle window must NOT invoke the verifier again"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -705,8 +844,40 @@ mod tests {
         );
         std::fs::write(hooks_dir.join("claude-pretooluse.sh"), tampered).unwrap();
 
-        let result = ensure_hooks_current_at(&dir);
+        // #349: see comment in hooks_current_old_version_triggers_regen.
+        let result =
+            ensure_hooks_current_at_with_verifier(&dir, |_, _| installer::HookContractStatus::Ok);
         assert!(result, "should regenerate hooks for hash mismatch (T2)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_hash_mismatch_not_reported_as_updated_when_verification_fails() {
+        // #349 Codex Round 1 P0 (hash-mismatch branch counterpart).
+        let dir = std::env::temp_dir().join(format!("omamori-hooks-g02-2b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        let tampered = format!(
+            "#!/bin/sh\n# omamori hook v{}\nset -eu\nexit 0\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), &tampered).unwrap();
+
+        let result = ensure_hooks_current_at_with_verifier(&dir, |_, _| {
+            installer::HookContractStatus::ExitNonZero(1)
+        });
+        assert!(
+            !result,
+            "must not report success when the resolved exe fails verification"
+        );
+
+        let content = std::fs::read_to_string(hooks_dir.join("claude-pretooluse.sh")).unwrap();
+        assert_eq!(
+            content, tampered,
+            "existing (tampered) hook must be left untouched when verification fails"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -754,7 +925,10 @@ mod tests {
             std::fs::set_permissions(&hooks_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
 
-        let result = ensure_hooks_current_at(&dir);
+        // #349: inject a passing verifier so the failure this test exercises
+        // is the readonly-dir I/O error, not contract verification.
+        let result =
+            ensure_hooks_current_at_with_verifier(&dir, |_, _| installer::HookContractStatus::Ok);
         assert!(!result, "should return false when regen fails");
 
         #[cfg(unix)]
@@ -788,7 +962,10 @@ mod tests {
             let hook_path = hooks_dir.join("claude-pretooluse.sh");
             std::os::unix::fs::symlink(&malicious, &hook_path).unwrap();
 
-            let result = ensure_hooks_current_at(&dir);
+            // #349: see comment in hooks_current_old_version_triggers_regen.
+            let result = ensure_hooks_current_at_with_verifier(&dir, |_, _| {
+                installer::HookContractStatus::Ok
+            });
             assert!(
                 result,
                 "symlink hook should trigger regeneration due to hash mismatch"

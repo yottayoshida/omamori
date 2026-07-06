@@ -315,6 +315,14 @@ This regenerates the hook script at the canonical path and re-merges the entry i
 
 If the above doesn't fix it, check for a **project-level** `.claude/settings.json` (in the repository you're working in, not `~/.claude/settings.json`). A `PreToolUse` entry tagged `x-omamori-version` there can also point at a stale path — remove that entry manually, since `omamori install --hooks` only manages the user-level `~/.claude/settings.json`.
 
+### Claude Code blocks every Bash command with a hook error that isn't "No such file or directory"
+
+Unlike the missing-path case above, the hook's registered path can exist but still be the wrong binary — for example, if you're developing omamori itself and run `cargo build`/`cargo test` in the repo, the shim's background self-repair can (rarely) resolve its own executable to a stale build artifact and bake that path into the hook script (#349).
+
+omamori now verifies that a resolved path actually satisfies the hook's contract before writing it anywhere: the background self-repair (triggered automatically on version/hash mismatch) silently keeps the existing hook and prints a warning if verification fails, and `omamori install --hooks` — which doubles as the recovery command for this whole class of problem — fails loudly with a non-zero exit instead of reporting success while leaving the old hook in place. `omamori doctor` also detects a hook whose on-disk path no longer passes verification, even if the file's content otherwise looks up to date.
+
+**Fix**: same as above — run `omamori install --hooks` in a plain terminal. If it fails, the error message names the broken path; make sure `omamori` on your `PATH` resolves to a stable install (Homebrew-linked or `~/.cargo/bin`), not a `target/debug`/`target/release` build directory, then retry.
+
 ### Contributing to omamori: `cargo test` and your real `~/.claude` / `~/.codex`
 
 omamori's test suite pins `HOME` to a throwaway directory for every subprocess/in-process test that touches settings merge (#210). If you add a new test that calls `install`/`uninstall` or spawns the `omamori` binary, inject an isolated `HOME` (see existing tests in `tests/integration.rs`) — otherwise the test can merge a dead hook path into your real `~/.claude/settings.json` or `~/.codex/hooks.json`.
