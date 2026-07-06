@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.12.1] - 2026-07-06
+
+**Summary**: Hook exec path contract verification (#349). A hook script's embedded exec path could silently go stale — e.g. a `cargo build` mid-session resolving to a dev-build artifact — causing the hook wrapper to fail-close every subsequent Bash call with no clear signal why. omamori now verifies a resolved path actually satisfies the `hook-check` contract before persisting it into any hook script.
+
+### Breaking
+
+- **`InstallOptions` gains a `verify_override: Option<HookVerifier>` field** — any external code constructing `InstallOptions` via a full struct literal (rather than `..Default::default()`) must add this field. `None` preserves existing production behavior (verifies by actually spawning the resolved exe). ([#349](https://github.com/yottayoshida/omamori/issues/349))
+
+### Fixed
+
+- **Hook scripts no longer silently repoint to a broken exec path** — `regenerate_hooks()` (background self-repair) and `install()` (explicit `--hooks` command) now spawn the resolved exe and confirm it satisfies the `hook-check --provider` contract before writing it into a hook script. `regenerate_hooks()` converges to its existing silent fail-safe (keep the old hook) on verification failure; `install()` fails loudly with a non-zero exit, since it doubles as the documented recovery command from a fail-close lockout and must not report success while leaving a broken hook in place. Layer 1 (PATH shims) is linked independently of hook verification, so a hook-contract failure never blocks shim repair — `omamori setup`'s first run and `doctor --fix`'s shim-only repairs are unaffected by an unrelated hook problem. A persistently-failing resolved exe is throttled to one verification attempt per 5 minutes, so it doesn't tax every subsequent shimmed command. `omamori doctor` also gained a check that probes the exe path actually embedded in an on-disk hook script (not a fresh re-resolution, which wouldn't catch a path that already went stale). ([#349](https://github.com/yottayoshida/omamori/issues/349), [#360](https://github.com/yottayoshida/omamori/pull/360))
+
+### Known Limitations
+
+- This verification confirms the resolved binary is *alive and contract-compatible*, not that it is the *genuine, unmodified* omamori release — a binary crafted to always return an ALLOW decision would still pass. Provenance/signature verification is tracked separately in [#354](https://github.com/yottayoshida/omamori/issues/354). See `SECURITY.md` for the full accepted-limitation writeup.
+
 ## [0.12.0] - 2026-07-05
 
 **Summary**: Test-suite HOME isolation + audit retention determinism (#210, #344). omamori's own `cargo test` was corrupting the maintainer's real `~/.claude/settings.json` and `~/.codex/hooks.json` on two consecutive days — install/uninstall tests resolved their settings-merge target against the real `$HOME` instead of a throwaway test directory, and a `.` (CWD-relative) fallback let a second path corrupt the repository's own `./.claude/settings.json`. Separately, three `audit` retention tests were non-deterministic due to a process-global `HOME` race with unrelated tests. Both are closed now.
