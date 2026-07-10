@@ -1236,12 +1236,23 @@ fn remove_claude_settings_entry(base_dir: &Path) -> Result<(), std::io::Error> {
 }
 
 /// Remove omamori's entry from `~/.codex/hooks.json` during uninstall.
+///
+/// Symlinks and non-regular files are skipped silently — same policy as
+/// `remove_claude_settings_entry` (#357). Without this guard, a hooks.json
+/// that is a symlink to a real file would be read through (following the
+/// link), then `atomic_write`'s rename would replace the symlink *entry*
+/// itself with a plain file — destroying the symlink and leaving the real
+/// target file untouched but orphaned from `~/.codex/hooks.json` (see
+/// `atomic_file` module docs on rename not following the destination link).
 fn remove_codex_hooks_entry() -> Result<(), std::io::Error> {
     let Some(codex_dir) = codex_home_dir() else {
         return Ok(()); // HOME unset — nothing to clean up
     };
     let hooks_path = codex_dir.join("hooks.json");
     if !hooks_path.exists() {
+        return Ok(());
+    }
+    if hooks_path.is_symlink() || !is_real_file(&hooks_path) {
         return Ok(());
     }
     let raw = fs::read_to_string(&hooks_path)?;
@@ -2435,6 +2446,152 @@ mod tests {
 
         let cleaned = fs::read_to_string(dir.join("hooks.json")).unwrap();
         assert!(!cleaned.contains(CODEX_STATUS_MESSAGE));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- #357: remove_codex_hooks_entry symlink/non-regular-file guard ---
+    // These call remove_codex_hooks_entry() directly via with_test_home,
+    // unlike remove_codex_hooks_entry_cleans_up above (which predates
+    // with_test_home and simulates removal manually).
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn remove_codex_hooks_entry_regular_file_removes_entry_preserves_others() {
+        let dir = fresh_test_dir("codex-rm-regular");
+        let codex_dir = dir.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+
+        let wrapper = dir.join("wrapper.sh");
+        fs::write(&wrapper, "#!/bin/sh").unwrap();
+        merge_codex_hooks(&codex_dir, &wrapper).unwrap();
+
+        // Add a sibling entry that must survive uninstall.
+        let raw = fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc.pointer_mut("/hooks/PreToolUse")
+            .and_then(|v| v.as_array_mut())
+            .unwrap()
+            .push(serde_json::json!({
+                "matcher": "Edit",
+                "hooks": [{"type": "command", "command": "/other/tool"}]
+            }));
+        fs::write(
+            codex_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&doc).unwrap(),
+        )
+        .unwrap();
+
+        with_test_home(&dir, || remove_codex_hooks_entry().unwrap());
+
+        let content = fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+        assert!(
+            !content.contains(CODEX_STATUS_MESSAGE),
+            "omamori entry should be removed: {content}"
+        );
+        assert!(
+            content.contains("/other/tool"),
+            "sibling entry must be preserved: {content}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    #[cfg(unix)]
+    fn remove_codex_hooks_entry_skips_symlink() {
+        let dir = fresh_test_dir("codex-rm-symlink");
+        let codex_dir = dir.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+
+        // Real hooks.json with an omamori entry, living outside .codex/.
+        let real = dir.join("real-hooks.json");
+        let wrapper = dir.join("wrapper.sh");
+        fs::write(&wrapper, "#!/bin/sh").unwrap();
+        merge_codex_hooks(&dir, &wrapper).unwrap(); // writes dir/hooks.json
+        fs::rename(dir.join("hooks.json"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, codex_dir.join("hooks.json")).unwrap();
+
+        with_test_home(&dir, || remove_codex_hooks_entry().unwrap());
+
+        assert!(
+            codex_dir.join("hooks.json").is_symlink(),
+            "symlink itself must be untouched"
+        );
+        let target_content = fs::read_to_string(&real).unwrap();
+        assert!(
+            target_content.contains(CODEX_STATUS_MESSAGE),
+            "symlink target must not be modified: {target_content}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    #[cfg(unix)]
+    fn remove_codex_hooks_entry_skips_dangling_symlink() {
+        let dir = fresh_test_dir("codex-rm-dangling");
+        let codex_dir = dir.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        std::os::unix::fs::symlink(dir.join("does-not-exist"), codex_dir.join("hooks.json"))
+            .unwrap();
+
+        // A dangling symlink must not be created, followed, or turned into a
+        // regular file — remove_codex_hooks_entry must simply leave it alone.
+        with_test_home(&dir, || remove_codex_hooks_entry().unwrap());
+
+        let link_path = codex_dir.join("hooks.json");
+        assert!(link_path.is_symlink(), "dangling symlink must remain untouched");
+        assert!(!link_path.exists(), "target must still not exist");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn remove_codex_hooks_entry_skips_directory() {
+        let dir = fresh_test_dir("codex-rm-directory");
+        let codex_dir = dir.join(".codex");
+        // hooks.json is itself a directory — same is_real_file() rejection
+        // path as a FIFO/socket, without requiring unsafe libc FFI in tests.
+        fs::create_dir_all(codex_dir.join("hooks.json")).unwrap();
+
+        with_test_home(&dir, || remove_codex_hooks_entry().unwrap());
+
+        assert!(
+            codex_dir.join("hooks.json").is_dir(),
+            "directory must be left untouched, not read or replaced"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    #[cfg(unix)]
+    fn remove_codex_hooks_entry_skips_fifo() {
+        // A directory proves the same is_real_file() classification, but a
+        // FIFO additionally proves the guard doesn't attempt to open it at
+        // all — a stray read/write on an unopened-reader FIFO would hang
+        // this test (Codex Round 1 adversarial review: directory read fails
+        // fast, FIFO read blocks, so only a FIFO exercises that failure mode).
+        let dir = fresh_test_dir("codex-rm-fifo");
+        let codex_dir = dir.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let fifo_path = codex_dir.join("hooks.json");
+        let c_path = std::ffi::CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        with_test_home(&dir, || remove_codex_hooks_entry().unwrap());
+
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            fifo_path.symlink_metadata().unwrap().file_type().is_fifo(),
+            "FIFO must be left untouched, not read or replaced"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
