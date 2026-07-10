@@ -127,6 +127,73 @@ fn uninstall_removes_generated_artifacts() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #357 end-to-end: a symlinked `~/.codex/hooks.json` must survive
+/// `omamori uninstall` untouched via the real CLI binary — the unit tests in
+/// `installer.rs` cover `remove_codex_hooks_entry()` directly, but this
+/// proves the guard is actually reached from the full uninstall command path.
+#[test]
+#[cfg(unix)]
+fn uninstall_skips_symlinked_codex_hooks_json() {
+    let binary = env!("CARGO_BIN_EXE_omamori");
+    let base_dir = unique_dir("uninstall-codex-symlink");
+    let home = isolated_home("uninstall-codex-symlink-home");
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+
+    let mut install_cmd = Command::new(binary);
+    clean_ai_env(&mut install_cmd);
+    let install_status = install_cmd
+        .arg("install")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .arg("--source")
+        .arg(binary)
+        .arg("--hooks")
+        .env("HOME", &home)
+        .status()
+        .expect("failed to run install");
+    assert!(install_status.success());
+    let generated = codex_dir.join("hooks.json");
+    assert!(generated.exists(), "install should have written hooks.json");
+
+    // Swap the generated file for a symlink pointing at it under another name.
+    let real = home.join("real-hooks.json");
+    fs::rename(&generated, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &generated).unwrap();
+
+    let mut uninstall_cmd = Command::new(binary);
+    clean_ai_env(&mut uninstall_cmd);
+    let uninstall_output = uninstall_cmd
+        .arg("uninstall")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run uninstall");
+    assert!(
+        uninstall_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&uninstall_output.stderr)
+    );
+
+    assert!(
+        generated
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "hooks.json symlink must survive uninstall untouched"
+    );
+    let real_content = fs::read_to_string(&real).unwrap();
+    assert!(
+        real_content.contains("omamori: checking command safety"),
+        "symlink target content must be untouched by uninstall: {real_content}"
+    );
+
+    let _ = fs::remove_dir_all(base_dir);
+    let _ = fs::remove_dir_all(home);
+}
+
 // ---------------------------------------------------------------------------
 // install auto-config tests
 // ---------------------------------------------------------------------------
