@@ -2543,7 +2543,10 @@ mod tests {
         with_test_home(&dir, || remove_codex_hooks_entry().unwrap());
 
         let link_path = codex_dir.join("hooks.json");
-        assert!(link_path.is_symlink(), "dangling symlink must remain untouched");
+        assert!(
+            link_path.is_symlink(),
+            "dangling symlink must remain untouched"
+        );
         assert!(!link_path.exists(), "target must still not exist");
 
         let _ = fs::remove_dir_all(dir);

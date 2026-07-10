@@ -177,7 +177,11 @@ fn uninstall_skips_symlinked_codex_hooks_json() {
     );
 
     assert!(
-        generated.symlink_metadata().unwrap().file_type().is_symlink(),
+        generated
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "hooks.json symlink must survive uninstall untouched"
     );
     let real_content = fs::read_to_string(&real).unwrap();
