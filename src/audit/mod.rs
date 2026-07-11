@@ -25,8 +25,8 @@ pub use verify::{
 use chain::{CHAIN_VERSION, compute_entry_hash, read_chain_state};
 use retention::{PRUNE_CHECK_INTERVAL, try_prune};
 use secret::{
-    current_key_id, default_audit_path, flock_exclusive, hmac_targets, load_or_create_secret,
-    open_audit_rw, secret_path_for,
+    current_key_id, flock_exclusive, hmac_targets, load_or_create_secret, open_audit_rw,
+    secret_path_for,
 };
 
 use std::fs;
@@ -88,6 +88,23 @@ fn default_true() -> bool {
     true
 }
 
+/// Resolve the effective audit log path: an explicit config override, or
+/// the default under `$HOME/.local/share/omamori/audit.jsonl`. `None`
+/// when neither is available — no override configured and `HOME` is
+/// unusable (unset/empty/relative) — callers must treat audit logging as
+/// unavailable rather than falling through to `secret::default_audit_path`.
+///
+/// Deliberately bypasses `default_audit_path`'s CWD fallback: since
+/// `AuditConfig.path` defaults to `None`, that fallback fires on every
+/// default install where `HOME` happens to be unusable, scattering the
+/// audit log (and its HMAC secret) into the process's working directory.
+pub(crate) fn resolved_audit_path(config: &AuditConfig) -> Option<PathBuf> {
+    config
+        .path
+        .clone()
+        .or_else(|| crate::context::data_dir().map(|d| d.join("audit.jsonl")))
+}
+
 // ---------------------------------------------------------------------------
 // Logger
 // ---------------------------------------------------------------------------
@@ -109,7 +126,7 @@ impl AuditLogger {
             return None;
         }
         let (validated, _warnings) = config.validate();
-        let path = validated.path.clone().unwrap_or_else(default_audit_path);
+        let path = resolved_audit_path(&validated)?;
         let secret = load_or_create_secret(&secret_path_for(&path));
         let key_id = current_key_id(&secret_path_for(&path));
         Some(Self {
@@ -476,8 +493,13 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
+    #[serial_test::serial(home_env)]
     fn from_config_default_path() {
+        // Uses ambient HOME (via resolved_audit_path → context::data_dir)
+        // — must share the `home_env` lock with tests elsewhere in this
+        // file that mutate HOME, or it can observe a torn value (#344-class
+        // flake; the bare `#[serial_test::serial]` this carried previously
+        // used a different, non-overlapping lock group).
         let config = AuditConfig {
             enabled: true,
             path: None,
@@ -2666,5 +2688,82 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["status"], "truncated");
         assert_eq!(status.as_str(), "truncated");
+    }
+
+    // -----------------------------------------------------------------
+    // resolved_audit_path() reroute (#306): explicit config.path always
+    // wins; the default fires only through `context::data_dir()`, which
+    // fails closed on an unusable HOME rather than falling back to CWD
+    // (secret::default_audit_path's behavior, which this reroute bypasses).
+    // -----------------------------------------------------------------
+
+    use crate::test_support::with_home;
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn resolved_audit_path_matches_data_dir_when_home_absolute() {
+        // Happy-path pin: with an absolute HOME, the default resolves to
+        // exactly `$HOME/.local/share/omamori/audit.jsonl` — the same
+        // location `secret::default_audit_path()` used before this reroute
+        // existed. Guards against `resolved_audit_path` accidentally being
+        // wired to `context::home_dir()` directly (which would move
+        // audit.jsonl for every user with a normal, working HOME).
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 0,
+            strict: false,
+        };
+        let result = with_home(Some("/tmp/omamori-resolved-audit-path-test"), || {
+            resolved_audit_path(&config)
+        });
+        assert_eq!(
+            result,
+            Some(PathBuf::from(
+                "/tmp/omamori-resolved-audit-path-test/.local/share/omamori/audit.jsonl"
+            ))
+        );
+    }
+
+    #[test]
+    fn resolved_audit_path_prefers_explicit_config_path() {
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("/explicit/audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(
+            resolved_audit_path(&config),
+            Some(PathBuf::from("/explicit/audit.jsonl"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn resolved_audit_path_none_when_no_override_and_home_unusable() {
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(with_home(Some(""), || resolved_audit_path(&config)), None);
+        assert_eq!(with_home(None, || resolved_audit_path(&config)), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn from_config_none_when_no_override_and_home_unusable() {
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 0,
+            strict: false,
+        };
+        assert!(
+            with_home(Some(""), || AuditLogger::from_config(&config)).is_none(),
+            "logger creation must fail closed (unavailable), not write into CWD"
+        );
     }
 }

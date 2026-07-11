@@ -180,6 +180,32 @@ pub fn resolve_path(raw: &str) -> (PathBuf, bool) {
 }
 
 // ---------------------------------------------------------------------------
+// HOME resolution (fail-close)
+// ---------------------------------------------------------------------------
+
+/// Resolve `$HOME` as an absolute path. `None` when `HOME` is unset, empty,
+/// or relative — callers must treat this as "no usable HOME", not silently
+/// fall back to the current working directory.
+///
+/// `env::var_os("HOME")` returns `Some("")` for `HOME=""`, so a bare
+/// `?`/`map` chain without the `is_absolute()` filter does not catch the
+/// empty-string case (nor a relative value like `HOME=.` or `HOME=rel`).
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// Resolve `$HOME/.local/share/omamori`. `None` when `HOME` is unusable
+/// (see `home_dir`). Single source of truth for this data directory —
+/// consumers (heartbeat, break-glass state, staging, audit log default)
+/// all fail closed together rather than each re-deriving their own
+/// CWD-fallback logic.
+pub(crate) fn data_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".local").join("share").join("omamori"))
+}
+
+// ---------------------------------------------------------------------------
 // Component boundary matching
 // ---------------------------------------------------------------------------
 
@@ -570,7 +596,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn normalize_expands_tilde() {
+        // Reads ambient HOME directly — tagged so it can't observe a
+        // torn/transient value from a concurrent HOME-mutating test
+        // elsewhere in this file (#344-class flake; this exact test name
+        // was previously observed flaking for the same reason).
         let result = normalize_path("~/Documents");
         if let Some(home) = env::var_os("HOME") {
             assert!(result.starts_with(PathBuf::from(home)));
@@ -1229,6 +1260,66 @@ mod tests {
         assert!(result2.is_some(), "--force must trigger context evaluation");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // home_dir() / data_dir() — HOME shape sweep (#323/#306)
+    // -----------------------------------------------------------------
+    //
+    // Mutates the process-global HOME env var; every test here is tagged
+    // `#[serial_test::serial(home_env)]` per the crate-wide convention
+    // (see lib.rs::shim_argv0_without_hook_check_still_enters_shim) to
+    // avoid racing other HOME-mutating tests. HOME is saved and restored
+    // around each mutation.
+
+    use crate::test_support::with_home;
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn home_dir_none_when_unset() {
+        assert_eq!(with_home(None, home_dir), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn home_dir_none_when_empty() {
+        // `env::var_os("HOME")` returns `Some("")` for `HOME=""` — this is
+        // the case a bare `?`/`map` chain does not catch (V-001/T1).
+        assert_eq!(with_home(Some(""), home_dir), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn home_dir_none_when_relative() {
+        assert_eq!(with_home(Some("relative/path"), home_dir), None);
+        assert_eq!(with_home(Some("."), home_dir), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn home_dir_some_when_absolute() {
+        assert_eq!(
+            with_home(Some("/tmp/omamori-home-dir-test"), home_dir),
+            Some(PathBuf::from("/tmp/omamori-home-dir-test"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn data_dir_none_propagates_from_home_dir() {
+        assert_eq!(with_home(Some(""), data_dir), None);
+        assert_eq!(with_home(None, data_dir), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn data_dir_joins_expected_subpath_when_home_absolute() {
+        assert_eq!(
+            with_home(Some("/tmp/omamori-data-dir-test"), data_dir),
+            Some(PathBuf::from(
+                "/tmp/omamori-data-dir-test/.local/share/omamori"
+            ))
+        );
     }
 
     #[test]
