@@ -35,6 +35,19 @@ jobs:
       - name: Enforce SECURITY.md AI-assisted contribution invariants
         run: ./scripts/check-invariants.sh
 
+  # #356: permanent inverted-control proof that the isolation canary's
+  # detection logic actually fires (rather than vacuously always passing).
+  # Bash-only, no Rust toolchain needed — cheap enough to run every CI
+  # invocation on every push/PR.
+  test-isolation-canary-self-test:
+    name: Test isolation canary self-test
+    runs-on: ubuntu-latest
+    needs: action-pin-check
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Prove the canary detects an injected isolation violation
+        run: ./scripts/test-isolation-canary.sh --self-test
+
   # v0.9.4 (#121): test + clippy run on a Linux+macOS matrix so the hook
   # integration suite in tests/hook_integration.rs exercises both /bin/sh
   # targets (Ubuntu dash vs macOS bash-as-sh). Keep fail-fast: false so a
@@ -53,7 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-      - run: cargo test --locked
+      # #356: wrapped by the isolation canary — pins HOME/XDG_* to a
+      # throwaway dir for the whole run and fails if any test writes
+      # outside it (real ~/.claude, ~/.codex, or repo-local ./.claude).
+      - run: ./scripts/test-isolation-canary.sh -- cargo test --locked
 
   # Deep proptest job (PR1c, v0.10.3+). Runs the v0.10.3 token-level
   # position-aware properties at PROPTEST_CASES=2048 to amplify mutation /
@@ -70,7 +86,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
-      - run: cargo test --locked --lib property_tests::prop_ -- --nocapture
+      # #356: same isolation canary wrapper as `test` (see comment there).
+      - run: ./scripts/test-isolation-canary.sh -- cargo test --locked --lib property_tests::prop_ -- --nocapture
 
   # Compile-check the criterion bench harnesses on the same macOS+Ubuntu
   # matrix as `test`. This catches API drift between the lib crate and
@@ -157,7 +174,8 @@ jobs:
           tool: cargo-tarpaulin@0.35.2
           fallback: none
       - name: Generate coverage
-        run: cargo tarpaulin --locked --out xml --skip-clean
+        # #356: same isolation canary wrapper as `test` (see comment there).
+        run: ./scripts/test-isolation-canary.sh -- cargo tarpaulin --locked --out xml --skip-clean
       - name: Upload to Codecov
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0

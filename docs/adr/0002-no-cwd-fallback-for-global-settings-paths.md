@@ -98,6 +98,64 @@ inside dev worktrees — invalidated that cost/benefit call, and #210 was reopen
   create files at all 3 target paths before the run to be a canary rather than a no-op on CI
   runners that don't have `~/.claude` in the first place. Bundling that into this PR would mix a
   behavior-preserving isolation fix with new CI infrastructure.
+
+### Follow-up (#356): `scripts/test-isolation-canary.sh` landed
+
+The CI-side canary deferred above shipped in #356. Design departs from the sketch above in two
+ways learned from getting it actually working:
+
+- **Sentinel placement, not a bare `sha256sum` diff on real files.** The canary creates its own
+  fresh throwaway `HOME` (seeded with sentinel `.claude/settings.json`/`.codex/hooks.json`) and
+  pins the wrapped command's `HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME` to it —
+  it does not run the test suite against the developer's/runner's real `HOME` at all. The real
+  `$HOME/.claude`, `$HOME/.codex`, and repo-local `./.claude` are still snapshotted (read-only,
+  never created if absent — no-clobber) and re-checked after the run as defense-in-depth, but the
+  primary detection mechanism is "did anything write into the throwaway HOME I handed the test
+  suite", not "did the real HOME change". This sidesteps the "no-op on CI runners without
+  `~/.claude`" problem entirely, since the throwaway HOME's sentinels always exist.
+- **Wraps an arbitrary command (`test-isolation-canary.sh -- <cmd...>`), not just `cargo test`.**
+  `ci.yml`'s `test`, `proptest-deep`, and `coverage` jobs each run a different underlying command
+  (`cargo test --locked`, `cargo test --locked --lib property_tests::prop_ -- --nocapture`,
+  `cargo tarpaulin --locked --out xml --skip-clean`); the wrapper takes the real invocation as its
+  argument list instead of hardcoding one.
+- **`--self-test` is a permanent CI job** (`test-isolation-canary-self-test`), not a one-off local
+  check: it seeds the same throwaway sentinels, corrupts one directly (what a leaking test would
+  do), and asserts the comparison logic reports it — proving the detection fires rather than
+  vacuously always passing, on every CI run.
+- **Building the canary found a real, then-undetected isolation gap**:
+  `shim_argv0_without_hook_check_still_enters_shim` (`src/lib.rs`) calls `run()` in-process with
+  argv0 `git`, which reaches `run_shim()` → `ensure_settings_current()` (`src/engine/shim.rs:53`)
+  unconditionally, before executing the wrapped command — an ambient-`HOME`-resolving merge path
+  this ADR's step 2 DI fields don't cover, because it isn't reached through `InstallOptions` at
+  all. The test passed its own narrow assertion (only checked the error variant) while silently
+  writing a re-synced `settings.json` into whatever `HOME` the test process happened to have —
+  exactly the "future test forgets isolation, undetected because it still passes" scenario this
+  ADR exists to prevent, caught here by the canary rather than by a third real-file incident.
+  Fixed by pinning `HOME` to a throwaway dir for the duration of that one test
+  (`#[serial_test::serial(home_env)]`, matching the existing convention), since `HomeGuard`
+  (`src/installer.rs`) lives in a private `mod tests` and isn't reachable from `src/lib.rs`'s own
+  test module.
+- **Known limitations, unchanged from the original sketch**: only catches writes that resolve
+  through `HOME`/`XDG_*` env vars (a test hardcoding an absolute path outside these would not be
+  caught); a test that deletes a sentinel and recreates byte-identical content is not caught
+  (content is compared, not mtime/existence-transition). This is a backstop for the #210 incident
+  class specifically, not a general filesystem sandbox.
+- **QA verification found a second, CI-specific gap the local Codex review rounds could not**:
+  swapping `HOME` to an empty throwaway dir for the wrapped `cargo test`/`cargo tarpaulin`
+  invocation risks breaking rustup-managed cargo installs (GitHub Actions runners install Rust via
+  `actions-rust-lang/setup-rust-toolchain`, which is rustup-based) — rustup's proxy binaries
+  resolve the active toolchain and registry/dependency cache via `RUSTUP_HOME`/`CARGO_HOME`,
+  defaulting to `$HOME/.rustup`/`$HOME/.cargo` when unset. An unpinned `HOME` swap would make the
+  wrapped `cargo` think no toolchain is installed, forcing a cold reinstall (or a hard failure) and
+  bypassing the setup action's cache entirely. Fixed by resolving `CARGO_HOME`/`RUSTUP_HOME` to
+  their real pre-swap locations (`${CARGO_HOME:-$HOME/.cargo}`, same for `RUSTUP_HOME`) and passing
+  them through explicitly alongside the `HOME` override. This did not surface during local manual
+  testing (repeated `cargo test`/`cargo tarpaulin` runs through the canary, all green) because the
+  local development machine's `cargo` is a standalone Homebrew binary, not a rustup proxy — it
+  doesn't consult either variable for toolchain resolution at all. Caught only by QA reasoning
+  through the CI runner's actual toolchain-installation mechanism, not by execution; verified with
+  a real CI run on the PR before merge (see PR for the confirming run) rather than trusted on
+  static analysis alone.
 - Two known, unrelated defects surfaced during shape enumeration and adversarial review are
   explicitly **not** fixed here, to keep this PR's scope to the HOME-isolation contract: Codex
   CLI's `merge_codex_hooks` orphans entries from prior install roots on multi-root duplication
