@@ -163,6 +163,78 @@ else
             echo "FAIL [invariant #7e]: render_hook_script body must propagate exit code"
             ih_fail=1
         fi
+        # Codex① Round 1: a substring check on just "plain terminal" would
+        # let a regression silently drop the agent-facing "do not retry"
+        # line or the `omamori install --hooks` command while still passing.
+        # Check all three fixed hint lines individually (kept in sync by
+        # hand with src/installer.rs's RECOVERY_HINT_LINES test constant).
+        if ! printf '%s\n' "$fn_body" | grep -qF 'this is not a decision about your command'; then
+            echo "FAIL [invariant #7h]: render_hook_script must keep the recovery hint's first line (#353)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'AI agent: do not retry this yourself'; then
+            echo "FAIL [invariant #7p]: render_hook_script must keep the recovery hint's agent-facing line (#353)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'plain terminal'; then
+            echo "FAIL [invariant #7q]: render_hook_script must keep the recovery hint's plain-terminal instruction (#353)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$fn_body" | grep -qF 'omamori install --hooks'; then
+            echo "FAIL [invariant #7r]: render_hook_script must keep the recovery hint's command (#353)"
+            ih_fail=1
+        fi
+    fi
+
+    # #356/#353: the Codex CLI wrapper is a twin of the Claude wrapper above
+    # (same fail-close contract, different --provider). Codex has no
+    # invariant coverage of its own until now — a change to one wrapper's
+    # tail without the other would previously pass this gate silently.
+    codex_fn_body=$(awk '
+        /^pub fn render_codex_pretooluse_script/ { inside=1 }
+        inside { print }
+        inside && /^}/ { exit }
+    ' "$ih")
+    if [ -z "$codex_fn_body" ]; then
+        echo "FAIL [invariant #7i]: render_codex_pretooluse_script function must exist in $ih"
+        ih_fail=1
+    else
+        if ! printf '%s\n' "$codex_fn_body" | grep -qF 'hook-check --provider codex'; then
+            echo "FAIL [invariant #7j]: render_codex_pretooluse_script must invoke hook-check --provider codex"
+            ih_fail=1
+        fi
+        if printf '%s\n' "$codex_fn_body" | grep -qF '| omamori hook-check'; then
+            echo "FAIL [invariant #7k]: render_codex_pretooluse_script must NOT use bare omamori (PATH vulnerability)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$codex_fn_body" | grep -qF 'omamori_exe'; then
+            echo "FAIL [invariant #7l]: render_codex_pretooluse_script must accept omamori_exe parameter"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$codex_fn_body" | grep -qF 'set -u'; then
+            echo "FAIL [invariant #7m]: render_codex_pretooluse_script body must use set -u"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$codex_fn_body" | grep -qE 'exit (0|2|\$\?)'; then
+            echo "FAIL [invariant #7n]: render_codex_pretooluse_script body must propagate exit code"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$codex_fn_body" | grep -qF 'this is not a decision about your command'; then
+            echo "FAIL [invariant #7o]: render_codex_pretooluse_script must keep the recovery hint's first line (#353)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$codex_fn_body" | grep -qF 'AI agent: do not retry this yourself'; then
+            echo "FAIL [invariant #7s]: render_codex_pretooluse_script must keep the recovery hint's agent-facing line (#353)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$codex_fn_body" | grep -qF 'plain terminal'; then
+            echo "FAIL [invariant #7t]: render_codex_pretooluse_script must keep the recovery hint's plain-terminal instruction (#353)"
+            ih_fail=1
+        fi
+        if ! printf '%s\n' "$codex_fn_body" | grep -qF 'omamori install --hooks'; then
+            echo "FAIL [invariant #7u]: render_codex_pretooluse_script must keep the recovery hint's command (#353)"
+            ih_fail=1
+        fi
     fi
 fi
 if [ "$ih_fail" -eq 0 ]; then

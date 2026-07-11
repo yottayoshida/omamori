@@ -313,6 +313,8 @@ omamori install --hooks
 
 This regenerates the hook script at the canonical path and re-merges the entry into `~/.claude/settings.json`. `omamori doctor --fix` diagnoses the same class of problem in more detail.
 
+**Why a plain terminal, specifically**: the "hook error" you're seeing blocks *every* Bash command through Claude Code — including one where you ask the AI agent to run `omamori install --hooks` itself. That command would go through the exact same broken hook and fail the same way, so an AI agent cannot fix this from inside its own Bash tool no matter what it tries (verified in #355). The hook wrapper itself now prints this same guidance to stderr when it can't reach `hook-check` at all (a broken/missing exec path, not a policy decision) — if you see that message, it's confirming the same thing this section describes.
+
 If the above doesn't fix it, check for a **project-level** `.claude/settings.json` (in the repository you're working in, not `~/.claude/settings.json`). A `PreToolUse` entry tagged `x-omamori-version` there can also point at a stale path — remove that entry manually, since `omamori install --hooks` only manages the user-level `~/.claude/settings.json`.
 
 ### Claude Code blocks every Bash command with a hook error that isn't "No such file or directory"

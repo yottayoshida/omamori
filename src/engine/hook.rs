@@ -519,7 +519,17 @@ fn format_unwrap_chain(original: &str, invocation: &CommandInvocation) -> Option
 
 /// `omamori hook-check [--provider NAME]`
 /// Reads PreToolUse JSON from stdin, classifies via `HookInput`, then evaluates.
-/// Exit 0 = allow, exit 2 = block.
+///
+/// Exit code contract (pinned, see ADR-0003): `0` = allow, `2` = block (all
+/// reasons — malformed input, unknown tool, matched rule). No other exit
+/// code is ever returned by this function; an `Err` propagating out of
+/// `run()` maps to exit 1 in `main.rs`, which the caller must treat the same
+/// as "reserved/infra-failure", not a policy decision. The Claude/Codex
+/// wrapper scripts (`render_hook_script`/`render_codex_pretooluse_script` in
+/// `installer.rs`) rely on this: any exit other than 0 or 2 from this
+/// process (including the shell's own 126/127 when the binary can't even be
+/// invoked) is their signal to show a recovery hint rather than treat it as
+/// a legitimate BLOCK.
 pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     use std::io::Read;
 
