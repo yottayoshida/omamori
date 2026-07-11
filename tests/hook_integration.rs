@@ -1315,9 +1315,18 @@ fn hook_script_wrapper_has_required_invariants() {
         !content.contains("set -eu"),
         "hook script must NOT use `set -e` (prevents STATUS=$? capture)"
     );
+    // #353: the wrapper now has a 3-way branch (allow / legit block / infra
+    // failure) instead of a single `else exit 2; fi`. Pin the equivalent
+    // guarantee against the new shape: legit BLOCK (STATUS=2) is a distinct
+    // branch from the else fallthrough, and that else branch still fails
+    // closed to exit 2.
     assert!(
-        content.contains("else exit 2; fi"),
-        "hook script must have `else exit 2; fi` control flow (not just in comments)"
+        content.contains("elif [ \"$STATUS\" -eq 2 ]; then\n  exit 2\nelse"),
+        "hook script must distinguish legit BLOCK (exit 2) from an else fallthrough"
+    );
+    assert!(
+        content.trim_end().ends_with("exit 2\nfi"),
+        "hook script's else (infra-failure) branch must still fail closed to exit 2"
     );
     assert!(
         !content.contains("exit $?"),

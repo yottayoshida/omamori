@@ -459,10 +459,20 @@ pub fn render_hook_script(omamori_exe: &Path) -> String {
 # omamori hook v{version} — Claude Code fail-close wrapper
 # Claude Code: exit 0 = allow, exit 2 = block, exit 1 = allow (fail-open!)
 # This wrapper maps all non-zero exits to exit 2 for fail-close safety.
+# exit 0 = allow, exit 2 = block(all reasons), other = infra failure (hint below).
 set -u
 cat | {exe} hook-check --provider claude-code
 STATUS=$?
-if [ "$STATUS" -eq 0 ]; then exit 0; else exit 2; fi
+if [ "$STATUS" -eq 0 ]; then
+  exit 0
+elif [ "$STATUS" -eq 2 ]; then
+  exit 2
+else
+  echo "omamori: hook binary did not respond as expected — this is not a decision about your command." >&2
+  echo "AI agent: do not retry this yourself. Tell the user to run this in a plain terminal (not via an AI agent):" >&2
+  echo "  omamori install --hooks" >&2
+  exit 2
+fi
 "#,
         version = env!("CARGO_PKG_VERSION"),
         exe = quoted,
@@ -1060,10 +1070,20 @@ pub fn render_codex_pretooluse_script(omamori_exe: &Path) -> String {
 # omamori hook v{version} — Codex CLI fail-close wrapper
 # Codex: exit 0 = allow, exit 2 = block, exit 1 = allow (fail-open!)
 # This wrapper maps all non-zero exits to exit 2 for fail-close safety.
+# exit 0 = allow, exit 2 = block(all reasons), other = infra failure (hint below).
 set -u
 cat | {exe} hook-check --provider codex
 STATUS=$?
-if [ "$STATUS" -eq 0 ]; then exit 0; else exit 2; fi
+if [ "$STATUS" -eq 0 ]; then
+  exit 0
+elif [ "$STATUS" -eq 2 ]; then
+  exit 2
+else
+  echo "omamori: hook binary did not respond as expected — this is not a decision about your command." >&2
+  echo "AI agent: do not retry this yourself. Tell the user to run this in a plain terminal (not via an AI agent):" >&2
+  echo "  omamori install --hooks" >&2
+  exit 2
+fi
 "#,
         version = env!("CARGO_PKG_VERSION"),
         exe = quoted,
@@ -2268,12 +2288,132 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// #353 V-003/V-004: run a rendered wrapper (Claude or Codex, both use
+    /// the same tail) around a stub inner "hook-check" and return
+    /// (wrapper_exit_code, stderr). `inner` selects what the stub does:
+    /// - `Some(script_body)`: a real, executable `#!/bin/sh` stub with that
+    ///   body (used for exit 0/1/2 cases)
+    /// - `None` with `executable = false`: exe exists but lacks +x (exit 126)
+    /// - the exe path simply doesn't exist at all (exit 127) — caller just
+    ///   never creates the file and passes a path under `dir`
+    #[cfg(unix)]
+    fn run_wrapper_around_stub(inner: Option<&str>, executable: bool, tag: &str) -> (i32, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-wrapper-matrix-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let fake_exe = dir.join("omamori");
+        if let Some(body) = inner {
+            fs::write(&fake_exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mode = if executable { 0o755 } else { 0o644 };
+            fs::set_permissions(&fake_exe, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        // inner=None && !fake_exe.exists() (the 127 case): leave it absent.
+
+        let hook_script = render_hook_script(&fake_exe);
+        let hook_path = dir.join("hook.sh");
+        fs::write(&hook_path, &hook_script).unwrap();
+        fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&hook_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let code = output.status.code().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let _ = fs::remove_dir_all(dir);
+        (code, stderr)
+    }
+
+    /// #353 exact recovery hint, one entry per `echo` line in the wrapper's
+    /// else branch. Checked line-by-line (not just a single substring like
+    /// "plain terminal") so a regression that drops or truncates any one
+    /// line — e.g. losing the agent-facing "do not retry" instruction while
+    /// keeping the human-facing line — is caught here, not just a partial
+    /// match. Kept in sync with `render_hook_script`/
+    /// `render_codex_pretooluse_script` by hand; `wrapper_tails_are_byte_identical_across_claude_and_codex`
+    /// separately guarantees both wrappers emit the same lines as each other.
+    const RECOVERY_HINT_LINES: [&str; 3] = [
+        "omamori: hook binary did not respond as expected — this is not a decision about your command.",
+        "AI agent: do not retry this yourself. Tell the user to run this in a plain terminal (not via an AI agent):",
+        "  omamori install --hooks",
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_exit_code_matrix_v003_v004() {
+        // (tag, inner script Some(body)/None-for-missing, executable, expected wrapper exit, hint expected)
+        let cases: &[(&str, Option<&str>, bool, i32, bool)] = &[
+            ("allow", Some("exit 0"), true, 0, false),
+            ("legit-block", Some("exit 2"), true, 2, false), // V-004: no hint on real BLOCK
+            ("internal-error", Some("exit 1"), true, 2, true),
+            ("non-executable", Some("exit 0"), false, 2, true), // 126
+            ("missing", None, true, 2, true),                   // 127
+            // A Rust panic exits 101 by default (no unwind boundary reaches
+            // main). This is not code-specific handling in the wrapper —
+            // its `else` branch catches ANY status that isn't 0 or 2 — but
+            // pinning 101 explicitly proves a hook-check panic is covered
+            // without needing a separate catch_unwind in hook-check itself.
+            ("panic-like", Some("exit 101"), true, 2, true),
+        ];
+
+        for (tag, inner, executable, expected_exit, expect_hint) in cases {
+            let (code, stderr) = run_wrapper_around_stub(*inner, *executable, tag);
+            assert_eq!(
+                code, *expected_exit,
+                "case '{tag}': wrapper exit code mismatch"
+            );
+            for line in RECOVERY_HINT_LINES {
+                assert_eq!(
+                    stderr.contains(line),
+                    *expect_hint,
+                    "case '{tag}': hint line presence mismatch for {line:?} (stderr: {stderr:?})"
+                );
+            }
+            if *expect_hint {
+                // Order matters: line 1 is agent-facing ("don't retry"),
+                // line 2 hands the human-facing instruction. A regression
+                // that keeps all 3 lines but scrambles their order would
+                // pass the presence checks above but not this one.
+                let positions: Vec<usize> = RECOVERY_HINT_LINES
+                    .iter()
+                    .map(|line| {
+                        stderr
+                            .find(line)
+                            .unwrap_or_else(|| panic!("case '{tag}': line {line:?} missing"))
+                    })
+                    .collect();
+                assert!(
+                    positions.windows(2).all(|w| w[0] < w[1]),
+                    "case '{tag}': recovery hint lines out of order (positions: {positions:?}, stderr: {stderr:?})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn hook_script_contains_fail_close() {
         let script = render_hook_script(Path::new(TEST_EXE));
+        // #353: the wrapper now has a 3-way branch (allow / legit block /
+        // infra failure) instead of a single `else exit 2; fi`. The
+        // fail-close guarantee this test pins is: any STATUS that is
+        // neither 0 (allow) nor 2 (legit block) still exits 2.
         assert!(
-            script.contains("else exit 2; fi"),
-            "Claude Code hook must have `else exit 2; fi` control flow (not just in comments)"
+            script.contains("elif [ \"$STATUS\" -eq 2 ]; then\n  exit 2\nelse"),
+            "Claude Code hook must distinguish legit BLOCK (exit 2) from an else fallthrough"
+        );
+        assert!(
+            script.trim_end().ends_with("exit 2\nfi"),
+            "Claude Code hook's else (infra-failure) branch must still fail closed to exit 2"
         );
         assert!(
             !script.contains("exit $?"),
@@ -2298,6 +2438,46 @@ mod tests {
         assert!(script.contains("hook-check --provider codex"));
         assert!(script.contains("set -u"));
         assert!(script.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    /// #353/#356: render_hook_script and render_codex_pretooluse_script are
+    /// deliberately NOT unified behind a shared helper (would break
+    /// check-invariants.sh Invariant #7's per-function literal extraction —
+    /// see plan). This test is the structural substitute: it pins that their
+    /// fail-close tail (from `STATUS=$?` through the closing `fi`, i.e.
+    /// everything except the provider-specific `hook-check --provider ...`
+    /// line) stays byte-identical, so a future edit to one wrapper's
+    /// 3-way branch without the other is caught here instead of silently
+    /// drifting.
+    #[test]
+    fn wrapper_tails_are_byte_identical_across_claude_and_codex() {
+        fn tail_from_status(script: &str) -> &str {
+            // Anchor on the exact line, not a substring search — a future
+            // comment mentioning "STATUS=$?" earlier in the script would
+            // otherwise silently make `find()` match the wrong occurrence.
+            let matches: Vec<usize> = script
+                .match_indices("\nSTATUS=$?\n")
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "wrapper must contain the STATUS=$? assignment line exactly once, got {} occurrences",
+                matches.len()
+            );
+            // +1 to skip the leading '\n' captured by the pattern, landing
+            // exactly on "STATUS=$?".
+            &script[matches[0] + 1..]
+        }
+
+        let claude = render_hook_script(Path::new(TEST_EXE));
+        let codex = render_codex_pretooluse_script(Path::new(TEST_EXE));
+
+        assert_eq!(
+            tail_from_status(&claude),
+            tail_from_status(&codex),
+            "Claude and Codex wrapper fail-close tails (STATUS=$? onward) must be byte-identical"
+        );
     }
 
     #[test]
