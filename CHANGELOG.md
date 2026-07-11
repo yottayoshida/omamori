@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.12.2] - 2026-07-11
+
+**Summary**: Lockout safety hardening (#357, #356, #355, #353). omamori's own tooling shouldn't be able to lock a user out or corrupt their environment without a clear, self-contained recovery path. This release closes three gaps found in that class: an uninstall-time symlink-following bug, a test-suite isolation backstop, and a wrapper-level recovery hint for the exact lockout scenario that made #349 hard to diagnose.
+
+### Fixed
+
+- **`omamori uninstall` no longer follows a symlinked `~/.codex/hooks.json`** — `remove_codex_hooks_entry()` lacked the same symlink/non-regular-file guard `remove_claude_settings_entry()` already had, so a symlinked hooks.json would be read through and then have its symlink entry replaced by `atomic_write`'s rename, destroying the symlink and orphaning the real target file. Now skipped, matching the Claude-side policy exactly. ([#357](https://github.com/yottayoshida/omamori/issues/357))
+- **Hook wrappers now distinguish a legitimate BLOCK from a broken exec path**, and print a recovery hint for the latter. Previously, both `render_hook_script` (Claude Code) and `render_codex_pretooluse_script` (Codex CLI) mapped every non-zero `hook-check` exit to a bare `exit 2`, giving no signal that the hook binary itself was unreachable rather than the command being denied. The wrapper now prints a fixed-string hint to stderr (no version/path interpolation, so it can't go stale across an upgrade) pointing at `omamori install --hooks`, only when the inner exit is neither 0 (allow) nor 2 (a real BLOCK) — a legitimate block never shows the hint. Verified (isolated HOME, #355) that once the exec path is broken, an AI agent cannot self-recover through its own Bash tool at all — every command, including the recovery command itself, goes through the same broken wrapper — so the hint text assumes it will be relayed to a human running a plain terminal, not executed by the agent. ([#353](https://github.com/yottayoshida/omamori/issues/353), [#355](https://github.com/yottayoshida/omamori/issues/355))
+
+### Added
+
+- **`scripts/test-isolation-canary.sh`**, wired into CI's `test`/`proptest-deep`/`coverage` jobs and `pre-pr-check.sh` — a suite-level backstop against a future test that writes into the real `~/.claude`, `~/.codex`, or repo-local `./.claude` (the #210 incident class) without going through the existing `isolated_home()`/`with_test_home()` isolation patterns. A permanent `test-isolation-canary-self-test` CI job proves the detection logic itself fires correctly, rather than vacuously always passing. ([#356](https://github.com/yottayoshida/omamori/issues/356))
+
+### Known Limitations
+
+- The test-isolation canary only catches writes that resolve through `HOME`/`XDG_*` env vars — a test hardcoding an absolute path outside these would not be caught, and a test that deletes a sentinel file and recreates byte-identical content is also undetected (content is compared, not mtime). See `docs/adr/0002-no-cwd-fallback-for-global-settings-paths.md` for the full writeup.
+- The wrapper recovery hint's exit-code contract (0=allow, 2=block(all reasons), other=infra-failure) and the alternatives considered and rejected (a sentinel token, a new reserved exit code, stderr capture/suppression) are recorded in `docs/adr/0003-wrapper-exit-code-contract-and-recovery-hint.md`.
+
 ## [0.12.1] - 2026-07-06
 
 **Summary**: Hook exec path contract verification (#349). A hook script's embedded exec path could silently go stale — e.g. a `cargo build` mid-session resolving to a dev-build artifact — causing the hook wrapper to fail-close every subsequent Bash call with no clear signal why. omamori now verifies a resolved path actually satisfies the `hook-check` contract before persisting it into any hook script.
