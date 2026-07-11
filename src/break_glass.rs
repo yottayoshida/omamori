@@ -88,7 +88,12 @@ pub(crate) fn is_bypassed(rule_id: &str) -> bool {
     if is_non_bypassable(rule_id) {
         return false;
     }
-    is_bypassed_inner(rule_id, &state_file_path())
+    let Some(path) = state_file_path() else {
+        // HOME is unset, empty, or relative — no usable state path, so no
+        // bypass can be in effect (fail-closed).
+        return false;
+    };
+    is_bypassed_inner(rule_id, &path)
 }
 
 fn is_bypassed_inner(rule_id: &str, path: &Path) -> bool {
@@ -128,7 +133,7 @@ pub(crate) fn bypass_info(rule_id: &str) -> Option<BreakGlassEntry> {
     if is_non_bypassable(rule_id) {
         return None;
     }
-    let path = state_file_path();
+    let path = state_file_path()?;
     let state = read_state(&path)?;
     state
         .entries
@@ -140,14 +145,12 @@ pub(crate) fn bypass_info(rule_id: &str) -> Option<BreakGlassEntry> {
 // State file I/O
 // ---------------------------------------------------------------------------
 
-pub(crate) fn state_file_path() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join(".local")
-        .join("share")
-        .join("omamori")
-        .join(STATE_FILE_NAME)
+/// `None` when `HOME` is unusable (unset/empty/relative) — see
+/// `context::data_dir`. Every caller treats `None` as "no state
+/// reachable", which for break-glass means fail-closed: no bypass can be
+/// read, activated, or cleared without a resolvable state path.
+pub(crate) fn state_file_path() -> Option<PathBuf> {
+    crate::context::data_dir().map(|d| d.join(STATE_FILE_NAME))
 }
 
 fn read_state(path: &Path) -> Option<BreakGlassState> {
@@ -164,7 +167,9 @@ fn read_state(path: &Path) -> Option<BreakGlassState> {
 }
 
 pub(crate) fn read_active_entries() -> Vec<BreakGlassEntry> {
-    let path = state_file_path();
+    let Some(path) = state_file_path() else {
+        return Vec::new();
+    };
     read_state(&path)
         .map(|s| s.entries.into_iter().filter(|e| !e.is_expired()).collect())
         .unwrap_or_default()
@@ -178,7 +183,11 @@ pub(crate) fn read_active_entries() -> Vec<BreakGlassEntry> {
 /// pre-check moot (an attacker can no longer predict the path to plant a
 /// symlink at).
 pub(crate) fn write_state(state: &BreakGlassState) -> Result<(), std::io::Error> {
-    let path = state_file_path();
+    let path = state_file_path().ok_or_else(|| {
+        std::io::Error::other(
+            "HOME is unset, empty, or relative — cannot resolve break-glass state path",
+        )
+    })?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -190,7 +199,9 @@ pub(crate) fn write_state(state: &BreakGlassState) -> Result<(), std::io::Error>
 }
 
 pub(crate) fn remove_state_file() -> Result<(), std::io::Error> {
-    let path = state_file_path();
+    let Some(path) = state_file_path() else {
+        return Ok(()); // no usable HOME → nothing could have been written
+    };
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -218,7 +229,11 @@ pub(crate) fn activate(
         return Err(ActivationError::NonBypassable(rule_id.to_string()));
     }
 
-    let path = state_file_path();
+    let path = state_file_path().ok_or_else(|| {
+        ActivationError::Io(std::io::Error::other(
+            "HOME is unset, empty, or relative — cannot resolve break-glass state path",
+        ))
+    })?;
     let mut state = read_state(&path).unwrap_or(BreakGlassState {
         version: STATE_VERSION,
         entries: Vec::new(),
@@ -258,7 +273,9 @@ pub(crate) fn activate(
 }
 
 pub(crate) fn clear_rule(rule_id: &str) -> Result<bool, std::io::Error> {
-    let path = state_file_path();
+    let Some(path) = state_file_path() else {
+        return Ok(false);
+    };
     let Some(mut state) = read_state(&path) else {
         return Ok(false);
     };
@@ -276,7 +293,9 @@ pub(crate) fn clear_rule(rule_id: &str) -> Result<bool, std::io::Error> {
 }
 
 pub(crate) fn clear_all() -> Result<usize, std::io::Error> {
-    let path = state_file_path();
+    let Some(path) = state_file_path() else {
+        return Ok(0);
+    };
     let Some(state) = read_state(&path) else {
         return Ok(0);
     };
@@ -402,10 +421,13 @@ mod tests {
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
     fn setup_temp_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        // `temp_dir()`, not ambient `$HOME`: this file also carries tests
+        // that mutate the process-global `HOME` env var (tagged
+        // `serial(home_env)`), and reading `HOME` here without the same
+        // tag would race them (#344-class flake).
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let dir = PathBuf::from(home).join(format!(".omamori-test-{pid}-{id}"));
+        let dir = std::env::temp_dir().join(format!("omamori-test-{pid}-{id}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -583,5 +605,130 @@ mod tests {
         assert_eq!(format_remaining(300), "5m");
         assert_eq!(format_remaining(0), "expired");
         assert_eq!(format_remaining(-10), "expired");
+    }
+
+    // -----------------------------------------------------------------
+    // HOME-unusable fail-close (#323): state_file_path() → None must
+    // propagate as "no bypass possible", not silently resolve against CWD.
+    // -----------------------------------------------------------------
+
+    use crate::test_support::with_home;
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn state_file_path_none_when_home_empty() {
+        assert_eq!(with_home(Some(""), state_file_path), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn state_file_path_none_when_home_relative() {
+        assert_eq!(with_home(Some("relative"), state_file_path), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn state_file_path_matches_data_dir_when_home_absolute() {
+        // Happy-path pin: guards against `state_file_path` accidentally
+        // being wired to `context::home_dir()` directly instead of
+        // `context::data_dir()`, which would move break-glass state from
+        // `~/.local/share/omamori/break-glass.json` to `~/break-glass.json`.
+        let result = with_home(Some("/tmp/omamori-state-file-path-test"), state_file_path);
+        assert_eq!(
+            result,
+            Some(PathBuf::from(
+                "/tmp/omamori-state-file-path-test/.local/share/omamori/break-glass.json"
+            ))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn is_bypassed_ignores_entry_activated_before_home_became_unusable() {
+        // An active entry written while HOME was fine must not somehow
+        // still be observed once HOME breaks — is_bypassed() re-resolves
+        // state_file_path() fresh on every call, so once HOME breaks there
+        // is no stale path to fall back to.
+        let home =
+            std::env::temp_dir().join(format!("omamori-bg-stale-entry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+
+        with_home(Some(home.to_str().unwrap()), || {
+            let now = OffsetDateTime::now_utc();
+            let expires = now + time::Duration::hours(1);
+            let state = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![BreakGlassEntry {
+                    rule_id: "rm-recursive-to-trash".to_string(),
+                    activated_at: now.format(&Rfc3339).unwrap(),
+                    expires_at: expires.format(&Rfc3339).unwrap(),
+                    reason: None,
+                }],
+            };
+            write_state(&state).unwrap();
+            assert!(
+                is_bypassed("rm-recursive-to-trash"),
+                "entry should be active while HOME is valid"
+            );
+        });
+
+        // HOME is now unusable — the entry written above still exists on
+        // disk at the old (now-unreachable) path, but is_bypassed() must
+        // not somehow still find it.
+        assert!(!with_home(Some(""), || is_bypassed(
+            "rm-recursive-to-trash"
+        )));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn is_bypassed_false_when_home_unusable() {
+        // Even a non-bypassable check aside, a usable rule must fail closed
+        // when the state path cannot be resolved at all.
+        assert!(!with_home(Some(""), || is_bypassed(
+            "rm-recursive-to-trash"
+        )));
+        assert!(!with_home(None, || is_bypassed("rm-recursive-to-trash")));
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn bypass_info_none_when_home_unusable() {
+        assert!(with_home(Some(""), || bypass_info("rm-recursive-to-trash")).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn read_active_entries_empty_when_home_unusable() {
+        assert!(with_home(Some(""), read_active_entries).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn activate_errors_when_home_unusable() {
+        let result = with_home(Some(""), || {
+            activate("rm-recursive-to-trash", DEFAULT_DURATION_SECS, None)
+        });
+        assert!(
+            matches!(result, Err(ActivationError::Io(_))),
+            "activate() must fail closed (Io error), not silently write to CWD; got {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn clear_rule_returns_false_when_home_unusable() {
+        let result = with_home(Some(""), || clear_rule("rm-recursive-to-trash"));
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn clear_all_returns_zero_when_home_unusable() {
+        let result = with_home(Some(""), clear_all);
+        assert_eq!(result.unwrap(), 0);
     }
 }

@@ -193,6 +193,37 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     }
 }
 
+/// Probes whether the resolved audit log path's parent directory accepts
+/// writes, without touching `audit.jsonl` or its HMAC secret, and without
+/// creating any directory (doctor's diagnose path writes nothing to disk
+/// by default — see module doc). Best-effort: unresolvable
+/// (`resolved_audit_path` → `None`, e.g. unusable `HOME`) or any I/O error
+/// is reported as not writable rather than silently skipped — this is the
+/// doctor-side complement to the sentinel-based stderr throttle in
+/// `try_audit_append` (#359): the sentinel can itself be unwritable in the
+/// same failure, so it can't be the only surface for this condition.
+///
+/// If the parent doesn't exist yet (fresh install, nothing has appended to
+/// the audit log), probes the nearest existing ancestor instead — a
+/// reasonable proxy, since a non-writable ancestor blocks creating the
+/// parent too.
+fn audit_path_is_writable(config: &crate::audit::AuditConfig) -> Option<bool> {
+    let path = crate::audit::resolved_audit_path(config)?;
+    let parent = path.parent()?;
+    let probe_dir = std::iter::successors(Some(parent), |p| p.parent()).find(|p| p.exists())?;
+    let probe = probe_dir.join(format!(".omamori-doctor-probe-{}", std::process::id()));
+    // `create_new` refuses to follow a pre-existing symlink/file at this
+    // predictable path (atomically fails instead), unlike a plain `write`
+    // which would follow and truncate it.
+    let writable = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    let _ = std::fs::remove_file(&probe);
+    Some(writable)
+}
+
 /// Section 4: Recent risk signals from audit aggregation (last 30 days).
 ///
 /// Uses `aggregate_report` from PR 1 to surface blocks and unknown-tool
@@ -210,8 +241,13 @@ fn print_risk_signals_section(ai_env: bool) {
         report.chain_status,
         ChainStatus::Broken { .. } | ChainStatus::Truncated
     );
+    let audit_unwritable = load_result.config.audit.enabled
+        && matches!(
+            audit_path_is_writable(&load_result.config.audit),
+            Some(false) | None
+        );
 
-    if !has_blocks && !has_unknown && !chain_broken && !report.hwm_tampered {
+    if !has_blocks && !has_unknown && !chain_broken && !report.hwm_tampered && !audit_unwritable {
         println!("  [Risk signals] Last 30 days: quiet");
         return;
     }
@@ -259,6 +295,15 @@ fn print_risk_signals_section(ai_env: bool) {
             );
         }
     }
+    if audit_unwritable {
+        if ai_env {
+            println!(
+                "    audit log: not writable — protection decisions are unaffected, but forensic trail is degraded"
+            );
+        } else {
+            println!("    audit log: not writable — run omamori doctor --verbose to diagnose");
+        }
+    }
 }
 
 fn print_break_glass_section() {
@@ -290,7 +335,9 @@ struct StagingInfo {
 }
 
 fn gather_staging_info() -> StagingInfo {
-    let dir = crate::engine::hook::staging_dir();
+    let Some(dir) = crate::engine::hook::staging_dir() else {
+        return StagingInfo::default();
+    };
 
     let Ok(meta) = std::fs::symlink_metadata(&dir) else {
         return StagingInfo::default();
@@ -929,6 +976,123 @@ mod tests {
     // (#349 /simplify) — see `installer::tests::regenerate_hooks_creates_files`
     // and `regenerate_hooks_keeps_existing_hook_on_verification_failure` for
     // the equivalent Written/KeptExisting coverage.
+
+    #[test]
+    fn audit_path_writable_true_for_fresh_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-doctor-audit-writable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_path_writable_does_not_create_missing_parent() {
+        // Doctor's diagnose path writes nothing to disk by default (module
+        // doc) — probing writability for a not-yet-created audit dir must
+        // not itself create it.
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-doctor-audit-no-create-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(true));
+        assert!(
+            !dir.exists(),
+            "probing writability must not create the missing parent directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_path_writable_false_when_probe_path_is_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-doctor-audit-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Pre-plant a symlink at the exact predictable probe path
+        // (`.omamori-doctor-probe-{pid}`) pointing at a target outside the
+        // probe directory. `create_new` must refuse to follow it rather
+        // than truncating whatever it points at.
+        let probe_path = dir.join(format!(".omamori-doctor-probe-{}", std::process::id()));
+        let target = std::env::temp_dir().join(format!(
+            "omamori-doctor-audit-symlink-target-{}",
+            std::process::id()
+        ));
+        std::fs::write(&target, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&target, &probe_path).unwrap();
+
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(false));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "do not touch",
+            "symlink target must not be truncated by the probe"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_path_writable_false_when_parent_readonly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-doctor-audit-readonly-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(false));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn audit_path_writable_none_when_home_unusable_and_no_override() {
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 0,
+            strict: false,
+        };
+        let result = crate::test_support::with_home(Some(""), || audit_path_is_writable(&config));
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn remediation_hint_non_ai() {

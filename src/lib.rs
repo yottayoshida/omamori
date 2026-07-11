@@ -42,6 +42,11 @@ pub use engine::hook::{fuzz_check_command_for_hook, fuzz_extract_hook_input};
 #[cfg(test)]
 mod property_tests;
 
+// Shared test-only helpers reachable from any module's `mod tests` (same
+// visibility rationale as `property_tests` above).
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[derive(Debug)]
 pub enum AppError {
     Usage(String),

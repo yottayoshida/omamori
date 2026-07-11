@@ -4,11 +4,8 @@ use std::io::{BufRead, Write};
 
 use super::chain::{compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash};
 use super::retention::is_prune_point;
-use super::secret::{
-    default_audit_path, flock_shared, load_keyring, open_read_nofollow, read_secret,
-    secret_path_for,
-};
-use super::{AuditConfig, AuditEvent};
+use super::secret::{flock_shared, load_keyring, open_read_nofollow, read_secret, secret_path_for};
+use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
 
 // ---------------------------------------------------------------------------
@@ -85,7 +82,7 @@ pub struct AuditSummary {
 // ---------------------------------------------------------------------------
 
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
-    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
     let secret_path = secret_path_for(&path);
 
     // Primary secret for genesis hash computation (always the active key).
@@ -263,7 +260,7 @@ pub fn show_entries(
 ) -> Result<(), AuditError> {
     use std::collections::VecDeque;
 
-    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
     let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => AuditError::FileNotFound,
         _ => AuditError::Io(e),
@@ -385,7 +382,17 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         };
     }
 
-    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let Some(path) = resolved_audit_path(config) else {
+        return AuditSummary {
+            enabled: true,
+            entry_count: 0,
+            secret_available: false,
+            retention_days: config.retention_days,
+            path_error: Some(
+                "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
+            ),
+        };
+    };
     let secret_available = read_secret(&secret_path_for(&path)).is_ok();
 
     let (entry_count, path_error) = match open_read_nofollow(&path) {
@@ -425,7 +432,9 @@ pub fn count_unknown_tool_fail_opens_within(config: &AuditConfig, days: u32) -> 
     if !config.enabled {
         return 0;
     }
-    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let Some(path) = resolved_audit_path(config) else {
+        return 0;
+    };
     let file = match open_read_nofollow(&path) {
         Ok(f) => f,
         Err(_) => return 0,

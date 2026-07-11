@@ -535,6 +535,11 @@ fn validate_destination(dest: &str, rule_name: &str, warnings: &mut Vec<String>)
 
 /// Returns the default config file path, respecting `XDG_CONFIG_HOME`.
 /// Priority: `$XDG_CONFIG_HOME/omamori/config.toml` → `$HOME/.config/omamori/config.toml`.
+/// Both branches require an absolute value (`context::home_dir` mirrors the
+/// `XDG_CONFIG_HOME` absoluteness check above) — a relative or empty `HOME`
+/// previously resolved this path against the current working directory,
+/// letting an unrelated `.config/omamori/config.toml` in the CWD silently
+/// override detector/rule configuration.
 pub fn default_config_path() -> Option<PathBuf> {
     // XDG_CONFIG_HOME must be absolute if set
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -544,9 +549,7 @@ pub fn default_config_path() -> Option<PathBuf> {
         }
         // Relative XDG_CONFIG_HOME is ignored (XDG spec requires absolute)
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".config").join("omamori").join("config.toml"))
+    crate::context::home_dir().map(|home| home.join(".config").join("omamori").join("config.toml"))
 }
 
 pub fn default_detectors() -> Vec<DetectorConfig> {
@@ -1890,5 +1893,39 @@ message = "custom"
         let template = config_template();
         assert!(template.contains("retention_days = 7"));
         assert!(template.contains("max_files = 500"));
+    }
+
+    // -----------------------------------------------------------------
+    // default_config_path() HOME-unusable fail-close: an empty/relative
+    // HOME must not resolve against CWD, matching the XDG_CONFIG_HOME
+    // absoluteness check already applied above it (Codex② finding).
+    // -----------------------------------------------------------------
+
+    use crate::test_support::with_home_and_xdg;
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn default_config_path_none_when_home_empty() {
+        assert_eq!(with_home_and_xdg(Some(""), default_config_path), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn default_config_path_none_when_home_relative() {
+        assert_eq!(
+            with_home_and_xdg(Some("relative/path"), default_config_path),
+            None
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn default_config_path_some_when_home_absolute() {
+        assert_eq!(
+            with_home_and_xdg(Some("/tmp/omamori-config-path-test"), default_config_path),
+            Some(PathBuf::from(
+                "/tmp/omamori-config-path-test/.config/omamori/config.toml"
+            ))
+        );
     }
 }

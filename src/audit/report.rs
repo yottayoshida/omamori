@@ -15,9 +15,9 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use super::secret::{default_audit_path, open_read_nofollow};
+use super::secret::open_read_nofollow;
 use super::verify::verify_chain;
-use super::{AuditConfig, AuditEvent};
+use super::{AuditConfig, AuditEvent, resolved_audit_path};
 
 /// Chain integrity status (3-state per SEC-R8).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -107,7 +107,7 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
         return result;
     }
 
-    let path = config.path.clone().unwrap_or_else(default_audit_path);
+    let path = resolved_audit_path(config);
 
     // Chain status via existing verify_chain (SEC-R11: shared reader)
     result.chain_status = match verify_chain(config) {
@@ -129,8 +129,8 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
         result.actual_window_days = config.retention_days;
     }
 
-    // Aggregate events
-    if let Some(stats) = aggregate_events(&path, days) {
+    // Aggregate events (no-op when HOME is unusable and no explicit path is set)
+    if let Some(stats) = path.as_deref().and_then(|p| aggregate_events(p, days)) {
         result.total_blocks = stats.total_blocks;
         result.by_layer = stats.by_layer;
         result.by_provider = stats.by_provider;
@@ -335,9 +335,12 @@ mod tests {
     }
 
     fn write_temp_audit(lines: &[String], tag: &str) -> std::path::PathBuf {
-        let dir = std::env::var("HOME").unwrap();
-        let path = std::path::PathBuf::from(dir)
-            .join(format!(".omamori-test-{}-{tag}.jsonl", std::process::id()));
+        // `temp_dir()`, not ambient `$HOME`: this file also carries a test
+        // that mutates the process-global `HOME` env var (tagged
+        // `serial(home_env)`), and reading `HOME` here without the same
+        // tag would race it (#344-class flake).
+        let path =
+            std::env::temp_dir().join(format!("omamori-test-{}-{tag}.jsonl", std::process::id()));
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         path
     }
@@ -509,5 +512,20 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn aggregate_report_degrades_gracefully_when_home_unusable() {
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 0,
+            strict: false,
+        };
+        let report = crate::test_support::with_home(Some(""), || aggregate_report(&config, 7));
+
+        assert_eq!(report.total_blocks, 0, "no path to read events from");
+        assert_eq!(report.chain_status, ChainStatus::Unavailable);
     }
 }

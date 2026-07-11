@@ -66,13 +66,7 @@ pub(crate) fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError
 // ---------------------------------------------------------------------------
 
 pub(crate) fn heartbeat_path() -> Option<PathBuf> {
-    let base = env::var_os("HOME").map(PathBuf::from)?;
-    Some(
-        base.join(".local")
-            .join("share")
-            .join("omamori")
-            .join("heartbeat"),
-    )
+    context::data_dir().map(|d| d.join("heartbeat"))
 }
 
 fn touch_heartbeat() {
@@ -380,14 +374,17 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
 // Audit append helper
 // ---------------------------------------------------------------------------
 
+/// Lives under the base dir (`~/.omamori`), not the audit data dir
+/// (`~/.local/share/omamori`) — the warning this throttles fires precisely
+/// when the audit data dir is unwritable, so co-locating the sentinel there
+/// would make the sentinel itself unwritable in the same failure and the
+/// warning would repeat on every shimmed command. Resolves independently of
+/// `installer::default_base_dir()` (which still has a `.` CWD fallback,
+/// out of scope for this PR) so an unusable `HOME` skips the FS sentinel
+/// entirely rather than writing to the CWD.
 fn audit_warn_sentinel_path() -> Option<PathBuf> {
-    let base = env::var_os("HOME").map(PathBuf::from)?;
-    Some(
-        base.join(".local")
-            .join("share")
-            .join("omamori")
-            .join("audit-warn-throttle"),
-    )
+    let home = context::home_dir()?;
+    Some(home.join(".omamori").join("audit-warn-throttle"))
 }
 
 fn should_emit_audit_warning() -> bool {
@@ -1100,6 +1097,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn audit_warn_sentinel_path_none_when_home_unusable() {
+        assert_eq!(
+            crate::test_support::with_home(Some(""), audit_warn_sentinel_path),
+            None
+        );
+        assert_eq!(
+            crate::test_support::with_home(Some("relative/path"), audit_warn_sentinel_path),
+            None
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn audit_warn_sentinel_path_lives_under_base_dir_not_data_dir() {
+        let path = crate::test_support::with_home(
+            Some("/tmp/omamori-sentinel-base-dir-test"),
+            audit_warn_sentinel_path,
+        )
+        .expect("absolute HOME must resolve");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/omamori-sentinel-base-dir-test/.omamori/audit-warn-throttle")
+        );
+    }
+
+    #[test]
+    fn audit_warn_sentinel_and_hook_verify_throttle_filenames_do_not_collide() {
+        let base_dir = std::path::Path::new("/tmp/irrelevant-base");
+        let hook_verify_path = hook_verify_throttle_path(base_dir);
+        assert_ne!(
+            hook_verify_path.file_name(),
+            Some(std::ffi::OsStr::new("audit-warn-throttle")),
+            "sentinel filenames sharing a directory must not collide"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // ensure_settings_current_for tests (#196 UX R3)
     // ---------------------------------------------------------------------
@@ -1407,7 +1442,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn heartbeat_path_points_to_data_dir() {
+        // Reads ambient HOME directly — tagged so it can't observe a
+        // torn/transient value from a concurrent HOME-mutating test
+        // elsewhere in this file (#344-class flake).
         let path = heartbeat_path().expect("HOME should be set in test environment");
         let home = env::var("HOME").unwrap();
         let expected_suffix = ".local/share/omamori/heartbeat";

@@ -1066,14 +1066,12 @@ const MAX_STAGING_BYTES: usize = 1_048_576; // 1 MB (matches MAX_INPUT_BYTES)
 use std::sync::atomic::{AtomicU64, Ordering};
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-pub fn staging_dir() -> std::path::PathBuf {
-    let base = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join(".local")
-        .join("share")
-        .join("omamori")
-        .join("staging")
+/// `None` when `HOME` is unusable (unset/empty/relative) — see
+/// `context::data_dir`. Callers fail closed on the write path (staging
+/// write returns an error, handled by the existing warn+allow / strict
+/// fail-close policy) and no-op on the read/prune paths.
+pub fn staging_dir() -> Option<std::path::PathBuf> {
+    crate::context::data_dir().map(|d| d.join("staging"))
 }
 
 fn ensure_staging_dir(dir: &std::path::Path) -> Result<(), std::io::Error> {
@@ -1105,7 +1103,11 @@ fn write_staging_file(command: &str) -> Result<std::path::PathBuf, std::io::Erro
         ));
     }
 
-    let dir = staging_dir();
+    let dir = staging_dir().ok_or_else(|| {
+        std::io::Error::other(
+            "HOME is unset, empty, or relative — cannot resolve staging directory",
+        )
+    })?;
     ensure_staging_dir(&dir)?;
 
     let nanos = std::time::SystemTime::now()
@@ -1153,7 +1155,10 @@ pub fn try_prune_staging(retention_days: u32, max_files: u32) {
     if retention_days == 0 && max_files == 0 {
         return;
     }
-    try_prune_staging_in(&staging_dir(), retention_days, max_files);
+    let Some(dir) = staging_dir() else {
+        return;
+    };
+    try_prune_staging_in(&dir, retention_days, max_files);
 }
 
 pub fn try_prune_staging_in(dir: &std::path::Path, retention_days: u32, max_files: u32) {
@@ -2872,12 +2877,13 @@ mod tests {
 
     fn create_staging_test_dir() -> std::path::PathBuf {
         let seq = TEST_DIR_COUNTER.fetch_add(1, TestOrdering::SeqCst);
-        let dir = std::path::PathBuf::from(format!(
-            "{}/omamori-staging-gc-{}-{}",
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
-            std::process::id(),
-            seq,
-        ));
+        // `temp_dir()`, not ambient `$HOME`: this file also carries tests
+        // that mutate the process-global `HOME` env var (tagged
+        // `serial(home_env)`), and reading `HOME` here without the same
+        // tag would race them (#344-class flake — this exact test name
+        // was observed flaking under concurrent HOME mutation).
+        let dir =
+            std::env::temp_dir().join(format!("omamori-staging-gc-{}-{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -3041,9 +3047,8 @@ mod tests {
     #[test]
     fn prune_staging_missing_dir_no_error() {
         let seq = TEST_DIR_COUNTER.fetch_add(1, TestOrdering::SeqCst);
-        let dir = std::path::PathBuf::from(format!(
-            "{}/omamori-staging-gc-nonexistent-{}-{}",
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-staging-gc-nonexistent-{}-{}",
             std::process::id(),
             seq,
         ));
@@ -3070,9 +3075,8 @@ mod tests {
     #[test]
     fn prune_staging_rejects_symlinked_dir() {
         let seq = TEST_DIR_COUNTER.fetch_add(1, TestOrdering::SeqCst);
-        let base = std::path::PathBuf::from(format!(
-            "{}/omamori-staging-gc-symdir-{}-{}",
-            std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()),
+        let base = std::env::temp_dir().join(format!(
+            "omamori-staging-gc-symdir-{}-{}",
             std::process::id(),
             seq,
         ));
@@ -3226,5 +3230,52 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // staging_dir() HOME-unusable fail-close (#323/#306)
+    // -----------------------------------------------------------------
+
+    use crate::test_support::with_home;
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn staging_dir_none_when_home_unusable() {
+        assert_eq!(with_home(Some(""), staging_dir), None);
+        assert_eq!(with_home(Some("relative"), staging_dir), None);
+        assert_eq!(with_home(None, staging_dir), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn staging_dir_matches_data_dir_when_home_absolute() {
+        // Happy-path pin: guards against `staging_dir` accidentally being
+        // wired to `context::home_dir()` directly instead of
+        // `context::data_dir()`, which would move staging files from
+        // `~/.local/share/omamori/staging` to `~/staging`.
+        let result = with_home(Some("/tmp/omamori-staging-dir-test"), staging_dir);
+        assert_eq!(
+            result,
+            Some(std::path::PathBuf::from(
+                "/tmp/omamori-staging-dir-test/.local/share/omamori/staging"
+            ))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn write_staging_file_errors_when_home_unusable() {
+        let result = with_home(Some(""), || write_staging_file("git status"));
+        assert!(
+            result.is_err(),
+            "write_staging_file must fail closed, not resolve staging dir against CWD"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn try_prune_staging_noop_when_home_unusable() {
+        // Must not panic or touch the CWD; absence of a panic is the assertion.
+        with_home(Some(""), || try_prune_staging(7, 10));
     }
 }
