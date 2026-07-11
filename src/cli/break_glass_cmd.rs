@@ -91,7 +91,7 @@ fn run_activate(
     }
 
     match break_glass::activate(rule_id, duration_secs, reason) {
-        Ok(entry) => {
+        Ok((entry, expired)) => {
             // Audit-log activation
             if let Some(logger) = config::load_config(None)
                 .ok()
@@ -101,6 +101,7 @@ fn run_activate(
                 if let Err(e) = logger.append(event) {
                     eprintln!("omamori warning: failed to audit-log activation: {e}");
                 }
+                log_expired_observed_events(&logger, &expired);
             }
 
             eprintln!();
@@ -122,17 +123,20 @@ fn run_clear(rule_id: Option<&str>) -> Result<i32, AppError> {
 
     match rule_id {
         Some(id) => {
-            let removed = break_glass::clear_rule(id)?;
-            if removed {
-                if let Some(logger) = config::load_config(None)
-                    .ok()
-                    .and_then(|r| AuditLogger::from_config(&r.config.audit))
-                {
+            let (removed, expired) = break_glass::clear_rule(id)?;
+            if let Some(logger) = config::load_config(None)
+                .ok()
+                .and_then(|r| AuditLogger::from_config(&r.config.audit))
+            {
+                if removed {
                     let event = create_deactivation_event(id);
                     if let Err(e) = logger.append(event) {
                         eprintln!("omamori warning: failed to audit-log deactivation: {e}");
                     }
                 }
+                log_expired_observed_events(&logger, &expired);
+            }
+            if removed {
                 eprintln!("Break-glass cleared for '{id}'.");
             } else {
                 eprintln!("No active break-glass for '{id}'.");
@@ -279,6 +283,78 @@ fn create_deactivation_event(rule_id: &str) -> crate::audit::AuditEvent {
 }
 
 // ---------------------------------------------------------------------------
+// #324: expired-observed audit event
+// ---------------------------------------------------------------------------
+
+/// Best-effort audit logging for entries `break_glass::prune_expired_entries`
+/// removed from state during `activate`/`clear_rule` (state-first,
+/// audit-best-effort: called only after the state write that actually
+/// removed the entry already succeeded — a failure here just means this
+/// particular expiry goes unrecorded, not that the state write is undone).
+fn log_expired_observed_events(logger: &AuditLogger, expired: &[break_glass::BreakGlassEntry]) {
+    for entry in expired {
+        let Some(event) = create_expired_observed_event(entry) else {
+            continue;
+        };
+        if let Err(e) = logger.append(event) {
+            eprintln!(
+                "omamori warning: failed to audit-log break-glass-expired-observed for '{}': {e}",
+                entry.rule_id
+            );
+        }
+    }
+}
+
+/// break-glass state carries no HMAC (#323), so a corrupted or forged
+/// entry could otherwise produce a chain-legitimate-looking audit event
+/// for a rule that was never actually activated (Codex② sanity-check
+/// requirement). Reject entries whose `rule_id` isn't a known core rule
+/// rather than logging them as-is; note the state-derived `expires_at` as
+/// unauthenticated in the result text rather than presenting it as a
+/// verified fact.
+fn create_expired_observed_event(
+    entry: &break_glass::BreakGlassEntry,
+) -> Option<crate::audit::AuditEvent> {
+    // DI-13 non-bypassable rules (omamori-*) can never actually reach the
+    // state file — `activate()` rejects them before an entry is created
+    // (see `is_non_bypassable` check). An entry claiming one of these
+    // rule_ids is therefore forged/corrupted by construction, not merely
+    // "unrecognized" — reject it the same way as an unknown rule_id
+    // (Codex R1 finding).
+    let known = config::core_rule_names();
+    let is_known_bypassable =
+        known.contains(&entry.rule_id.as_str()) && !break_glass::is_non_bypassable(&entry.rule_id);
+    if !is_known_bypassable {
+        eprintln!(
+            "omamori warning: skipping expired-observed audit event for unrecognized rule '{}' \
+             — break-glass state is unauthenticated; this may indicate tampering",
+            entry.rule_id
+        );
+        return None;
+    }
+    let result = if time::OffsetDateTime::parse(
+        &entry.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .is_ok()
+    {
+        format!(
+            "expired (per state: active until {} — unauthenticated, see state file)",
+            entry.expires_at
+        )
+    } else {
+        "expired (state expires_at was unparseable)".to_string()
+    };
+    Some(build_break_glass_event(
+        &entry.rule_id,
+        "omamori",
+        "break-glass (auto-pruned expired entry)".to_string(),
+        "break-glass-expired-observed",
+        result,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Audit event for bypass (used by shim and hook)
 // ---------------------------------------------------------------------------
 
@@ -325,4 +401,116 @@ fn extract_flag_value(args: &[String], flag: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(rule_id: &str, expires_at: &str) -> break_glass::BreakGlassEntry {
+        break_glass::BreakGlassEntry {
+            rule_id: rule_id.to_string(),
+            activated_at: "2020-01-01T00:00:00Z".to_string(),
+            expires_at: expires_at.to_string(),
+            reason: None,
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // create_expired_observed_event (#324)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn expired_observed_event_has_expected_shape_for_known_rule() {
+        let e = entry("rm-recursive-to-trash", "2020-01-01T01:00:00Z");
+        let event = create_expired_observed_event(&e).expect("known rule must produce an event");
+        assert_eq!(event.action, "break-glass-expired-observed");
+        assert_eq!(event.provider, "omamori");
+        assert_eq!(event.rule_id.as_deref(), Some("rm-recursive-to-trash"));
+        assert_eq!(event.detection_layer.as_deref(), Some("break-glass"));
+        assert!(
+            event.result.contains("2020-01-01T01:00:00Z"),
+            "result must surface the state-derived expires_at: {}",
+            event.result
+        );
+    }
+
+    #[test]
+    fn expired_observed_event_none_for_unknown_rule_id() {
+        // break-glass state has no HMAC — a forged/corrupted rule_id must
+        // not produce a chain-legitimate-looking event.
+        let e = entry("totally-made-up-rule", "2020-01-01T01:00:00Z");
+        assert!(
+            create_expired_observed_event(&e).is_none(),
+            "unrecognized rule_id must not produce an audit event"
+        );
+    }
+
+    #[test]
+    fn expired_observed_event_none_for_non_bypassable_rule_id() {
+        // "omamori-config-modify-block" is a real entry in
+        // config::core_rule_names(), but it's DI-13 non-bypassable —
+        // activate() rejects it before any state entry could ever be
+        // created. An entry claiming this rule_id is forged by
+        // construction, not merely unrecognized (Codex R1 finding).
+        let e = entry("omamori-config-modify-block", "2020-01-01T01:00:00Z");
+        assert!(
+            create_expired_observed_event(&e).is_none(),
+            "non-bypassable rule_id must not produce an audit event, even though it's a known core rule name"
+        );
+    }
+
+    #[test]
+    fn expired_observed_event_notes_unparseable_expires_at_without_panicking() {
+        let e = entry("rm-recursive-to-trash", "not-a-timestamp");
+        let event =
+            create_expired_observed_event(&e).expect("known rule must still produce an event");
+        assert!(
+            event.result.contains("unparseable"),
+            "result must flag the unparseable expires_at rather than presenting it as valid: {}",
+            event.result
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // log_expired_observed_events (#324, Codex R1 P1): exercises the real
+    // append path through a real AuditLogger, not just
+    // create_expired_observed_event's return shape in isolation — this
+    // would fail if append() were ever skipped or the event's action
+    // field silently changed.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn log_expired_observed_events_appends_to_chain() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-bg-cmd-expired-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        let logger =
+            crate::audit::AuditLogger::from_config(&audit_config).expect("should create logger");
+
+        let expired = vec![
+            entry("rm-recursive-to-trash", "2020-01-01T01:00:00Z"),
+            entry("totally-made-up-rule", "2020-01-01T01:00:00Z"), // rejected, must not appear
+        ];
+        log_expired_observed_events(&logger, &expired);
+
+        let content = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the known-rule entry should be appended, got: {content}"
+        );
+        assert!(lines[0].contains("\"action\":\"break-glass-expired-observed\""));
+        assert!(lines[0].contains("\"rule_id\":\"rm-recursive-to-trash\""));
+        assert!(!content.contains("totally-made-up-rule"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
