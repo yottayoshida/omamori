@@ -1327,6 +1327,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_chain_accepts_break_glass_expired_observed_action() {
+        // #324: confirms the plan's "no CHAIN_VERSION bump needed" claim —
+        // a new `action` string is just data to the HMAC chain, not part
+        // of any schema chain verification depends on.
+        let dir = test_dir("verify-expired-observed");
+        let logger = test_logger(&dir);
+        let mut event = make_event("break-glass (auto-pruned expired entry)");
+        event.provider = "omamori".to_string();
+        event.rule_id = Some("rm-recursive-to-trash".to_string());
+        event.action = "break-glass-expired-observed".to_string();
+        event.result = "expired (per state: active until 2020-01-01T01:00:00Z)".to_string();
+        event.detection_layer = Some("break-glass".to_string());
+        logger.append(event).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.chain_entries, 1);
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn verify_legacy_then_chain() {
         let dir = test_dir("verify-legacy-chain");
         let logger = test_logger(&dir);

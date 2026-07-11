@@ -211,17 +211,36 @@ fn audit_path_is_writable(config: &crate::audit::AuditConfig) -> Option<bool> {
     let path = crate::audit::resolved_audit_path(config)?;
     let parent = path.parent()?;
     let probe_dir = std::iter::successors(Some(parent), |p| p.parent()).find(|p| p.exists())?;
-    let probe = probe_dir.join(format!(".omamori-doctor-probe-{}", std::process::id()));
+    // Process ID alone is not unique enough: multiple threads within one
+    // process (e.g. parallel `cargo test` runs) share it, and when
+    // `probe_dir` resolves to a common ancestor (like the OS temp root),
+    // concurrent calls collided on the same probe path — one thread's
+    // `create_new` would spuriously fail with EEXIST against another
+    // thread's in-flight probe. A per-process atomic counter closes this.
+    static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = probe_dir.join(format!(
+        ".omamori-doctor-probe-{}-{seq}",
+        std::process::id()
+    ));
+    Some(probe_write(&probe))
+}
+
+/// Attempts an atomic, symlink-safe write-then-cleanup at `probe_path`,
+/// returning whether it succeeded. Split out from `audit_path_is_writable`
+/// so tests can target a specific, pre-planted path directly instead of
+/// needing to predict the counter-suffixed name that function generates.
+fn probe_write(probe_path: &std::path::Path) -> bool {
     // `create_new` refuses to follow a pre-existing symlink/file at this
-    // predictable path (atomically fails instead), unlike a plain `write`
-    // which would follow and truncate it.
+    // path (atomically fails instead), unlike a plain `write` which would
+    // follow and truncate it.
     let writable = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&probe)
+        .open(probe_path)
         .is_ok();
-    let _ = std::fs::remove_file(&probe);
-    Some(writable)
+    let _ = std::fs::remove_file(probe_path);
+    writable
 }
 
 /// Section 4: Recent risk signals from audit aggregation (last 30 days).
@@ -1019,33 +1038,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn audit_path_writable_false_when_probe_path_is_symlink() {
+    fn probe_write_false_when_path_is_symlink() {
+        // Exercises `probe_write` directly (the atomic create-new-refuses-
+        // symlink logic) rather than through `audit_path_is_writable`,
+        // since that function's probe filename is now counter-suffixed
+        // and not predictable enough to pre-plant a symlink at.
         let dir = std::env::temp_dir().join(format!(
-            "omamori-doctor-audit-symlink-{}",
+            "omamori-doctor-probe-symlink-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Pre-plant a symlink at the exact predictable probe path
-        // (`.omamori-doctor-probe-{pid}`) pointing at a target outside the
-        // probe directory. `create_new` must refuse to follow it rather
-        // than truncating whatever it points at.
-        let probe_path = dir.join(format!(".omamori-doctor-probe-{}", std::process::id()));
+        let probe_path = dir.join("probe");
         let target = std::env::temp_dir().join(format!(
-            "omamori-doctor-audit-symlink-target-{}",
+            "omamori-doctor-probe-symlink-target-{}",
             std::process::id()
         ));
         std::fs::write(&target, b"do not touch").unwrap();
         std::os::unix::fs::symlink(&target, &probe_path).unwrap();
 
-        let config = crate::audit::AuditConfig {
-            enabled: true,
-            path: Some(dir.join("audit.jsonl")),
-            retention_days: 0,
-            strict: false,
-        };
-        assert_eq!(audit_path_is_writable(&config), Some(false));
+        assert!(
+            !probe_write(&probe_path),
+            "create_new must refuse to follow a pre-existing symlink"
+        );
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "do not touch",
@@ -1054,6 +1070,48 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn audit_path_is_writable_no_race_under_concurrent_calls() {
+        // Regression test for the TOCTOU race `PROBE_COUNTER` fixes:
+        // multiple threads whose target audit-path parent doesn't exist
+        // all fall back to probing the SAME existing ancestor directory
+        // (`shared_ancestor` here stands in for what was, before this fix,
+        // often the OS temp root when many tests' target dirs didn't
+        // exist). Before the counter, concurrent `create_new` calls at the
+        // same pid-only-named path could race and spuriously report
+        // `Some(false)` (Codex test-adversarial review — the prior test
+        // only checked single-threaded correctness, not the actual race).
+        let shared_ancestor = std::env::temp_dir().join(format!(
+            "omamori-doctor-race-ancestor-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&shared_ancestor);
+        std::fs::create_dir_all(&shared_ancestor).unwrap();
+
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let missing_parent = shared_ancestor.join(format!("missing-{i}"));
+                std::thread::spawn(move || {
+                    let config = crate::audit::AuditConfig {
+                        enabled: true,
+                        path: Some(missing_parent.join("audit.jsonl")),
+                        retention_days: 0,
+                        strict: false,
+                    };
+                    audit_path_is_writable(&config)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert!(
+            results.iter().all(|r| *r == Some(true)),
+            "all concurrent probes into the same writable ancestor must succeed, got: {results:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&shared_ancestor);
     }
 
     #[cfg(unix)]

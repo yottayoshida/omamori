@@ -44,10 +44,19 @@ pub(crate) struct BreakGlassEntry {
 
 impl BreakGlassEntry {
     pub fn is_expired(&self) -> bool {
+        self.is_expired_at(OffsetDateTime::now_utc())
+    }
+
+    /// `is_expired()` with an injectable "now", so the inclusive boundary
+    /// (`now >= expires`, not `now > expires`) is deterministically
+    /// testable — a real clock reading has always advanced by the time a
+    /// test can compare it to itself, so both operators would agree by
+    /// coincidence rather than by the comparison actually being exercised.
+    fn is_expired_at(&self, now: OffsetDateTime) -> bool {
         let Ok(expires) = OffsetDateTime::parse(&self.expires_at, &Rfc3339) else {
             return true; // unparseable = expired (fail-closed)
         };
-        OffsetDateTime::now_utc() >= expires
+        now >= expires
     }
 
     pub fn remaining_secs(&self) -> Option<i64> {
@@ -198,6 +207,36 @@ pub(crate) fn write_state(state: &BreakGlassState) -> Result<(), std::io::Error>
     crate::atomic_file::atomic_write_with_mode(&path, &content, 0o600)
 }
 
+/// Removes expired entries from `state.entries` in place, returning them.
+///
+/// This is the single place expiry is discovered as a *state transition*
+/// (as opposed to `is_expired()`, which is a stateless per-entry check
+/// used everywhere on the read path). `activate()` and `clear_rule()` are
+/// the two callers that persist state afterward — each is a record point
+/// for #324's `break-glass-expired-observed` audit event, and each pruned
+/// entry is returned to the caller exactly once, only when the state that
+/// no longer contains it has actually been written (see call sites: the
+/// return value is discarded on any early-return path that doesn't reach
+/// `write_state`, so a pruned-but-never-persisted entry is never reported
+/// as having "left" the state — because on disk, it hasn't).
+///
+/// There is no daemon, so this can't fire at the instant an entry expires
+/// — only the next time something calls `activate()`/`clear_rule()` (or
+/// never, if neither is called again for that rule). This is a structural
+/// limitation of the zero-daemon design, not a bug.
+pub(crate) fn prune_expired_entries(state: &mut BreakGlassState) -> Vec<BreakGlassEntry> {
+    let mut expired = Vec::new();
+    state.entries.retain(|e| {
+        if e.is_expired() {
+            expired.push(e.clone());
+            false
+        } else {
+            true
+        }
+    });
+    expired
+}
+
 pub(crate) fn remove_state_file() -> Result<(), std::io::Error> {
     let Some(path) = state_file_path() else {
         return Ok(()); // no usable HOME → nothing could have been written
@@ -213,11 +252,18 @@ pub(crate) fn remove_state_file() -> Result<(), std::io::Error> {
 // Activation / Deactivation
 // ---------------------------------------------------------------------------
 
+/// On success, also returns any entries `prune_expired_entries` removed
+/// during this call — the caller (CLI layer) audit-logs each as
+/// `break-glass-expired-observed` (#324). Only ever returned alongside
+/// `Ok`: every early-return path below (`UnknownRule`/`NonBypassable`/
+/// `AlreadyActive`/`MaxConcurrent`) exits before `write_state` runs, so a
+/// pruned-in-memory entry that was never actually persisted is never
+/// reported as expired-and-removed.
 pub(crate) fn activate(
     rule_id: &str,
     duration_secs: u64,
     reason: Option<String>,
-) -> Result<BreakGlassEntry, ActivationError> {
+) -> Result<(BreakGlassEntry, Vec<BreakGlassEntry>), ActivationError> {
     // Validate rule_id is known
     let known = config::core_rule_names();
     if !known.contains(&rule_id) {
@@ -239,8 +285,7 @@ pub(crate) fn activate(
         entries: Vec::new(),
     });
 
-    // Prune expired
-    state.entries.retain(|e| !e.is_expired());
+    let expired = prune_expired_entries(&mut state);
 
     // Check if already active for this rule
     if state.entries.iter().any(|e| e.rule_id == rule_id) {
@@ -269,29 +314,49 @@ pub(crate) fn activate(
     state.entries.push(entry.clone());
     write_state(&state).map_err(ActivationError::Io)?;
 
-    Ok(entry)
+    Ok((entry, expired))
 }
 
-pub(crate) fn clear_rule(rule_id: &str) -> Result<bool, std::io::Error> {
+/// Returns `(rule_removed, expired)`: `rule_removed` is `true` only if
+/// `rule_id` specifically was found and removed (unchanged CLI-facing
+/// semantics — "was the requested rule cleared"). `expired` is any
+/// entries `prune_expired_entries` removed during this call, regardless
+/// of whether `rule_id` itself was found — pruning and the requested
+/// removal are independent state changes that share this one write
+/// (#324 V-013: this is the second of the two record points, alongside
+/// `activate`).
+pub(crate) fn clear_rule(rule_id: &str) -> Result<(bool, Vec<BreakGlassEntry>), std::io::Error> {
     let Some(path) = state_file_path() else {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     };
     let Some(mut state) = read_state(&path) else {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     };
+    let expired = prune_expired_entries(&mut state);
     let before = state.entries.len();
     state.entries.retain(|e| e.rule_id != rule_id);
-    if state.entries.len() == before {
-        return Ok(false);
+    let rule_removed = state.entries.len() != before;
+
+    if !rule_removed && expired.is_empty() {
+        // Nothing changed — avoid a no-op state write.
+        return Ok((false, Vec::new()));
     }
+
     if state.entries.is_empty() {
         remove_state_file()?;
     } else {
         write_state(&state)?;
     }
-    Ok(true)
+    Ok((rule_removed, expired))
 }
 
+/// Note (#324 scope): unlike `activate`/`clear_rule`, this does not report
+/// pruned-expired entries for audit recording. It destroys the whole
+/// state file in one step rather than selectively pruning, and the
+/// existing `break-glass-deactivate` event this call's caller already
+/// logs covers the operator-initiated clear as a single action — plan
+/// scoped #324's expired-observed event to the two selective-prune call
+/// sites only.
 pub(crate) fn clear_all() -> Result<usize, std::io::Error> {
     let Some(path) = state_file_path() else {
         return Ok(0);
@@ -722,7 +787,9 @@ mod tests {
     #[serial_test::serial(home_env)]
     fn clear_rule_returns_false_when_home_unusable() {
         let result = with_home(Some(""), || clear_rule("rm-recursive-to-trash"));
-        assert!(!result.unwrap());
+        let (rule_removed, expired) = result.unwrap();
+        assert!(!rule_removed);
+        assert!(expired.is_empty());
     }
 
     #[test]
@@ -730,5 +797,262 @@ mod tests {
     fn clear_all_returns_zero_when_home_unusable() {
         let result = with_home(Some(""), clear_all);
         assert_eq!(result.unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // prune_expired_entries (#324)
+    // -----------------------------------------------------------------
+
+    fn entry(rule_id: &str, expires_at: &str) -> BreakGlassEntry {
+        BreakGlassEntry {
+            rule_id: rule_id.to_string(),
+            activated_at: "2020-01-01T00:00:00Z".to_string(),
+            expires_at: expires_at.to_string(),
+            reason: None,
+        }
+    }
+
+    fn expired_entry(rule_id: &str) -> BreakGlassEntry {
+        entry(rule_id, "2020-01-01T01:00:00Z") // long past
+    }
+
+    fn active_entry(rule_id: &str) -> BreakGlassEntry {
+        let expires = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        entry(rule_id, &expires.format(&Rfc3339).unwrap())
+    }
+
+    #[test]
+    fn prune_expired_entries_removes_expired_keeps_active() {
+        let mut state = BreakGlassState {
+            version: STATE_VERSION,
+            entries: vec![
+                expired_entry("rm-recursive-to-trash"),
+                active_entry("git-reset-hard-stash"),
+            ],
+        };
+        let pruned = prune_expired_entries(&mut state);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].rule_id, "rm-recursive-to-trash");
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].rule_id, "git-reset-hard-stash");
+    }
+
+    #[test]
+    fn prune_expired_entries_empty_state_returns_empty() {
+        let mut state = BreakGlassState {
+            version: STATE_VERSION,
+            entries: Vec::new(),
+        };
+        assert!(prune_expired_entries(&mut state).is_empty());
+    }
+
+    #[test]
+    fn prune_expired_entries_all_active_returns_empty() {
+        let mut state = BreakGlassState {
+            version: STATE_VERSION,
+            entries: vec![active_entry("rm-recursive-to-trash")],
+        };
+        assert!(prune_expired_entries(&mut state).is_empty());
+        assert_eq!(state.entries.len(), 1);
+    }
+
+    #[test]
+    fn is_expired_at_boundary_is_inclusive() {
+        // `is_expired_at` uses `now >= expires`, not `>` — an entry whose
+        // expiry is exactly "now" must count as expired (Codex
+        // test-adversarial review: a real clock reading can't distinguish
+        // `>` from `>=` since time has always moved on by the time of
+        // comparison, so this needs the injectable-`now` seam).
+        let now = OffsetDateTime::now_utc();
+        let e = entry("rm-recursive-to-trash", &now.format(&Rfc3339).unwrap());
+        assert!(
+            e.is_expired_at(now),
+            "an entry expiring at exactly `now` must be considered expired"
+        );
+        assert!(
+            !e.is_expired_at(now - time::Duration::seconds(1)),
+            "an entry must not be considered expired one second before its expiry"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // activate()/clear_rule() surfacing pruned entries (#324, end-to-end
+    // through the real HOME-resolved state file)
+    // -----------------------------------------------------------------
+
+    /// Shared HOME temp-dir lifecycle for the tests below: create a fresh
+    /// throwaway HOME, run `f` with it active, clean up afterward. Extracted
+    /// (`/simplify`) since all 6 callers repeated this dance verbatim,
+    /// differing only in state seeding (left to each test via
+    /// `entry`/`expired_entry`/`active_entry`, not folded in here).
+    fn with_temp_home<T>(label: &str, f: impl FnOnce() -> T) -> T {
+        let home = std::env::temp_dir().join(format!("omamori-bg-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+        let result = with_home(Some(home.to_str().unwrap()), f);
+        let _ = fs::remove_dir_all(&home);
+        result
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn activate_returns_pruned_expired_entries_on_success() {
+        with_temp_home("activate-prune", || {
+            let seed = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![
+                    expired_entry("rm-recursive-to-trash"),
+                    active_entry("git-reset-hard-stash"),
+                ],
+            };
+            write_state(&seed).unwrap();
+
+            let (new_entry, expired) =
+                activate("git-push-force-block", DEFAULT_DURATION_SECS, None).unwrap();
+            assert_eq!(new_entry.rule_id, "git-push-force-block");
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].rule_id, "rm-recursive-to-trash");
+
+            // Persisted state: expired entry gone, active + new entry remain.
+            let on_disk = read_state(&state_file_path().unwrap()).unwrap();
+            let rule_ids: Vec<&str> = on_disk.entries.iter().map(|e| e.rule_id.as_str()).collect();
+            assert!(!rule_ids.contains(&"rm-recursive-to-trash"));
+            assert!(rule_ids.contains(&"git-reset-hard-stash"));
+            assert!(rule_ids.contains(&"git-push-force-block"));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn activate_does_not_report_pruned_entries_on_early_return() {
+        // AlreadyActive short-circuits before write_state — the pruned
+        // expired entry must not be reported as removed, because on disk
+        // it wasn't (see prune_expired_entries doc).
+        with_temp_home("activate-noprune", || {
+            let seed = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![
+                    expired_entry("rm-recursive-to-trash"),
+                    active_entry("git-reset-hard-stash"),
+                ],
+            };
+            write_state(&seed).unwrap();
+            let bytes_before = fs::read(state_file_path().unwrap()).unwrap();
+
+            let result = activate("git-reset-hard-stash", DEFAULT_DURATION_SECS, None);
+            assert!(matches!(result, Err(ActivationError::AlreadyActive(_))));
+
+            // State on disk must be byte-for-byte unaffected by the
+            // discarded in-memory prune — a raw byte comparison, not just
+            // a parsed-content check (Codex test-adversarial review: a
+            // parsed comparison wouldn't catch a spurious no-op rewrite).
+            let bytes_after = fs::read(state_file_path().unwrap()).unwrap();
+            assert_eq!(
+                bytes_before, bytes_after,
+                "a failed activate() must never touch the state file at all"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn activate_reports_each_expired_entry_at_most_once_across_sequential_calls() {
+        // Single-process guarantee (plan: concurrent-process duplication
+        // is accepted, but a given entry must not be re-reported by a
+        // second, sequential call once it has already left the state).
+        with_temp_home("activate-once", || {
+            let seed = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![expired_entry("rm-recursive-to-trash")],
+            };
+            write_state(&seed).unwrap();
+
+            let (_, first_pruned) =
+                activate("git-push-force-block", DEFAULT_DURATION_SECS, None).unwrap();
+            assert_eq!(first_pruned.len(), 1, "first call observes the expiry");
+
+            let (_, second_pruned) =
+                activate("git-clean-force-block", DEFAULT_DURATION_SECS, None).unwrap();
+            assert!(
+                second_pruned.is_empty(),
+                "the same expired entry must not be reported a second time — it already left the state"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn clear_rule_returns_pruned_entries_even_when_target_rule_not_found() {
+        with_temp_home("clear-prune", || {
+            let seed = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![
+                    expired_entry("rm-recursive-to-trash"),
+                    active_entry("git-reset-hard-stash"),
+                ],
+            };
+            write_state(&seed).unwrap();
+
+            // "git-push-force-block" was never activated — clear_rule
+            // must still prune+persist the expired sibling entry.
+            let (rule_removed, expired) = clear_rule("git-push-force-block").unwrap();
+            assert!(!rule_removed, "target rule was never active");
+            assert_eq!(expired.len(), 1);
+            assert_eq!(expired[0].rule_id, "rm-recursive-to-trash");
+
+            let on_disk = read_state(&state_file_path().unwrap()).unwrap();
+            assert_eq!(on_disk.entries.len(), 1);
+            assert_eq!(on_disk.entries[0].rule_id, "git-reset-hard-stash");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn clear_rule_no_write_when_nothing_changes() {
+        with_temp_home("clear-nochange", || {
+            let seed = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![active_entry("git-reset-hard-stash")],
+            };
+            write_state(&seed).unwrap();
+
+            let (rule_removed, expired) = clear_rule("git-push-force-block").unwrap();
+            assert!(!rule_removed);
+            assert!(expired.is_empty());
+
+            let on_disk = read_state(&state_file_path().unwrap()).unwrap();
+            assert_eq!(on_disk.entries.len(), 1);
+            assert_eq!(on_disk.entries[0].rule_id, "git-reset-hard-stash");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn clear_rule_then_clear_all_does_not_double_count_pruned_entry() {
+        // #324 scope boundary check (Codex test-adversarial review):
+        // clear_rule() prunes+reports an unrelated expired entry, then a
+        // later clear_all() must count only what's genuinely still active
+        // — not re-observe the entry clear_rule() already removed.
+        with_temp_home("clear-then-clearall", || {
+            let seed = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![
+                    expired_entry("rm-recursive-to-trash"),
+                    active_entry("git-reset-hard-stash"),
+                ],
+            };
+            write_state(&seed).unwrap();
+
+            let (_, expired) = clear_rule("git-push-force-block").unwrap();
+            assert_eq!(expired.len(), 1, "clear_rule prunes the expired sibling");
+
+            // Only the one still-active entry remains for clear_all to count.
+            let count = clear_all().unwrap();
+            assert_eq!(
+                count, 1,
+                "clear_all must count exactly the remaining active entry, \
+                 not re-count the entry clear_rule already pruned"
+            );
+        });
     }
 }
