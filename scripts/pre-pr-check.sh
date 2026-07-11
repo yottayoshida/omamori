@@ -12,8 +12,11 @@ cargo fmt --all -- --check
 echo "==> cargo clippy --all-targets --all-features --locked -- -D warnings"
 cargo clippy --all-targets --all-features --locked -- -D warnings
 
-echo "==> cargo test --all-features --locked"
-cargo test --all-features --locked
+echo "==> test-isolation-canary --self-test"
+./scripts/test-isolation-canary.sh --self-test
+
+echo "==> cargo test --all-features --locked (via test-isolation-canary)"
+./scripts/test-isolation-canary.sh -- cargo test --all-features --locked
 
 echo
 echo "pre-pr-check: OK"

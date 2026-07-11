@@ -191,12 +191,38 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn shim_argv0_without_hook_check_still_enters_shim() {
         // Mutation resistance: when argv0 is a shim name but subcommand
         // is NOT hook-check, must enter shim mode (not omamori dispatch).
         // "git status" via shim should not hit "unknown subcommand" error.
+        //
+        // run_shim() unconditionally calls ensure_settings_current() (#356:
+        // discovered via the test-isolation-canary), which resolves
+        // ~/.claude via the ambient HOME env var and may write a re-synced
+        // settings.json into it. This test runs run() in-process (not a
+        // subprocess), so without pinning HOME here it would resolve the
+        // real developer/CI-runner HOME, not an isolated one — the exact
+        // #210 incident class. Pin HOME to a throwaway dir for the
+        // duration of this test only.
+        let home =
+            std::env::temp_dir().join(format!("omamori-shim-argv0-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let saved_home = std::env::var_os("HOME");
+        // SAFETY: #[serial_test::serial(home_env)] ensures no other test
+        // tagged with the same key mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", &home) };
+
         let args = vec![OsString::from("git"), OsString::from("status")];
         let result = run(&args);
+
+        match saved_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
         // run_shim will try to execute real git; the important thing is
         // it does NOT return AppError::Usage("unknown subcommand: status")
         if let Err(AppError::Usage(msg)) = &result {
