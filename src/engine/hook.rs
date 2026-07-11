@@ -596,7 +596,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
             tool_input,
         } => run_hook_check_unknown_tool(&tool_name, &tool_input, &provider, verbose, json_error),
         HookInput::FileOp { tool, path } => {
-            if let Some((pattern, description)) = is_protected_file_path(&path) {
+            if let Some((pattern, kind, description)) = is_protected_file_path(&path) {
                 if json_error {
                     emit_json_error(
                         "layer2:file-protection",
@@ -609,6 +609,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                     return Ok(2);
                 }
                 eprintln!("omamori hook: blocked {tool} to protected file — {description}");
+                eprintln!("  matched: {} '{pattern}'", kind.label());
                 eprintln!("  AI agents cannot modify omamori configuration or security files.");
                 eprintln!(
                     "  To edit config: use `omamori config` CLI or edit the file directly in your terminal."
@@ -867,7 +868,7 @@ fn run_hook_check_unknown_tool(
             run_hook_check_command(cmd, provider, verbose, json_error)
         }
         InputShape::FileOp(path) => {
-            if let Some((pattern, description)) = is_protected_file_path(path) {
+            if let Some((pattern, kind, description)) = is_protected_file_path(path) {
                 if json_error {
                     emit_json_error(
                         "layer2:file-protection",
@@ -880,6 +881,7 @@ fn run_hook_check_unknown_tool(
                     return Ok(2);
                 }
                 eprintln!("omamori hook: blocked {tool_name} to protected file — {description}");
+                eprintln!("  matched: {} '{pattern}'", kind.label());
                 eprintln!("  AI agents cannot modify omamori configuration or security files.");
                 eprintln!(
                     "  To edit config: use `omamori config` CLI or edit the file directly in your terminal."
@@ -1501,27 +1503,129 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
 // File path protection for Edit/Write/MultiEdit (#110)
 // ---------------------------------------------------------------------------
 
+/// How a `PROTECTED_FILE_PATTERNS` entry is matched against a path.
+///
+/// Plain substring matching (the pre-#320 approach) both over-matches
+/// (`audit.jsonl.md` incidentally contains `audit.jsonl`) and, if naively
+/// replaced with pure path-component matching, under-matches: filename-only
+/// artifacts like `audit.jsonl.hwm` or `audit-secret.1.retired` don't
+/// appear as their own path component anywhere, so a component-only
+/// matcher would silently stop protecting them outside the omamori data
+/// directory (see PR2 shape enumeration, `.jsonl.hwm.tmp` FilenameSuffix
+/// entry below). Each pattern picks the kind that actually matches how
+/// that file is named on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MatchKind {
+    /// Pattern is a sequence of path components that must appear
+    /// contiguously somewhere in the path (`context::path_matches_pattern`).
+    Subpath,
+    /// Pattern is the file's exact `file_name()`.
+    ExactFile,
+    /// Pattern is a prefix of the file's `file_name()`.
+    FilenamePrefix,
+    /// Pattern is a suffix of the file's `file_name()`.
+    FilenameSuffix,
+}
+
+impl MatchKind {
+    /// Human-readable label for the UX self-recovery hint (block messages
+    /// name which pattern+kind matched, so a false positive is diagnosable
+    /// without reading source).
+    fn label(self) -> &'static str {
+        match self {
+            MatchKind::Subpath => "path contains",
+            MatchKind::ExactFile => "exact filename",
+            MatchKind::FilenamePrefix => "filename starts with",
+            MatchKind::FilenameSuffix => "filename ends with",
+        }
+    }
+
+    fn matches(self, path: &std::path::Path, pattern: &str) -> bool {
+        if self == MatchKind::Subpath {
+            return crate::context::path_matches_pattern(path, pattern);
+        }
+        // Remaining kinds all key off the filename — extracted once
+        // instead of duplicated per arm. `Subpath` is handled above; the
+        // arm below returns `false` rather than `unreachable!()` since
+        // this is a security-relevant match path (never panic here).
+        let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
+            return false;
+        };
+        match self {
+            MatchKind::ExactFile => file_name == pattern,
+            MatchKind::FilenamePrefix => file_name.starts_with(pattern),
+            MatchKind::FilenameSuffix => file_name.ends_with(pattern),
+            MatchKind::Subpath => false,
+        }
+    }
+}
+
 /// Patterns that identify omamori's own files and external hook registrations.
 /// SECURITY: pub(crate) const, never pub const. See threat model T2.
-pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, &str)] = &[
-    ("omamori/config.toml", "omamori config"),
-    (".integrity.json", "integrity baseline"),
-    ("audit-secret", "audit HMAC secret"),
-    ("audit.jsonl", "audit log"),
-    (".jsonl.hwm", "audit high-water-mark"),
-    (".local/share/omamori", "omamori data directory"),
-    ("claude-pretooluse.sh", "omamori hook script"),
-    ("codex-pretooluse.sh", "omamori Codex hook script"),
-    (".codex/hooks.json", "Codex hooks config"),
-    (".codex/config.toml", "Codex config"),
+pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
+    ("omamori/config.toml", MatchKind::Subpath, "omamori config"),
+    (
+        ".integrity.json",
+        MatchKind::ExactFile,
+        "integrity baseline",
+    ),
+    (
+        "audit-secret",
+        MatchKind::FilenamePrefix,
+        "audit HMAC secret",
+    ),
+    ("audit.jsonl", MatchKind::ExactFile, "audit log"),
+    (
+        ".jsonl.hwm",
+        MatchKind::FilenameSuffix,
+        "audit high-water-mark",
+    ),
+    (
+        // The only `.tmp`-suffixed file `write_hwm` ever produces on disk
+        // (mod.rs). `ends_with(".jsonl.hwm")` alone does not match
+        // `audit.jsonl.hwm.tmp` — this entry closes that gap.
+        ".jsonl.hwm.tmp",
+        MatchKind::FilenameSuffix,
+        "audit high-water-mark (in-progress write)",
+    ),
+    (
+        ".local/share/omamori",
+        MatchKind::Subpath,
+        "omamori data directory",
+    ),
+    (
+        "claude-pretooluse.sh",
+        MatchKind::ExactFile,
+        "omamori hook script",
+    ),
+    (
+        "codex-pretooluse.sh",
+        MatchKind::ExactFile,
+        "omamori Codex hook script",
+    ),
+    (
+        ".codex/hooks.json",
+        MatchKind::Subpath,
+        "Codex hooks config",
+    ),
+    (".codex/config.toml", MatchKind::Subpath, "Codex config"),
     (
         ".claude/settings.json",
+        MatchKind::Subpath,
         "Claude Code settings (contains hook config)",
     ),
 ];
 
 /// Check whether a file path targets a protected omamori file.
-fn is_protected_file_path(path: &str) -> Option<(&'static str, &'static str)> {
+///
+/// Applies each pattern to both the lexically-normalized path and every
+/// canonicalized candidate (the file itself if it exists, or its parent +
+/// file name if only the parent resolves) — preserving the pre-#320
+/// substring matcher's dual coverage: a symlink whose *name* doesn't match
+/// any pattern but which resolves to a protected file is still caught via
+/// the canonical candidate, while a distinct, non-symlinked file that
+/// merely shares a substring (`audit.jsonl.md`) is not.
+fn is_protected_file_path(path: &str) -> Option<(&'static str, MatchKind, &'static str)> {
     let lexical = crate::context::normalize_path(path);
 
     let candidates: Vec<std::path::PathBuf> = match std::fs::canonicalize(&lexical) {
@@ -1534,14 +1638,13 @@ fn is_protected_file_path(path: &str) -> Option<(&'static str, &'static str)> {
             .collect(),
     };
 
-    let lexical_str = lexical.to_string_lossy();
-    for &(pattern, reason) in PROTECTED_FILE_PATTERNS {
-        if lexical_str.contains(pattern) {
-            return Some((pattern, reason));
+    for &(pattern, kind, reason) in PROTECTED_FILE_PATTERNS {
+        if kind.matches(&lexical, pattern) {
+            return Some((pattern, kind, reason));
         }
         for candidate in &candidates {
-            if candidate.to_string_lossy().contains(pattern) {
-                return Some((pattern, reason));
+            if kind.matches(candidate, pattern) {
+                return Some((pattern, kind, reason));
             }
         }
     }
@@ -1748,12 +1851,42 @@ fn truncate_for_log(s: &str, max_chars: usize) -> &str {
     }
 }
 
+/// Closed taxonomy for the `--provider` flag on `hook-check` — the one
+/// place an untrusted external value flowed straight into the audit chain
+/// unvalidated (SEC-8 already applies this discipline to
+/// `detection_layer` via `is_valid_detection_layer`; this closes the same
+/// gap for `provider`).
+///
+/// Scope: this validates ONLY the `hook-check --provider` CLI flag. Audit
+/// events built directly in Rust elsewhere (`break_glass_cmd.rs`'s
+/// `"human"`, `retention.rs`'s `"omamori"`, etc.) are untouched — they
+/// aren't attacker-controlled input, and folding them into this taxonomy
+/// would corrupt existing, unrelated audit semantics. Neither `"human"`
+/// nor `"omamori"` is a member of `KNOWN_HOOK_PROVIDERS`: that's
+/// intentional — this is a canonicalization taxonomy for a specific
+/// external input, not a namespace shared with internally-constructed
+/// events, and keeping them disjoint prevents this flag from being used
+/// to forge an internally-originated provider label.
+const KNOWN_HOOK_PROVIDERS: &[&str] = &["claude-code", "codex"];
+
+/// `unknown` = flag not supplied at all. `invalid` = flag supplied but the
+/// value isn't in `KNOWN_HOOK_PROVIDERS`. Kept distinct rather than
+/// collapsing both to one label: a forged/typo'd `--provider` value is a
+/// different forensic signal than the caller simply not passing the flag.
+/// Does NOT reject the command either way — provider is audit metadata,
+/// not a policy input (v0.9.6 embedded-allowlist lesson: rejecting on an
+/// unrecognized-but-legitimate future value would be a forward-compat
+/// regression). The raw attacker-controlled string is discarded, not
+/// logged to the chain or stderr, once it fails the taxonomy check.
 fn parse_provider_flag(args: &[OsString]) -> String {
     for (i, arg) in args.iter().enumerate() {
         if arg.to_str() == Some("--provider")
             && let Some(val) = args.get(i + 1)
         {
-            return val.to_string_lossy().to_string();
+            return match val.to_str() {
+                Some(v) if KNOWN_HOOK_PROVIDERS.contains(&v) => v.to_string(),
+                _ => "invalid".to_string(),
+            };
         }
     }
     "unknown".to_string()
@@ -2247,6 +2380,14 @@ mod tests {
 
     #[test]
     fn protected_file_path_all_patterns_match() {
+        // Coarse smoke test only: proves each witness path matches *some*
+        // pattern, not which one (some witnesses here resolve via the
+        // `.local/share/omamori` Subpath backstop rather than the
+        // filename-specific pattern they'd naively suggest). The
+        // `protected_file_path_*_outside_data_dir_via_filename_kind_only`
+        // and `protected_file_path_canonical_only_*` tests below are what
+        // actually pin match-kind correctness (Codex R1 test-adversarial
+        // review).
         let test_paths = [
             "/home/user/.config/omamori/config.toml",
             "/home/user/.local/share/omamori/.integrity.json",
@@ -2265,6 +2406,376 @@ mod tests {
                 "PROTECTED_FILE_PATTERNS gap: {path} was not matched"
             );
         }
+    }
+
+    // --- #320: match-kind non-regression (PR2 shape enumeration) ---
+    //
+    // These pin every real on-disk file shape found during shape
+    // enumeration, PLUS the false-positive removals the match-kind
+    // rewrite is for. Written before the substring→match-kind rewrite so
+    // they'd catch it landing wrong (Red-first): a naive component-only
+    // rewrite (rejected alternative, see plan) passes
+    // `protected_file_path_all_patterns_match` above but fails
+    // `protected_file_path_hwm_tmp_matches` and
+    // `protected_file_path_retired_secret_matches` below, since
+    // `audit.jsonl.hwm.tmp` and `audit-secret.N.retired` don't appear as
+    // their own path *component* anywhere.
+
+    #[test]
+    fn protected_file_path_hwm_matches() {
+        assert!(
+            is_protected_file_path("/home/user/.local/share/omamori/audit.jsonl.hwm").is_some(),
+            "audit.jsonl.hwm (real HWM sidecar) must stay protected"
+        );
+    }
+
+    #[test]
+    fn protected_file_path_hwm_tmp_matches() {
+        // D1 (Critical): the only `.tmp`-suffixed file `write_hwm` ever
+        // produces. `ends_with(".jsonl.hwm")` alone does NOT match this —
+        // requires the dedicated `.jsonl.hwm.tmp` FilenameSuffix entry.
+        assert!(
+            is_protected_file_path("/home/user/.local/share/omamori/audit.jsonl.hwm.tmp").is_some(),
+            "audit.jsonl.hwm.tmp (in-progress HWM write) must stay protected"
+        );
+    }
+
+    #[test]
+    fn protected_file_path_retired_secret_matches() {
+        assert!(
+            is_protected_file_path("/home/user/.local/share/omamori/audit-secret.1.retired")
+                .is_some(),
+            "audit-secret.N.retired (rotate_key backup) must stay protected"
+        );
+    }
+
+    // The three tests above use paths under `.local/share/omamori`, so a
+    // regression from FilenameSuffix/FilenamePrefix to a strictly narrower
+    // kind would still pass via the `.local/share/omamori` Subpath
+    // backstop (Codex R1 P1). These variants use a custom audit-path
+    // directory that does NOT contain that Subpath sequence — the only
+    // thing that can protect them is the filename-kind match itself —
+    // and assert the exact `(pattern, kind)` returned, not just `is_some`.
+
+    #[test]
+    fn protected_file_path_hwm_matches_outside_data_dir_via_filename_kind_only() {
+        let (pattern, kind, _) = is_protected_file_path("/custom/audit-dir/audit.jsonl.hwm")
+            .expect("audit.jsonl.hwm under a custom (non-data-dir) audit path must stay protected");
+        assert_eq!(pattern, ".jsonl.hwm");
+        assert_eq!(kind, MatchKind::FilenameSuffix);
+    }
+
+    #[test]
+    fn protected_file_path_hwm_tmp_matches_outside_data_dir_via_filename_kind_only() {
+        let (pattern, kind, _) = is_protected_file_path("/custom/audit-dir/audit.jsonl.hwm.tmp")
+            .expect(
+                "audit.jsonl.hwm.tmp under a custom (non-data-dir) audit path must stay protected",
+            );
+        assert_eq!(pattern, ".jsonl.hwm.tmp");
+        assert_eq!(kind, MatchKind::FilenameSuffix);
+    }
+
+    #[test]
+    fn protected_file_path_retired_secret_matches_outside_data_dir_via_filename_kind_only() {
+        let (pattern, kind, _) =
+            is_protected_file_path("/custom/audit-dir/audit-secret.1.retired").expect(
+                "audit-secret.N.retired under a custom (non-data-dir) audit path must stay protected",
+            );
+        assert_eq!(pattern, "audit-secret");
+        assert_eq!(kind, MatchKind::FilenamePrefix);
+    }
+
+    #[test]
+    fn protected_file_path_audit_jsonl_md_outside_data_dir_no_longer_false_positive() {
+        // The headline #320 false positive: a genuinely unrelated file
+        // that merely contains "audit.jsonl" as a substring. Only removed
+        // OUTSIDE the omamori data directory — see next test.
+        assert!(
+            is_protected_file_path("/tmp/notes/audit.jsonl.md").is_none(),
+            "audit.jsonl.md outside the data dir must no longer be a false positive"
+        );
+    }
+
+    #[test]
+    fn protected_file_path_audit_jsonl_md_inside_data_dir_still_protected() {
+        // Asymmetry documented in the shape enumeration: `audit.jsonl.md`
+        // placed *inside* `.local/share/omamori` is still caught by the
+        // Subpath backstop on the data directory itself. Do not read the
+        // previous test as "audit.jsonl.md is always allowed".
+        assert!(
+            is_protected_file_path("/home/user/.local/share/omamori/audit.jsonl.md").is_some(),
+            "the data-directory Subpath backstop must still catch files placed inside it"
+        );
+    }
+
+    #[test]
+    fn protected_file_path_sibling_directory_name_no_longer_false_positive() {
+        assert!(
+            is_protected_file_path("/home/user/my-omamori/config.toml").is_none(),
+            "my-omamori/config.toml must not match the omamori/config.toml Subpath pattern"
+        );
+        assert!(
+            is_protected_file_path("/home/user/.local/share/omamori-backup/x").is_none(),
+            "omamori-backup must not match the .local/share/omamori Subpath pattern"
+        );
+    }
+
+    #[test]
+    fn protected_file_path_hook_script_backup_no_longer_false_positive() {
+        assert!(
+            is_protected_file_path("/home/user/x/claude-pretooluse.sh.bak").is_none(),
+            "claude-pretooluse.sh.bak must not match the ExactFile claude-pretooluse.sh pattern"
+        );
+    }
+
+    #[test]
+    fn protected_file_path_codex_config_backup_no_longer_protected() {
+        // D2 (decided, plan-approved): the incidental protection substring
+        // matching gave `~/.codex/config.toml.bak` is intentionally not
+        // replaced — see plan judgment record. Documented here so a
+        // future change to this pattern set is a deliberate decision, not
+        // an accidental regression.
+        assert!(
+            is_protected_file_path("/home/user/.codex/config.toml.bak").is_none(),
+            "config.toml.bak is intentionally out of the protected set (D2)"
+        );
+    }
+
+    #[test]
+    fn protected_file_path_audit_secret_prefix_residual_false_positive_accepted() {
+        // D3 (accepted): FilenamePrefix on "audit-secret" still matches
+        // unrelated files with that prefix outside the data dir. Narrower
+        // than the old substring matcher; accepted per plan judgment
+        // record rather than adding an ExactFile+FilenameSuffix split
+        // that would itself create a new residual FP surface.
+        assert!(
+            is_protected_file_path("/tmp/audit-secret-notes.txt").is_some(),
+            "residual prefix false positive is a known, accepted trade-off (D3)"
+        );
+        // Boundary check (Codex R1 test-adversarial review): proves this
+        // is genuinely `starts_with`, not a regression back toward
+        // `contains`. A file with "audit-secret" only as a mid-string
+        // substring — not a prefix — must NOT match.
+        assert!(
+            is_protected_file_path("/tmp/my-audit-secret-notes.txt").is_none(),
+            "FilenamePrefix must not degrade into substring matching"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_file_path_symlinked_parent_resolves_to_protected_target() {
+        let base =
+            std::env::temp_dir().join(format!("omamori-gr004-symparent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real_dir = base.join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(real_dir.join("audit.jsonl"), b"").unwrap();
+        let link_dir = base.join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let path = link_dir.join("audit.jsonl");
+        assert!(
+            is_protected_file_path(path.to_str().unwrap()).is_some(),
+            "a symlinked parent directory resolving to a protected file must still be caught \
+             via the canonical candidate, even though the lexical path doesn't match by name"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_file_path_canonical_only_subpath_match_via_symlinked_parent() {
+        // Codex R1 P1: the test above uses leaf name "audit.jsonl", which
+        // ExactFile matches on the *lexical* path too (file_name() doesn't
+        // care which directory it's in) — so it would still pass even if
+        // the canonical-candidate loop were deleted entirely. This variant
+        // uses a leaf name that matches NO pattern by filename, so the
+        // only path to a match is the Subpath backstop resolving through
+        // symlinked-parent canonicalization.
+        let base = std::env::temp_dir().join(format!(
+            "omamori-gr004-canonical-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        // `link` aliases the `.local/share/omamori` directory itself (not
+        // some ancestor of it) — the query path below never spells out
+        // ".local/share/omamori" lexically, so a lexical-only matcher has
+        // no literal components to find. Only resolving the symlink
+        // (canonicalize) reveals them.
+        let real_data_dir = base.join("real_data/.local/share/omamori");
+        std::fs::create_dir_all(&real_data_dir).unwrap();
+        std::fs::write(real_data_dir.join("scratch.txt"), b"").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real_data_dir, &link).unwrap();
+
+        let path = link.join("scratch.txt");
+        let result = is_protected_file_path(path.to_str().unwrap());
+        assert!(
+            result.is_some(),
+            "a leaf name matching no filename pattern must still be caught by the \
+             data-directory Subpath backstop once the symlinked parent is canonicalized \
+             (lexical path alone cannot match this case)"
+        );
+        assert_eq!(result.unwrap().0, ".local/share/omamori");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn protected_file_path_nonexistent_child_with_canonical_parent_still_checked() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-gr004-nonexistent-child-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Parent exists and canonicalizes; the file itself does not exist
+        // yet. Must fall through to the parent-canonicalize candidate
+        // path (not just lexical) without panicking or false-matching.
+        let path = dir.join("audit.jsonl");
+        assert!(
+            is_protected_file_path(path.to_str().unwrap()).is_some(),
+            "non-existent file under a canonicalizable parent must still match by name"
+        );
+        let unrelated = dir.join("scratch.txt");
+        assert!(
+            is_protected_file_path(unrelated.to_str().unwrap()).is_none(),
+            "non-existent unrelated file under a canonicalizable parent must not false-match"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn protected_file_path_block_message_includes_matched_pattern_and_kind() {
+        let (pattern, kind, _reason) =
+            is_protected_file_path("/home/user/.local/share/omamori/audit.jsonl.hwm.tmp")
+                .expect("should match");
+        assert_eq!(pattern, ".jsonl.hwm.tmp");
+        assert_eq!(kind, MatchKind::FilenameSuffix);
+        assert_eq!(kind.label(), "filename ends with");
+    }
+
+    #[test]
+    fn protected_file_path_overlapping_patterns_resolve_by_array_order() {
+        // "audit-secret.jsonl.hwm.tmp" simultaneously starts_with
+        // "audit-secret" (FilenamePrefix, PROTECTED_FILE_PATTERNS index 2)
+        // and ends_with ".jsonl.hwm.tmp" (FilenameSuffix, index 5). The
+        // match is first-match-wins by array order — pin that here so a
+        // reorder of PROTECTED_FILE_PATTERNS is a visible, deliberate
+        // decision rather than a silent change to which pattern a block
+        // message reports (Codex R1 test-adversarial review).
+        let (pattern, kind, _reason) =
+            is_protected_file_path("/custom/audit-dir/audit-secret.jsonl.hwm.tmp")
+                .expect("should match (via either candidate pattern)");
+        assert_eq!(pattern, "audit-secret");
+        assert_eq!(kind, MatchKind::FilenamePrefix);
+    }
+
+    // --- #321: parse_provider_flag taxonomy ---
+
+    fn args(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn parse_provider_flag_known_values_pass_through() {
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", "claude-code"])),
+            "claude-code"
+        );
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", "codex"])),
+            "codex"
+        );
+    }
+
+    #[test]
+    fn parse_provider_flag_unknown_when_flag_absent() {
+        assert_eq!(parse_provider_flag(&args(&["hook-check"])), "unknown");
+    }
+
+    #[test]
+    fn parse_provider_flag_invalid_when_value_not_in_taxonomy() {
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", "gemini-cli"])),
+            "invalid",
+            "an unrecognized (even if legitimate-looking) value must not pass through raw"
+        );
+    }
+
+    #[test]
+    fn parse_provider_flag_rejects_internal_only_labels() {
+        // "human" and "omamori" are internal-event labels (break_glass_cmd.rs,
+        // retention.rs) — this external flag must not be able to forge them.
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", "human"])),
+            "invalid"
+        );
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", "omamori"])),
+            "invalid"
+        );
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", "system"])),
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn parse_provider_flag_invalid_when_value_empty() {
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", ""])),
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn parse_provider_flag_invalid_when_case_differs() {
+        // Case sensitivity is intentional — the two legitimate producers
+        // (installer-rendered hook scripts) always emit the lowercase
+        // literal; a case mismatch signals a non-standard caller.
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider", "Claude-Code"])),
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn parse_provider_flag_takes_first_occurrence_on_duplicate() {
+        assert_eq!(
+            parse_provider_flag(&args(&[
+                "hook-check",
+                "--provider",
+                "claude-code",
+                "--provider",
+                "codex"
+            ])),
+            "claude-code"
+        );
+    }
+
+    #[test]
+    fn parse_provider_flag_unknown_when_flag_has_no_value() {
+        // "--provider" as the last argument, with nothing after it.
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider"])),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn parse_provider_flag_unknown_for_equals_form() {
+        // `--provider=x` is a single token, not the two-token
+        // `["--provider", "x"]` form every real caller (installer-rendered
+        // hook scripts) uses — treated as flag-absent, not parsed.
+        assert_eq!(
+            parse_provider_flag(&args(&["hook-check", "--provider=claude-code"])),
+            "unknown"
+        );
     }
 
     // --- GR-007: check_command_for_hook meta-pattern ---

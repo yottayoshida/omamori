@@ -1533,6 +1533,29 @@ fn hook_check_write_unrelated_path_allowed() {
     assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
 }
 
+/// #320: block message names the matched pattern and match-kind, so a
+/// false positive is diagnosable from the message alone (self-recovery,
+/// UX requirement). Uses `run_hook_check`'s isolated-HOME subprocess
+/// wrapper so this exercises the real `eprintln!` output, not just the
+/// `(pattern, kind, reason)` tuple `is_protected_file_path` returns.
+#[test]
+fn hook_check_write_block_message_names_matched_pattern_and_kind() {
+    let input = serde_json::json!({
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": "/whatever/.local/share/omamori/audit.jsonl.hwm.tmp",
+            "content": "x"
+        }
+    })
+    .to_string();
+    let (_, stderr, exit_code) = run_hook_check(&input);
+    assert_eq!(exit_code, 2);
+    assert!(
+        stderr.contains("matched: filename ends with '.jsonl.hwm.tmp'"),
+        "block message must name the matched pattern + kind for self-recovery, got: {stderr}"
+    );
+}
+
 /// #110: Block message includes 3-layer structure and omamori config hint.
 #[test]
 fn hook_check_edit_block_message_has_3_layers() {
