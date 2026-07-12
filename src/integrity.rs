@@ -268,6 +268,90 @@ fn hook_script_exe_path(content: &str) -> Option<PathBuf> {
     (!exe.is_empty()).then(|| PathBuf::from(exe))
 }
 
+/// Result of comparing a hook script's embedded `# omamori hook v{X}`
+/// version comment against the running binary's version (#327). An enum
+/// rather than `Option<String>` so "versions agree" and "no comparable
+/// version found" can't be collapsed into the same `None` and silently
+/// treated as "ok" — the plan invariant is that missing/unparseable version
+/// comments never read as a false green. `Missing` and `Rejected` are kept
+/// distinct (rather than one `Unknown`) so the displayed message can say
+/// which happened: a script with no comment at all reads differently from
+/// one whose comment was specifically flagged as suspicious (/code-review
+/// finding — the SEC-1 adversarial case deserves its own message, not the
+/// same text as a pre-#327 legacy script).
+enum HookVersionDrift {
+    Matches,
+    Missing,
+    Rejected,
+    Drift { installed: String },
+}
+
+/// Compares a hook script's version comment against `CARGO_PKG_VERSION`,
+/// independent of exe resolution succeeding — deliberately so, since a
+/// failed exe resolution (e.g. a broken Homebrew Cellar symlink) is exactly
+/// the scenario that otherwise masks staleness (the motivating incident for
+/// #327): the hash-comparison check that depends on exe resolution skips
+/// entirely in that case, so this reads the script's own version comment
+/// instead of needing a resolved exe to render an expected comparison.
+fn detect_hook_version_drift(script_content: &str) -> HookVersionDrift {
+    match installer::parse_hook_version(script_content) {
+        None => HookVersionDrift::Missing,
+        // An empty version string (malformed comment, e.g. `# omamori hook
+        // v` with nothing after `v`) is unparseable in practice even though
+        // `parse_hook_version` returns `Some("")` for it — treat it the same
+        // as a missing comment rather than displaying a blank version.
+        Some("") => HookVersionDrift::Missing,
+        // A hook file with a tampered version comment already fails the
+        // hash comparison independently (that content differs from any
+        // render), so this shape check isn't a security boundary — but
+        // without it, `installed` (attacker-controlled once the file is
+        // writable) flows unsanitized into a human-terminal tamper-warning
+        // line. Reject anything that isn't a plausible version string
+        // rather than echoing it (Phase 8 security review, SEC-1).
+        Some(installed) if !is_plausible_version_string(installed) => HookVersionDrift::Rejected,
+        Some(env!("CARGO_PKG_VERSION")) => HookVersionDrift::Matches,
+        Some(installed) => HookVersionDrift::Drift {
+            installed: installed.to_string(),
+        },
+    }
+}
+
+/// Whether `s` looks like a version string (digits, ASCII letters, `.`, `-`,
+/// `+` — covers semver including pre-release/build metadata) rather than
+/// control characters, ANSI escapes, or other terminal-hostile content.
+fn is_plausible_version_string(s: &str) -> bool {
+    s.len() <= 32
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+}
+
+/// Formats `detect_hook_version_drift`'s result as a detail-string suffix:
+/// empty when versions match, otherwise a bracketed clause naming both
+/// versions (or noting why no comparison could be made). Advisory only —
+/// this never changes a `CheckItem`'s status, only appends context to
+/// whatever hash-comparison status was already decided; the sha256 baseline
+/// stays the sole authority on tampering. `binary` is read directly at this
+/// one call site rather than stored on `HookVersionDrift::Drift` — it's
+/// always exactly `CARGO_PKG_VERSION`, a compile-time constant with no
+/// independent value to carry through the enum (/code-review finding).
+fn hook_version_drift_suffix(script_content: &str) -> String {
+    match detect_hook_version_drift(script_content) {
+        HookVersionDrift::Matches => String::new(),
+        HookVersionDrift::Missing => {
+            " [version drift: unknown \u{2014} hook script has no version comment]".to_string()
+        }
+        HookVersionDrift::Rejected => {
+            " [version drift: unknown \u{2014} hook script's version comment is unparseable]"
+                .to_string()
+        }
+        HookVersionDrift::Drift { installed } => format!(
+            " [version drift: hooks rendered by v{installed}, binary is v{} \u{2014} run \
+             `omamori install --hooks` (or `omamori doctor --fix`) to regenerate]",
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
+}
+
 /// Extract the omamori exe path embedded in a cursor hooks snippet.
 fn cursor_snippet_exe_path(content: &str) -> Option<PathBuf> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
@@ -360,15 +444,22 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
 /// Closes the "doctor 12/12 green but Layer 2 dormant" gap from #196:
 /// a green doctor report now guarantees Layer 2 is active.
 fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
-    check_claude_settings_integration_with_verifier(base_dir, installer::verify_hook_contract)
+    check_claude_settings_integration_with_verifier(
+        base_dir,
+        installer::verify_hook_contract,
+        installer::resolved_current_omamori_exe,
+    )
 }
 
 /// `check_claude_settings_integration()` with an injectable contract verifier
-/// (#349), so tests can exercise the hash-match "wired up" path without the
-/// production verifier rejecting the test binary as a non-omamori exe.
+/// (#349) and exe resolver (#327), so tests can exercise the hash-match
+/// "wired up" path without the production verifier rejecting the test binary
+/// as a non-omamori exe, and can drive the "exe cannot be resolved" branch
+/// directly.
 fn check_claude_settings_integration_with_verifier(
     base_dir: &Path,
     verify: installer::HookVerifier,
+    resolve_exe: ExeResolver,
 ) -> CheckItem {
     let name = "claude-code-settings".to_string();
     let category = "Hooks";
@@ -541,28 +632,19 @@ fn check_claude_settings_integration_with_verifier(
             };
         }
     };
-    let omamori_exe = match installer::resolved_current_omamori_exe() {
+    let omamori_exe = match resolve_exe_or_warn(resolve_exe, category, name.clone(), &actual) {
         Ok(exe) => exe,
-        Err(_) => {
-            return CheckItem {
-                category,
-                name,
-                status: CheckStatus::Warn,
-                detail: "(cannot resolve omamori exe — hash check skipped)".to_string(),
-                remediation: Some(Remediation::RunInstall),
-            };
-        }
+        Err(item) => return item,
     };
     let expected_hash = installer::hook_content_hash(&installer::render_hook_script(&omamori_exe));
     let actual_hash = installer::hook_content_hash(&actual);
     if actual_hash != expected_hash {
-        return CheckItem {
+        return hash_mismatch_fail(
             category,
             name,
-            status: CheckStatus::Fail,
-            detail: "(script content hash mismatch — possible tampering)".to_string(),
-            remediation: Some(Remediation::RegenerateHooks),
-        };
+            "(script content hash mismatch — possible tampering)",
+            &actual,
+        );
     }
 
     // #349: hash match only proves the on-disk script mirrors what we'd
@@ -625,6 +707,124 @@ fn shim_matches_baseline(
     actual == expected
 }
 
+/// A fn-pointer seam for resolving "the currently running omamori exe",
+/// mirroring `HookVerifier`'s injection pattern so tests can drive the
+/// "exe cannot be resolved" branch directly — the exact failure mode (e.g. a
+/// broken Homebrew Cellar symlink) that #327's version-drift suffix exists to
+/// surface instead of silently skipping.
+type ExeResolver = fn() -> std::io::Result<PathBuf>;
+
+/// Resolves the running omamori exe, or a fully-formed "(cannot resolve
+/// omamori exe — hash check skipped)" `CheckItem` if resolution fails —
+/// shared by `check_claude_hook_hash` and
+/// `check_claude_settings_integration_with_verifier`, which both hit this
+/// exact failure mode and message. `script_content` is only read to compute
+/// the version-drift suffix when resolution actually fails (#327's masked-skip
+/// branch), not on the common path where resolution succeeds.
+fn resolve_exe_or_warn(
+    resolve_exe: ExeResolver,
+    category: &'static str,
+    name: String,
+    script_content: &str,
+) -> Result<PathBuf, CheckItem> {
+    resolve_exe().map_err(|_| CheckItem {
+        category,
+        name,
+        status: CheckStatus::Warn,
+        detail: format!(
+            "(cannot resolve omamori exe — hash check skipped){}",
+            hook_version_drift_suffix(script_content)
+        ),
+        remediation: Some(Remediation::RunInstall),
+    })
+}
+
+/// Builds the `Fail`/`RegenerateHooks` `CheckItem` for a hash mismatch, with
+/// the version-drift suffix appended — shared by `check_claude_hook_hash`
+/// and `check_claude_settings_integration_with_verifier`, whose mismatch
+/// branches otherwise differ only in `base_detail` (/code-review finding:
+/// this pair was left duplicated while the parallel `resolve_exe_or_warn`
+/// case, one function above, was deduped in the same diff).
+fn hash_mismatch_fail(
+    category: &'static str,
+    name: String,
+    base_detail: &str,
+    script_content: &str,
+) -> CheckItem {
+    CheckItem {
+        category,
+        name,
+        status: CheckStatus::Fail,
+        detail: format!("{base_detail}{}", hook_version_drift_suffix(script_content)),
+        remediation: Some(Remediation::RegenerateHooks),
+    }
+}
+
+/// `full_check()`'s hash-comparison check for `claude-pretooluse.sh`.
+/// Extracted so `resolve_exe` can be swapped for a failing stub in tests.
+fn check_claude_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckItem {
+    let name = "claude-pretooluse.sh".to_string();
+    let hook_path = hooks_dir.join("claude-pretooluse.sh");
+
+    if !hook_path.exists() {
+        return CheckItem {
+            category: "Hooks",
+            name,
+            status: CheckStatus::Warn,
+            detail: "(not installed — run `omamori install --hooks`)".to_string(),
+            remediation: Some(Remediation::RunInstall),
+        };
+    }
+
+    // Deliberately reads the file before attempting exe resolution — a
+    // precedence decision, not an accident of refactoring. This means an
+    // unreadable file now reports Fail/RegenerateHooks even if exe
+    // resolution would *also* fail (previously, exe-resolution failure
+    // always took priority and reported Warn/RunInstall, since the old
+    // inline code never attempted the read in that branch). Read-first is
+    // required for #327's core case (file readable, exe unresolvable) to
+    // surface a drift suffix at all; for the rarer double-failure case, an
+    // unreadable file is itself a concrete, actionable diagnosis (pinned by
+    // `check_claude_hook_hash_unreadable_and_exe_both_fail_reports_unreadable`
+    // below) rather than an untested side effect.
+    let actual = match fs::read_to_string(&hook_path) {
+        Ok(c) => c,
+        Err(_) => {
+            return CheckItem {
+                category: "Hooks",
+                name,
+                status: CheckStatus::Fail,
+                detail: "(unreadable)".to_string(),
+                remediation: Some(Remediation::RegenerateHooks),
+            };
+        }
+    };
+    let omamori_exe = match resolve_exe_or_warn(resolve_exe, "Hooks", name.clone(), &actual) {
+        Ok(exe) => exe,
+        Err(item) => return item,
+    };
+    let expected = installer::render_hook_script(&omamori_exe);
+    let expected_hash = installer::hook_content_hash(&expected);
+    let actual_hash = installer::hook_content_hash(&actual);
+
+    if expected_hash == actual_hash {
+        CheckItem {
+            category: "Hooks",
+            name,
+            status: CheckStatus::Ok,
+            detail: "(hash match)".to_string(),
+            remediation: None,
+        }
+    } else {
+        hash_mismatch_fail(
+            "Hooks",
+            name,
+            "(hash MISMATCH — run `omamori install --hooks`)",
+            &actual,
+        )
+    }
+}
+
 /// Run a full integrity check of all defense layers.
 pub fn full_check(base_dir: &Path) -> IntegrityReport {
     let mut items = Vec::new();
@@ -679,64 +879,10 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
 
     // --- Hooks (implementation-derived hash comparison) ---
     let hooks_dir = base_dir.join("hooks");
-    let hook_path = hooks_dir.join("claude-pretooluse.sh");
-    if hook_path.exists() {
-        match installer::resolved_current_omamori_exe() {
-            Ok(omamori_exe) => {
-                let expected = installer::render_hook_script(&omamori_exe);
-                let expected_hash = installer::hook_content_hash(&expected);
-                match fs::read_to_string(&hook_path) {
-                    Ok(actual) => {
-                        let actual_hash = installer::hook_content_hash(&actual);
-                        if expected_hash == actual_hash {
-                            items.push(CheckItem {
-                                category: "Hooks",
-                                name: "claude-pretooluse.sh".to_string(),
-                                status: CheckStatus::Ok,
-                                detail: "(hash match)".to_string(),
-                                remediation: None,
-                            });
-                        } else {
-                            items.push(CheckItem {
-                                category: "Hooks",
-                                name: "claude-pretooluse.sh".to_string(),
-                                status: CheckStatus::Fail,
-                                detail: "(hash MISMATCH — run `omamori install --hooks`)"
-                                    .to_string(),
-                                remediation: Some(Remediation::RegenerateHooks),
-                            });
-                        }
-                    }
-                    Err(_) => {
-                        items.push(CheckItem {
-                            category: "Hooks",
-                            name: "claude-pretooluse.sh".to_string(),
-                            status: CheckStatus::Fail,
-                            detail: "(unreadable)".to_string(),
-                            remediation: Some(Remediation::RegenerateHooks),
-                        });
-                    }
-                }
-            }
-            Err(_) => {
-                items.push(CheckItem {
-                    category: "Hooks",
-                    name: "claude-pretooluse.sh".to_string(),
-                    status: CheckStatus::Warn,
-                    detail: "(cannot resolve omamori exe — hash check skipped)".to_string(),
-                    remediation: Some(Remediation::RunInstall),
-                });
-            }
-        }
-    } else {
-        items.push(CheckItem {
-            category: "Hooks",
-            name: "claude-pretooluse.sh".to_string(),
-            status: CheckStatus::Warn,
-            detail: "(not installed — run `omamori install --hooks`)".to_string(),
-            remediation: Some(Remediation::RunInstall),
-        });
-    }
+    items.push(check_claude_hook_hash(
+        &hooks_dir,
+        installer::resolved_current_omamori_exe,
+    ));
 
     // claude-settings.snippet.json — existence check only
     let settings_snippet = hooks_dir.join("claude-settings.snippet.json");
@@ -1185,6 +1331,290 @@ mod tests {
             hook_script_exe_path(script).is_none(),
             "line without a `|` doesn't match the expected `cat | <exe> hook-check` shape"
         );
+    }
+
+    // --- hook version drift tests (#327) ---
+
+    /// A syntactically valid hook script whose version comment names
+    /// `fake_version` instead of the current binary's real version — content
+    /// otherwise mirrors a real render, so hash comparisons against it behave
+    /// like a genuinely stale on-disk script.
+    fn script_with_version(fake_version: &str) -> String {
+        let current = env!("CARGO_PKG_VERSION");
+        let real = installer::render_hook_script(Path::new("/opt/homebrew/bin/omamori"));
+        let replaced = real.replacen(
+            &format!("# omamori hook v{current}"),
+            &format!("# omamori hook v{fake_version}"),
+            1,
+        );
+        assert_ne!(
+            replaced, real,
+            "fixture setup bug: version substitution did not change the script"
+        );
+        replaced
+    }
+
+    #[test]
+    fn detect_hook_version_drift_matches_when_versions_agree() {
+        let current = env!("CARGO_PKG_VERSION");
+        let content = format!("#!/bin/sh\n# omamori hook v{current} — wrapper\nexit 0\n");
+        assert!(matches!(
+            detect_hook_version_drift(&content),
+            HookVersionDrift::Matches
+        ));
+    }
+
+    #[test]
+    fn detect_hook_version_drift_flags_older_installed_version() {
+        let content = "#!/bin/sh\n# omamori hook v0.0.1 — wrapper\nexit 0\n";
+        match detect_hook_version_drift(content) {
+            HookVersionDrift::Drift { installed } => assert_eq!(installed, "0.0.1"),
+            _ => panic!("expected Drift, got a different shape"),
+        }
+    }
+
+    #[test]
+    fn detect_hook_version_drift_flags_newer_installed_version() {
+        // A "future" version (e.g. binary was downgraded) must also be
+        // flagged — drift is symmetric, not just staleness detection.
+        let content = "#!/bin/sh\n# omamori hook v99.0.0 — wrapper\nexit 0\n";
+        match detect_hook_version_drift(content) {
+            HookVersionDrift::Drift { installed } => assert_eq!(installed, "99.0.0"),
+            _ => panic!("expected Drift for a newer installed version"),
+        }
+    }
+
+    #[test]
+    fn detect_hook_version_drift_missing_when_comment_absent() {
+        let content = "#!/bin/sh\nexit 0\n";
+        assert!(matches!(
+            detect_hook_version_drift(content),
+            HookVersionDrift::Missing
+        ));
+    }
+
+    #[test]
+    fn detect_hook_version_drift_missing_when_comment_empty() {
+        // `parse_hook_version` returns `Some("")` for `# omamori hook v` with
+        // nothing after `v` — must not be displayed as a blank-version drift.
+        let content = "#!/bin/sh\n# omamori hook v\nexit 0\n";
+        assert!(matches!(
+            detect_hook_version_drift(content),
+            HookVersionDrift::Missing
+        ));
+    }
+
+    #[test]
+    fn detect_hook_version_drift_rejected_when_comment_has_control_chars() {
+        // SEC-1 (Phase 8 security review): a tampered hook already fails the
+        // hash comparison independently, but the version comment must not be
+        // echoed unsanitized into a human-terminal tamper-warning line. ESC
+        // + CR here would let an attacker visually cloak the "possible
+        // tampering" message that follows it. Distinct from `Missing` so the
+        // displayed message can say "unparseable" rather than "no comment at
+        // all" — a legacy pre-#327 script and a specifically-flagged
+        // suspicious one shouldn't read the same to a user (/code-review
+        // finding).
+        let content = "#!/bin/sh\n# omamori hook v0.0.1\x1b[31m\rCLOAKED\nexit 0\n";
+        assert!(matches!(
+            detect_hook_version_drift(content),
+            HookVersionDrift::Rejected
+        ));
+    }
+
+    #[test]
+    fn detect_hook_version_drift_rejected_when_comment_too_long() {
+        let content = format!("#!/bin/sh\n# omamori hook v{}\nexit 0\n", "9".repeat(64));
+        assert!(matches!(
+            detect_hook_version_drift(&content),
+            HookVersionDrift::Rejected
+        ));
+    }
+
+    #[test]
+    fn detect_hook_version_drift_accepts_prerelease_and_build_metadata() {
+        // Real semver shapes must not be rejected by the shape check.
+        let content = "#!/bin/sh\n# omamori hook v1.2.3-beta.1+build.456\nexit 0\n";
+        match detect_hook_version_drift(content) {
+            HookVersionDrift::Drift { installed } => {
+                assert_eq!(installed, "1.2.3-beta.1+build.456")
+            }
+            _ => panic!("expected Drift, got a different shape"),
+        }
+    }
+
+    #[test]
+    fn hook_version_drift_suffix_empty_when_matches() {
+        let current = env!("CARGO_PKG_VERSION");
+        let content = format!("#!/bin/sh\n# omamori hook v{current} — wrapper\nexit 0\n");
+        assert_eq!(hook_version_drift_suffix(&content), "");
+    }
+
+    #[test]
+    fn hook_version_drift_suffix_names_both_versions_when_drift() {
+        let content = "#!/bin/sh\n# omamori hook v0.0.1 — wrapper\nexit 0\n";
+        let suffix = hook_version_drift_suffix(content);
+        assert!(suffix.contains("v0.0.1"), "suffix: {suffix}");
+        assert!(
+            suffix.contains(env!("CARGO_PKG_VERSION")),
+            "suffix: {suffix}"
+        );
+        assert!(suffix.contains("version drift"), "suffix: {suffix}");
+    }
+
+    #[test]
+    fn hook_version_drift_suffix_flags_unknown_when_comment_missing() {
+        let suffix = hook_version_drift_suffix("#!/bin/sh\nexit 0\n");
+        assert!(suffix.contains("unknown"), "suffix: {suffix}");
+        assert!(suffix.contains("no version comment"), "suffix: {suffix}");
+    }
+
+    #[test]
+    fn hook_version_drift_suffix_distinguishes_rejected_from_missing() {
+        // /code-review finding: a script with a version comment that was
+        // specifically flagged as suspicious (SEC-1) must not read
+        // identically to a legacy script with no comment at all.
+        let missing = hook_version_drift_suffix("#!/bin/sh\nexit 0\n");
+        let rejected = hook_version_drift_suffix(
+            "#!/bin/sh\n# omamori hook v0.0.1\x1b[31m\rCLOAKED\nexit 0\n",
+        );
+        assert_ne!(missing, rejected);
+        assert!(rejected.contains("unparseable"), "suffix: {rejected}");
+    }
+
+    // --- check_claude_hook_hash tests (#327) ---
+
+    #[test]
+    fn check_claude_hook_hash_reports_drift_when_exe_resolution_fails() {
+        let dir = std::env::temp_dir().join(format!("omamori-hookdrift-t1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("claude-pretooluse.sh"),
+            script_with_version("0.0.1"),
+        )
+        .unwrap();
+
+        fn always_fails() -> std::io::Result<PathBuf> {
+            Err(std::io::Error::other("simulated exe resolution failure"))
+        }
+        let item = check_claude_hook_hash(&dir, always_fails);
+
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(
+            item.detail.contains("cannot resolve omamori exe"),
+            "detail: {}",
+            item.detail
+        );
+        assert!(item.detail.contains("0.0.1"), "detail: {}", item.detail);
+        assert!(
+            item.detail.contains(env!("CARGO_PKG_VERSION")),
+            "detail: {}",
+            item.detail
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_claude_hook_hash_hash_mismatch_includes_drift_suffix() {
+        let dir = std::env::temp_dir().join(format!("omamori-hookdrift-t2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("claude-pretooluse.sh"),
+            script_with_version("0.0.1"),
+        )
+        .unwrap();
+
+        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert!(item.detail.contains("MISMATCH"), "detail: {}", item.detail);
+        assert!(item.detail.contains("0.0.1"), "detail: {}", item.detail);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_claude_hook_hash_ok_when_hash_matches_no_drift_noise() {
+        let dir = std::env::temp_dir().join(format!("omamori-hookdrift-t3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = installer::resolved_current_omamori_exe().unwrap();
+        fs::write(
+            dir.join("claude-pretooluse.sh"),
+            installer::render_hook_script(&exe),
+        )
+        .unwrap();
+
+        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+
+        assert_eq!(item.status, CheckStatus::Ok);
+        assert_eq!(item.detail, "(hash match)");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_claude_hook_hash_not_installed_returns_warn() {
+        let dir = std::env::temp_dir().join(format!("omamori-hookdrift-t4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(
+            item.detail.contains("not installed"),
+            "detail: {}",
+            item.detail
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_claude_hook_hash_unreadable_returns_fail() {
+        let dir = std::env::temp_dir().join(format!("omamori-hookdrift-t5-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // A directory at the expected script path exists but can't be
+        // read as a file — triggers the "(unreadable)" branch.
+        fs::create_dir_all(dir.join("claude-pretooluse.sh")).unwrap();
+
+        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert_eq!(item.detail, "(unreadable)");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_claude_hook_hash_unreadable_and_exe_both_fail_reports_unreadable() {
+        // /code-review finding: extracting this function out of full_check
+        // reversed the precedence between "file unreadable" and "exe cannot
+        // be resolved" relative to the original inline code (which resolved
+        // the exe first and never attempted the read on failure). Pins the
+        // now-deliberate choice: an unreadable file wins even when exe
+        // resolution would also fail, since read-first is what makes #327's
+        // drift suffix reachable at all in the primary (file-readable) case.
+        let dir = std::env::temp_dir().join(format!("omamori-hookdrift-t6-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("claude-pretooluse.sh")).unwrap();
+
+        fn always_fails() -> std::io::Result<PathBuf> {
+            Err(std::io::Error::other("simulated exe resolution failure"))
+        }
+        let item = check_claude_hook_hash(&dir, always_fails);
+
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert_eq!(item.detail, "(unreadable)");
+        assert_eq!(item.remediation, Some(Remediation::RegenerateHooks));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1849,11 +2279,103 @@ mod tests {
         // #349: the test binary is never a genuine omamori binary, so the
         // production verifier would always reject the embedded exe path —
         // inject a passing stub to exercise the hash-match "wired up" path.
-        let item =
-            check_claude_settings_integration_with_verifier(&dir.join(".omamori"), |_, _| {
-                installer::HookContractStatus::Ok
-            });
+        let item = check_claude_settings_integration_with_verifier(
+            &dir.join(".omamori"),
+            |_, _| installer::HookContractStatus::Ok,
+            installer::resolved_current_omamori_exe,
+        );
         assert_eq!(item.status, CheckStatus::Ok, "details: {}", item.detail);
+        // #327 test-adversarial finding: a matching-version fixture proves
+        // `check_claude_hook_hash`'s OK path is drift-free, but says nothing
+        // about *this* function's separate OK branch — assert directly.
+        assert!(
+            !item.detail.contains("version drift"),
+            "OK path must not append drift noise: {}",
+            item.detail
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn check_claude_settings_hash_mismatch_includes_drift_suffix() {
+        // #327 test-adversarial finding: `check_claude_hook_hash`'s
+        // hash-MISMATCH+drift combination has direct coverage, but this
+        // function's own (separate) mismatch branch at integrity.rs:624 did
+        // not — a bug that dropped the suffix here, or built it from the
+        // wrong content, would have passed unnoticed.
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-int-settingsmismatch-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        // Tampered version comment — same technique as
+        // `check_claude_hook_hash_hash_mismatch_includes_drift_suffix` — this
+        // also makes the content hash mismatch (verified below the resolver
+        // never reaches `verify()`, since the mismatch branch returns first).
+        fs::write(&script, script_with_version("0.0.1")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let current = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        // A verifier that panics if called proves the mismatch branch
+        // returns before ever reaching `verify()` — i.e. `resolve_exe`
+        // disagreeing with the embedded content can never smuggle a wrong
+        // path into the contract probe (test-adversarial finding: this is
+        // the actual safety property behind "does verify get the embedded
+        // path, not resolve_exe's" — provable structurally, since the
+        // mismatch check gates before `verify()` is reached at all).
+        fn panics_if_called(_: &Path, _: std::time::Duration) -> installer::HookContractStatus {
+            panic!("verify() must not be called when the hash comparison already failed")
+        }
+        let item = check_claude_settings_integration_with_verifier(
+            &dir.join(".omamori"),
+            panics_if_called,
+            installer::resolved_current_omamori_exe,
+        );
+        assert_eq!(item.status, CheckStatus::Fail, "details: {}", item.detail);
+        assert!(
+            item.detail.contains("hash mismatch"),
+            "detail: {}",
+            item.detail
+        );
+        assert!(item.detail.contains("0.0.1"), "detail: {}", item.detail);
+        assert!(
+            item.detail.contains(env!("CARGO_PKG_VERSION")),
+            "detail: {}",
+            item.detail
+        );
 
         match saved {
             Some(v) => unsafe { std::env::set_var("HOME", v) },
@@ -1909,10 +2431,11 @@ mod tests {
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &dir) };
 
-        let item =
-            check_claude_settings_integration_with_verifier(&dir.join(".omamori"), |_, _| {
-                installer::HookContractStatus::ExitNonZero(1)
-            });
+        let item = check_claude_settings_integration_with_verifier(
+            &dir.join(".omamori"),
+            |_, _| installer::HookContractStatus::ExitNonZero(1),
+            installer::resolved_current_omamori_exe,
+        );
         assert_eq!(item.status, CheckStatus::Fail, "details: {}", item.detail);
         assert!(
             item.detail.contains("hook-check contract"),
@@ -1932,6 +2455,75 @@ mod tests {
             item.remediation,
             Some(Remediation::RunInstall),
             "must remediate via RunInstall, not RegenerateHooks"
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn check_claude_settings_reports_drift_when_exe_resolution_fails() {
+        // #327: the settings-integration check's own exe-resolution-failure
+        // branch (distinct from `check_claude_hook_hash`'s) must also surface
+        // version drift instead of masking it — this is the same "hash check
+        // depends on exe resolution succeeding" gap, at the second call site.
+        let dir =
+            std::env::temp_dir().join(format!("omamori-int-settingsdrift-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&script, script_with_version("0.0.1")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
+        let current = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&current).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        fn always_fails() -> std::io::Result<PathBuf> {
+            Err(std::io::Error::other("simulated exe resolution failure"))
+        }
+        let item = check_claude_settings_integration_with_verifier(
+            &dir.join(".omamori"),
+            |_, _| installer::HookContractStatus::Ok,
+            always_fails,
+        );
+        assert_eq!(item.status, CheckStatus::Warn, "details: {}", item.detail);
+        assert!(
+            item.detail.contains("cannot resolve omamori exe"),
+            "detail: {}",
+            item.detail
+        );
+        assert!(item.detail.contains("0.0.1"), "detail: {}", item.detail);
+        assert!(
+            item.detail.contains(env!("CARGO_PKG_VERSION")),
+            "detail: {}",
+            item.detail
         );
 
         match saved {

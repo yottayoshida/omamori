@@ -118,8 +118,8 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         let all_ok = pass == total;
 
         println!("  {} {pass}/{total}", section.heading());
-        if *section == DoctorSection::Layer1 {
-            print_heartbeat_line();
+        for annotate in section_annotations(*section) {
+            annotate(ai_env);
         }
         if all_ok {
             continue;
@@ -152,7 +152,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     print_risk_signals_section(ai_env);
 
     // Section 5: Break-glass status
-    print_break_glass_section();
+    print_break_glass_section(ai_env);
 
     // Section 6: Staging usage (#313)
     print_staging_section();
@@ -190,6 +190,30 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         Ok(2)
     } else {
         Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Section annotations (#310)
+// ---------------------------------------------------------------------------
+
+/// Which per-section informational lines `run_diagnose`'s loop prints after
+/// each section heading. Replaces a single hardcoded
+/// `if section == Layer1 { print_heartbeat_line() }` special case — a second
+/// entry (e.g. a future Layer2 annotation) is a table addition here, not a
+/// new `if` branch. Entries take `ai_env` because `print_heartbeat_line`'s
+/// awaiting-state hint is gated by it (/code-review finding: the file-wide
+/// convention this PR itself establishes — remediation_hint, risk-signals,
+/// break-glass all gate human-oriented phrasing on `ai_env` — must apply
+/// here too). Break-glass display stays a separate, standalone call (not a
+/// table entry): it's a cross-cutting status independent of any one Layer's
+/// check items, and folding it in here would interleave it between the
+/// Layer 1 heading and Layer 1's own FAIL/WARN item list whenever Layer 1
+/// has failures.
+fn section_annotations(section: DoctorSection) -> &'static [fn(bool)] {
+    match section {
+        DoctorSection::Layer1 => &[print_heartbeat_line],
+        DoctorSection::Layer2 | DoctorSection::Integrity => &[],
     }
 }
 
@@ -325,13 +349,22 @@ fn print_risk_signals_section(ai_env: bool) {
     }
 }
 
-fn print_break_glass_section() {
+/// AI environments see only the bypass count, never `rule_id`/remaining-time
+/// detail: `omamori doctor` (unlike `--fix`) is not blocked from AI agents,
+/// so an unconditional detail dump would hand an AI agent an oracle for
+/// exactly which protection rule has an active bypass window and how long it
+/// has left — the same class of leak SEC-R5 already closes for remediation
+/// hints.
+fn print_break_glass_section(ai_env: bool) {
     let entries = crate::break_glass::read_active_entries();
     if entries.is_empty() {
         return;
     }
     println!();
     println!("  [Break-glass] {} active bypass(es)", entries.len());
+    if ai_env {
+        return;
+    }
     for entry in &entries {
         let remaining = entry.remaining_secs().unwrap_or(0);
         println!(
@@ -523,15 +556,37 @@ fn heartbeat_days_ago(path: &Path) -> Option<i64> {
     Some(i64::from(today_jd - mtime_jd))
 }
 
-fn print_heartbeat_line() {
-    let path = match crate::engine::shim::heartbeat_path() {
-        Some(p) => p,
-        None => {
-            println!("    last active: awaiting first invocation");
-            return;
-        }
-    };
-    match heartbeat_days_ago(&path) {
+/// heartbeat is written at the very start of shim execution (Step 1a, before
+/// any policy decision) — so any AI-tool-invoked guarded command, not just a
+/// destructive one, updates it. The non-AI hint deliberately points at a
+/// harmless command instead of the destructive examples earlier drafts used.
+/// AI environments get a shorter form: telling an AI agent to "have your AI
+/// tool run..." (referring to itself) is confusing rather than useful, and
+/// every other doctor-output string this PR gates on `ai_env` follows the
+/// same "run it yourself, directly in your terminal" phrasing (SEC-R5;
+/// /code-review finding — this hint was the one exception).
+fn print_heartbeat_awaiting_hint(ai_env: bool) {
+    if ai_env {
+        println!(
+            "        hint: still awaiting first invocation \u{2014} run a harmless guarded \
+             command, then re-run 'omamori doctor' directly in your terminal (not via AI)."
+        );
+    } else {
+        println!(
+            "        hint: open a new terminal tab, then have your AI tool run a harmless guarded \
+             command (e.g. 'git status'). Re-run 'omamori doctor' \u{2014} this should switch to \
+             \"last active: today\". Still awaiting? check that shims are on PATH."
+        );
+    }
+}
+
+/// Computes the awaiting-vs-active state once (rather than branching on
+/// `heartbeat_path()` returning `None` and `heartbeat_days_ago()` returning
+/// `None` as two separate duplicated cases — /code-review finding) and
+/// prints accordingly.
+fn print_heartbeat_line(ai_env: bool) {
+    let days = crate::engine::shim::heartbeat_path().and_then(|p| heartbeat_days_ago(&p));
+    match days {
         Some(days) if days < 0 => {
             println!("    WARN  last active: future timestamp \u{2014} clock skew detected");
         }
@@ -551,6 +606,7 @@ fn print_heartbeat_line() {
         }
         None => {
             println!("    last active: awaiting first invocation");
+            print_heartbeat_awaiting_hint(ai_env);
         }
     }
 }
@@ -592,9 +648,31 @@ fn heartbeat_json_summary() -> serde_json::Value {
 // Fix mode
 // ---------------------------------------------------------------------------
 
+/// #309: `--fix` previously stayed silent on heartbeat/break-glass — the
+/// exact information someone running `--fix` because shims "aren't working"
+/// most wants (structural checks can all read OK while AI tools still never
+/// invoke the shim). Printed unconditionally by `run_fix`, including its
+/// "nothing to repair" fast path: a stale heartbeat alongside an all-green
+/// structural report is itself the diagnostic signal in that case.
+///
+/// `run_fix` is only reached after DI-7's guard already proved a non-AI
+/// environment (`run_doctor_command`'s `--fix` arm), so `ai_env` is provably
+/// `false` here today — `run_fix` computes it once (mirroring
+/// `run_diagnose`'s own `let ai_env = is_ai_environment();`) and threads it
+/// through rather than each caller re-deriving it, but still passes it (not
+/// a literal `false`) so `print_break_glass_section`'s AI-oracle gate (T8)
+/// holds on its own terms if the guard's placement ever changes.
+fn print_fix_shim_activity_footer(ai_env: bool) {
+    println!();
+    println!("  [Shim activity]");
+    print_heartbeat_line(ai_env);
+    print_break_glass_section(ai_env);
+}
+
 /// Deduplicate and execute repairs in the correct order (DI-10).
 /// Order: RunInstall → RegenerateHooks → ChmodConfig → RegenerateBaseline (last).
 fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, AppError> {
+    let ai_env = is_ai_environment();
     let problems: Vec<_> = items
         .iter()
         .filter(|i| i.status != CheckStatus::Ok)
@@ -602,6 +680,7 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     if problems.is_empty() {
         println!("omamori doctor --fix: nothing to repair, all healthy");
+        print_fix_shim_activity_footer(ai_env);
         return Ok(0);
     }
 
@@ -723,6 +802,8 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
             manual_items.len()
         );
     }
+
+    print_fix_shim_activity_footer(ai_env);
 
     if verbose {
         // Re-check after repair
@@ -1040,6 +1121,33 @@ mod tests {
     // (#349 /simplify) — see `installer::tests::regenerate_hooks_creates_files`
     // and `regenerate_hooks_keeps_existing_hook_on_verification_failure` for
     // the equivalent Written/KeptExisting coverage.
+
+    // --- section_annotations tests (#310) ---
+
+    #[test]
+    fn section_annotations_layer1_has_heartbeat_entry() {
+        assert_eq!(section_annotations(DoctorSection::Layer1).len(), 1);
+    }
+
+    #[test]
+    fn section_annotations_layer2_and_integrity_are_empty() {
+        assert!(section_annotations(DoctorSection::Layer2).is_empty());
+        assert!(section_annotations(DoctorSection::Integrity).is_empty());
+    }
+
+    #[test]
+    fn section_annotations_entries_do_not_panic() {
+        for section in [
+            DoctorSection::Layer1,
+            DoctorSection::Layer2,
+            DoctorSection::Integrity,
+        ] {
+            for annotate in section_annotations(section) {
+                annotate(false);
+                annotate(true);
+            }
+        }
+    }
 
     #[test]
     fn audit_path_writable_true_for_fresh_dir() {
