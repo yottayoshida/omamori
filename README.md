@@ -264,8 +264,8 @@ max_files = 500      # cap on staging file count; oldest deleted first. 0 = disa
 ## CLI Reference
 
 ```
-omamori setup [--dry-run] [--non-interactive]  # One-command install + shell profile + verify
-omamori install [--hooks]                # Install shims + hooks (no shell profile)
+omamori setup [--dry-run] [--non-interactive] [--source PATH]  # One-command install + shell profile + verify
+omamori install [--hooks] [--source PATH]  # Install shims + hooks (no shell profile)
 omamori doctor [--fix] [--verbose] [--json]  # Diagnose and auto-repair installation
 omamori explain [--json] -- <cmd...>     # Show what would happen to a command and why
 omamori test [--config PATH]             # Verify policy rules
@@ -319,11 +319,11 @@ If the above doesn't fix it, check for a **project-level** `.claude/settings.jso
 
 ### Claude Code blocks every Bash command with a hook error that isn't "No such file or directory"
 
-Unlike the missing-path case above, the hook's registered path can exist but still be the wrong binary — for example, if you're developing omamori itself and run `cargo build`/`cargo test` in the repo, the shim's background self-repair can (rarely) resolve its own executable to a stale build artifact and bake that path into the hook script (#349).
+Unlike the missing-path case above, the hook's registered path can exist but still be the wrong binary — for example, if you're developing omamori itself and run `cargo build`/`cargo test` in the repo, the shim's background self-repair could (rarely) resolve its own executable to a stale build artifact and bake that path into the hook script (#349).
 
-omamori now verifies that a resolved path actually satisfies the hook's contract before writing it anywhere: the background self-repair (triggered automatically on version/hash mismatch) silently keeps the existing hook and prints a warning if verification fails, and `omamori install --hooks` — which doubles as the recovery command for this whole class of problem — fails loudly with a non-zero exit instead of reporting success while leaving the old hook in place. `omamori doctor` also detects a hook whose on-disk path no longer passes verification, even if the file's content otherwise looks up to date.
+omamori verifies that a resolved path actually satisfies the hook's contract before writing it anywhere (#349), *and* refuses to persist a path that looks like a `cargo build`/`cargo test` artifact in the first place — `target/debug/...`, `target/release/...`, or the `cargo build --target <triple>` cross-compile layout — even when that binary would otherwise pass verification (#354). Both the background self-repair (triggered automatically on version/hash mismatch) and `omamori install --hooks`/`omamori setup` silently keep the existing hook / fail loudly (respectively) rather than pinning a path the next build can delete or replace out from under you. `omamori doctor` also detects a hook whose on-disk path no longer passes verification, even if the file's content otherwise looks up to date.
 
-**Fix**: same as above — run `omamori install --hooks` in a plain terminal. If it fails, the error message names the broken path; make sure `omamori` on your `PATH` resolves to a stable install (Homebrew-linked or `~/.cargo/bin`), not a `target/debug`/`target/release` build directory, then retry.
+**Fix**: same as above — run `omamori install --hooks` in a plain terminal. If it fails, the error message names the broken path; make sure `omamori` on your `PATH` resolves to a stable install (Homebrew-linked or `~/.cargo/bin`), not a `target/debug`/`target/release` build directory, then retry. If you're intentionally developing omamori itself and want to pin a dev build anyway, pass `--source` explicitly: `omamori install --hooks --source <path>` or `omamori setup --source <path>` — this is the one case where you're making the provenance judgment the check otherwise makes automatically.
 
 ### Contributing to omamori: `cargo test` and your real `~/.claude` / `~/.codex`
 
