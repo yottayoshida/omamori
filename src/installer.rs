@@ -31,6 +31,16 @@ pub struct InstallOptions {
     /// in-process tests substitute a fixed status without spawning a real
     /// binary (the test process's own exe is never a genuine omamori binary).
     pub verify_override: Option<HookVerifier>,
+    /// Whether `source_exe` was explicitly named by the caller (e.g. a
+    /// `--source` flag), as opposed to implicitly resolved from
+    /// `current_exe()` (#354). `false` (the default) subjects `source_exe`
+    /// to the dev-build provenance check in `install()`; `true` is the
+    /// documented recovery path (a human explicitly pointing at a known
+    /// binary) and bypasses it. Never set this to `true` for a path that
+    /// was itself derived from `current_exe()`/`resolve_stable_exe_path()`
+    /// without direct user input — that reintroduces the implicit-resolution
+    /// risk this field exists to distinguish from.
+    pub source_is_explicit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +144,23 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
     // hook artifacts only — it runs after Layer 1 is already linked above, so
     // a hook-contract failure never prevents shim repair.
     if options.generate_hooks {
+        // #354: `source_exe` came from an implicit current-exe resolution
+        // (setup/doctor's auto-repair, or `install` with no `--source`) unless
+        // the caller explicitly marked it. An implicit dev-build path is
+        // rejected here, before even probing the hook-check contract — a
+        // fresh `cargo build` binary can be fully contract-compliant today
+        // and still be the wrong thing to pin (see `is_dev_build_path`).
+        if !options.source_is_explicit && is_dev_build_path(&source_exe) {
+            return Err(AppError::Config(format!(
+                "could not update hooks — resolved binary at {} {DEV_BUILD_PATH_DESCRIPTION}\n\
+                 Layer 1 (PATH shims) was still updated; existing hooks (if any) are kept and protection remains active with the previously installed binary\n\
+                 if this is intentional (e.g. developing omamori itself), pass --source explicitly: `omamori install --hooks --source {}` or `omamori setup --source {}`",
+                source_exe.display(),
+                source_exe.display(),
+                source_exe.display()
+            )));
+        }
+
         let verify = options.verify_override.unwrap_or(verify_hook_contract);
         match verify(&source_exe, HOOK_CONTRACT_TIMEOUT) {
             HookContractStatus::Ok => {}
@@ -365,16 +392,56 @@ pub(crate) enum HookOutcome {
 }
 
 /// Why `regenerate_hooks_with_verifier` kept the existing hook instead of
-/// writing a new one — two unrelated causes that callers must not conflate
+/// writing a new one — three unrelated causes that callers must not conflate
 /// into one message (#349 code review): resolving the current exe can fail
 /// for reasons that have nothing to do with the hook-check contract (e.g.
 /// `std::env::current_exe()` failing in a restrictive container), in which
-/// case the binary was never even probed.
+/// case the binary was never even probed. `NonDeploymentPath` (#354) is a
+/// distinct third cause: the binary resolved and would likely pass contract
+/// verification just fine, but its path is a transient `cargo build` output
+/// directory rather than a stable install — persisting it would silently
+/// repoint the hook at a path the next build can delete or replace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HookKeptReason {
     ExeResolutionFailed,
     VerificationFailed(HookContractStatus),
+    NonDeploymentPath,
 }
+
+/// True if `path` resolves through a Cargo build output directory
+/// (`target/debug/...`, `target/release/...`, or the cross-compile layout
+/// `target/<triple>/debug|release/...` produced by `cargo build --target`)
+/// rather than a stable, deployed install (#354) — the signature of a
+/// `cargo build`/`cargo test` artifact that the next build can delete or
+/// overwrite out from under a persisted hook/shim reference.
+///
+/// Checked as whole path *components*, not a substring — `.contains("target/debug")`
+/// would false-positive on `target/debugger/omamori` (V-018). `cargo install`
+/// output lives under `~/.cargo/bin`, so it never matches. The cross-compile
+/// case is checked with one arbitrary component allowed between `target` and
+/// `debug`/`release` (matching Cargo's own two documented layouts, not an
+/// open-ended "anywhere later" match, which would false-positive on
+/// unrelated paths like `target/staging/release/...`).
+fn is_dev_build_path(path: &Path) -> bool {
+    let components: Vec<_> = path.components().collect();
+    let is_target = |c: &std::path::Component| c.as_os_str() == "target";
+    let is_profile_dir =
+        |c: &std::path::Component| c.as_os_str() == "debug" || c.as_os_str() == "release";
+    components
+        .windows(2)
+        .any(|pair| is_target(&pair[0]) && is_profile_dir(&pair[1]))
+        || components
+            .windows(3)
+            .any(|triple| is_target(&triple[0]) && is_profile_dir(&triple[2]))
+}
+
+/// Diagnostic clause shared by every call site that rejects an implicitly
+/// resolved dev-build path (`install()`, `regenerate_hooks_for_exe`,
+/// `auto_setup_codex_if_needed`, and doctor.rs's `describe_regen_hooks_outcome`)
+/// — kept as a single constant (/simplify review) so a future wording change
+/// can't drift out of sync across the four sites.
+pub(crate) const DEV_BUILD_PATH_DESCRIPTION: &str =
+    "looks like a cargo build artifact (target/debug or target/release), not a stable install";
 
 /// Regenerate hooks only (no shim recreation, no config touch).
 /// Called from shim when version mismatch detected.
@@ -390,9 +457,6 @@ pub(crate) fn regenerate_hooks_with_verifier(
     base_dir: &Path,
     verify: HookVerifier,
 ) -> Result<HookOutcome, std::io::Error> {
-    let hooks_dir = base_dir.join("hooks");
-    fs::create_dir_all(&hooks_dir)?;
-
     // Resolve exe path once, shared by Claude/Cursor/Codex hooks.
     // Fail-close: if resolution fails, skip all hook regeneration rather than
     // falling back to bare `omamori` which would reintroduce PATH vulnerability (#315).
@@ -409,12 +473,42 @@ pub(crate) fn regenerate_hooks_with_verifier(
         }
     };
 
+    regenerate_hooks_for_exe(base_dir, &stable_exe, verify)
+}
+
+/// `regenerate_hooks_with_verifier()` with the resolved exe path also
+/// injectable, so tests can exercise the dev-build-path/contract-verification
+/// logic against a synthetic path instead of the test binary's own
+/// `current_exe()` — which is itself always a `target/debug`/`target/release`
+/// path under `cargo test` and would otherwise trip the #354 check below
+/// before the test even gets to what it's actually checking.
+pub(crate) fn regenerate_hooks_for_exe(
+    base_dir: &Path,
+    stable_exe: &Path,
+    verify: HookVerifier,
+) -> Result<HookOutcome, std::io::Error> {
+    let hooks_dir = base_dir.join("hooks");
+
+    // #354: this path is always implicitly resolved (regenerate_hooks_with_verifier
+    // has no caller-supplied "explicit source" concept — it's the shim's own
+    // silent self-healing path). Reject dev-build artifacts before even probing
+    // the contract: a fresh `cargo build` binary can be fully contract-compliant
+    // today and still be the wrong thing to pin, since `target/debug`/`target/release`
+    // gets overwritten or removed by the next build.
+    if is_dev_build_path(stable_exe) {
+        eprintln!(
+            "omamori warning: resolved exe {} {DEV_BUILD_PATH_DESCRIPTION}; hooks not regenerated. Run: omamori install --hooks --source <stable-path> if this is intentional",
+            stable_exe.display()
+        );
+        return Ok(HookOutcome::KeptExisting(HookKeptReason::NonDeploymentPath));
+    }
+
     // #349: a resolved path that exists is not necessarily a working omamori
     // binary (e.g. a stale dev build from a `cargo build` mid-session). Verify
     // the hook-check contract actually works before persisting the path —
     // otherwise the hook silently repoints to a binary that fails at hook-run
     // time, fail-closing every subsequent Bash call.
-    match verify(&stable_exe, HOOK_CONTRACT_TIMEOUT) {
+    match verify(stable_exe, HOOK_CONTRACT_TIMEOUT) {
         HookContractStatus::Ok => {}
         status => {
             eprintln!(
@@ -427,20 +521,22 @@ pub(crate) fn regenerate_hooks_with_verifier(
         }
     }
 
+    fs::create_dir_all(&hooks_dir)?;
+
     let script_path = hooks_dir.join("claude-pretooluse.sh");
-    atomic_write_script(&script_path, &render_hook_script(&stable_exe))?;
+    atomic_write_script(&script_path, &render_hook_script(stable_exe))?;
 
     let snippet_path = hooks_dir.join("claude-settings.snippet.json");
     atomic_write(&snippet_path, &render_settings_snippet(&script_path))?;
 
     // Cursor hooks
     let cursor_path = hooks_dir.join("cursor-hooks.snippet.json");
-    atomic_write(&cursor_path, &render_cursor_hooks_snippet(&stable_exe))?;
+    atomic_write(&cursor_path, &render_cursor_hooks_snippet(stable_exe))?;
 
     // Codex hooks: regenerate wrapper + re-merge hooks.json
     let codex_wrapper = hooks_dir.join("codex-pretooluse.sh");
     if codex_wrapper.exists() {
-        atomic_write_script(&codex_wrapper, &render_codex_pretooluse_script(&stable_exe))?;
+        atomic_write_script(&codex_wrapper, &render_codex_pretooluse_script(stable_exe))?;
         if let Some(codex_dir) = codex_home_dir()
             && is_real_directory(&codex_dir)
         {
@@ -494,7 +590,7 @@ pub enum HookContractStatus {
 
 /// Signature shared by `verify_hook_contract` and its test doubles. Spelled
 /// out once here rather than at each of its 4 call sites (`InstallOptions`,
-/// `regenerate_hooks_with_verifier`, `ensure_hooks_current_at_with_verifier`,
+/// `regenerate_hooks_with_verifier`, `ensure_hooks_current_at_with_verifier_and_exe`,
 /// `check_claude_settings_integration_with_verifier`) so a signature change
 /// is a one-site edit.
 pub(crate) type HookVerifier = fn(&Path, Duration) -> HookContractStatus;
@@ -1419,16 +1515,33 @@ pub fn auto_setup_codex_if_needed(base_dir: &Path) -> bool {
         return false; // Already configured
     }
 
+    let Some(codex_dir) = codex_home_dir() else {
+        return false; // HOME unset — Codex not detected
+    };
+    if !is_real_directory(&codex_dir) {
+        return false; // Codex not detected — nothing to warn about
+    }
+
     // Codex detected but hooks not set up — auto-configure
     let source_exe = match std::env::current_exe() {
         Ok(exe) => resolve_stable_exe_path(&exe),
         Err(_) => return false,
     };
 
-    let Some(codex_dir) = codex_home_dir() else {
-        return false; // HOME unset — Codex not detected
-    };
-    if !is_real_directory(&codex_dir) {
+    // #354: this is the same silent shim self-heal entry point as
+    // `ensure_hooks_current` (both are called back-to-back from `run_shim`),
+    // resolving `current_exe()` implicitly with no caller-supplied
+    // provenance. Without this check, a dev-build binary would get pinned
+    // into the Codex wrapper (`hooks/codex-pretooluse.sh`) the moment
+    // `CODEX_CI` is detected — the exact persistence this ADR exists to
+    // prevent, just for Codex instead of Claude/Cursor. Checked after the
+    // Codex-presence checks above so the warning only fires when there's
+    // actually a Codex install to configure.
+    if is_dev_build_path(&source_exe) {
+        eprintln!(
+            "omamori warning: resolved exe {} {DEV_BUILD_PATH_DESCRIPTION}; Codex hooks not auto-configured. Run: omamori install --hooks --source <stable-path> if this is intentional",
+            source_exe.display()
+        );
         return false;
     }
 
@@ -1489,6 +1602,222 @@ pub(crate) fn render_codex_hooks_snippet(wrapper_path: &Path) -> String {
 mod tests {
     use super::*;
 
+    // --- is_dev_build_path tests (#354) ---
+
+    #[test]
+    fn is_dev_build_path_matches_target_debug() {
+        assert!(is_dev_build_path(Path::new(
+            "/Users/x/project/target/debug/omamori"
+        )));
+    }
+
+    #[test]
+    fn is_dev_build_path_matches_target_release() {
+        assert!(is_dev_build_path(Path::new(
+            "/Users/x/project/target/release/omamori"
+        )));
+    }
+
+    #[test]
+    fn is_dev_build_path_matches_nested_target_debug_deps() {
+        // The actual shape of a `cargo test` harness binary's own current_exe().
+        assert!(is_dev_build_path(Path::new(
+            "/Users/x/project/target/debug/deps/omamori-abc123"
+        )));
+    }
+
+    #[test]
+    fn is_dev_build_path_does_not_match_debugger_lookalike() {
+        // V-018: substring match on "target/debug" would false-positive here.
+        assert!(!is_dev_build_path(Path::new(
+            "/Users/x/project/target/debugger/omamori"
+        )));
+    }
+
+    #[test]
+    fn is_dev_build_path_does_not_match_stable_install() {
+        assert!(!is_dev_build_path(Path::new("/opt/homebrew/bin/omamori")));
+        assert!(!is_dev_build_path(Path::new("/Users/x/.cargo/bin/omamori")));
+        assert!(!is_dev_build_path(Path::new("/Users/x/.omamori/shim/git")));
+    }
+
+    #[test]
+    fn is_dev_build_path_does_not_match_unrelated_target_dir() {
+        // A "target" directory not followed by debug/release must not match.
+        assert!(!is_dev_build_path(Path::new(
+            "/Users/x/target/config/omamori"
+        )));
+    }
+
+    #[test]
+    fn is_dev_build_path_matches_relative_target_debug() {
+        // No leading "/" — a relative path is a real shape `current_exe()`
+        // resolution can hand back (e.g. under some container/CI setups).
+        assert!(is_dev_build_path(Path::new("target/debug/omamori")));
+        assert!(is_dev_build_path(Path::new("./target/debug/omamori")));
+    }
+
+    #[test]
+    fn is_dev_build_path_does_not_match_hidden_dot_target() {
+        // #354 test-adversarial review: a hidden `.target` directory (as
+        // used by some `CARGO_TARGET_DIR` conventions) is a known, accepted
+        // evasion of the path-component check (documented in ADR-0004's
+        // Consequences) — pinned here so a future edit doesn't "fix" this
+        // boundary by accident and break the documented CARGO_TARGET_DIR
+        // limitation's own reasoning.
+        assert!(!is_dev_build_path(Path::new("/x/.target/debug/omamori")));
+    }
+
+    #[test]
+    fn is_dev_build_path_matches_cross_compile_target_triple() {
+        // Security review (Phase 8): `cargo build --target <triple>` produces
+        // `target/<triple>/debug|release/...` — a standard, undocumented-limitation
+        // Cargo layout the original adjacency-only check missed entirely.
+        assert!(is_dev_build_path(Path::new(
+            "/x/project/target/x86_64-apple-darwin/debug/omamori"
+        )));
+        assert!(is_dev_build_path(Path::new(
+            "/x/project/target/aarch64-unknown-linux-gnu/release/omamori"
+        )));
+    }
+
+    #[test]
+    fn is_dev_build_path_three_component_window_is_component_exact() {
+        // Components with a suffix/prefix ("target-notes", "debug-log") are
+        // not the exact literal "target"/"debug"/"release", so the 3-component
+        // window (added for the cross-compile triple case) does not loosen
+        // the existing component-exact-match guarantee.
+        assert!(!is_dev_build_path(Path::new(
+            "/x/target-notes/staging/debug-log/omamori"
+        )));
+
+        // Accepted tradeoff, pinned deliberately: a literal `target/<anything>/release`
+        // shape DOES match even when the middle component isn't a real Rust
+        // target triple — the 3-component window can't distinguish "some
+        // arbitrary directory happens to sit between target/ and release/"
+        // from Cargo's own `target/<triple>/release/` layout. Narrower than
+        // an open-ended substring/anywhere-later match (see the unrelated-
+        // two-component test above), and a false positive here only means a
+        // legitimate stable install gets asked to pass --source explicitly —
+        // safety guard, not a security boundary (ADR-0004 Consequences).
+        assert!(is_dev_build_path(Path::new(
+            "/x/target/staging/release/omamori"
+        )));
+    }
+
+    // --- regenerate_hooks_for_exe dev-build rejection (#354) ---
+
+    #[test]
+    fn regenerate_hooks_for_exe_rejects_dev_build_path() {
+        let root =
+            std::env::temp_dir().join(format!("omamori-regen-devbuild-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let dev_exe = Path::new("/Users/x/project/target/debug/omamori");
+        let outcome = regenerate_hooks_for_exe(&root, dev_exe, |_, _| {
+            panic!("verifier must not be called when the path is rejected as a dev build")
+        })
+        .unwrap();
+        assert_eq!(
+            outcome,
+            HookOutcome::KeptExisting(HookKeptReason::NonDeploymentPath)
+        );
+        assert!(
+            !root.join("hooks/claude-pretooluse.sh").exists(),
+            "no hook script should be written for a rejected dev-build path"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- install() dev-build rejection (#354) ---
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn install_rejects_implicit_dev_build_source() {
+        let root =
+            std::env::temp_dir().join(format!("omamori-install-devbuild-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+
+        let dev_exe = PathBuf::from("/Users/x/project/target/release/omamori");
+        let result = install(&InstallOptions {
+            base_dir: root.clone(),
+            source_exe: dev_exe.clone(),
+            generate_hooks: true,
+            home_override: Some(root.clone()),
+            verify_override: Some(|_, _| {
+                panic!("verifier must not be called when the path is rejected as a dev build")
+            }),
+            source_is_explicit: false,
+        });
+
+        let err = result.expect_err("install must reject an implicit dev-build source_exe");
+        let message = err.to_string();
+        assert!(
+            message.contains("cargo build artifact"),
+            "message should explain the rejection: {message}"
+        );
+        assert!(
+            message.contains("Layer 1 (PATH shims) was still updated"),
+            "message should state that shim repair was not blocked: {message}"
+        );
+        assert!(
+            message.contains("--source"),
+            "message should point at the explicit-source escape hatch: {message}"
+        );
+        // `.exists()` follows symlinks and would report `false` here since
+        // the fake dev_exe target doesn't actually exist on disk — check the
+        // symlink itself was created, not whether its (synthetic) target resolves.
+        assert!(
+            fs::symlink_metadata(root.join("shim").join("rm")).is_ok(),
+            "shim must still be linked even when the hook-artifact write is rejected"
+        );
+        assert!(
+            !root.join("hooks").join("claude-pretooluse.sh").exists(),
+            "hook script must not be created for a rejected dev-build path"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn install_accepts_explicit_dev_build_source() {
+        let root = std::env::temp_dir().join(format!(
+            "omamori-install-devbuild-explicit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+
+        // Same dev-build-shaped path as the rejection test above, but this
+        // time the caller explicitly named it — the documented recovery path
+        // (e.g. developing omamori itself) must not be blocked.
+        let dev_exe = PathBuf::from("/Users/x/project/target/release/omamori");
+        let result = install(&InstallOptions {
+            base_dir: root.clone(),
+            source_exe: dev_exe.clone(),
+            generate_hooks: true,
+            home_override: Some(root.clone()),
+            verify_override: Some(|_, _| HookContractStatus::Ok),
+            source_is_explicit: true,
+        });
+
+        result.expect("install must accept an explicit dev-build source_exe");
+        assert!(
+            root.join("hooks").join("claude-pretooluse.sh").exists(),
+            "hook script must be created when the dev-build path was explicitly named"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     #[serial_test::serial(home_env)]
     fn install_creates_shims_and_hook_templates() {
@@ -1510,6 +1839,7 @@ mod tests {
             generate_hooks: true,
             home_override: Some(root.clone()),
             verify_override: Some(|_, _| HookContractStatus::Ok),
+            source_is_explicit: false,
         })
         .unwrap();
 
@@ -1695,10 +2025,16 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
-        // Uses the DI seam, not the public `regenerate_hooks()`: the test
-        // binary's own exe is never a genuine omamori binary, so the
-        // production verifier would always reject it (#349).
-        let outcome = regenerate_hooks_with_verifier(&root, |_, _| HookContractStatus::Ok).unwrap();
+        // Uses the exe-injectable DI seam, not the public `regenerate_hooks()`:
+        // the test binary's own `current_exe()` is never a genuine omamori
+        // binary (the production verifier would always reject it, #349) and
+        // is itself always a `target/debug`/`target/release` path under
+        // `cargo test`, which would trip the #354 dev-build check below
+        // before this test gets to what it's actually checking.
+        let fake_exe = root.join("omamori");
+        fs::write(&fake_exe, "binary").unwrap();
+        let outcome =
+            regenerate_hooks_for_exe(&root, &fake_exe, |_, _| HookContractStatus::Ok).unwrap();
         assert_eq!(outcome, HookOutcome::Written);
 
         let hook_path = root.join("hooks/claude-pretooluse.sh");
@@ -1737,8 +2073,12 @@ mod tests {
         let existing_content = "#!/bin/sh\n# omamori hook v0.0.1 (pre-existing)\nexit 0\n";
         fs::write(&hook_path, existing_content).unwrap();
 
+        // See `regenerate_hooks_creates_files` for why this uses the
+        // exe-injectable seam rather than a `target/debug` test-binary path.
+        let fake_exe = root.join("omamori");
+        fs::write(&fake_exe, "binary").unwrap();
         let result =
-            regenerate_hooks_with_verifier(&root, |_, _| HookContractStatus::ExitNonZero(1));
+            regenerate_hooks_for_exe(&root, &fake_exe, |_, _| HookContractStatus::ExitNonZero(1));
         assert_eq!(
             result.unwrap(),
             HookOutcome::KeptExisting(HookKeptReason::VerificationFailed(
@@ -2105,6 +2445,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn resolve_stable_exe_path_of_shim_pointing_at_dev_build_is_flagged() {
+        // #354 test-adversarial review: the composed chain that actually
+        // matters end-to-end — a shim symlink resolving through to a
+        // `target/debug`/`target/release` binary must be recognized by
+        // `is_dev_build_path` on the *resolved* path, not just on a raw
+        // synthetic path handed directly to the predicate.
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-devbuild-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let target_debug = dir.join("target").join("debug");
+        fs::create_dir_all(&target_debug).unwrap();
+        let dev_bin = target_debug.join("omamori");
+        fs::write(&dev_bin, "binary").unwrap();
+
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        let shim_path = shim_dir.join("git");
+        std::os::unix::fs::symlink(&dev_bin, &shim_path).unwrap();
+
+        let resolved = resolve_stable_exe_path(&shim_path);
+        assert_eq!(
+            resolved, dev_bin,
+            "shim should resolve to the dev-build binary"
+        );
+        assert!(
+            is_dev_build_path(&resolved),
+            "resolved shim target must be flagged as a dev-build path: {}",
+            resolved.display()
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shim_to_real_exe_rejects_non_omamori_target() {
         let dir = std::env::temp_dir().join(format!("omamori-shim-reject-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -2241,6 +2616,7 @@ mod tests {
             generate_hooks: true,
             home_override: Some(dir.clone()),
             verify_override: Some(|_, _| HookContractStatus::Ok),
+            source_is_explicit: false,
         })
         .unwrap();
 
@@ -2944,8 +3320,51 @@ mod tests {
         }
     }
 
-    // Note: Testing CODEX_CI=1 + no wrapper requires setting env var (unsafe in Rust 2024)
-    // and having a valid codex home dir. This is covered by integration tests (E-01~E-05).
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn auto_setup_codex_rejects_implicit_dev_build_source() {
+        // #354: the test binary's own current_exe() is always a
+        // target/debug (or target/release) path under `cargo test` — the
+        // exact shape this check exists to reject, no injection needed.
+        // SAFETY: serial_test ensures no concurrent access to env vars
+        let saved = std::env::var_os("CODEX_CI");
+        unsafe { std::env::set_var("CODEX_CI", "1") };
+
+        let home =
+            std::env::temp_dir().join(format!("omamori-codex-devbuild-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _guard = HomeGuard::set(Some(home.as_os_str()));
+
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-codex-devbuild-base-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = auto_setup_codex_if_needed(&dir);
+        assert!(
+            !result,
+            "must reject an implicit dev-build source instead of auto-configuring"
+        );
+        assert!(
+            !dir.join("hooks").join("codex-pretooluse.sh").exists(),
+            "codex wrapper must not be written for an implicit dev-build source"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&dir);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CODEX_CI", v) };
+        } else {
+            unsafe { std::env::remove_var("CODEX_CI") };
+        }
+    }
+
+    // Note: Testing CODEX_CI=1 + no wrapper + a genuine (non-dev-build) source
+    // requires an injectable exe seam this function doesn't have. Covered by
+    // manual verification only; see PR description.
 
     // ---------------------------------------------------------------------
     // Claude Code settings.json merge tests (#196)
@@ -3082,6 +3501,7 @@ mod tests {
                 generate_hooks: true,
                 home_override: None,
                 verify_override: Some(|_, _| HookContractStatus::Ok),
+                source_is_explicit: false,
             })
         };
 
@@ -3123,6 +3543,7 @@ mod tests {
             generate_hooks: true,
             home_override: Some(root.clone()),
             verify_override: Some(|_, _| HookContractStatus::ExitNonZero(1)),
+            source_is_explicit: false,
         });
 
         let err = result.expect_err("install must fail loudly when verification fails");
@@ -3177,6 +3598,7 @@ mod tests {
             verify_override: Some(|_, _| {
                 panic!("verifier must not be called when generate_hooks is false")
             }),
+            source_is_explicit: false,
         });
 
         assert!(result.is_ok(), "install without --hooks must not verify");

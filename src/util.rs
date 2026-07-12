@@ -17,9 +17,9 @@ pub(crate) fn usage_text() -> &'static str {
 omamori — AI tool safety guard
 
 ESSENTIALS
-  setup [--dry-run] [--non-interactive]            One-command install + shell profile + verify
-  doctor                                          Check protection health
-  test                                            Verify policy rules match expected actions
+  setup [--dry-run] [--non-interactive] [--source PATH] Install + shell profile + verify
+  doctor                                                Check protection health
+  test                                                  Verify policy rules match expected actions
 
 DIAGNOSTICS
   report [--last <duration>] [--json] [--verbose] Aggregate audit summary
@@ -48,9 +48,9 @@ pub(crate) fn usage_text_full() -> &'static str {
 omamori — AI tool safety guard
 
 ESSENTIALS
-  setup [--dry-run] [--non-interactive]            One-command install + shell profile + verify
-  doctor                                          Check protection health
-  test                                            Verify policy rules match expected actions
+  setup [--dry-run] [--non-interactive] [--source PATH] Install + shell profile + verify
+  doctor                                                Check protection health
+  test                                                  Verify policy rules match expected actions
 
 DIAGNOSTICS
   report [--last <duration>] [--json] [--verbose] Aggregate audit summary

@@ -38,6 +38,7 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut dry_run = false;
     let mut non_interactive = false;
     let mut base_dir: Option<PathBuf> = None;
+    let mut source_override: Option<PathBuf> = None;
     let mut index = 2usize;
 
     while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
@@ -55,6 +56,13 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
                     AppError::Usage("setup requires a path after --base-dir".to_string())
                 })?;
                 base_dir = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--source" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    AppError::Usage("setup requires a path after --source".to_string())
+                })?;
+                source_override = Some(PathBuf::from(value));
                 index += 2;
             }
             _ => {
@@ -91,11 +99,18 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     println!("\nomamori setup \u{2014} one-command installation\n");
     println!("  [1/3] Installing shims and hooks...");
 
-    let source_exe = installer::resolve_stable_exe_path(&env::current_exe()?);
+    let (source_exe, source_is_explicit) = match source_override {
+        Some(path) => (path, true),
+        None => (
+            installer::resolve_stable_exe_path(&env::current_exe()?),
+            false,
+        ),
+    };
     let result = installer::install(&InstallOptions {
         base_dir: base_dir.clone(),
         source_exe,
         generate_hooks: true,
+        source_is_explicit,
         ..Default::default()
     })?;
 
