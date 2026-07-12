@@ -37,10 +37,16 @@ fn clean_ai_env(cmd: &mut Command) -> &mut Command {
 }
 
 /// `omamori install --base-dir <base_dir> --source <this test binary> --hooks
-/// --env HOME=<home>`, asserting success. Shared by the Batch C PR-C1 doctor
-/// tests, which each need an identical real install before exercising
-/// `doctor`/`doctor --fix` (/code-review finding: this 12-line block was
-/// copy-pasted 3 times).
+/// --env HOME=<home> --env XDG_CONFIG_HOME=<home>/.config`, asserting success.
+/// Shared by the Batch C PR-C1 doctor tests, which each need an identical
+/// real install before exercising `doctor`/`doctor --fix` (/code-review
+/// finding: this 12-line block was copy-pasted 3 times). `XDG_CONFIG_HOME`
+/// is pinned alongside `HOME` — CI runners can have it set ambiently, which
+/// would make `default_config_path()` resolve outside `home` entirely,
+/// silently missing any config.toml a test plants there (caught by CI: the
+/// initial version of this helper omitted this and passed locally but
+/// failed on both CI runners, matching the isolation convention every other
+/// config-touching test in this file already follows).
 fn install_with_hooks(base_dir: &std::path::Path, home: &std::path::Path) {
     let mut install_cmd = Command::new(binary());
     clean_ai_env(&mut install_cmd);
@@ -52,6 +58,7 @@ fn install_with_hooks(base_dir: &std::path::Path, home: &std::path::Path) {
         .arg(binary())
         .arg("--hooks")
         .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("failed to run omamori install");
     assert!(
@@ -2997,6 +3004,7 @@ fn doctor_awaiting_heartbeat_shows_hint_and_json_stays_unchanged() {
         .arg("--base-dir")
         .arg(&base_dir)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("failed to run omamori doctor");
     let human_stdout = String::from_utf8_lossy(&human.stdout);
@@ -3049,6 +3057,7 @@ fn doctor_awaiting_heartbeat_shows_hint_and_json_stays_unchanged() {
         .arg(&base_dir)
         .arg("--json")
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("failed to run omamori doctor --json");
     let json: serde_json::Value =
@@ -3085,6 +3094,7 @@ fn doctor_awaiting_heartbeat_hint_differs_in_ai_env() {
         .arg("--base-dir")
         .arg(&base_dir)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("failed to run omamori doctor (human)");
     let human_stdout = String::from_utf8_lossy(&human.stdout);
@@ -3102,6 +3112,7 @@ fn doctor_awaiting_heartbeat_hint_differs_in_ai_env() {
         .arg("--base-dir")
         .arg(&base_dir)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("CLAUDECODE", "1")
         .output()
         .expect("failed to run omamori doctor (AI env)");
@@ -3154,6 +3165,7 @@ fn doctor_break_glass_detail_suppressed_in_ai_env() {
     let human = human_cmd
         .arg("doctor")
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("failed to run omamori doctor (human)");
     let human_stdout = String::from_utf8_lossy(&human.stdout);
@@ -3165,6 +3177,7 @@ fn doctor_break_glass_detail_suppressed_in_ai_env() {
     let ai = Command::new(binary())
         .arg("doctor")
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("CLAUDECODE", "1")
         .output()
         .expect("failed to run omamori doctor (AI env)");
@@ -3209,6 +3222,7 @@ fn doctor_fix_shows_shim_activity_footer_when_healthy() {
         .arg("--base-dir")
         .arg(&base_dir)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("PATH", &healthy_path)
         .output()
         .expect("failed to run omamori doctor --fix");
@@ -3269,6 +3283,7 @@ fn doctor_fix_shows_shim_activity_footer_after_an_actual_repair() {
         .arg("--base-dir")
         .arg(&base_dir)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("PATH", &healthy_path)
         .output()
         .expect("failed to run omamori doctor --fix");
@@ -3323,6 +3338,7 @@ fn doctor_reports_hook_version_drift_in_human_and_json_output() {
         .arg("--base-dir")
         .arg(&base_dir)
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("failed to run omamori doctor");
     let human_stdout = String::from_utf8_lossy(&human.stdout);
@@ -3344,6 +3360,7 @@ fn doctor_reports_hook_version_drift_in_human_and_json_output() {
         .arg(&base_dir)
         .arg("--json")
         .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .expect("failed to run omamori doctor --json");
     let json: serde_json::Value =
