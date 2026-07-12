@@ -36,6 +36,31 @@ fn clean_ai_env(cmd: &mut Command) -> &mut Command {
         .env_remove("AI_GUARD")
 }
 
+/// `omamori install --base-dir <base_dir> --source <this test binary> --hooks
+/// --env HOME=<home>`, asserting success. Shared by the Batch C PR-C1 doctor
+/// tests, which each need an identical real install before exercising
+/// `doctor`/`doctor --fix` (/code-review finding: this 12-line block was
+/// copy-pasted 3 times).
+fn install_with_hooks(base_dir: &std::path::Path, home: &std::path::Path) {
+    let mut install_cmd = Command::new(binary());
+    clean_ai_env(&mut install_cmd);
+    let install = install_cmd
+        .arg("install")
+        .arg("--base-dir")
+        .arg(base_dir)
+        .arg("--source")
+        .arg(binary())
+        .arg("--hooks")
+        .env("HOME", home)
+        .output()
+        .expect("failed to run omamori install");
+    assert!(
+        install.status.success(),
+        "install should succeed. stderr: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+}
+
 #[test]
 fn omamori_test_command_succeeds_with_defaults() {
     let output = Command::new(binary())
@@ -2950,6 +2975,390 @@ message = "test: blocking ls /tmp"
         output.status.success(),
         "install must succeed even when the real user config would block the probe payload; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&base_dir);
+    let _ = fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// doctor display integration tests (Batch C PR-C1: #310/#309/#326/#327)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_awaiting_heartbeat_shows_hint_and_json_stays_unchanged() {
+    let base_dir = unique_dir("doctor-awaiting-base");
+    let home = unique_dir("doctor-awaiting-home");
+
+    let mut human_cmd = Command::new(binary());
+    clean_ai_env(&mut human_cmd);
+    let human = human_cmd
+        .arg("doctor")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori doctor");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("awaiting first invocation"),
+        "stdout: {human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("hint:") && human_stdout.contains("git status"),
+        "awaiting state should print the non-destructive hint: {human_stdout}"
+    );
+    // Plan V-012: hint must not steer the user toward a destructive command.
+    // Scoped to the hint line itself — the shim inventory above it legitimately
+    // lists a shim command literally named "rm", which would false-positive a
+    // whole-stdout substring check.
+    let hint_line = human_stdout
+        .lines()
+        .find(|line| line.contains("hint:"))
+        .expect("already asserted a hint: line is present above");
+    assert!(
+        !hint_line.contains("rm "),
+        "awaiting hint must not suggest a destructive command: {hint_line}"
+    );
+    // #310 test-adversarial finding: proves the heartbeat annotation is
+    // actually wired through `section_annotations` at the Layer 1 slot, not
+    // merely printed somewhere in the output — a test only checking
+    // substring presence would still pass if the hardcoded
+    // `if section == Layer1 { print_heartbeat_line() }` special case were
+    // reintroduced (or moved to the wrong section) instead of going through
+    // the table.
+    let layer1_pos = human_stdout
+        .find("[Layer 1]")
+        .expect("stdout should contain [Layer 1] heading");
+    let layer2_pos = human_stdout
+        .find("[Layer 2]")
+        .expect("stdout should contain [Layer 2] heading");
+    let awaiting_pos = human_stdout
+        .find("awaiting first invocation")
+        .expect("already asserted present above");
+    assert!(
+        layer1_pos < awaiting_pos && awaiting_pos < layer2_pos,
+        "heartbeat annotation must render between [Layer 1] and [Layer 2]: {human_stdout}"
+    );
+
+    let mut json_cmd = Command::new(binary());
+    clean_ai_env(&mut json_cmd);
+    let json_out = json_cmd
+        .arg("doctor")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .arg("--json")
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori doctor --json");
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_out.stdout).expect("doctor --json must produce valid JSON");
+    let shim_activity = &json["summary"]["shim_activity"];
+    assert_eq!(shim_activity["status"], "awaiting_first_invocation");
+    let mut keys: Vec<&String> = shim_activity.as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["last_active_days_ago", "status"],
+        "#326's hint is human-output only — shim_activity's JSON shape must stay exactly \
+         {{last_active_days_ago, status}}, no new keys"
+    );
+
+    let _ = fs::remove_dir_all(&base_dir);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn doctor_awaiting_heartbeat_hint_differs_in_ai_env() {
+    // /code-review finding: the awaiting-state hint was the one doctor-output
+    // string this PR didn't gate on ai_env, unlike remediation_hint and
+    // print_break_glass_section. Confirms the human and AI phrasing actually
+    // differ, and that the AI phrasing doesn't refer to "your AI tool" (which
+    // reads as nonsensical when the reader IS the AI tool).
+    let base_dir = unique_dir("doctor-awaiting-aihint-base");
+    let home = unique_dir("doctor-awaiting-aihint-home");
+
+    let mut human_cmd = Command::new(binary());
+    clean_ai_env(&mut human_cmd);
+    let human = human_cmd
+        .arg("doctor")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori doctor (human)");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    let human_hint = human_stdout
+        .lines()
+        .find(|line| line.contains("hint:"))
+        .expect("human output should contain a hint line");
+    assert!(
+        human_hint.contains("your AI tool"),
+        "human hint: {human_hint}"
+    );
+
+    let ai = Command::new(binary())
+        .arg("doctor")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .env("HOME", &home)
+        .env("CLAUDECODE", "1")
+        .output()
+        .expect("failed to run omamori doctor (AI env)");
+    let ai_stdout = String::from_utf8_lossy(&ai.stdout);
+    let ai_hint = ai_stdout
+        .lines()
+        .find(|line| line.contains("hint:"))
+        .expect("AI env output should contain a hint line");
+    assert!(
+        !ai_hint.contains("your AI tool"),
+        "AI env hint must not refer to 'your AI tool': {ai_hint}"
+    );
+    assert!(
+        ai_hint.contains("not via AI"),
+        "AI env hint should follow the SEC-R5 'directly in your terminal (not via AI)' \
+         convention: {ai_hint}"
+    );
+    assert_ne!(human_hint, ai_hint);
+
+    let _ = fs::remove_dir_all(&base_dir);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn doctor_break_glass_detail_suppressed_in_ai_env() {
+    let home = unique_dir("doctor-bg-home");
+    let data_dir = home.join(".local").join("share").join("omamori");
+    fs::create_dir_all(&data_dir).unwrap();
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::minutes(30);
+    let state = serde_json::json!({
+        "version": 1,
+        "entries": [{
+            "rule_id": "some-custom-rule-block",
+            "activated_at": time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "expires_at": expires
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        }]
+    });
+    fs::write(
+        data_dir.join("break-glass.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    let mut human_cmd = Command::new(binary());
+    clean_ai_env(&mut human_cmd);
+    let human = human_cmd
+        .arg("doctor")
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori doctor (human)");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("some-custom-rule-block") && human_stdout.contains("remaining"),
+        "non-AI env should show rule_id and remaining time: {human_stdout}"
+    );
+
+    let ai = Command::new(binary())
+        .arg("doctor")
+        .env("HOME", &home)
+        .env("CLAUDECODE", "1")
+        .output()
+        .expect("failed to run omamori doctor (AI env)");
+    let ai_stdout = String::from_utf8_lossy(&ai.stdout);
+    assert!(
+        ai_stdout.contains("1 active bypass(es)"),
+        "AI env should still show the count: {ai_stdout}"
+    );
+    assert!(
+        !ai_stdout.contains("some-custom-rule-block") && !ai_stdout.contains("remaining"),
+        "T8: AI env must not see which rule or how much time is left: {ai_stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn doctor_fix_shows_shim_activity_footer_when_healthy() {
+    let base_dir = unique_dir("doctor-fix-footer-base");
+    let home = unique_dir("doctor-fix-footer-home");
+    // `merge_claude_settings` only runs when `~/.claude` already exists as a
+    // real directory (its signal for "Claude Code is installed") — without
+    // this, `check_claude_settings_integration` stays WARN and `problems`
+    // is never empty, so the "nothing to repair" fast path this test targets
+    // would be unreachable.
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    install_with_hooks(&base_dir, &home);
+
+    // `check_path_order` reads the live `PATH` env var — the shim dir is
+    // never actually on this test process's PATH, so without overriding it
+    // here that check permanently WARNs and `problems` is never empty
+    // either. Order it correctly (shim dir before /usr/bin) to reach the
+    // fast path this test targets.
+    let shim_dir = base_dir.join("shim");
+    let healthy_path = format!("{}:/usr/bin:/bin", shim_dir.display());
+
+    let mut fix_cmd = Command::new(binary());
+    clean_ai_env(&mut fix_cmd);
+    let fix = fix_cmd
+        .arg("doctor")
+        .arg("--fix")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .env("HOME", &home)
+        .env("PATH", &healthy_path)
+        .output()
+        .expect("failed to run omamori doctor --fix");
+    assert!(
+        fix.status.success(),
+        "doctor --fix should succeed on a healthy install. stderr: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+    let fix_stdout = String::from_utf8_lossy(&fix.stdout);
+    assert!(
+        fix_stdout.contains("nothing to repair"),
+        "stdout: {fix_stdout}"
+    );
+    assert!(
+        fix_stdout.contains("[Shim activity]") && fix_stdout.contains("last active:"),
+        "#309: --fix's own output must show shim activity even on the \
+         nothing-to-repair fast path: {fix_stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&base_dir);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn doctor_fix_shows_shim_activity_footer_after_an_actual_repair() {
+    // #309 test-adversarial finding: the "nothing to repair" fast path was
+    // the only path covered — this exercises the footer print AFTER real
+    // remediation work, not just on the early return. Uses a `ChmodConfig`
+    // fixable issue specifically because it needs no exe resolution (unlike
+    // `RunInstall`/`RegenerateHooks`, which would hit #354's dev-build-path
+    // rejection here: this subprocess's own `current_exe()` under `cargo
+    // test` IS a `target/debug` path).
+    let base_dir = unique_dir("doctor-fix-repair-base");
+    let home = unique_dir("doctor-fix-repair-home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    install_with_hooks(&base_dir, &home);
+
+    let config_dir = home.join(".config").join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Wrong mode (world/group-readable) — the Config integrity check
+        // wants exactly 0o600, triggering a `ChmodConfig` remediation.
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    let shim_dir = base_dir.join("shim");
+    let healthy_path = format!("{}:/usr/bin:/bin", shim_dir.display());
+
+    let mut fix_cmd = Command::new(binary());
+    clean_ai_env(&mut fix_cmd);
+    let fix = fix_cmd
+        .arg("doctor")
+        .arg("--fix")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .env("HOME", &home)
+        .env("PATH", &healthy_path)
+        .output()
+        .expect("failed to run omamori doctor --fix");
+    assert!(
+        fix.status.success(),
+        "doctor --fix should succeed after a plain chmod repair. stderr: {}",
+        String::from_utf8_lossy(&fix.stderr)
+    );
+    let fix_stdout = String::from_utf8_lossy(&fix.stdout);
+    assert!(
+        fix_stdout.contains("chmod 600") && fix_stdout.contains("[fixed]"),
+        "control: fixture must actually trigger a repair for this test to be \
+         meaningful: {fix_stdout}"
+    );
+    assert!(
+        fix_stdout.contains("[Shim activity]") && fix_stdout.contains("last active:"),
+        "#309: the footer must also appear after real repair work, not only \
+         on the nothing-to-repair fast path: {fix_stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&base_dir);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn doctor_reports_hook_version_drift_in_human_and_json_output() {
+    let base_dir = unique_dir("doctor-drift-base");
+    let home = unique_dir("doctor-drift-home");
+    install_with_hooks(&base_dir, &home);
+
+    // Tamper only the version comment line — same technique #327's own unit
+    // tests use (src/integrity.rs's `script_with_version` fixture) — this
+    // also makes the content hash mismatch, exercising the real "hash
+    // MISMATCH + drift suffix" combination a stale post-upgrade hook hits.
+    let hook_path = base_dir.join("hooks").join("claude-pretooluse.sh");
+    let current = fs::read_to_string(&hook_path).unwrap();
+    let tampered = current.replacen(
+        &format!("# omamori hook v{}", env!("CARGO_PKG_VERSION")),
+        "# omamori hook v0.0.1",
+        1,
+    );
+    assert_ne!(
+        tampered, current,
+        "fixture setup bug: version substitution did not change the installed hook script"
+    );
+    fs::write(&hook_path, &tampered).unwrap();
+
+    let mut human_cmd = Command::new(binary());
+    clean_ai_env(&mut human_cmd);
+    let human = human_cmd
+        .arg("doctor")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori doctor");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("version drift"),
+        "stdout: {human_stdout}"
+    );
+    assert!(human_stdout.contains("v0.0.1"), "stdout: {human_stdout}");
+    assert!(
+        human_stdout.contains(env!("CARGO_PKG_VERSION")),
+        "stdout: {human_stdout}"
+    );
+
+    let mut json_cmd = Command::new(binary());
+    clean_ai_env(&mut json_cmd);
+    let json_out = json_cmd
+        .arg("doctor")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .arg("--json")
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori doctor --json");
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_out.stdout).expect("doctor --json must produce valid JSON");
+    let hook_item = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["name"] == "claude-pretooluse.sh")
+        .expect("claude-pretooluse.sh item must be present in JSON output");
+    let detail = hook_item["detail"].as_str().unwrap();
+    assert!(detail.contains("v0.0.1"), "detail: {detail}");
+    assert!(
+        detail.contains(env!("CARGO_PKG_VERSION")),
+        "detail: {detail}"
     );
 
     let _ = fs::remove_dir_all(&base_dir);
