@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.12.4] - 2026-07-12
+
+**Summary**: doctor display consistency batch (#310, #309, #326, #327). Replaces a hardcoded per-section special case with a data-driven annotation table, surfaces heartbeat and break-glass in `doctor --fix` output, adds a non-destructive next-action hint for a fresh install, and detects hook version drift even when exe resolution fails — the exact scenario that previously masked staleness entirely. Also closes an existing AI-oracle gap in break-glass detail and hardens hook version-comment parsing against terminal-hostile content.
+
+### Fixed
+
+- **`doctor --fix` now shows heartbeat and break-glass status**, including on its "nothing to repair" fast path — previously silent on both, even though a stale heartbeat alongside an all-green structural report is itself the most relevant diagnostic for someone running `--fix` because shims "aren't working." ([#309](https://github.com/yottayoshida/omamori/issues/309))
+- **A hook script's version drift from the running binary is now detected even when exe resolution fails** — the exact scenario (e.g. a broken Homebrew Cellar symlink) that previously masked staleness entirely, since the pre-existing hash-comparison check depends on exe resolution succeeding and silently skipped when it didn't. The drift check reads the script's own `# omamori hook v{X}` comment directly, independent of exe resolution, and is purely advisory — the sha256 baseline stays the sole authority on tampering. Version comments are also validated against a plausible-version shape before being echoed into a human-terminal message, rejecting control characters/ANSI escapes an attacker could use to cloak a tamper warning, and distinguishing "no version comment" from "comment present but rejected as suspicious." ([#327](https://github.com/yottayoshida/omamori/issues/327))
+- **Break-glass `rule_id`/remaining-time detail is now suppressed to a bare count in AI-executable output paths** — plain `omamori doctor` (unlike `--fix`, not blocked from AI environments) previously showed this detail unconditionally, giving an AI agent an oracle for exactly which protection rule has an active bypass window and how long it has left.
+
+### Added
+
+- **doctor's per-section informational lines (currently: heartbeat) now render through a data-driven `section_annotations` table** instead of a hardcoded `if section == Layer1 { ... }` special case, so a second annotation is a table addition rather than a new branch. ([#310](https://github.com/yottayoshida/omamori/issues/310))
+- **A non-destructive next-action hint prints when heartbeat is awaiting its first invocation** — points at re-running a harmless guarded command (e.g. `git status`) via the AI tool and checking PATH, with separate phrasing for AI vs. human environments. ([#326](https://github.com/yottayoshida/omamori/issues/326))
+
 ## [0.12.3] - 2026-07-12
 
 **Summary**: Security hardening batch (#359, #323, #306, #320, #321, #324, #354). Four fixes closing gaps in HOME resolution, protected-file matching, break-glass expiry auditing, and hook exec-path provenance.
