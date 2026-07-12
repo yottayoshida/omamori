@@ -1068,6 +1068,115 @@ fn install_generates_integrity_baseline() {
 }
 
 // ---------------------------------------------------------------------------
+// dev-build provenance rejection tests (#354)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn install_hooks_rejects_implicit_dev_build_source() {
+    let dir = unique_dir("install-devbuild");
+    let home = unique_dir("install-devbuild-home");
+
+    // No --source: source_exe resolves implicitly to the running binary's
+    // own current_exe(), which under `cargo test` IS a target/debug (or
+    // target/release) path — exactly the shape #354 rejects.
+    let output = Command::new(binary())
+        .arg("install")
+        .arg("--base-dir")
+        .arg(dir.to_str().unwrap())
+        .arg("--hooks")
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori install");
+
+    assert!(
+        !output.status.success(),
+        "install --hooks with an implicit dev-build source must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cargo build artifact"),
+        "stderr should explain the rejection: {stderr}"
+    );
+    assert!(
+        !dir.join("hooks").join("claude-pretooluse.sh").exists(),
+        "hook script must not be written for an implicit dev-build source"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn install_hooks_accepts_explicit_dev_build_source() {
+    let dir = unique_dir("install-devbuild-explicit");
+    let home = unique_dir("install-devbuild-explicit-home");
+
+    // Same underlying binary as the implicit case above, but named via
+    // --source — the documented recovery/dev-workflow path, must succeed.
+    let output = Command::new(binary())
+        .arg("install")
+        .arg("--base-dir")
+        .arg(dir.to_str().unwrap())
+        .arg("--source")
+        .arg(binary())
+        .arg("--hooks")
+        .env("HOME", &home)
+        .output()
+        .expect("failed to run omamori install");
+
+    assert!(
+        output.status.success(),
+        "install --hooks --source <dev-build-path> must succeed. stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.join("hooks").join("claude-pretooluse.sh").exists(),
+        "hook script must be written when the dev-build path was explicitly named"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn setup_rejects_implicit_dev_build_source() {
+    let home = unique_dir("setup-devbuild-home");
+
+    // No --source flag at all here (mirrors real `cargo run -- setup` /
+    // `omamori setup` invoked directly from a dev checkout).
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("SHELL", "/bin/zsh")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup");
+
+    assert!(
+        !output.status.success(),
+        "setup with an implicit dev-build source must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cargo build artifact"),
+        "stderr should explain the rejection: {stderr}"
+    );
+    assert!(
+        !home
+            .join(".omamori")
+            .join("hooks")
+            .join("claude-pretooluse.sh")
+            .exists(),
+        "hook script must not be written for an implicit dev-build source"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
 // hook-check Auto mode compatibility tests (#62)
 // ---------------------------------------------------------------------------
 
@@ -2336,7 +2445,8 @@ fn setup_non_interactive_installs_and_appends() {
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
     let output = cmd
-        .args(["setup", "--non-interactive"])
+        .args(["setup", "--non-interactive", "--source"])
+        .arg(binary())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("SHELL", "/bin/zsh")
@@ -2389,7 +2499,8 @@ fn setup_idempotent_no_duplicate_path() {
         let mut cmd = Command::new(binary());
         clean_ai_env(&mut cmd);
         let output = cmd
-            .args(["setup", "--non-interactive"])
+            .args(["setup", "--non-interactive", "--source"])
+            .arg(binary())
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("SHELL", "/bin/zsh")
@@ -2425,7 +2536,8 @@ fn setup_unknown_shell_exits_2() {
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
     let output = cmd
-        .args(["setup", "--non-interactive"])
+        .args(["setup", "--non-interactive", "--source"])
+        .arg(binary())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env_remove("SHELL")
@@ -2461,6 +2573,8 @@ fn setup_ai_env_skips_profile() {
     let output = Command::new(binary())
         .args(["setup", "--base-dir"])
         .arg(&base)
+        .args(["--source"])
+        .arg(binary())
         .env("HOME", &home)
         .env("SHELL", "/bin/zsh")
         .env("CLAUDECODE", "1")
@@ -2500,7 +2614,8 @@ fn setup_already_configured_exits_0() {
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
     let output = cmd
-        .args(["setup", "--non-interactive"])
+        .args(["setup", "--non-interactive", "--source"])
+        .arg(binary())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("SHELL", "/bin/zsh")
@@ -2559,7 +2674,8 @@ fn setup_bash_uses_bashrc() {
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
     let output = cmd
-        .args(["setup", "--non-interactive"])
+        .args(["setup", "--non-interactive", "--source"])
+        .arg(binary())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("SHELL", "/bin/bash")
@@ -2593,7 +2709,8 @@ fn setup_bash_prefers_bash_profile() {
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
     let output = cmd
-        .args(["setup", "--non-interactive"])
+        .args(["setup", "--non-interactive", "--source"])
+        .arg(binary())
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("SHELL", "/bin/bash")

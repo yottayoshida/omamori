@@ -659,31 +659,15 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
     // 2. RegenerateHooks (only if install wasn't needed)
     if needs_regen_hooks {
         print!("  [Layer 2] regenerating hook scripts...");
-        match installer::regenerate_hooks_with_verifier(base_dir, installer::verify_hook_contract) {
-            Ok(installer::HookOutcome::Written) => {
-                println!(" [fixed]");
-                fixed += 1;
-            }
-            Ok(installer::HookOutcome::KeptExisting(
-                installer::HookKeptReason::VerificationFailed(status),
-            )) => {
-                println!(
-                    " [FAILED] resolved binary failed the hook-check contract ({status:?}); existing hook kept — try `omamori install --hooks`"
-                );
-                failed += 1;
-            }
-            Ok(installer::HookOutcome::KeptExisting(
-                installer::HookKeptReason::ExeResolutionFailed,
-            )) => {
-                println!(
-                    " [FAILED] could not resolve the current omamori binary; existing hook kept — try `omamori install --hooks`"
-                );
-                failed += 1;
-            }
-            Err(e) => {
-                println!(" [FAILED] {e}");
-                failed += 1;
-            }
+        let outcome = describe_regen_hooks_outcome(installer::regenerate_hooks_with_verifier(
+            base_dir,
+            installer::verify_hook_contract,
+        ));
+        println!("{}", outcome.message());
+        if outcome.is_failure() {
+            failed += 1;
+        } else {
+            fixed += 1;
         }
     }
 
@@ -818,6 +802,67 @@ fn run_fix_silent(items: &[CheckItem], base_dir: &Path) -> Result<(), AppError> 
 // ---------------------------------------------------------------------------
 // Repair helpers
 // ---------------------------------------------------------------------------
+
+/// Outcome of `describe_regen_hooks_outcome`: the `[Layer 2]` print line
+/// paired with whether it counts as a failure. An enum rather than a
+/// `(String, bool)` tuple so the fixed/failure classification is enforced by
+/// the match in `describe_regen_hooks_outcome` (and by `is_failure`'s own
+/// exhaustive match below) rather than trusted convention at each call site
+/// (/simplify review).
+enum RegenHooksOutcome {
+    Fixed(String),
+    Failed(String),
+}
+
+impl RegenHooksOutcome {
+    fn message(&self) -> &str {
+        match self {
+            RegenHooksOutcome::Fixed(m) | RegenHooksOutcome::Failed(m) => m,
+        }
+    }
+
+    fn is_failure(&self) -> bool {
+        matches!(self, RegenHooksOutcome::Failed(_))
+    }
+}
+
+/// Formats `regenerate_hooks_with_verifier`'s result into the `[Layer 2]`
+/// print line and whether it counts as a failure. Pure and separated from
+/// `run_fix`'s orchestration specifically so every `HookKeptReason` variant's
+/// message can be pinned directly, without needing to reproduce the
+/// underlying condition (exe-resolution failure, contract-verification
+/// failure, dev-build path) end-to-end — `run_fix` has no verifier/exe DI
+/// seam of its own, so in-process tests can only ever drive whichever branch
+/// the *test binary's own* `current_exe()` happens to hit (#354 test
+/// adversarial review: this used to be `VerificationFailed` before #354, and
+/// silently became `NonDeploymentPath` once the test binary's `target/debug`
+/// path started tripping the new check first — the existing test's `code == 1`
+/// assertion couldn't tell the difference, so `VerificationFailed`'s message
+/// lost direct coverage without any test failing).
+fn describe_regen_hooks_outcome(
+    result: Result<installer::HookOutcome, std::io::Error>,
+) -> RegenHooksOutcome {
+    match result {
+        Ok(installer::HookOutcome::Written) => RegenHooksOutcome::Fixed(" [fixed]".to_string()),
+        Ok(installer::HookOutcome::KeptExisting(
+            installer::HookKeptReason::VerificationFailed(status),
+        )) => RegenHooksOutcome::Failed(format!(
+            " [FAILED] resolved binary failed the hook-check contract ({status:?}); existing hook kept — try `omamori install --hooks`"
+        )),
+        Ok(installer::HookOutcome::KeptExisting(
+            installer::HookKeptReason::ExeResolutionFailed,
+        )) => RegenHooksOutcome::Failed(
+            " [FAILED] could not resolve the current omamori binary; existing hook kept — try `omamori install --hooks`".to_string(),
+        ),
+        Ok(installer::HookOutcome::KeptExisting(
+            installer::HookKeptReason::NonDeploymentPath,
+        )) => RegenHooksOutcome::Failed(format!(
+            " [FAILED] resolved binary {}; existing hook kept — rebuild from a stable path, or run `omamori install --hooks --source <path>` explicitly",
+            installer::DEV_BUILD_PATH_DESCRIPTION
+        )),
+        Err(e) => RegenHooksOutcome::Failed(format!(" [FAILED] {e}")),
+    }
+}
 
 fn run_install_repair(base_dir: &Path) -> Result<(), AppError> {
     let source_exe = std::env::current_exe()?;
@@ -1282,15 +1327,20 @@ mod tests {
     }
 
     #[test]
-    fn fix_regenerate_hooks_reports_failed_when_verification_keeps_existing() {
+    fn fix_regenerate_hooks_reports_failed_when_kept_existing() {
         // #349 QA gap: this is the exact re-derivation of Codex Round 1's P0
         // ("doctor --fix reports [fixed] for a silent no-op"). In a test
-        // process, `resolved_current_omamori_exe()` resolves to the test
-        // harness binary — never a genuine omamori binary — so the
-        // production verifier naturally rejects it here, driving
-        // `regenerate_hooks_with_verifier` to `KeptExisting` without any
-        // stub injection. `run_fix` has no verifier-DI seam of its own, so
-        // this is the only way to exercise its `KeptExisting` branch.
+        // process, `current_exe()` resolves to the test harness binary —
+        // itself always a `target/debug`/`target/release` path under
+        // `cargo test` — so `regenerate_hooks_with_verifier` drives
+        // `KeptExisting(NonDeploymentPath)` here (#354's dev-build check,
+        // not the production contract verifier this test originally
+        // exercised pre-#354; `run_fix` has no verifier/exe DI seam of its
+        // own, so whichever `KeptExisting` reason the test binary's own path
+        // happens to trip is the only one reachable this way — see
+        // `describe_regen_hooks_outcome_*` below for direct per-variant
+        // message coverage, including `VerificationFailed`, which this test
+        // can no longer reach).
         let items = vec![CheckItem {
             category: "Hooks",
             name: "claude-pretooluse.sh".to_string(),
@@ -1305,10 +1355,83 @@ mod tests {
         let code = run_fix(&items, &base_dir, false).unwrap();
         assert_eq!(
             code, 1,
-            "run_fix must report a failed exit code, not [fixed], when verification keeps the existing hook"
+            "run_fix must report a failed exit code, not [fixed], when the hook is kept existing"
         );
 
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    // --- describe_regen_hooks_outcome (#354 test-adversarial follow-up) ---
+    //
+    // Direct, per-variant coverage of the [Layer 2] message/failure
+    // classification — restores the `VerificationFailed` coverage that
+    // `fix_regenerate_hooks_reports_failed_when_kept_existing` lost when
+    // #354's dev-build check started intercepting the test binary's own
+    // `current_exe()` before verification ever ran.
+
+    #[test]
+    fn describe_regen_hooks_outcome_written_is_fixed_not_failure() {
+        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::Written));
+        assert_eq!(outcome.message(), " [fixed]");
+        assert!(!outcome.is_failure());
+    }
+
+    #[test]
+    fn describe_regen_hooks_outcome_verification_failed_is_failure() {
+        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::KeptExisting(
+            installer::HookKeptReason::VerificationFailed(
+                installer::HookContractStatus::ExitNonZero(1),
+            ),
+        )));
+        assert!(outcome.is_failure());
+        let message = outcome.message();
+        assert!(
+            message.contains("failed the hook-check contract"),
+            "message: {message}"
+        );
+        assert!(message.contains("ExitNonZero(1)"), "message: {message}");
+    }
+
+    #[test]
+    fn describe_regen_hooks_outcome_exe_resolution_failed_is_failure() {
+        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::KeptExisting(
+            installer::HookKeptReason::ExeResolutionFailed,
+        )));
+        assert!(outcome.is_failure());
+        assert!(
+            outcome
+                .message()
+                .contains("could not resolve the current omamori binary"),
+            "message: {}",
+            outcome.message()
+        );
+    }
+
+    #[test]
+    fn describe_regen_hooks_outcome_non_deployment_path_is_failure() {
+        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::KeptExisting(
+            installer::HookKeptReason::NonDeploymentPath,
+        )));
+        assert!(outcome.is_failure());
+        assert!(
+            outcome.message().contains("cargo build artifact"),
+            "message: {}",
+            outcome.message()
+        );
+    }
+
+    #[test]
+    fn describe_regen_hooks_outcome_err_is_failure() {
+        let outcome = describe_regen_hooks_outcome(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )));
+        assert!(outcome.is_failure());
+        assert!(
+            outcome.message().contains("permission denied"),
+            "message: {}",
+            outcome.message()
+        );
     }
 
     #[test]

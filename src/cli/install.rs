@@ -14,6 +14,7 @@ use crate::util::USAGE_HINT;
 pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut base_dir = default_base_dir();
     let mut source_exe = installer::resolve_stable_exe_path(&env::current_exe()?);
+    let mut source_is_explicit = false;
     let mut generate_hooks = false;
     let mut index = 2usize;
 
@@ -31,6 +32,7 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
                     AppError::Usage("install requires a path after --source".to_string())
                 })?;
                 source_exe = PathBuf::from(value);
+                source_is_explicit = true;
                 index += 2;
             }
             "--hooks" => {
@@ -50,6 +52,7 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
         base_dir,
         source_exe,
         generate_hooks,
+        source_is_explicit,
         ..Default::default()
     })?;
 
