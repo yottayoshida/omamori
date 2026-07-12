@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.12.3] - 2026-07-12
+
+**Summary**: Security hardening batch (#359, #323, #306, #320, #321, #324, #354). Four fixes closing gaps in HOME resolution, protected-file matching, break-glass expiry auditing, and hook exec-path provenance.
+
+### Fixed
+
+- **HOME resolution now fails closed across every security-state path** — `HOME` being unset, empty, or relative previously let heartbeat, break-glass state, staging files, the default audit log path, and config resolve against the current working directory instead of failing closed. A new shared `data_dir()` helper (`is_absolute()`-filtered) is now the single constructor for `~/.local/share/omamori`, and the audit log path is rerouted through the same fail-closed logic without touching `secret.rs`'s read/write-protected internals. ([#359](https://github.com/yottayoshida/omamori/issues/359), [#323](https://github.com/yottayoshida/omamori/issues/323), [#306](https://github.com/yottayoshida/omamori/issues/306))
+- **Protected-file matching replaced substring containment with a `MatchKind` enum** (`Subpath`/`ExactFile`/`FilenamePrefix`/`FilenameSuffix`) — the old substring check both over-matched (`audit.jsonl.md` incidentally contains `audit.jsonl`) and would have under-matched if naively replaced with pure path-component matching (filename-only artifacts like `audit.jsonl.hwm.tmp` or `audit-secret.1.retired` don't appear as their own path component). Each pattern is now matched the way that file is actually named on disk. `--provider` is also normalized to a closed taxonomy (`claude-code`/`codex`/`unknown`/`invalid`) rather than flowing an attacker-controlled string straight into the audit chain. ([#320](https://github.com/yottayoshida/omamori/issues/320), [#321](https://github.com/yottayoshida/omamori/issues/321))
+- **Break-glass entry expiry is now recorded as a `break-glass-expired-observed` audit-chain event** — previously, an expired bypass was silently dropped from state with no trace in the audit log. The new event fires when `activate()` or `clear_rule()` prunes an expired entry (state-first + audit-best-effort: the state write always succeeds, a failed audit append only produces a warning). The entry's `rule_id` is sanity-checked against known bypassable rules before being treated as chain-legitimate, since break-glass state itself has no HMAC protection. A latent bug was also fixed in the same change: `clear_rule()` never pruned expired sibling entries before this release, only the exact targeted rule. ([#324](https://github.com/yottayoshida/omamori/issues/324))
+- **A resolved omamori exe under a `target/debug`/`target/release` (or `cargo build --target <triple>` cross-compile) path is no longer silently persisted as the permanent hook-exec target or used to auto-configure Codex hooks.** This is additive to the existing hook-check contract verification (#349) — a `cargo build` binary can be fully contract-compliant and still be the wrong thing to pin, since the next build can delete or replace it. Gated at four call sites: the shim's silent self-heal for Claude/Cursor hooks, its Codex-specific counterpart, `install()` (only when `--source` wasn't given explicitly), and the newly-added `omamori setup --source` flag. Passing `--source` explicitly always bypasses the check — this is the documented recovery/dev-workflow path, not something being closed. ([#354](https://github.com/yottayoshida/omamori/issues/354))
+
+### Added
+
+- `omamori setup` gained a `--source PATH` flag, mirroring `install`'s existing one, so the dev-build provenance check above has the same explicit escape hatch on both commands.
+
 ## [0.12.2] - 2026-07-11
 
 **Summary**: Lockout safety hardening (#357, #356, #355, #353). omamori's own tooling shouldn't be able to lock a user out or corrupt their environment without a clear, self-contained recovery path. This release closes three gaps found in that class: an uninstall-time symlink-following bug, a test-suite isolation backstop, and a wrapper-level recovery hint for the exact lockout scenario that made #349 hard to diagnose.
