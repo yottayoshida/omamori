@@ -418,6 +418,14 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "phase2-self-protect-config-enable-block",
     ),
+    // DI-13 parity (PR-C2, #325): `config add` must be caught by the same
+    // Phase 2 backstop as disable/enable, so the PATH-shim/hook layer defends
+    // it even if the env-based runtime guard is defeated (e.g. `env -i`).
+    (
+        "omamori config add some-rule --command rm --action log-only",
+        Decision::Block,
+        "phase2-self-protect-config-add-block",
+    ),
     (
         "omamori uninstall",
         Decision::Block,
@@ -1138,6 +1146,11 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         "sudo omamori config disable rm-recursive",
         Decision::Block,
         "fn-sudo-config-disable-block",
+    ),
+    (
+        "sudo omamori config add some-rule --command rm --action log-only",
+        Decision::Block,
+        "fn-sudo-config-add-block",
     ),
     // v0.10.4: non-TRANSPARENT wrappers (xargs/time/find/parallel) and
     // data-context vectors (echo "$(...)") were caught by the deleted

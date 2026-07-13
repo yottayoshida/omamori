@@ -1,7 +1,11 @@
 //! AI environment guard for config-mutating operations.
 //!
 //! SECURITY (T3): `guard_ai_config_modification` must be called on every
-//! config-mutating code path (9 call sites as of v0.9.0).
+//! config-mutating code path. (A call-site *count* used to be pinned here,
+//! but it went stale at least twice as new mutating subcommands were added
+//! without updating it — /code-review R1 finding. Grep for
+//! `guard_ai_config_modification(` to see the current call sites instead of
+//! trusting a number in this comment.)
 
 use crate::AppError;
 use crate::config;

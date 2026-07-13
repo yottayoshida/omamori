@@ -109,7 +109,7 @@ name = "omamori-config-modify-block"
 command = "omamori"
 action = "block"
 subcommand = "config"
-match_any = ["disable", "enable"]
+match_any = ["disable", "enable", "add"]
 message = "omamori blocked self-modification of rules"
 
 [[rules]]

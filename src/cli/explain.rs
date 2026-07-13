@@ -371,6 +371,16 @@ mod tests {
         assert!(result.blocked);
     }
 
+    /// DI-13 parity: `config add` must be caught by the same Phase 2 backstop
+    /// rule as `config disable`/`enable`, not rely solely on the runtime
+    /// `guard_ai_config_modification` env check (which `env -i` can defeat).
+    #[test]
+    fn layer2_phase2_rule_blocks_config_add() {
+        let result = evaluate_layer2("omamori config add evil-rule --command rm --action log-only");
+        assert!(result.blocked);
+        assert!(result.phase.contains("omamori-config-modify-block"));
+    }
+
     #[test]
     fn verdict_blocked_if_either_layer_blocks() {
         // Layer 1 allow + Layer 2 block = blocked
