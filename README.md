@@ -303,6 +303,8 @@ omamori --version                        # Show version
 
 ## Troubleshooting
 
+Stuck on something else — a false positive, a temporary bypass, "why was this blocked?", or a staging-file message? Start with the [FAQ](docs/FAQ.md). This section covers the hook-error class of problems specifically.
+
 ### Claude Code blocks every Bash command with a "hook error" / "No such file or directory"
 
 This means the hook script registered in `~/.claude/settings.json` points at a path that no longer exists (e.g. a Homebrew Cellar path from a removed version, or a build directory that was cleaned up). omamori's hooks are fail-close by design, so a missing hook script blocks everything rather than silently allowing it.

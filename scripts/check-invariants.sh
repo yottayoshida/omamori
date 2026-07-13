@@ -436,6 +436,115 @@ echo "DI-15 RETIRED (v0.10.4): subst_depth removed with strip_quoted_data"
 # audit_log_hook_allow_relaxed and layer2:relaxed: removed with relaxed_by infrastructure.
 echo "DI-16 RETIRED (v0.10.4): relaxed_by audit path removed with meta-pattern infrastructure"
 
+# ---------- Invariant: faq-doc-sync (#328, PR-C3) ----------
+# docs/FAQ.md must not rot against the code and SECURITY.md it points into:
+#   (a) every `SECURITY.md#anchor` the FAQ references must resolve to a real
+#       heading (regenerated here with GitHub's anchor rules: lowercase,
+#       strip everything but [a-z0-9 _-], spaces -> hyphens);
+#   (b) every `omamori <subcommand>` the FAQ shows the user -- in a fenced
+#       ```bash example or backtick-quoted in prose -- must resolve to a real
+#       dispatch arm. Checked at both words: the top-level verb against
+#       src/lib.rs, and, for the commands that have their own sub-verbs
+#       (config/override/audit), the second word against the file that
+#       actually dispatches it -- a one-word check alone would pass
+#       "omamori config bogus-verb" as long as "config" itself is real.
+faq_fail=0
+faq=docs/FAQ.md
+if [ ! -f "$faq" ]; then
+    echo "FAIL [invariant faq-doc-sync/#328]: $faq is missing"
+    faq_fail=1
+else
+    # (a) SECURITY.md anchors, regenerated with GitHub's anchor rules:
+    # lowercase, strip everything but [a-z0-9 _-], spaces -> hyphens.
+    # LC_ALL=C forces byte-mode processing (a plain multi-byte tr/sed would
+    # otherwise mangle the em dash differently); in byte mode, the em dash's
+    # bytes are simply stripped by the character class, which matches
+    # GitHub's own behavior for "Not caught — by design": the em dash
+    # vanishes and its surrounding spaces each become a hyphen ("--").
+    # Each extraction is wrapped in `(... || true)`: under this script's
+    # global `set -euo pipefail`, a grep matching zero lines exits 1, which
+    # would otherwise abort the whole invariants-check script right here
+    # instead of reaching the FAIL diagnostics below.
+    security_anchors=$( (grep -E '^#+ ' SECURITY.md || true) | sed -E 's/^#+ //' \
+        | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+        | LC_ALL=C sed 's/[^a-z0-9 _-]//g; s/ /-/g')
+    faq_anchors=$( (grep -oE 'SECURITY\.md#[a-z0-9_-]+' "$faq" || true) | sed 's/.*#//' | sort -u)
+    for a in $faq_anchors; do
+        if ! printf '%s\n' "$security_anchors" | grep -qxF "$a"; then
+            echo "FAIL [invariant faq-doc-sync/#328]: FAQ references SECURITY.md#$a but no heading generates that anchor"
+            faq_fail=1
+        fi
+    done
+
+    # (b) omamori subcommand references. check_omamori_ref verifies `top` is
+    # a real src/lib.rs dispatch arm and, if `sub` is non-empty, that `sub`
+    # is a real dispatch arm in whichever file handles `top`'s own sub-verbs.
+    # A top-level command with no entry in the case below fails loudly on a
+    # two-word reference instead of silently passing -- that's a prompt to
+    # extend the case statement, not a bug.
+    check_omamori_ref() {
+        top=$1
+        sub=$2
+        if ! grep -qF "Some(\"$top\")" src/lib.rs; then
+            echo "FAIL [invariant faq-doc-sync/#328]: FAQ uses 'omamori $top' but src/lib.rs has no such subcommand"
+            faq_fail=1
+            return
+        fi
+        [ -z "$sub" ] && return
+        case "$top" in
+            config|override) subfile="src/cli/config_cmd.rs" ;;
+            audit) subfile="src/cli/audit_cmd.rs" ;;
+            *) subfile="" ;;
+        esac
+        if [ -z "$subfile" ]; then
+            echo "FAIL [invariant faq-doc-sync/#328]: FAQ uses 'omamori $top $sub' but this invariant doesn't know which file dispatches '$top' sub-verbs -- add '$top' to the case statement in scripts/check-invariants.sh"
+            faq_fail=1
+        elif ! grep -qF "Some(\"$sub\")" "$subfile"; then
+            echo "FAIL [invariant faq-doc-sync/#328]: FAQ uses 'omamori $top $sub' but $subfile has no '$sub' arm"
+            faq_fail=1
+        fi
+    }
+    # Extract "<top> [<sub>]" pairs from two places: fenced ```bash examples
+    # (fence patterns allow leading whitespace -- blocks nested inside
+    # Markdown list items are indented, and an anchored /^```bash/ silently
+    # skips them, caught by mutation-testing this invariant) and
+    # backtick-quoted mentions in running prose (e.g. "`omamori doctor`"), so
+    # a reference isn't invisible to this check just because of where in the
+    # doc it happens to be formatted. The second word only counts as a
+    # sub-verb candidate if it starts with a letter (`[a-z][a-z-]*`) --
+    # excludes flags (`--rule`) and placeholders (`<rule-name>`), which
+    # would otherwise be misread as an unknown sub-verb.
+    # Both greps are wrapped in `(... || true)` for the same reason as (a):
+    # zero matches (e.g. a FAQ with no bash examples, or none in prose) would
+    # otherwise make this whole assignment fail under pipefail and abort the
+    # script via set -e before either scan's real findings get evaluated.
+    faq_pairs=$( { \
+        awk '/^[[:space:]]*```bash/{inblock=1; next} /^[[:space:]]*```/{inblock=0} inblock' "$faq" \
+            | (grep -oE '(^|[ `(])omamori [a-z][a-z-]*( [a-z][a-z-]*)?' || true) | sed -E 's/.*omamori //'; \
+        (grep -oE '`omamori [a-z][a-z-]*( [a-z][a-z-]*)?' "$faq" || true) | sed -E 's/`omamori //'; \
+    } | sort -u)
+    while IFS= read -r pair; do
+        [ -z "$pair" ] && continue
+        top=${pair%% *}
+        if [ "$top" = "$pair" ]; then
+            check_omamori_ref "$top" ""
+        else
+            check_omamori_ref "$top" "${pair#* }"
+        fi
+    done <<FAQ_PAIRS_EOF
+$faq_pairs
+FAQ_PAIRS_EOF
+fi
+if [ "$faq_fail" -eq 0 ]; then
+    # Scope note: this only pins structural references (anchor targets exist,
+    # subcommand/sub-verb names exist) -- it does NOT verify semantic claims
+    # in the prose (durations, retention counts, "as of version X"). Those
+    # still need a human to re-check on future FAQ or behavior changes.
+    echo "faq-doc-sync OK: docs/FAQ.md SECURITY.md anchors and omamori subcommand references all resolve (#328)"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"
