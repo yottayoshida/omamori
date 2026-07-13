@@ -3381,3 +3381,983 @@ fn doctor_reports_hook_version_drift_in_human_and_json_output() {
     let _ = fs::remove_dir_all(&base_dir);
     let _ = fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// config add tests (PR-C2, #325)
+// ---------------------------------------------------------------------------
+
+/// The 14 core (built-in) safety rule ids — mirrors `config::core_rule_names()`.
+/// Hardcoded here (this file is a black-box binary test, no crate import) so a
+/// future addition to that list is caught by drift between this constant and
+/// the real one, not silently under-tested.
+const CORE_RULE_IDS: &[&str] = &[
+    "rm-recursive-to-trash",
+    "git-reset-hard-stash",
+    "git-push-force-block",
+    "git-clean-force-block",
+    "chmod-777-block",
+    "find-delete-block",
+    "rsync-delete-block",
+    "omamori-config-modify-block",
+    "omamori-uninstall-block",
+    "omamori-init-force-block",
+    "omamori-override-block",
+    "omamori-doctor-fix-block",
+    "omamori-explain-block",
+    "omamori-break-glass-block",
+];
+
+fn config_add_cmd(dir: &std::path::Path) -> Command {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.env("XDG_CONFIG_HOME", dir).env_remove("HOME");
+    cmd
+}
+
+fn config_add_init(dir: &std::path::Path) {
+    let out = config_add_cmd(dir).args(["init"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "init should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// V-001: a rule created by `config add` loads cleanly and fires in `explain`.
+#[test]
+fn config_add_creates_rule_that_fires_in_explain() {
+    let dir = unique_dir("cfg-add-fires");
+    config_add_init(&dir);
+
+    let add_out = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "my-ls-guard",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "--omamori-poc-target",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "add should succeed, stderr: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let add_stderr = String::from_utf8_lossy(&add_out.stderr);
+    assert!(
+        add_stderr.contains("Added rule `my-ls-guard`"),
+        "stderr: {add_stderr}"
+    );
+
+    let validate_out = config_add_cmd(&dir)
+        .args(["config", "validate"])
+        .output()
+        .unwrap();
+    assert!(
+        validate_out.status.success(),
+        "config should load cleanly (degraded=false) after add, stderr: {}",
+        String::from_utf8_lossy(&validate_out.stderr)
+    );
+
+    let explain_out = config_add_cmd(&dir)
+        .args(["explain", "--", "ls", "--omamori-poc-target"])
+        .output()
+        .unwrap();
+    assert!(
+        explain_out.status.success() || explain_out.status.code() == Some(2),
+        "explain should run to completion, stderr: {}",
+        String::from_utf8_lossy(&explain_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&explain_out.stdout);
+    assert!(
+        stdout.contains("rule: my-ls-guard"),
+        "explain should show the newly added rule matched: {stdout}"
+    );
+    assert!(stdout.contains("Verdict: BLOCK"), "stdout: {stdout}");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// /code-review R1 finding: a successful `add` must still surface an
+/// unrelated pre-existing warning in the same file, matching `disable`/
+/// `enable` (both end by calling `run_config_list()` -> `emit_config_warnings`).
+/// Checking only `post.degraded` would silently swallow it.
+#[test]
+fn config_add_surfaces_unrelated_preexisting_warning() {
+    let dir = unique_dir("cfg-add-unrelated-warning");
+    config_add_init(&dir);
+
+    // Hand-plant a malformed *different-named* rule: `merge_rules` skips it
+    // with a warning (missing command/action) but does NOT degrade the file.
+    let config_path = dir.join("omamori").join("config.toml");
+    let mut content = fs::read_to_string(&config_path).unwrap();
+    content.push_str("\n[[rules]]\nname = \"some-other-broken-rule\"\n");
+    fs::write(&config_path, &content).unwrap();
+
+    let add_out = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "unrelated-new-rule",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&add_out.stderr);
+    assert!(
+        stderr.contains("some-other-broken-rule") && stderr.contains("missing"),
+        "a successful add must still surface an unrelated pre-existing warning: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// V-002: `config add` is blocked when an AI detector env var is present,
+/// same as `config disable`/`enable`.
+#[test]
+fn config_add_blocked_in_ai_session() {
+    let dir = unique_dir("cfg-add-ai-block");
+    config_add_init(&dir);
+
+    let output = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "some-rule",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+        ])
+        .env("CLAUDECODE", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "should be blocked, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("blocked"), "stderr: {stderr}");
+
+    // The config file must be untouched — guard runs before any write.
+    let config_path = dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !content.contains("some-rule"),
+        "blocked add must not write anything: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// V-004 (DI-13): every core rule id is rejected as a shadow target, not just
+/// the one used in ad-hoc manual testing.
+#[test]
+fn config_add_rejects_all_core_rule_ids() {
+    let dir = unique_dir("cfg-add-core-shadow");
+    config_add_init(&dir);
+    let config_path = dir.join("omamori").join("config.toml");
+    let before = fs::read_to_string(&config_path).unwrap();
+
+    for id in CORE_RULE_IDS {
+        let output = config_add_cmd(&dir)
+            .args([
+                "config",
+                "add",
+                id,
+                "--command",
+                "ls",
+                "--action",
+                "log-only",
+                "--match-any",
+                "-l",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "core id `{id}` must be rejected, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("core safety rule") && stderr.contains("DI-13"),
+            "id `{id}`: stderr should explain the DI-13 rejection: {stderr}"
+        );
+    }
+
+    let after = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(
+        after, before,
+        "no rejected add for a core id may have written anything to the file"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Cross-check `CORE_RULE_IDS` (hardcoded here since this is a black-box
+/// binary test with no crate import) against the live core-rule count via
+/// `omamori config list`'s "core"-sourced rows. If a future core rule is
+/// added to `core_rule_names()` without updating `CORE_RULE_IDS`, this test
+/// fails on a count mismatch instead of silently under-testing DI-13 shadow
+/// rejection for the new rule (Codex adversarial review finding).
+#[test]
+fn core_rule_ids_constant_matches_live_core_rule_count() {
+    let dir = unique_dir("cfg-core-count-check");
+    config_add_init(&dir);
+
+    let list_out = config_add_cmd(&dir)
+        .args(["config", "list"])
+        .output()
+        .unwrap();
+    assert!(list_out.status.success());
+    let stdout = String::from_utf8_lossy(&list_out.stdout);
+    let core_row_count = stdout
+        .lines()
+        .filter(|line| line.trim_end().ends_with("core"))
+        .count();
+
+    assert_eq!(
+        core_row_count,
+        CORE_RULE_IDS.len(),
+        "CORE_RULE_IDS (len {}) is out of sync with the live core rule count ({core_row_count}). \
+         Update the CORE_RULE_IDS constant in this file.\nfull output:\n{stdout}",
+        CORE_RULE_IDS.len()
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// V-006 / AD1: adding a rule name that already exists (custom, not core) is
+/// rejected rather than silently ignored by `merge_rules`' first-wins dedup.
+#[test]
+fn config_add_rejects_duplicate_rule_name() {
+    let dir = unique_dir("cfg-add-dup");
+    config_add_init(&dir);
+
+    let first = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "dup-rule",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "first add should succeed");
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let after_first = fs::read_to_string(&config_path).unwrap();
+
+    let second = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "dup-rule",
+            "--command",
+            "ls",
+            "--action",
+            "trash",
+            "--match-any",
+            "-a",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !second.status.success(),
+        "duplicate name must be rejected, stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("already exists"), "stderr: {stderr}");
+
+    // The file must be byte-for-byte unchanged — not just "still exactly one
+    // `dup-rule` name" (which a bug that mutates the existing entry's action/
+    // message/match tokens before rejecting would still satisfy).
+    let after_second = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(
+        after_second, after_first,
+        "a rejected duplicate add must not modify the existing entry's fields"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Codex R1 P0: a pre-existing *malformed* raw entry (missing command/action,
+/// so `merge_rules` skips it with only a warning — not `degraded`) sharing
+/// the new rule's name must still be caught. Before the fix, the dup check
+/// only consulted the *merged* rule set, which never contained the malformed
+/// entry — so `add` would report success while claiming a name that
+/// `merge_rules`'s first-name-wins semantics had already given away to the
+/// broken entry, silently dropping the newly-added (valid) rule on next load.
+#[test]
+fn config_add_rejects_duplicate_name_against_malformed_raw_entry() {
+    let dir = unique_dir("cfg-add-dup-malformed");
+    config_add_init(&dir);
+
+    let config_path = dir.join("omamori").join("config.toml");
+    // Hand-plant a malformed entry (name only, no command/action) — this is
+    // exactly what `merge_rules` skips-with-warning rather than `degraded`.
+    let mut content = fs::read_to_string(&config_path).unwrap();
+    content.push_str("\n[[rules]]\nname = \"shadowed-by-malformed\"\n");
+    fs::write(&config_path, &content).unwrap();
+
+    // Sanity: the file still loads as non-degraded (a skipped rule is just a
+    // warning), confirming this really does bypass a merged-rule-set check.
+    let validate_out = config_add_cmd(&dir)
+        .args(["config", "validate"])
+        .output()
+        .unwrap();
+    assert!(
+        validate_out.status.success(),
+        "a malformed custom rule alone must not degrade the config, stderr: {}",
+        String::from_utf8_lossy(&validate_out.stderr)
+    );
+
+    let add_out = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "shadowed-by-malformed",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !add_out.status.success(),
+        "add must reject a name already claimed by a malformed raw entry, stderr: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&add_out.stderr).contains("already exists"),
+        "stderr: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    let after = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(
+        after, content,
+        "rejected add must not modify the file at all"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// V-005 / AD9 (SECURITY T2): metacharacters in flag values cannot inject a
+/// sibling TOML table. `toml_edit`'s typed value API escapes them.
+#[test]
+fn config_add_escapes_metacharacters_without_corrupting_config() {
+    let dir = unique_dir("cfg-add-injection");
+    config_add_init(&dir);
+
+    let malicious_message = "x\"\n[audit]\nenabled = false\n[[rules]]\nname = \"evil";
+    let output = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "injection-test",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+            "--message",
+            malicious_message,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "add with metacharacters in --message should still succeed (value is escaped), stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+
+    // Re-parse with the independent `toml` crate (mirrors mutate_config's failsafe):
+    // exactly one rule named "injection-test" and no injected `[audit]` override
+    // or second `evil` rule.
+    let parsed: toml::Value =
+        toml::from_str(&content).expect("written config must still be valid TOML");
+    let rules = parsed["rules"].as_array().expect("rules array");
+    assert_eq!(
+        rules
+            .iter()
+            .filter(|r| r["name"].as_str() == Some("injection-test"))
+            .count(),
+        1,
+        "exactly one injection-test rule: {content}"
+    );
+    assert!(
+        rules.iter().all(|r| r["name"].as_str() != Some("evil")),
+        "no injected `evil` rule: {content}"
+    );
+    assert!(
+        parsed
+            .get("audit")
+            .and_then(|a| a.get("enabled"))
+            .and_then(|v| v.as_bool())
+            != Some(false),
+        "injected [audit] override must not take effect: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// AD6/AD7: a bad `--destination` is rejected before writing, not silently
+/// disabled after the fact the way post-load `validate_rules` does it.
+#[test]
+fn config_add_rejects_bad_destination_before_writing() {
+    let dir = unique_dir("cfg-add-bad-dest");
+    config_add_init(&dir);
+
+    // "system" uses `/etc` itself (guaranteed to exist on macOS/Linux CI runners):
+    // `validate_destination`'s blocked-prefix check runs on `Path::canonicalize()`,
+    // which requires the full path to already exist on disk — a nonexistent
+    // subdirectory under a blocked prefix (e.g. `/etc/made-up-name`) silently
+    // passes this pre-write check. That's a real gap in the pre-existing
+    // `validate_destination` helper (shared with post-load `validate_rules`),
+    // tracked separately (issue TBD) — it isn't a security bypass because
+    // `move_to_dir` fails closed at execution time when the destination
+    // doesn't exist (src/actions.rs:106), it just means the rule silently
+    // scaffolds as "added" instead of being rejected at add-time.
+    for (label, dest) in [("relative", "backup/quarantine"), ("system", "/etc")] {
+        let output = config_add_cmd(&dir)
+            .args([
+                "config",
+                "add",
+                "dest-test",
+                "--command",
+                "rm",
+                "--action",
+                "move-to",
+                "--match-any",
+                "-rf",
+                "--destination",
+                dest,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{label} destination `{dest}` must be rejected, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let config_path = dir.join("omamori").join("config.toml");
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !content.contains("dest-test"),
+            "{label} destination must not be written: {content}"
+        );
+    }
+
+    // /code-review R1 finding: an earlier version of the error-message
+    // cleanup stripped `validate_destination`'s "; rule disabled" trailing
+    // clause via `str::split`, which matches that substring ANYWHERE in the
+    // message — including inside the `--destination` value itself once
+    // interpolated — silently truncating the real failure reason. A
+    // destination containing the literal substring must still show the
+    // actual reason ("not an absolute path"), not get cut off before it.
+    let injected = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "dest-injection-test",
+            "--command",
+            "rm",
+            "--action",
+            "move-to",
+            "--match-any",
+            "-rf",
+            "--destination",
+            "; rule disabled bogus",
+        ])
+        .output()
+        .unwrap();
+    assert!(!injected.status.success());
+    let stderr = String::from_utf8_lossy(&injected.stderr);
+    assert!(
+        stderr.contains("not an absolute path"),
+        "the real rejection reason must survive even when --destination contains \
+         the message-stripping substring: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Usage-error surface (QA G-1/G-2/G-3 + Codex② Major): missing --command,
+/// missing --action, and missing match token are all rejected up front with
+/// an actionable message, rather than scaffolding a rule that silently never
+/// fires (merge_rules would skip it, or match everything).
+#[test]
+fn config_add_requires_command_action_and_match_token() {
+    let dir = unique_dir("cfg-add-usage");
+    config_add_init(&dir);
+
+    let missing_command = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r1",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_command.status.success());
+    assert!(String::from_utf8_lossy(&missing_command.stderr).contains("--command"));
+
+    // QA finding: an empty --command is "present but blank", not "missing" —
+    // needs its own rejection, same silent-break class as an empty match
+    // token (`rule.command != ""` can never equal a real program name).
+    let empty_command = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r1b",
+            "--command",
+            "",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    assert!(!empty_command.status.success());
+    assert!(String::from_utf8_lossy(&empty_command.stderr).contains("--command"));
+
+    let missing_action = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r2",
+            "--command",
+            "ls",
+            "--match-any",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_action.status.success());
+    assert!(String::from_utf8_lossy(&missing_action.stderr).contains("--action"));
+
+    let missing_match = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r3",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+        ])
+        .output()
+        .unwrap();
+    assert!(!missing_match.status.success());
+    let stderr = String::from_utf8_lossy(&missing_match.stderr);
+    assert!(
+        stderr.contains("--match-any") || stderr.contains("--match-all"),
+        "stderr: {stderr}"
+    );
+
+    // Empty-string tokens must not satisfy the "at least one token" check —
+    // `--match-any ""` has a non-empty Vec (one element) but a de facto no-op
+    // token; a naive `.is_empty()`-on-the-Vec check would wrongly accept it.
+    let empty_token = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r4",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !empty_token.status.success(),
+        "an empty-string match token must be rejected like no token at all"
+    );
+
+    // Codex adversarial review R2: a *mixed* empty token (alongside a real
+    // one) must also be rejected — `match_all` requires every token present
+    // via exact equality, so an empty token makes the rule permanently
+    // unmatchable (no real invocation has a literal empty-string arg) even
+    // though a non-empty token is also present.
+    let mixed_empty_token = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r5",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-all",
+            "",
+            "--match-all",
+            "-l",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !mixed_empty_token.status.success(),
+        "a match_all token list with any empty-string entry must be rejected"
+    );
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !content.contains("r1")
+            && !content.contains("r2")
+            && !content.contains("r3")
+            && !content.contains("r5")
+            && !content.contains("r4"),
+        "no rule should have been written on usage errors: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Flag consistency: `--destination` requires `--action move-to`, and
+/// `--action move-to` requires `--destination`.
+#[test]
+fn config_add_destination_and_move_to_action_are_mutually_required() {
+    let dir = unique_dir("cfg-add-move-to-pair");
+    config_add_init(&dir);
+
+    let dest_without_move_to = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r1",
+            "--command",
+            "rm",
+            "--action",
+            "trash",
+            "--match-any",
+            "-rf",
+            "--destination",
+            "/tmp/omamori-quarantine",
+        ])
+        .output()
+        .unwrap();
+    assert!(!dest_without_move_to.status.success());
+    assert!(
+        String::from_utf8_lossy(&dest_without_move_to.stderr).contains("move-to"),
+        "stderr: {}",
+        String::from_utf8_lossy(&dest_without_move_to.stderr)
+    );
+
+    let move_to_without_dest = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "r2",
+            "--command",
+            "rm",
+            "--action",
+            "move-to",
+            "--match-any",
+            "-rf",
+        ])
+        .output()
+        .unwrap();
+    assert!(!move_to_without_dest.status.success());
+    assert!(
+        String::from_utf8_lossy(&move_to_without_dest.stderr).contains("--destination"),
+        "stderr: {}",
+        String::from_utf8_lossy(&move_to_without_dest.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Codex adversarial review finding: the negative tests above (bad
+/// destination, mismatched action/destination pairing) never exercise a
+/// *valid* `move-to` + `--destination` pairing, so a mutation that rejected
+/// every `move-to` rule would still pass the whole suite. This is the
+/// missing happy path, and also covers `--match-all` (every other happy-path
+/// test in this file uses `--match-any` only).
+#[test]
+fn config_add_move_to_with_valid_destination_and_match_all_fires_in_explain() {
+    let dir = unique_dir("cfg-add-move-to-happy");
+    config_add_init(&dir);
+    // NOTE: the destination must NOT live under `std::env::temp_dir()`. On
+    // macOS that resolves to `/var/folders/...`, which `Path::canonicalize()`
+    // turns into `/private/var/folders/...` — and `/var`/`/private` are both
+    // in `BLOCKED_DESTINATION_PREFIXES` (config.rs). Using `unique_dir()` here
+    // (as every other test in this file does) would make `validate_destination`
+    // reject this as a system directory, defeating the "valid" happy path this
+    // test exists to cover. `target/` under the repo checkout isn't blocked.
+    let scratch_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-scratch");
+    let quarantine = scratch_root.join(format!("cfg-add-move-to-happy-{}", std::process::id()));
+    fs::create_dir_all(&quarantine).unwrap();
+
+    // Uses `ls` rather than `rm`: `rm -r -f` would also match the built-in
+    // `rm-recursive-to-trash` rule (higher priority, checked first), which
+    // would make this test pass for the wrong reason (built-in firing, not
+    // our new custom rule).
+    let add_out = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "quarantine-rule",
+            "--command",
+            "ls",
+            "--action",
+            "move-to",
+            "--match-all",
+            "-a",
+            "--match-all",
+            "-l",
+            "--destination",
+            quarantine.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "valid move-to + destination should succeed, stderr: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains("match_all = [\"-a\", \"-l\"]")
+            || content.contains("match_all = [\"-a\", \"-l\",]"),
+        "config: {content}"
+    );
+
+    // match_all requires ALL tokens: "-a" alone must NOT fire...
+    let explain_partial = config_add_cmd(&dir)
+        .args(["explain", "--", "ls", "-a", "/tmp/x"])
+        .output()
+        .unwrap();
+    let stdout_partial = String::from_utf8_lossy(&explain_partial.stdout);
+    assert!(
+        !stdout_partial.contains("rule: quarantine-rule"),
+        "match_all with only one of two tokens present must not fire: {stdout_partial}"
+    );
+
+    // ...but "-a -l" together must fire, and the action must be move-to.
+    let explain_full = config_add_cmd(&dir)
+        .args(["explain", "--", "ls", "-a", "-l", "/tmp/x"])
+        .output()
+        .unwrap();
+    let stdout_full = String::from_utf8_lossy(&explain_full.stdout);
+    assert!(
+        stdout_full.contains("rule: quarantine-rule"),
+        "match_all with both tokens present must fire: {stdout_full}"
+    );
+    assert!(
+        stdout_full.contains("action: move-to"),
+        "stdout: {stdout_full}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&quarantine);
+}
+
+/// Codex② Minor: `--action stash` (the user-facing alias) must be written to
+/// the config file as the literal schema value `stash-then-exec`.
+#[test]
+fn config_add_stash_action_writes_schema_literal() {
+    let dir = unique_dir("cfg-add-stash-literal");
+    config_add_init(&dir);
+
+    let output = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "stash-rule",
+            "--command",
+            "git",
+            "--action",
+            "stash",
+            "--match-any",
+            "reset",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains("action = \"stash-then-exec\""),
+        "config must contain the schema-literal action, not the CLI alias: {content}"
+    );
+    assert!(
+        !content.contains("action = \"stash\"\n"),
+        "config must not contain the bare CLI alias `stash`: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// V-008 (mirror pattern core finding): `add` must refuse to edit a
+/// malformed/degraded config.toml rather than silently clobbering it the way
+/// `disable`'s fallback branch would (shape (d): bare `[rules]` table; shape
+/// (f): broken TOML syntax). The file must be left byte-for-byte unchanged.
+#[test]
+fn config_add_rejects_degraded_config_without_modifying_it() {
+    for (label, contents) in [
+        ("bare-rules-table", "[rules]\nfoo = \"bar\"\n"),
+        ("broken-toml", "[[rules]\nname = \n"),
+    ] {
+        let dir = unique_dir(&format!("cfg-add-degraded-{label}"));
+        fs::create_dir_all(dir.join("omamori")).unwrap();
+        let config_path = dir.join("omamori").join("config.toml");
+        fs::write(&config_path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let output = config_add_cmd(&dir)
+            .args([
+                "config",
+                "add",
+                "new-rule",
+                "--command",
+                "ls",
+                "--action",
+                "block",
+                "--match-any",
+                "-l",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{label}: add on a degraded config must be rejected, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("malformed")
+                || stderr.contains("degraded")
+                || stderr.contains("cannot be safely edited"),
+            "{label} stderr: {stderr}"
+        );
+
+        let after = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            after, contents,
+            "{label}: config.toml must be byte-for-byte unchanged after a rejected add"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// V-009: `add` updates the integrity baseline the same way `disable`/`enable`
+/// do, so a subsequent `doctor` run does not flag the config as tampered.
+#[test]
+fn config_add_updates_baseline_so_doctor_stays_clean() {
+    let base_dir = unique_dir("cfg-add-baseline-base");
+    let home = unique_dir("cfg-add-baseline-home");
+    install_with_hooks(&base_dir, &home);
+
+    let mut add_cmd = Command::new(binary());
+    clean_ai_env(&mut add_cmd);
+    let add_out = add_cmd
+        .args([
+            "config",
+            "add",
+            "baseline-rule",
+            "--command",
+            "ls",
+            "--action",
+            "block",
+            "--match-any",
+            "-l",
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .unwrap();
+    assert!(
+        add_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    // Precise check via --json rather than "stdout doesn't contain 'tamper'"
+    // (which a doctor bug could satisfy vacuously, e.g. by renaming the
+    // string or omitting the check entirely): the `.integrity.json` /
+    // Baseline item's status must be exactly "ok", not "WARN"/"FAIL".
+    let mut doctor_cmd = Command::new(binary());
+    clean_ai_env(&mut doctor_cmd);
+    let doctor_out = doctor_cmd
+        .arg("doctor")
+        .arg("--base-dir")
+        .arg(&base_dir)
+        .arg("--json")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&doctor_out.stdout).expect("doctor --json must produce valid JSON");
+    let baseline_item = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["category"] == "Baseline")
+        .expect("Baseline item must be present in doctor --json output");
+    assert_eq!(
+        baseline_item["status"], "ok",
+        "baseline must be clean after config add updates it, got: {baseline_item}"
+    );
+
+    let _ = fs::remove_dir_all(&base_dir);
+    let _ = fs::remove_dir_all(&home);
+}

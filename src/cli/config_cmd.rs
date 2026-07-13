@@ -23,6 +23,7 @@ pub(crate) fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(2).and_then(|item| item.to_str()) {
         Some("list") => run_config_list(),
         Some("validate") => run_config_validate(args.get(3).and_then(|item| item.to_str())),
+        Some("add") => run_config_add(args),
         Some("disable") => {
             let rule_name = args.get(3).and_then(|item| item.to_str()).ok_or_else(|| {
                 AppError::Usage("config disable requires a rule name".to_string())
@@ -324,6 +325,336 @@ fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
 
     eprintln!("Enabled: {rule_name} (restored to built-in default)");
     run_config_list()
+}
+
+// ---------------------------------------------------------------------------
+// config add
+// ---------------------------------------------------------------------------
+
+const CONFIG_ADD_USAGE: &str = "Usage: omamori config add <rule-name> --command <cmd> --action <block|trash|stash|log-only|move-to> [--match-any <token>]... [--match-all <token>]... [--destination <abs-path>] [--message <text>]";
+
+struct ConfigAddArgs {
+    rule_name: String,
+    command: String,
+    action: rules::ActionKind,
+    match_any: Vec<String>,
+    match_all: Vec<String>,
+    destination: Option<String>,
+    message: Option<String>,
+}
+
+fn parse_config_add_action(raw: &str) -> Result<rules::ActionKind, AppError> {
+    rules::ActionKind::from_cli_str(raw).ok_or_else(|| {
+        AppError::Usage(format!(
+            "config add: unknown --action `{raw}`\n  Valid values: block, trash, stash, log-only, move-to\n\n{CONFIG_ADD_USAGE}"
+        ))
+    })
+}
+
+/// SECURITY (T2): every flag here is inserted into the TOML document via
+/// `toml_edit`'s typed value API (see `run_config_add`'s `mutate_config` closure),
+/// never via `format!`-based string concatenation. `toml_edit` escapes string
+/// values, so metacharacters in `--rule-name`/`--match-any`/etc. cannot inject
+/// a sibling TOML table (e.g. `[audit]`).
+fn parse_config_add_args(args: &[OsString]) -> Result<ConfigAddArgs, AppError> {
+    let rule_name = args
+        .get(3)
+        .and_then(|item| item.to_str())
+        .ok_or_else(|| {
+            AppError::Usage(format!(
+                "config add requires a rule name\n\n{CONFIG_ADD_USAGE}"
+            ))
+        })?
+        .to_string();
+
+    if rule_name.starts_with('-') {
+        return Err(AppError::Usage(format!(
+            "config add requires a rule name as the first argument (got `{rule_name}`)\n\n{CONFIG_ADD_USAGE}"
+        )));
+    }
+
+    let mut command: Option<String> = None;
+    let mut action: Option<rules::ActionKind> = None;
+    let mut match_any: Vec<String> = Vec::new();
+    let mut match_all: Vec<String> = Vec::new();
+    let mut destination: Option<String> = None;
+    let mut message: Option<String> = None;
+
+    let mut index = 4usize;
+    while index < args.len() {
+        let arg = args[index].to_str().unwrap_or("");
+        let take_value = |flag: &str| -> Result<String, AppError> {
+            let val = args
+                .get(index + 1)
+                .and_then(|v| v.to_str())
+                .ok_or_else(|| {
+                    AppError::Usage(format!(
+                        "config add: {flag} requires a value\n\n{CONFIG_ADD_USAGE}"
+                    ))
+                })?;
+            Ok(val.to_string())
+        };
+        match arg {
+            "--command" => {
+                command = Some(take_value("--command")?);
+                index += 2;
+            }
+            "--action" => {
+                let raw = take_value("--action")?;
+                action = Some(parse_config_add_action(&raw)?);
+                index += 2;
+            }
+            "--match-any" => {
+                match_any.push(take_value("--match-any")?);
+                index += 2;
+            }
+            "--match-all" => {
+                match_all.push(take_value("--match-all")?);
+                index += 2;
+            }
+            "--destination" => {
+                destination = Some(take_value("--destination")?);
+                index += 2;
+            }
+            "--message" => {
+                message = Some(take_value("--message")?);
+                index += 2;
+            }
+            other => {
+                return Err(AppError::Usage(format!(
+                    "config add: unknown flag `{other}`\n\n{CONFIG_ADD_USAGE}"
+                )));
+            }
+        }
+    }
+
+    let command = command.ok_or_else(|| {
+        AppError::Usage(format!(
+            "config add: missing --command\n  Example: omamori config add {rule_name} --command rm --action block --match-any -rf\n\n{CONFIG_ADD_USAGE}"
+        ))
+    })?;
+    // QA finding: an empty --command is accepted by the flag parser (it's a
+    // present-but-blank value, not a missing flag) yet `rule.command != ""`
+    // can never equal a real invocation's program name — same silent-break
+    // class as an empty match token.
+    if command.is_empty() {
+        return Err(AppError::Usage(format!(
+            "config add: --command must not be an empty string\n\n{CONFIG_ADD_USAGE}"
+        )));
+    }
+    let action = action.ok_or_else(|| {
+        AppError::Usage(format!(
+            "config add: missing --action\n  Example: omamori config add {rule_name} --command {command} --action block --match-any -rf\n\n{CONFIG_ADD_USAGE}"
+        ))
+    })?;
+
+    // Reject empty-string tokens first: `--match-any ""` (or a mix like
+    // `--match-all "" --match-all -l`) is a de facto no-op that would slip
+    // past an "is the Vec empty" check while still writing a token that can
+    // never realistically match (rules.rs `rule_matches` requires exact
+    // token equality, and no real invocation has a literal empty-string
+    // arg — with match_all this makes the whole rule permanently
+    // unmatchable, per Codex adversarial review). Checking this first means
+    // the "at least one token" check below can just be a plain `is_empty()`.
+    if match_any.iter().any(|t| t.is_empty()) || match_all.iter().any(|t| t.is_empty()) {
+        return Err(AppError::Usage(format!(
+            "config add: --match-any/--match-all tokens must not be empty strings\n\n{CONFIG_ADD_USAGE}"
+        )));
+    }
+    // A rule with no match tokens matches every invocation of `command`
+    // (rules.rs `rule_matches`: empty match_any/match_all is vacuously
+    // true) — almost never what a guided `add` should scaffold.
+    if match_any.is_empty() && match_all.is_empty() {
+        return Err(AppError::Usage(format!(
+            "config add: at least one --match-any or --match-all token is required\n  \
+             A rule with no match tokens fires on every invocation of `{command}` — that's rarely intended.\n  \
+             Example: omamori config add {rule_name} --command {command} --action {} --match-any -rf\n\n{CONFIG_ADD_USAGE}",
+            action.as_str()
+        )));
+    }
+
+    if destination.is_some() && action != rules::ActionKind::MoveTo {
+        return Err(AppError::Usage(format!(
+            "config add: --destination is only valid with --action move-to (got --action {})\n\n{CONFIG_ADD_USAGE}",
+            action.as_str()
+        )));
+    }
+    if destination.is_none() && action == rules::ActionKind::MoveTo {
+        return Err(AppError::Usage(format!(
+            "config add: --action move-to requires --destination <abs-path>\n\n{CONFIG_ADD_USAGE}"
+        )));
+    }
+
+    Ok(ConfigAddArgs {
+        rule_name,
+        command,
+        action,
+        match_any,
+        match_all,
+        destination,
+        message,
+    })
+}
+
+fn run_config_add(args: &[OsString]) -> Result<i32, AppError> {
+    // O1 (SECURITY T3/DI-13): guard first, before touching the filesystem or
+    // even finishing arg parsing — mirrors disable/enable/override precedent.
+    guard_ai_config_modification("config add")?;
+
+    let parsed = parse_config_add_args(args)?;
+
+    // O2 (DI-13): reject shadowing a core self-protection rule id up front.
+    if is_core_rule(&parsed.rule_name) {
+        return Err(AppError::Config(format!(
+            "`{}` is a core safety rule id and cannot be shadowed.\n  \
+             Core rule ids are non-overridable to prevent self-disablement (DI-13).\n  \
+             To adjust a core rule: omamori override disable {}\n  \
+             To see core vs custom rules: omamori config list",
+            parsed.rule_name, parsed.rule_name
+        )));
+    }
+
+    let config_path = resolve_config_path_checked()?;
+    if !config_path.exists() {
+        config::write_default_config(&config_path, false)?;
+    }
+
+    // O3: precondition — refuse to edit a config that's already degraded (shape
+    // (d)/(f)/(i) in the shape enumeration) rather than silently clobbering or
+    // building on top of a fallback-to-core-defaults state (T3 silent fail).
+    let precheck = load_config(Some(&config_path))?;
+    if precheck.degraded {
+        return Err(AppError::Config(
+            "config add: config.toml is malformed and cannot be safely edited.\n  \
+             Run `omamori config validate` to see the error,\n  \
+             then fix it, or run `omamori init --force` to regenerate.\n  \
+             (add refuses to modify a degraded config to avoid data loss.)"
+                .to_string(),
+        ));
+    }
+    // Duplicate-name check against the RAW `[[rules]]` array, not the merged
+    // `precheck.config.rules`. `merge_rules` records a name as "claimed" the
+    // moment it's seen — even if that entry is malformed (missing command/
+    // action) and gets skipped with just a warning (config.rs:311-348) — so a
+    // pre-existing malformed entry sharing our new name would silently cause
+    // *our* well-formed entry to be the one skipped on next load, while this
+    // command still reports success (Codex R1 P0 finding).
+    if config::raw_rule_names(&config_path)?.contains(&parsed.rule_name) {
+        // NOTE (UX review): by this point `parsed.rule_name` is guaranteed to
+        // NOT be a core rule id (the O2 shadow check above already rejected
+        // that), so it can only be a pre-existing *custom* entry — and
+        // `config disable` only accepts known/built-in names (validate_rule_name
+        // checks against default_rules()). Don't suggest a recovery command
+        // that's guaranteed to fail with "unknown rule".
+        return Err(AppError::Config(format!(
+            "config add: a rule named `{}` already exists.\n  \
+             To change it: edit {} directly, or remove the existing `[[rules]]` block first.",
+            parsed.rule_name,
+            config_path.display()
+        )));
+    }
+
+    // O4: destination policy (absolute, no symlink, not under a blocked system
+    // prefix) — same policy `validate_rules` applies after load, enforced here
+    // *before* writing so `add` never reports success for a rule that would be
+    // silently disabled on next load.
+    if let Some(dest) = &parsed.destination {
+        let mut dest_warnings = Vec::new();
+        if !config::validate_destination(dest, &parsed.rule_name, &mut dest_warnings) {
+            // `validate_destination`'s messages are phrased for its other
+            // caller (`validate_rules`, post-load: an existing rule gets
+            // disabled) and end in "...; rule disabled" / "...; rule
+            // disabled for security". Here nothing was ever created, so
+            // "rule not created" is stated up front for correct context,
+            // rather than trying to string-edit the reused message (an
+            // earlier version of this fix truncated the real reason via
+            // `.split("; rule disabled")`, which matches that substring
+            // anywhere — including inside a maliciously/accidentally
+            // crafted `--destination` value itself — silently dropping the
+            // actual failure reason; /code-review R1 finding).
+            return Err(AppError::Config(format!(
+                "config add: invalid --destination, rule not created\n  {}",
+                dest_warnings.join("\n  ")
+            )));
+        }
+    }
+
+    let mut new_table = toml_edit::Table::new();
+    new_table["name"] = toml_edit::value(parsed.rule_name.as_str());
+    new_table["command"] = toml_edit::value(parsed.command.as_str());
+    new_table["action"] = toml_edit::value(parsed.action.as_str());
+    if !parsed.match_any.is_empty() {
+        let arr: toml_edit::Array = parsed.match_any.iter().map(|s| s.as_str()).collect();
+        new_table["match_any"] = toml_edit::value(arr);
+    }
+    if !parsed.match_all.is_empty() {
+        let arr: toml_edit::Array = parsed.match_all.iter().map(|s| s.as_str()).collect();
+        new_table["match_all"] = toml_edit::value(arr);
+    }
+    if let Some(dest) = &parsed.destination {
+        new_table["destination"] = toml_edit::value(dest.as_str());
+    }
+    if let Some(msg) = &parsed.message {
+        new_table["message"] = toml_edit::value(msg.as_str());
+    }
+    // One clone for display (the closure below moves the original once,
+    // rather than cloning it again in each of its two mutually-exclusive
+    // branches — /code-review R1 simplification finding).
+    let rendered_entry = new_table.clone();
+
+    // O5: write via the shared atomic pipeline (SECURITY T6: DO NOT SPLIT).
+    mutate_config(&config_path, |doc| {
+        let Some(array) = doc
+            .get_mut("rules")
+            .and_then(|item| item.as_array_of_tables_mut())
+        else {
+            if doc.get("rules").is_some() {
+                // `rules` exists but isn't array-of-tables form (shape (d): bare
+                // `[rules]` table). The O3 precondition should already have
+                // rejected this via `degraded` — stay defensive rather than
+                // clobbering it the way `disable`'s else-branch does.
+                return Err(AppError::Config(
+                    "config add: existing `[rules]` in config.toml is not in `[[rules]]` \
+                     array form; refusing to overwrite it."
+                        .to_string(),
+                ));
+            }
+            let mut array = toml_edit::ArrayOfTables::new();
+            array.push(new_table);
+            doc.insert("rules", toml_edit::Item::ArrayOfTables(array));
+            return Ok(());
+        };
+        array.push(new_table);
+        Ok(())
+    })?;
+
+    // O6: post-write self-check — the rule we just wrote must load cleanly,
+    // AND any pre-existing unrelated warning in the same file must still
+    // surface, matching `disable`/`enable` (which both end by calling
+    // `run_config_list()` -> `emit_config_warnings`). Checking only
+    // `degraded` would silently swallow, say, another custom rule's
+    // "missing command/action; skipped" warning on an otherwise-successful
+    // `add` (/code-review R1 finding).
+    let post = load_config(Some(&config_path))?;
+    if post.degraded {
+        return Err(AppError::Config(
+            "config add: internal error — the config we just wrote failed to load cleanly. \
+             This should not happen; please report this as a bug."
+                .to_string(),
+        ));
+    }
+
+    eprintln!(
+        "Added rule `{}` to {}\n",
+        parsed.rule_name,
+        config_path.display()
+    );
+    eprintln!("[[rules]]\n{rendered_entry}");
+    emit_config_warnings(&post);
+    eprintln!("Next: run `omamori test` to verify the rule fires.");
+    eprintln!("      run `omamori config list` to see it alongside built-ins.");
+
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------

@@ -202,6 +202,7 @@ Built-in rules are always inherited. Only write the rules you want to change:
 
 ```bash
 omamori config list                          # show all rules
+omamori config add my-rule --command rm --action block --match-any -rf  # scaffold a custom rule
 omamori config disable git-push-force-block  # disable a rule
 omamori config enable git-push-force-block   # restore default
 omamori test                                 # verify policy
@@ -282,6 +283,7 @@ omamori audit show --provider <name>     # Filter by provider
 omamori audit show --relaxed             # Filter to relaxed allows (legacy data-context flag; pre-v0.10.4 logs only)
 
 omamori config list                      # Show rules with status
+omamori config add <name> --command <cmd> --action <block|trash|stash|log-only|move-to> [--match-any <token>]... [--match-all <token>]... [--destination <abs-path>] [--message <text>]  # Scaffold a custom rule
 omamori config disable <rule>            # Disable a rule
 omamori config enable <rule>             # Re-enable a rule
 omamori config validate [PATH]           # Validate config (exit 0/1/2)

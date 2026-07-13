@@ -48,6 +48,21 @@ impl ActionKind {
         }
     }
 
+    /// Inverse of `as_str`, plus a `"stash"` CLI-friendly alias for
+    /// `StashThenExec`. Used by `omamori config add`'s `--action` flag.
+    /// Kept alongside `as_str` (rather than hand-rolled at the call site) so
+    /// the forward/inverse mapping lives in one place.
+    pub fn from_cli_str(s: &str) -> Option<Self> {
+        match s {
+            "trash" => Some(Self::Trash),
+            "stash" | "stash-then-exec" => Some(Self::StashThenExec),
+            "block" => Some(Self::Block),
+            "log-only" => Some(Self::LogOnly),
+            "move-to" => Some(Self::MoveTo),
+            _ => None,
+        }
+    }
+
     /// Defense level: higher = stronger protection.
     /// Used to prevent downgrade of core rules' action via config.
     pub fn defense_level(&self) -> u8 {
@@ -94,10 +109,10 @@ pub struct RuleConfig {
     /// When `Some(s)`, the rule matches only when `args[0] == s`.
     /// Prevents false positives like `omamori exec -- echo disable config`
     /// matching a generic `match_any=["disable"]` builtin rule.
-    /// Used by the 6 `omamori-*-block` self-protection rules.
+    /// Used by the 7 `omamori-*-block` self-protection rules.
     #[serde(default)]
     pub subcommand: Option<String>,
-    /// True for the 13 built-in core safety rules. Cannot be injected via config.toml.
+    /// True for the 14 built-in core safety rules. Cannot be injected via config.toml.
     #[serde(skip)]
     pub is_builtin: bool,
 }
@@ -225,6 +240,47 @@ fn rule_matches(rule: &RuleConfig, invocation: &CommandInvocation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// /code-review R1 (Reuse) finding: `from_cli_str` matches on `&str`
+    /// with a catch-all `_ => None`, unlike `as_str`/`defense_level`/
+    /// `context_message` which match exhaustively *on the enum* (compiler-
+    /// enforced — a new variant forces a compile error there). Adding a
+    /// variant to `ActionKind` without updating `from_cli_str` would compile
+    /// fine and silently create a capability gap: `config.toml` accepts the
+    /// new action via serde, but `omamori config add --action <new>` rejects
+    /// it as unknown. This test's `match action { ... }` IS exhaustive over
+    /// the enum, so a new variant forces a compile error here too, catching
+    /// the omission at the same point `as_str` would.
+    #[test]
+    fn from_cli_str_round_trips_every_action_kind_via_as_str() {
+        for action in [
+            ActionKind::Trash,
+            ActionKind::StashThenExec,
+            ActionKind::Block,
+            ActionKind::LogOnly,
+            ActionKind::MoveTo,
+        ] {
+            // Exhaustive match: a new variant added above without a case
+            // here fails to compile, not just silently passes.
+            match action {
+                ActionKind::Trash
+                | ActionKind::StashThenExec
+                | ActionKind::Block
+                | ActionKind::LogOnly
+                | ActionKind::MoveTo => {}
+            }
+            assert_eq!(
+                ActionKind::from_cli_str(action.as_str()),
+                Some(action.clone()),
+                "from_cli_str(as_str({action:?})) must round-trip"
+            );
+        }
+        // The one deliberate non-round-tripping alias: "stash" -> StashThenExec.
+        assert_eq!(
+            ActionKind::from_cli_str("stash"),
+            Some(ActionKind::StashThenExec)
+        );
+    }
 
     #[test]
     fn matches_when_all_tokens_present() {

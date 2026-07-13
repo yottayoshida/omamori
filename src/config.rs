@@ -199,6 +199,36 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
     })
 }
 
+/// Read the raw `name` field of every `[[rules]]` entry in the config file,
+/// regardless of whether the entry is otherwise well-formed.
+///
+/// Used by `config add`'s duplicate-name check. `merge_rules` claims a name
+/// the moment it sees it — even for a malformed entry (missing `command`/
+/// `action`) that it then skips with only a warning, not `degraded` — so a
+/// pre-existing malformed raw entry sharing a name would silently cause a
+/// *newly added, well-formed* entry with that same name to be the one
+/// skipped on the next load (first-name-wins), while `config add` still
+/// reported success. Checking the merged rule set alone misses this because
+/// the malformed entry never made it into the merged set to begin with.
+pub(crate) fn raw_rule_names(path: &Path) -> Result<HashSet<String>, AppError> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let content = fs::read_to_string(path)?;
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return Ok(HashSet::new());
+    };
+    let names = value
+        .get("rules")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("name")?.as_str())
+        .map(str::to_string)
+        .collect();
+    Ok(names)
+}
+
 // ---------------------------------------------------------------------------
 // Merge logic
 // ---------------------------------------------------------------------------
@@ -491,7 +521,15 @@ fn validate_rules(rules: &mut [RuleConfig], warnings: &mut Vec<String>) {
 }
 
 /// Returns `true` if the destination is valid, `false` if it should be blocked.
-fn validate_destination(dest: &str, rule_name: &str, warnings: &mut Vec<String>) -> bool {
+///
+/// `pub(crate)`: also called from `cli::config_cmd::run_config_add` to reject
+/// a bad `--destination` before writing, using the same policy as post-load
+/// validation (absolute path, no symlink, not under a blocked system prefix).
+pub(crate) fn validate_destination(
+    dest: &str,
+    rule_name: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
     let path = Path::new(dest);
 
     // Must be absolute
@@ -656,7 +694,11 @@ pub fn default_rules() -> Vec<RuleConfig> {
             "omamori",
             ActionKind::Block,
             Vec::new(),
-            vec!["disable".to_string(), "enable".to_string()],
+            vec![
+                "disable".to_string(),
+                "enable".to_string(),
+                "add".to_string(),
+            ],
             Some("omamori blocked self-modification of rules".to_string()),
         )
         .with_subcommand("config")
@@ -1070,6 +1112,70 @@ mod tests {
         );
     }
 
+    /// Altitude review (PR-C2, #325): `raw_rule_names` re-derives, from the
+    /// raw file, the same "name claimed" universe that `merge_rules` computes
+    /// internally and then discards (`applied_names`, this file, `merge_rules`
+    /// above — inserted for every `UserRule.name` seen, valid or not, before
+    /// validity is checked). The two are two independent implementations of
+    /// the same concept; nothing enforces they stay in sync if `merge_rules`'
+    /// claim semantics ever change. This test pins today's invariant: a
+    /// malformed (missing command/action) entry's name is claimed by
+    /// `merge_rules` (so it does NOT appear in the merged rule set — that's
+    /// the exact gap `raw_rule_names` exists to close for `config add`'s
+    /// duplicate-name check) while `raw_rule_names` still reports it.
+    #[test]
+    fn raw_rule_names_sees_names_merge_rules_claims_but_drops() {
+        let dir = std::env::temp_dir().join(format!("omamori-rawnames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[rules]]
+name = "well-formed"
+command = "ls"
+action = "block"
+
+[[rules]]
+name = "malformed-no-command"
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let raw = raw_rule_names(&path).unwrap();
+        assert!(raw.contains("well-formed"));
+        assert!(
+            raw.contains("malformed-no-command"),
+            "raw_rule_names must see a malformed entry's name"
+        );
+
+        let result = load_config(Some(&path)).unwrap();
+        assert!(
+            !result.degraded,
+            "a malformed custom rule alone must not degrade the config"
+        );
+        let merged_names: std::collections::HashSet<&str> = result
+            .config
+            .rules
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(merged_names.contains("well-formed"));
+        assert!(
+            !merged_names.contains("malformed-no-command"),
+            "the merged set must NOT contain the malformed entry — this is exactly why \
+             config add's duplicate check cannot rely on the merged set alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn merge_preserves_all_defaults_when_no_user_rules() {
         let mut warnings = Vec::new();
@@ -1262,12 +1368,51 @@ mod tests {
         }
     }
 
+    /// /code-review finding: `core_rule_names()` (config.rs:770) is a
+    /// hand-maintained literal list, separate from `default_rules()`'s
+    /// `.with_builtin(true)` markers — nothing enforces they stay in sync.
+    /// If a future builtin rule is added to `default_rules()` without also
+    /// adding its name here, `config_cmd::is_core_rule()` (which is what
+    /// `config add`'s DI-13 shadow-rejection relies on) would silently miss
+    /// it: `config add <that-name> ...` would pass the shadow check, get
+    /// merged into the existing builtin rule via `apply_user_overrides`'s
+    /// `is_builtin` branch (which only honors `message`, silently ignoring
+    /// `command`/`action`/`match_any`), and `config add` would report
+    /// success for a rule that never actually takes effect. A type-level fix
+    /// (deriving `core_rule_names()` from `default_rules()`) would require
+    /// changing its `Vec<&'static str>` return type, which touches
+    /// `break_glass.rs`/`break_glass_cmd.rs`'s DI-13 non-bypassable-rule
+    /// validation — well outside this PR's diff. Pin the invariant instead.
+    #[test]
+    fn core_rule_names_matches_default_rules_builtin_set() {
+        let mut from_core_rule_names: Vec<&str> = core_rule_names();
+        from_core_rule_names.sort_unstable();
+
+        let defaults = default_rules();
+        let mut from_default_rules: Vec<String> = defaults
+            .iter()
+            .filter(|r| r.is_builtin)
+            .map(|r| r.name.clone())
+            .collect();
+        from_default_rules.sort();
+
+        assert_eq!(
+            from_core_rule_names, from_default_rules,
+            "core_rule_names() and default_rules()'s is_builtin set have drifted apart — \
+             update core_rule_names() to match"
+        );
+        assert!(
+            defaults.iter().all(|r| r.is_builtin),
+            "default_rules() must contain only builtin rules"
+        );
+    }
+
     /// DI-13: omamori self-protect rules must exist in `default_rules()`.
     /// PR1c will relax Phase 1A verb-pattern substring match for `omamori`
     /// subcommands; without these Phase 2 builtin rules a real `omamori
     /// config disable` invocation would not be caught.
     #[test]
-    fn default_rules_includes_omamori_self_protect_six_rules() {
+    fn default_rules_includes_omamori_self_protect_seven_rules() {
         let rules = default_rules();
         let required: &[&str] = &[
             "omamori-config-modify-block",
@@ -1276,6 +1421,7 @@ mod tests {
             "omamori-override-block",
             "omamori-doctor-fix-block",
             "omamori-explain-block",
+            "omamori-break-glass-block",
         ];
         for name in required {
             let rule = rules
@@ -1297,6 +1443,37 @@ mod tests {
         }
     }
 
+    /// DI-13 parity (PR-C2, #325): pin the exact `match_any`/`subcommand` of
+    /// `omamori-config-modify-block`, not just that the rule exists. A test
+    /// that only checks presence would not catch someone re-adding "disable"
+    /// and "enable" without "add" (or dropping the `subcommand` gate, which
+    /// would turn this into a much broader — and false-positive-prone —
+    /// match against any argument anywhere).
+    #[test]
+    fn omamori_config_modify_block_match_any_covers_add() {
+        let rules = default_rules();
+        let rule = rules
+            .iter()
+            .find(|r| r.name == "omamori-config-modify-block")
+            .expect("omamori-config-modify-block must exist");
+        assert_eq!(
+            rule.subcommand.as_deref(),
+            Some("config"),
+            "must gate on args[0] == \"config\""
+        );
+        let mut match_any = rule.match_any.clone();
+        match_any.sort();
+        assert_eq!(
+            match_any,
+            vec![
+                "add".to_string(),
+                "disable".to_string(),
+                "enable".to_string(),
+            ],
+            "match_any must be exactly {{add, disable, enable}}, not a superset or subset"
+        );
+    }
+
     /// Verify each `omamori-*-block` rule actually matches its target invocation
     /// via `match_rule`, independently of Phase 1A `command.contains`.
     #[test]
@@ -1314,6 +1491,11 @@ mod tests {
                 &["config", "enable", "git-reset-block"],
                 "omamori-config-modify-block",
             ),
+            (
+                "omamori",
+                &["config", "add", "my-rule", "--command", "rm"],
+                "omamori-config-modify-block",
+            ),
             ("omamori", &["uninstall"], "omamori-uninstall-block"),
             ("omamori", &["init", "--force"], "omamori-init-force-block"),
             ("omamori", &["override"], "omamori-override-block"),
@@ -1322,6 +1504,11 @@ mod tests {
                 "omamori",
                 &["explain", "rm", "-rf", "/"],
                 "omamori-explain-block",
+            ),
+            (
+                "omamori",
+                &["break-glass", "--rule", "rm-recursive-to-trash"],
+                "omamori-break-glass-block",
             ),
         ];
         for (program, args, expected) in cases {
@@ -1365,6 +1552,13 @@ mod tests {
             ("omamori", &["status", "--note", "explain something"]),
             ("omamori", &["init"]), // no --force, must not match init-force-block
             ("omamori", &["doctor"]), // no --fix, must not match doctor-fix-block
+            // "add" is a far more common English/CLI verb than
+            // disable/enable, so it carries elevated false-positive risk
+            // (config add, PR-C2, #325). args[0] != "config" must still gate.
+            ("omamori", &["exec", "--", "git", "add", "."]),
+            ("omamori", &["report", "--note", "add a rule later"]),
+            ("omamori", &["config", "list"]), // real config subcommand, but not "add"
+            ("omamori", &["config", "validate"]),
         ];
         for (program, args) in benign_cases {
             let inv = CommandInvocation::new(

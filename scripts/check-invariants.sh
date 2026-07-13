@@ -385,7 +385,7 @@ fi
 
 # ---------- Invariant: phase1a-relaxation-requires-phase2 (DI-13, v0.10.3+) ----------
 # Phase 2 backstop for verb patterns that may be relaxed in Phase 1A by the
-# data-flag allowlist (v0.10.3+, #240). These 6 builtin rules MUST exist in
+# data-flag allowlist (v0.10.3+, #240). These 7 builtin rules MUST exist in
 # `default_rules()` so that a real self-modification invocation is caught
 # even if Phase 1A is relaxed by the data-flag allowlist.
 #
@@ -403,6 +403,7 @@ required_omamori_rules=(
     "omamori-override-block"
     "omamori-doctor-fix-block"
     "omamori-explain-block"
+    "omamori-break-glass-block"
 )
 cf=src/config.rs
 default_rules_body=$(awk '
