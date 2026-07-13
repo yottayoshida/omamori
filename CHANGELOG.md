@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [0.12.5] - 2026-07-13
+
+**Summary**: doctor/UX batch, part 2 (#325, #328). Adds `omamori config add` for scaffolding custom rules from the CLI without hand-editing `config.toml`, and a new `docs/FAQ.md` consolidating the most common troubleshooting/bypass/boundary questions into one symptom-ordered page.
+
+### Added
+
+- **`omamori config add <name> --command <cmd> --action <action> [--match-any <token>]... [--match-all <token>]... [--destination <abs-path>] [--message <text>]`** scaffolds a custom rule and appends it to `config.toml` atomically, without requiring the user to hand-write TOML. Like every other config-mutating subcommand, it is blocked when run through an AI agent (DI-13) — the `omamori-config-modify-block` backstop rule's `match_any` list was extended to cover the new `add` verb, closing a gap where an AI agent running under `env -i` could otherwise have bypassed detection for this specific subcommand. ([#325](https://github.com/yottayoshida/omamori/issues/325))
+- **`docs/FAQ.md`**: a new FAQ page covering, in user-urgency order, false-positive blocks and how to adjust the ruleset, temporary bypass via `break-glass`, an `omamori explain` walkthrough, staging-file/`materialize` semantics, and a plain-language defense-boundary quick-reference — each section links to `SECURITY.md` as the normative source rather than duplicating its claims. README's Troubleshooting section now points to it. A new `faq-doc-sync` CI invariant pins that every `SECURITY.md#anchor` and every `omamori <subcommand>` the FAQ references (including two-word forms like `config add`/`override disable`, and mentions in prose as well as in bash examples) still resolves to something real, so the FAQ can't silently rot as the CLI evolves. ([#328](https://github.com/yottayoshida/omamori/issues/328))
+
 ## [0.12.4] - 2026-07-12
 
 **Summary**: doctor display consistency batch (#310, #309, #326, #327). Replaces a hardcoded per-section special case with a data-driven annotation table, surfaces heartbeat and break-glass in `doctor --fix` output, adds a non-destructive next-action hint for a fresh install, and detects hook version drift even when exe resolution fails — the exact scenario that previously masked staleness entirely. Also closes an existing AI-oracle gap in break-glass detail and hardens hook version-comment parsing against terminal-hostile content.
