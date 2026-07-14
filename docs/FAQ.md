@@ -2,7 +2,7 @@
 
 Practical answers for the situations omamori users hit most often. Start here when you're stuck; each section links to the normative reference ([SECURITY.md](../SECURITY.md)) instead of restating it.
 
-> Verified against omamori **v0.12.5**. If a command here disagrees with your installed version's `omamori --help`, trust `--help`.
+> Verified against omamori **v0.12.6**. If a command here disagrees with your installed version's `omamori --help`, trust `--help`.
 
 | If this is you… | Go to |
 |-----------------|-------|
