@@ -229,6 +229,99 @@ pub(crate) fn raw_rule_names(path: &Path) -> Result<HashSet<String>, AppError> {
     Ok(names)
 }
 
+/// Raw `rules`-array state for one target name: is it present more than
+/// once, and what does its (first match's) `enabled` key say.
+///
+/// Read generically via `toml::Value::as_array()`, which treats
+/// `[[rules]]` array-of-tables and inline-array (`rules = [{...}]`) TOML
+/// syntax identically — both parse to the same array structure.
+/// Idempotence ("is this rule already in the requested state?") is a
+/// question about *content*, answerable the same way regardless of which
+/// TOML syntax wrote it; only *writing* an in-place change needs
+/// `[[rules]]` array-of-tables specifically (`toml_edit`'s targeted
+/// mutation requires it), and that distinction belongs solely to
+/// `get_or_create_rules_array` inside `mutate_config` — the one place that
+/// needs to care, and the one place whose shape-refusal message should be
+/// authoritative.
+pub(crate) struct RawRuleArrayState {
+    /// Count of raw `rules` entries named `name` (0 if absent). An
+    /// in-place `enabled` rewrite only ever touches the *first* match — if
+    /// this is more than 1, `config disable`/`enable` must refuse rather
+    /// than silently rewrite one and leave the rest untouched while still
+    /// reporting success.
+    pub count: usize,
+    /// Raw `enabled` value of the first match, or `true` (the TOML-level
+    /// default) if absent/no match.
+    ///
+    /// Deliberately independent of the *merged, validated* `ConfigLoadResult`
+    /// — `validate_rules` can force a rule's *effective* `enabled` to
+    /// `false` for reasons unrelated to the raw toggle (e.g. a `move-to`
+    /// rule with a destination that resolves under a blocked prefix).
+    /// `config disable`/`enable`'s "already disabled"/"already enabled"
+    /// idempotence checks must use this raw value, not the merged one —
+    /// using the merged value would report "already disabled" (and skip
+    /// writing) for a rule a validation issue merely happens to be
+    /// suppressing right now, silently reactivating it the moment that
+    /// issue is fixed, despite the user's explicit `disable` having
+    /// reported success.
+    pub enabled: bool,
+}
+
+pub(crate) fn read_raw_rule_state(path: &Path, name: &str) -> Result<RawRuleArrayState, AppError> {
+    if !path.exists() {
+        return Ok(RawRuleArrayState {
+            count: 0,
+            enabled: true,
+        });
+    }
+    let content = fs::read_to_string(path)?;
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return Ok(RawRuleArrayState {
+            count: 0,
+            enabled: true,
+        });
+    };
+    let matches: Vec<&toml::Value> = value
+        .get("rules")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(name))
+        .collect();
+    let enabled = matches
+        .first()
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    Ok(RawRuleArrayState {
+        count: matches.len(),
+        enabled,
+    })
+}
+
+/// `true` if `[overrides]` explicitly sets `name = false` — the mechanism
+/// `omamori override disable` actually writes to. Core-rule disablement
+/// can happen two ways: a raw `rules` entry (which `apply_user_overrides`
+/// ignores for `enabled` unless `[overrides]` also has an entry — core
+/// `enabled` immutability) or `[overrides]` itself. `config enable` needs
+/// to distinguish these to give an accurate redirect rather than silently
+/// no-op'ing or falsely claiming success on a rule disabled the *other*
+/// way.
+pub(crate) fn raw_override_disables(path: &Path, name: &str) -> Result<bool, AppError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(path)?;
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return Ok(false);
+    };
+    Ok(value
+        .get("overrides")
+        .and_then(|o| o.get(name))
+        .and_then(|v| v.as_bool())
+        == Some(false))
+}
+
 // ---------------------------------------------------------------------------
 // Merge logic
 // ---------------------------------------------------------------------------
@@ -520,6 +613,88 @@ fn validate_rules(rules: &mut [RuleConfig], warnings: &mut Vec<String>) {
     }
 }
 
+/// Which existence guarantee `resolve_for_prefix_check` should enforce.
+///
+/// omamori has two callers with different authority: validate-time checks
+/// (`validate_destination`, `config add`'s pre-write check) are best-effort
+/// UX — they warn early but are never the last word. Runtime (`move_to_dir`)
+/// is the fail-close authority and must not be weakened by the validate-time
+/// leniency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathResolutionMode {
+    /// Validate-time: the destination may not exist yet. Walk up to the
+    /// nearest existing ancestor, canonicalize *that* (resolving any
+    /// symlink in the confirmed-existing portion), then rejoin the raw
+    /// (still possibly containing `..`) remainder and lexically fold the
+    /// whole result. Never authoritative — a `None` result here must not
+    /// be read as "safe", only as "could not be evaluated yet".
+    AllowMissingTail,
+    /// Runtime: the destination has already been confirmed to exist by the
+    /// caller. Require the full path to canonicalize; any failure is a
+    /// hard error, not a fallback.
+    RequireFullExistence,
+}
+
+/// Resolve `path` to an absolute, symlink-resolved form suitable for
+/// blocked-prefix comparison, per `mode` (see `PathResolutionMode`).
+///
+/// Lexically folding `..`/`.` in the tail (the portion past the nearest
+/// existing ancestor) is sound: that ancestor is already canonical
+/// (absolute, symlink-free), and everything folded past it is, by
+/// construction, a path that does not exist on disk — there is no real
+/// symlink in that tail to mis-resolve by folding it lexically instead of
+/// asking the OS.
+///
+/// Returns `Err` with a human-readable reason on failure rather than a bare
+/// `None` — `RequireFullExistence`'s failure is always a real
+/// `canonicalize()` I/O error (e.g. EACCES, ELOOP, a TOCTOU deletion) whose
+/// detail matters for diagnosing an intermittent runtime failure (Codex
+/// Round 1 removed-behavior audit finding: the pre-#391 code included this
+/// detail in its error message).
+pub(crate) fn resolve_for_prefix_check(
+    path: &Path,
+    mode: PathResolutionMode,
+) -> Result<PathBuf, String> {
+    match path.canonicalize() {
+        Ok(canonical) => return Ok(canonical),
+        Err(e) if mode == PathResolutionMode::RequireFullExistence => {
+            return Err(format!("cannot be verified: {e}"));
+        }
+        Err(_) => {} // AllowMissingTail: fall through to the ancestor walk.
+    }
+
+    let components: Vec<std::path::Component> = path.components().collect();
+    for split in (1..components.len()).rev() {
+        let prefix: PathBuf = components[..split].iter().collect();
+        if let Ok(canonical_ancestor) = prefix.canonicalize() {
+            let suffix: PathBuf = components[split..].iter().collect();
+            return Ok(lexical_fold(&canonical_ancestor.join(suffix)));
+        }
+    }
+    // Unreachable in practice — the root component always canonicalizes —
+    // but not a hard invariant the type system can express, so fail closed
+    // with a message rather than panicking.
+    Err("no existing ancestor could be resolved".to_string())
+}
+
+/// Fold `..`/`.` components without touching the filesystem. Only safe to
+/// call on a path whose non-existent tail has already been joined onto a
+/// canonical (existing, symlink-resolved) ancestor — see
+/// `resolve_for_prefix_check`.
+fn lexical_fold(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Returns `true` if the destination is valid, `false` if it should be blocked.
 ///
 /// `pub(crate)`: also called from `cli::config_cmd::run_config_add` to reject
@@ -550,20 +725,21 @@ pub(crate) fn validate_destination(
         return false;
     }
 
-    // Resolve canonical path (catches .. traversal)
-    if let Ok(canonical) = path.canonicalize() {
-        let canonical_str = canonical.to_string_lossy();
+    // Resolve via the nearest existing ancestor (catches both blocked
+    // prefixes under a path that doesn't exist yet, and `..` traversal) —
+    // best-effort; runtime `move_to_dir` is the fail-close authority.
+    if let Ok(canonical) = resolve_for_prefix_check(path, PathResolutionMode::AllowMissingTail) {
         for prefix in BLOCKED_DESTINATION_PREFIXES {
-            if canonical_str.starts_with(prefix) {
+            if canonical.starts_with(prefix) {
                 warnings.push(format!(
                     "rule `{rule_name}`: destination `{dest}` resolves to system directory \
-                     `{canonical_str}`; rule disabled for security"
+                     `{}`; rule disabled for security",
+                    canonical.display()
                 ));
                 return false;
             }
         }
     }
-    // If canonicalize fails (path doesn't exist yet), we'll catch it at runtime
     true
 }
 
@@ -828,7 +1004,7 @@ pub fn config_template() -> String {
          # name = \"rm-to-backup\"\n\
          # command = \"rm\"\n\
          # action = \"move-to\"\n\
-         # destination = \"/tmp/omamori-quarantine/\"\n\
+         # destination = \"/Users/you/.omamori-quarantine/\"  # under your home directory, not /tmp\n\
          # match_any = [\"-r\", \"-rf\", \"-fr\", \"--recursive\"]\n\
          # message = \"omamori moved targets to backup instead of deleting\"\n",
     );
@@ -1284,6 +1460,20 @@ name = "malformed-no-command"
 
     #[test]
     fn validate_destination_on_non_move_to_warns() {
+        // NOTE: must not be `/tmp/...` (macOS: `/tmp` -> `/private/tmp`) or
+        // `/home/...` (macOS: `/home` -> `/System/Volumes/Data/home`) — both
+        // canonicalize under a blocked prefix (`/private`, `/System`).
+        // `resolve_for_prefix_check`'s ancestor walk now correctly resolves
+        // this even for a nonexistent leaf (#391), which would disable the
+        // rule via the *separate* prefix-block check below — defeating this
+        // test, which exists to cover the unrelated "destination is ignored"
+        // warning path (action != move-to) in isolation. `target/test-scratch`
+        // under the repo checkout is never under a blocked prefix.
+        let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-scratch")
+            .join("validate-destination-non-move-to-warns")
+            .join("x");
         let mut rules = vec![
             RuleConfig::new(
                 "weird",
@@ -1293,7 +1483,7 @@ name = "malformed-no-command"
                 Vec::new(),
                 None,
             )
-            .with_destination("/tmp/x".to_string()),
+            .with_destination(scratch.display().to_string()),
         ];
         let mut warnings = Vec::new();
         validate_rules(&mut rules, &mut warnings);
@@ -1355,6 +1545,145 @@ name = "malformed-no-command"
         assert!(!rules[0].enabled);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #391: resolve_for_prefix_check (shape enumeration: V-002, V-012, V-016)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_for_prefix_check_blocks_nonexistent_subdir_under_blocked_prefix() {
+        // The #391 bug: a nonexistent path under a blocked prefix used to
+        // silently pass because `Path::canonicalize()` requires the whole
+        // path to exist. Walking up to the nearest existing ancestor (`/etc`,
+        // which on macOS is itself a symlink to `/private/etc`) and rejoining
+        // the missing tail must still land under a blocked prefix (`/etc` on
+        // Linux, `/private` on macOS — either way `BLOCKED_DESTINATION_PREFIXES`
+        // catches it).
+        let path = Path::new("/etc/omamori-test-made-up-name-xyz");
+        let resolved = resolve_for_prefix_check(path, PathResolutionMode::AllowMissingTail)
+            .expect("root always canonicalizes, so an ancestor must be found");
+        assert!(
+            BLOCKED_DESTINATION_PREFIXES
+                .iter()
+                .any(|prefix| resolved.starts_with(prefix)),
+            "expected resolution under a blocked prefix, got {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn resolve_for_prefix_check_allows_segment_boundary_confusables() {
+        // `str::starts_with("/etc")` would wrongly block these; `Path::starts_with`
+        // is segment-aware and must not.
+        for candidate in [
+            "/usr-local/omamori-test-nonexistent",
+            "/etcetera/omamori-test-nonexistent",
+            "/vartmp/omamori-test-nonexistent",
+            "/binary/omamori-test-nonexistent",
+            "/private-data/omamori-test-nonexistent",
+        ] {
+            let resolved = resolve_for_prefix_check(
+                Path::new(candidate),
+                PathResolutionMode::AllowMissingTail,
+            )
+            .unwrap_or_else(|e| panic!("expected a resolution for {candidate}, got: {e}"));
+            let blocked = BLOCKED_DESTINATION_PREFIXES
+                .iter()
+                .any(|prefix| resolved.starts_with(prefix));
+            assert!(
+                !blocked,
+                "{candidate} resolved to {} and was wrongly treated as blocked",
+                resolved.display()
+            );
+        }
+    }
+
+    /// Codex Round 1 test-adversarial finding: the test above calls
+    /// `resolve_for_prefix_check` and re-implements its own `Path::starts_with`
+    /// comparison inline — it does NOT exercise the production comparator in
+    /// `validate_destination` itself. A regression there (e.g. reverting to
+    /// `canonical.to_string_lossy().starts_with(prefix)`, the pre-#391
+    /// pattern) would not be caught by that test alone. This test calls
+    /// `validate_destination` directly for the same segment-boundary
+    /// confusables.
+    #[test]
+    fn validate_destination_allows_segment_boundary_confusables() {
+        for candidate in [
+            "/usr-local/omamori-test-nonexistent",
+            "/etcetera/omamori-test-nonexistent",
+            "/vartmp/omamori-test-nonexistent",
+            "/binary/omamori-test-nonexistent",
+            "/private-data/omamori-test-nonexistent",
+        ] {
+            let mut warnings = Vec::new();
+            assert!(
+                validate_destination(candidate, "seg-boundary-test", &mut warnings),
+                "{candidate} must be accepted by validate_destination, got warnings: {warnings:?}"
+            );
+            assert!(
+                warnings.is_empty(),
+                "{candidate} must not produce any warning: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_for_prefix_check_folds_parent_traversal_before_prefix_test() {
+        // `/tmp/<nonexistent>/../../etc/<nonexistent>` must resolve under
+        // `/etc` (blocked) — proving the lexical fold runs on the full
+        // ancestor-joined path, not just the raw (pre-fold) tail.
+        let path = Path::new("/tmp/omamori-test-fold-a/../../etc/omamori-test-fold-b");
+        let resolved = resolve_for_prefix_check(path, PathResolutionMode::AllowMissingTail)
+            .expect("ancestor resolution must succeed");
+        assert!(
+            resolved.starts_with("/etc") || resolved.starts_with("/private"),
+            "expected `..` to fold onto /etc (or macOS's /private/etc), got {}",
+            resolved.display()
+        );
+        assert!(
+            !resolved.to_string_lossy().contains(".."),
+            "resolved path must not retain literal `..`: {}",
+            resolved.display()
+        );
+    }
+
+    #[test]
+    fn resolve_for_prefix_check_resolves_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+        let dir =
+            std::env::temp_dir().join(format!("omamori-prefix-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real_target = dir.join("real-etc-standin");
+        std::fs::create_dir_all(&real_target).unwrap();
+        let link = dir.join("link");
+        symlink(&real_target, &link).unwrap();
+
+        // Nonexistent leaf under a symlinked (existing) intermediate ancestor.
+        let path = link.join("nonexistent-leaf");
+        let resolved = resolve_for_prefix_check(&path, PathResolutionMode::AllowMissingTail)
+            .expect("existing symlink ancestor must resolve");
+        let expected = real_target.canonicalize().unwrap().join("nonexistent-leaf");
+        assert_eq!(
+            resolved, expected,
+            "expected the symlink ancestor to be resolved to its real target before joining the tail"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_for_prefix_check_require_full_existence_rejects_missing_path() {
+        let path = Path::new("/etc/omamori-test-require-full-nonexistent");
+        let err = resolve_for_prefix_check(path, PathResolutionMode::RequireFullExistence)
+            .expect_err("RequireFullExistence must not fall back to ancestor resolution");
+        // Codex Round 1 removed-behavior audit finding: the underlying OS
+        // error detail must survive, not just a bare failure.
+        assert!(
+            err.contains("cannot be verified"),
+            "expected the underlying canonicalize error to be preserved, got: {err}"
+        );
     }
 
     #[test]

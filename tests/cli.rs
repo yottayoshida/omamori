@@ -632,6 +632,125 @@ fn config_enable_blocked_in_ai_session() {
     assert!(stderr.contains("blocked"));
 }
 
+/// Security-review finding: the two tests above only exercise a *core*
+/// rule name. #388 widened `config disable`/`enable` to accept custom
+/// names too — confirm the AI-env guard blocks those identically (it's a
+/// name-agnostic, unconditional first statement in both functions, so this
+/// is a belt-and-suspenders regression pin, not a gap that was ever
+/// actually exploitable).
+#[test]
+fn config_disable_enable_blocked_in_ai_session_for_custom_rule_name() {
+    let dir = unique_dir("guard-disable-enable-custom");
+    config_add_init(&dir);
+    let add = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "my-guarded-custom-rule",
+            "--command",
+            "curl",
+            "--action",
+            "block",
+            "--match-any",
+            "x",
+        ])
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+
+    for subcommand in ["disable", "enable"] {
+        let output = Command::new(binary())
+            .args(["config", subcommand, "my-guarded-custom-rule"])
+            .env("XDG_CONFIG_HOME", &dir)
+            .env_remove("HOME")
+            .env("CLAUDECODE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "config {subcommand} on a custom name must still be blocked in an AI session"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("blocked"),
+            "config {subcommand}: expected a blocked message, got: {stderr}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// V-007 (QA gap): every one of the 14 core rule ids must be rejected by
+/// `config disable`, not just `git-push-force-block` (the one exercised by
+/// `config_disable_blocked_in_ai_session`, which additionally only checks
+/// the AI-guard path, not the actual core-rejection message).
+#[test]
+fn config_disable_rejects_all_core_rule_ids() {
+    let dir = unique_dir("cfg-disable-core-all");
+    config_add_init(&dir);
+    let config_path = dir.join("omamori").join("config.toml");
+    let before = fs::read_to_string(&config_path).unwrap();
+
+    for id in CORE_RULE_IDS {
+        let output = config_add_cmd(&dir)
+            .args(["config", "disable", id])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "core id `{id}` must be rejected by config disable, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("core safety rule") && stderr.contains("override disable"),
+            "id `{id}`: stderr should redirect to override disable: {stderr}"
+        );
+    }
+
+    let after = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(
+        after, before,
+        "no rejected disable for a core id may have written anything to the file"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// V-007 companion: `config enable` on a fresh (never-disabled) core rule
+/// must be a safe, non-crashing "already enabled" no-op for every one of
+/// the 14 core ids — `enable` (unlike `disable`) does not unconditionally
+/// reject core names, since it also has to clean up a hand-written raw
+/// stub; this pins that every core id survives that path without error or
+/// an unintended write.
+#[test]
+fn config_enable_is_safe_noop_for_all_core_rule_ids() {
+    let dir = unique_dir("cfg-enable-core-all");
+    config_add_init(&dir);
+    let config_path = dir.join("omamori").join("config.toml");
+    let before = fs::read_to_string(&config_path).unwrap();
+
+    for id in CORE_RULE_IDS {
+        let output = config_add_cmd(&dir)
+            .args(["config", "enable", id])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("already enabled"),
+            "id `{id}`: expected the idempotence message, got: {stderr}"
+        );
+    }
+
+    let after = fs::read_to_string(&config_path).unwrap();
+    assert_eq!(
+        after, before,
+        "no no-op enable for a core id may have written anything to the file"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn uninstall_blocked_in_ai_session() {
     let output = Command::new(binary())
@@ -3842,17 +3961,23 @@ fn config_add_rejects_bad_destination_before_writing() {
     let dir = unique_dir("cfg-add-bad-dest");
     config_add_init(&dir);
 
-    // "system" uses `/etc` itself (guaranteed to exist on macOS/Linux CI runners):
-    // `validate_destination`'s blocked-prefix check runs on `Path::canonicalize()`,
-    // which requires the full path to already exist on disk — a nonexistent
-    // subdirectory under a blocked prefix (e.g. `/etc/made-up-name`) silently
-    // passes this pre-write check. That's a real gap in the pre-existing
-    // `validate_destination` helper (shared with post-load `validate_rules`),
-    // tracked separately (issue TBD) — it isn't a security bypass because
-    // `move_to_dir` fails closed at execution time when the destination
-    // doesn't exist (src/actions.rs:106), it just means the rule silently
-    // scaffolds as "added" instead of being rejected at add-time.
-    for (label, dest) in [("relative", "backup/quarantine"), ("system", "/etc")] {
+    // "system" uses `/etc` itself (guaranteed to exist on macOS/Linux CI
+    // runners). "system-nonexistent" (#391 fix): a nonexistent subdirectory
+    // under a blocked prefix — `validate_destination` used to only check
+    // `Path::canonicalize()` on the full path, which requires the whole path
+    // to already exist, so this silently passed the pre-write check (the
+    // rule scaffolded as "added" instead of being rejected). Since #391,
+    // `resolve_for_prefix_check` walks up to the nearest existing ancestor
+    // (`/etc`) and rejoins the missing tail before the prefix test, so this
+    // is now rejected too — it was never a security bypass (`move_to_dir`
+    // already failed closed at execution time, src/actions.rs), but `add`
+    // silently reporting success for a rule that could never fire was itself
+    // the bug this test now pins closed.
+    for (label, dest) in [
+        ("relative", "backup/quarantine"),
+        ("system", "/etc"),
+        ("system-nonexistent", "/etc/omamori-test-made-up-name"),
+    ] {
         let output = config_add_cmd(&dir)
             .args([
                 "config",
@@ -3912,6 +4037,64 @@ fn config_add_rejects_bad_destination_before_writing() {
         stderr.contains("not an absolute path"),
         "the real rejection reason must survive even when --destination contains \
          the message-stripping substring: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// #391 V-001: the flip side of `config_add_rejects_bad_destination_before_writing`'s
+/// "system-nonexistent" case — a destination that does not exist yet but is
+/// **not** under a blocked prefix must still be accepted at add-time. This is
+/// the shape of the README's `move-to` example (a quarantine directory the
+/// user is expected to create on first use, not pre-provision). Deliberately
+/// does NOT pre-create the directory (unlike
+/// `config_add_move_to_with_valid_destination_and_match_all_fires_in_explain`),
+/// to isolate "nonexistent + unblocked" from "nonexistent + blocked".
+#[test]
+fn config_add_accepts_nonexistent_destination_outside_blocked_prefix() {
+    let dir = unique_dir("cfg-add-dest-unblocked-nonexistent");
+    config_add_init(&dir);
+
+    let scratch_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-scratch");
+    let quarantine = scratch_root.join(format!(
+        "cfg-add-unblocked-nonexistent-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&quarantine);
+    assert!(
+        !quarantine.exists(),
+        "precondition: destination must not exist yet"
+    );
+
+    let output = config_add_cmd(&dir)
+        .args([
+            "config",
+            "add",
+            "dest-unblocked-test",
+            "--command",
+            "rm",
+            "--action",
+            "move-to",
+            "--match-any",
+            "-rf",
+            "--destination",
+        ])
+        .arg(&quarantine)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a nonexistent, non-blocked destination must be accepted, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains("dest-unblocked-test"),
+        "rule must have been written: {content}"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -4076,7 +4259,7 @@ fn config_add_destination_and_move_to_action_are_mutually_required() {
             "--match-any",
             "-rf",
             "--destination",
-            "/tmp/omamori-quarantine",
+            "/Users/you/.omamori-quarantine",
         ])
         .output()
         .unwrap();
@@ -4286,6 +4469,89 @@ fn config_add_rejects_degraded_config_without_modifying_it() {
                 || stderr.contains("degraded")
                 || stderr.contains("cannot be safely edited"),
             "{label} stderr: {stderr}"
+        );
+
+        let after = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            after, contents,
+            "{label}: config.toml must be byte-for-byte unchanged after a rejected add"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Codex Round 1 test-adversarial finding: shape enumeration's headline
+/// correction was that `rules = [{...}]` (inline array) and `rules = []`
+/// (empty inline array) are VALID, non-degraded configs (`config list`
+/// loads and honors them) — their refuse can only come from
+/// `get_or_create_rules_array`'s own dispatch, never from the `degraded`
+/// precheck covered by `config_add_rejects_degraded_config_without_modifying_it`
+/// above. This is a materially different code path and needs its own test.
+#[test]
+fn config_add_refuses_non_degraded_inline_array_shapes_without_modifying_them() {
+    for (label, contents) in [
+        (
+            "inline-array-with-rule",
+            "rules = [{ name = \"inline-rule\", command = \"curl\", action = \"block\", match_any = [\"x\"] }]\n",
+        ),
+        ("empty-inline-array", "rules = []\n"),
+    ] {
+        let dir = unique_dir(&format!("cfg-add-inline-{label}"));
+        fs::create_dir_all(dir.join("omamori")).unwrap();
+        let config_path = dir.join("omamori").join("config.toml");
+        fs::write(&config_path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Sanity: not degraded — `config list` must succeed and (for the
+        // non-empty case) show the inline rule as active.
+        let list = config_add_cmd(&dir)
+            .args(["config", "list"])
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "{label}: config list must succeed on a non-degraded config, stderr: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        if label == "inline-array-with-rule" {
+            assert!(
+                String::from_utf8_lossy(&list.stdout).contains("inline-rule"),
+                "{label}: inline rule must be loaded and honored (not degraded)"
+            );
+        }
+
+        let output = config_add_cmd(&dir)
+            .args([
+                "config",
+                "add",
+                "new-rule",
+                "--command",
+                "ls",
+                "--action",
+                "block",
+                "--match-any",
+                "-l",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{label}: add must refuse a non-`[[rules]]` shape even though it's valid, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.to_lowercase().contains("malformed"),
+            "{label}: a valid inline-array config must not be called malformed: {stderr}"
+        );
+        assert!(
+            stderr.contains("not in `[[rules]]`") || stderr.contains("array form"),
+            "{label}: expected the shape-refuse message, got: {stderr}"
         );
 
         let after = fs::read_to_string(&config_path).unwrap();

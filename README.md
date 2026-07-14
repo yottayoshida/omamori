@@ -203,8 +203,9 @@ Built-in rules are always inherited. Only write the rules you want to change:
 ```bash
 omamori config list                          # show all rules
 omamori config add my-rule --command rm --action block --match-any -rf  # scaffold a custom rule
-omamori config disable git-push-force-block  # disable a rule
-omamori config enable git-push-force-block   # restore default
+omamori config disable my-rule               # disable it
+omamori config enable my-rule                # re-enable it
+omamori override disable git-push-force-block  # disable a built-in (core rules use override, not config disable)
 omamori test                                 # verify policy
 ```
 
@@ -213,11 +214,17 @@ Or edit `~/.config/omamori/config.toml` directly. Config is auto-created by `oma
 <details>
 <summary>Configuration examples</summary>
 
-**Disable a rule**:
+**Disable a custom rule** (built-ins ignore `enabled = false` here — see below):
 ```toml
 [[rules]]
-name = "git-push-force-block"
+name = "my-rule"
 enabled = false
+```
+
+**Disable a built-in rule** (core rules can only be disabled via `[overrides]`, equivalent to `omamori override disable <rule-name>`):
+```toml
+[overrides]
+git-push-force-block = false
 ```
 
 **Move files to a custom directory**:
@@ -226,7 +233,7 @@ enabled = false
 name = "rm-to-backup"
 command = "rm"
 action = "move-to"
-destination = "/tmp/omamori-quarantine/"
+destination = "/Users/you/.omamori-quarantine/"  # under your home directory, not /tmp
 match_any = ["-r", "-rf", "-fr", "--recursive"]
 ```
 
@@ -235,7 +242,7 @@ match_any = ["-r", "-rf", "-fr", "--recursive"]
 [[rules]]
 name = "rm-recursive-to-trash"
 action = "move-to"
-destination = "/tmp/omamori-quarantine/"
+destination = "/Users/you/.omamori-quarantine/"  # under your home directory, not /tmp
 ```
 
 **Enable audit retention** (prunes entries older than N days):

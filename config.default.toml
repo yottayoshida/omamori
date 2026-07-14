@@ -161,7 +161,7 @@ message = "omamori blocked break-glass activation via AI"
 # name = "rm-to-backup"
 # command = "rm"
 # action = "move-to"
-# destination = "/tmp/omamori-quarantine/"
+# destination = "/Users/you/.omamori-quarantine/"  # under your home directory, not /tmp
 # match_any = ["-r", "-rf", "-fr", "--recursive"]
 # message = "omamori moved targets to backup instead of deleting"
 
