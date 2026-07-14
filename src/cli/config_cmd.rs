@@ -146,18 +146,41 @@ pub(crate) fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn validate_rule_name(name: &str) -> Result<(), AppError> {
-    let known_names: Vec<String> = config::default_rules()
-        .iter()
-        .map(|r| r.name.clone())
-        .collect();
-    if !known_names.contains(&name.to_string()) {
+/// `known_names` is caller-supplied so the *scope* of what counts as "known"
+/// can differ: `override disable/enable` pass core-only names (blast radius
+/// unchanged — overrides only ever apply to built-ins); `config
+/// disable/enable` (#388) pass core names **plus** the current config's
+/// custom rule names, so a `config add`-created rule can be toggled too.
+fn validate_rule_name(name: &str, known_names: &[String]) -> Result<(), AppError> {
+    if !known_names.iter().any(|n| n == name) {
         return Err(AppError::Config(format!(
             "unknown rule `{name}`\n  Known rules: {}",
             known_names.join(", ")
         )));
     }
     Ok(())
+}
+
+fn core_rule_names_owned() -> Vec<String> {
+    config::core_rule_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Core rule names plus every custom (non-builtin) rule name present in the
+/// already-merged config — i.e. the set `config disable`/`enable` may
+/// legally target (#388). Built from the *merged* rule set, not the raw
+/// `[[rules]]` array, so a malformed custom entry that `merge_rules` skipped
+/// (missing `command`/`action`) is correctly treated as not-yet-toggleable,
+/// matching what `config list` would show.
+fn known_rule_names(load_result: &config::ConfigLoadResult) -> Vec<String> {
+    load_result
+        .config
+        .rules
+        .iter()
+        .map(|r| r.name.clone())
+        .collect()
 }
 
 fn resolve_config_path_checked() -> Result<std::path::PathBuf, AppError> {
@@ -214,9 +237,97 @@ where
 // config disable / enable
 // ---------------------------------------------------------------------------
 
+/// Shared `[[rules]]` get-or-create (#389). `rules` absent -> create an empty
+/// array-of-tables. `rules` present as `[[rules]]` -> return it (covers
+/// normal entries, no-target-yet, and duplicate-name entries alike). Any
+/// other shape (bare `[rules]` table, scalar, inline array, table-of-tables)
+/// -> refuse rather than `disable`'s previous `doc.insert` (which silently
+/// clobbered whatever was there). `caller` is embedded in the message.
+///
+/// This is the *sole* authoritative refuse point for the "valid TOML, but
+/// not `[[rules]]` array form" shapes (an inline `rules = [{...}]` is a
+/// genuinely working config — NOT malformed — so it will never be caught by
+/// a `degraded` precheck; only this dispatch catches it). Callers should
+/// still run a `degraded` precheck first for the truly-malformed shapes
+/// (bare table, scalar, etc.) — it fires earlier with a better-targeted
+/// "run `config validate`" message — but must not rely on it alone.
+fn get_or_create_rules_array<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    caller: &str,
+) -> Result<&'a mut toml_edit::ArrayOfTables, AppError> {
+    if doc.get("rules").is_none() {
+        doc.insert(
+            "rules",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+    doc.get_mut("rules")
+        .and_then(|item| item.as_array_of_tables_mut())
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "{caller}: existing `rules` in config.toml is not in `[[rules]]` array form; \
+                 refusing to overwrite it.\n  Edit the config directly, or run `omamori init --force`."
+            ))
+        })
+}
+
+/// Shared malformed-config precondition (#389/#388): `disable`/`enable`
+/// (like `add`'s existing O3) refuse to edit a `degraded` config rather than
+/// building on the silent fallback-to-core-defaults state.
+fn reject_if_degraded(
+    caller: &str,
+    load_result: &config::ConfigLoadResult,
+) -> Result<(), AppError> {
+    if load_result.degraded {
+        return Err(AppError::Config(format!(
+            "{caller}: config.toml is malformed and cannot be safely edited.\n  \
+             Run `omamori config validate` to see the error,\n  \
+             then fix it, or run `omamori init --force` to regenerate.\n  \
+             ({caller} refuses to modify a degraded config to avoid data loss.)"
+        )));
+    }
+    Ok(())
+}
+
+/// Shared raw-duplicate-name precondition (#389): an in-place `enabled`
+/// rewrite only ever touches the *first* raw match by name — if the config
+/// has more than one, `config disable`/`enable` must refuse rather than
+/// silently rewrite one and leave the rest untouched while still reporting
+/// success.
+fn reject_if_duplicate_raw_entry(
+    caller: &str,
+    raw: &config::RawRuleArrayState,
+    config_path: &Path,
+    rule_name: &str,
+) -> Result<(), AppError> {
+    if raw.count > 1 {
+        return Err(AppError::Config(format!(
+            "{caller}: `{rule_name}` appears more than once in config.toml's `[[rules]]` \
+             array; refusing to guess which entry to change.\n  \
+             Edit {} directly to remove the duplicate, then retry.",
+            config_path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     guard_ai_config_modification("config disable")?;
-    validate_rule_name(rule_name)?;
+
+    let config_path = resolve_config_path_checked()?;
+    // `load_config` handles a missing path internally (falls back to
+    // `Config::default()`, i.e. core rules only) — so `known_rule_names`
+    // is exactly the 14 core names when no config file exists yet. Every
+    // one of those is then caught by the `is_core_rule` redirect below,
+    // and any other name fails `validate_rule_name` as unknown. There is
+    // therefore no reachable case where a config file needs to be created
+    // here (unlike `config add`, which always creates something new): a
+    // *custom* name can only validate successfully if it is already present
+    // in an existing config.
+    let precheck = load_config(Some(&config_path))?;
+    reject_if_degraded("config disable", &precheck)?;
+
+    validate_rule_name(rule_name, &known_rule_names(&precheck))?;
 
     if is_core_rule(rule_name) {
         return Err(AppError::Config(format!(
@@ -226,50 +337,36 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
         )));
     }
 
-    let config_path = resolve_config_path_checked()?;
-    if !config_path.exists() {
-        config::write_default_config(&config_path, false)?;
-    }
-
-    let load_result = load_config(None)?;
-    if let Some(r) = load_result
-        .config
-        .rules
-        .iter()
-        .find(|r| r.name == rule_name)
-        && !r.enabled
-    {
+    let raw = config::read_raw_rule_state(&config_path, rule_name)?;
+    reject_if_duplicate_raw_entry("config disable", &raw, &config_path, rule_name)?;
+    // Checked against the *raw* `enabled` value, not `precheck`'s
+    // merged/validated state — a rule can be effectively disabled by
+    // validation (e.g. a bad `move-to` destination) while its raw entry
+    // has no explicit `enabled = false`. Reporting "already disabled" from
+    // the merged state would skip the write here, and a later fix to the
+    // validation issue would then silently reactivate the rule despite this
+    // `disable` having reported success. Read generically (works for both
+    // `[[rules]]` and inline-array form) — whether a subsequent write is
+    // actually possible for this shape is `get_or_create_rules_array`'s
+    // question alone, asked only if a write turns out to be needed (see
+    // `RawRuleArrayState`'s doc comment).
+    if !raw.enabled {
         eprintln!("Rule `{rule_name}` is already disabled.");
         return Ok(2);
     }
 
     mutate_config(&config_path, |doc| {
-        let rules = doc
-            .get_mut("rules")
-            .and_then(|item| item.as_array_of_tables_mut());
-
-        if let Some(entry) = rules.and_then(|tables| {
-            tables
-                .iter_mut()
-                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(rule_name))
-        }) {
-            entry["enabled"] = toml_edit::value(false);
-            return Ok(());
-        }
-
-        let mut new_table = toml_edit::Table::new();
-        new_table["name"] = toml_edit::value(rule_name);
-        new_table["enabled"] = toml_edit::value(false);
-        if let Some(array) = doc
-            .get_mut("rules")
-            .and_then(|item| item.as_array_of_tables_mut())
-        {
-            array.push(new_table);
-        } else {
-            let mut array = toml_edit::ArrayOfTables::new();
-            array.push(new_table);
-            doc.insert("rules", toml_edit::Item::ArrayOfTables(array));
-        }
+        let rules = get_or_create_rules_array(doc, "config disable")?;
+        let entry = rules
+            .iter_mut()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(rule_name))
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "config disable: internal error — `{rule_name}` was found while loading \
+                     config.toml but not while writing it; please report this as a bug."
+                ))
+            })?;
+        entry["enabled"] = toml_edit::value(false);
         Ok(())
     })?;
 
@@ -279,51 +376,111 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
 
 fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
     guard_ai_config_modification("config enable")?;
-    validate_rule_name(rule_name)?;
 
     let config_path = resolve_config_path_checked()?;
+    // `load_config` handles a missing path internally (falls back to
+    // `Config::default()`, i.e. core rules only, `degraded = false`) — so
+    // this naturally validates `rule_name` against "core names only" when
+    // no config file exists yet, without a separate early return.
+    let precheck = load_config(Some(&config_path))?;
+    reject_if_degraded("config enable", &precheck)?;
+
+    validate_rule_name(rule_name, &known_rule_names(&precheck))?;
 
     if !config_path.exists() {
         eprintln!("Rule `{rule_name}` is already enabled (built-in default).");
         return Ok(2);
     }
 
-    let load_result = load_config(None)?;
-    if let Some(r) = load_result
-        .config
-        .rules
-        .iter()
-        .find(|r| r.name == rule_name)
-        && r.enabled
-    {
+    let Some(existing) = precheck.config.rules.iter().find(|r| r.name == rule_name) else {
+        return Err(AppError::Config(format!(
+            "config enable: internal error — `{rule_name}` passed validation but is not in \
+             the merged rule set; please report this as a bug."
+        )));
+    };
+    let is_builtin = existing.is_builtin;
+
+    // Core-rule disablement can happen two ways: a raw `rules` entry (which
+    // core `enabled` immutability makes inert on its own — see
+    // `raw_override_disables`'s doc comment) or `[overrides]` itself
+    // (`omamori override disable`, the mechanism that's actually
+    // effective). `config enable` only ever touches `rules`, so if
+    // `[overrides]` is what's disabling this rule, redirect rather than
+    // silently no-op-ing while claiming success.
+    if is_builtin && config::raw_override_disables(&config_path, rule_name)? {
+        return Err(AppError::Config(format!(
+            "`{rule_name}` is disabled via `[overrides]`, not `config disable`.\n\n  \
+             To restore it: omamori override enable {rule_name}\n  \
+             To see core vs custom rules: omamori config list"
+        )));
+    }
+
+    let raw = config::read_raw_rule_state(&config_path, rule_name)?;
+
+    reject_if_duplicate_raw_entry("config enable", &raw, &config_path, rule_name)?;
+    // Checked against the *raw* `enabled` value, not `existing.enabled`
+    // (merged/validated) — see the matching note in `run_config_disable`.
+    // A rule can be effectively disabled by validation alone (no explicit
+    // raw `enabled = false`); reporting "already enabled" from the merged
+    // state here is correct only when the raw toggle is the reason it's
+    // off. If it's off for a raw reason, we still need to write (remove the
+    // raw `enabled = false` / stub) even though the effective state may
+    // remain disabled afterward due to the unrelated validation issue.
+    if raw.enabled {
         eprintln!("Rule `{rule_name}` is already enabled.");
+        // Angle-A follow-up finding: the raw toggle and the merged/
+        // validated effective state can disagree (e.g. a `move-to` rule
+        // with an invalid destination) — say so, rather than letting
+        // "already enabled" read as "and therefore active", which
+        // `omamori config list`'s warnings would immediately contradict.
+        if !existing.enabled {
+            eprintln!(
+                "  Note: it is still shown as disabled in `omamori config list` — \
+                 that's a separate validation issue (see the warning there), not \
+                 the `enabled` toggle `config enable` controls."
+            );
+        }
         return Ok(2);
     }
 
     mutate_config(&config_path, |doc| {
-        if let Some(tables) = doc
-            .get_mut("rules")
-            .and_then(|item| item.as_array_of_tables_mut())
-        {
-            let idx = tables
-                .iter()
-                .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(rule_name));
+        let rules = get_or_create_rules_array(doc, "config enable")?;
+        let idx = rules
+            .iter()
+            .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(rule_name))
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "config enable: internal error — `{rule_name}` was found while loading \
+                     config.toml but not while writing it; please report this as a bug."
+                ))
+            })?;
 
-            if let Some(i) = idx {
-                let key_count = tables.iter().nth(i).map_or(0, |t| t.iter().count());
-                if key_count <= 2 {
-                    tables.remove(i);
-                } else {
-                    if let Some(entry) = tables.iter_mut().nth(i) {
-                        entry.remove("enabled");
-                    }
-                }
+        // A raw 2-key stub `{name, enabled=false}` — created by an earlier
+        // `disable` on a *core* rule — can be deleted entirely once
+        // re-enabled; that's exactly "restored to built-in default". A
+        // custom rule's raw entry must NEVER be deleted by `enable`, no
+        // matter its key count — deleting it would delete the rule itself
+        // (this is the one thing that distinguishes the core and custom
+        // paths here; #388 makes reaching this code with a custom name
+        // possible for the first time).
+        if is_builtin {
+            let key_count = rules.iter().nth(idx).map_or(0, |t| t.iter().count());
+            if key_count <= 2 {
+                rules.remove(idx);
+                return Ok(());
             }
+        }
+        if let Some(entry) = rules.iter_mut().nth(idx) {
+            entry.remove("enabled");
         }
         Ok(())
     })?;
 
-    eprintln!("Enabled: {rule_name} (restored to built-in default)");
+    if is_builtin {
+        eprintln!("Enabled: {rule_name} (restored to built-in default)");
+    } else {
+        eprintln!("Enabled: {rule_name}");
+    }
     run_config_list()
 }
 
@@ -523,15 +680,7 @@ fn run_config_add(args: &[OsString]) -> Result<i32, AppError> {
     // (d)/(f)/(i) in the shape enumeration) rather than silently clobbering or
     // building on top of a fallback-to-core-defaults state (T3 silent fail).
     let precheck = load_config(Some(&config_path))?;
-    if precheck.degraded {
-        return Err(AppError::Config(
-            "config add: config.toml is malformed and cannot be safely edited.\n  \
-             Run `omamori config validate` to see the error,\n  \
-             then fix it, or run `omamori init --force` to regenerate.\n  \
-             (add refuses to modify a degraded config to avoid data loss.)"
-                .to_string(),
-        ));
-    }
+    reject_if_degraded("config add", &precheck)?;
     // Duplicate-name check against the RAW `[[rules]]` array, not the merged
     // `precheck.config.rules`. `merge_rules` records a name as "claimed" the
     // moment it's seen — even if that entry is malformed (missing command/
@@ -542,13 +691,20 @@ fn run_config_add(args: &[OsString]) -> Result<i32, AppError> {
     if config::raw_rule_names(&config_path)?.contains(&parsed.rule_name) {
         // NOTE (UX review): by this point `parsed.rule_name` is guaranteed to
         // NOT be a core rule id (the O2 shadow check above already rejected
-        // that), so it can only be a pre-existing *custom* entry — and
-        // `config disable` only accepts known/built-in names (validate_rule_name
-        // checks against default_rules()). Don't suggest a recovery command
-        // that's guaranteed to fail with "unknown rule".
+        // that), so it can only be a pre-existing *custom* entry. Since #388,
+        // `config disable <name>` accepts custom names too (previously it
+        // only accepted built-ins, so this message used to avoid suggesting
+        // it — Codex Round 1 removed-behavior audit finding: that reasoning
+        // predates #388 and is now stale). Phrased as "if you want to
+        // disable" rather than a flat imperative: it only actually succeeds
+        // for `[[rules]]`-form entries, not a hand-written inline-array
+        // duplicate (sweep-pass finding) — `config disable` will say so if
+        // it doesn't apply here.
         return Err(AppError::Config(format!(
             "config add: a rule named `{}` already exists.\n  \
+             If you want to disable it instead: omamori config disable {}\n  \
              To change it: edit {} directly, or remove the existing `[[rules]]` block first.",
+            parsed.rule_name,
             parsed.rule_name,
             config_path.display()
         )));
@@ -603,27 +759,12 @@ fn run_config_add(args: &[OsString]) -> Result<i32, AppError> {
     let rendered_entry = new_table.clone();
 
     // O5: write via the shared atomic pipeline (SECURITY T6: DO NOT SPLIT).
+    // Shared with disable/enable (#389) — an inline array `rules = [{...}]`
+    // is valid, working TOML (NOT malformed), so the O3 `degraded` precheck
+    // above does not catch it; `get_or_create_rules_array`'s own dispatch is
+    // the actual (and only) guarantee against clobbering that shape.
     mutate_config(&config_path, |doc| {
-        let Some(array) = doc
-            .get_mut("rules")
-            .and_then(|item| item.as_array_of_tables_mut())
-        else {
-            if doc.get("rules").is_some() {
-                // `rules` exists but isn't array-of-tables form (shape (d): bare
-                // `[rules]` table). The O3 precondition should already have
-                // rejected this via `degraded` — stay defensive rather than
-                // clobbering it the way `disable`'s else-branch does.
-                return Err(AppError::Config(
-                    "config add: existing `[rules]` in config.toml is not in `[[rules]]` \
-                     array form; refusing to overwrite it."
-                        .to_string(),
-                ));
-            }
-            let mut array = toml_edit::ArrayOfTables::new();
-            array.push(new_table);
-            doc.insert("rules", toml_edit::Item::ArrayOfTables(array));
-            return Ok(());
-        };
+        let array = get_or_create_rules_array(doc, "config add")?;
         array.push(new_table);
         Ok(())
     })?;
@@ -663,7 +804,7 @@ fn run_config_add(args: &[OsString]) -> Result<i32, AppError> {
 
 fn run_override_disable(rule_name: &str) -> Result<i32, AppError> {
     guard_ai_config_modification("override disable")?;
-    validate_rule_name(rule_name)?;
+    validate_rule_name(rule_name, &core_rule_names_owned())?;
 
     if !is_core_rule(rule_name) {
         return Err(AppError::Config(format!(
@@ -702,7 +843,7 @@ fn run_override_disable(rule_name: &str) -> Result<i32, AppError> {
 
 fn run_override_enable(rule_name: &str) -> Result<i32, AppError> {
     guard_ai_config_modification("override enable")?;
-    validate_rule_name(rule_name)?;
+    validate_rule_name(rule_name, &core_rule_names_owned())?;
 
     if !is_core_rule(rule_name) {
         return Err(AppError::Config(format!(
@@ -747,10 +888,10 @@ fn run_config_list() -> Result<i32, AppError> {
         .collect();
 
     println!(
-        "\n  {:<30} {:<16} {:<10} Source",
+        "\n  {:<30} {:<40} {:<10} Source",
         "Rule", "Action", "Status"
     );
-    println!("  {}", "-".repeat(76));
+    println!("  {}", "-".repeat(100));
 
     for rule in &config.rules {
         let status = if rule.enabled { "active" } else { "disabled" };
@@ -784,7 +925,7 @@ fn run_config_list() -> Result<i32, AppError> {
             other => other.as_str().to_string(),
         };
         println!(
-            "  {:<30} {:<16} {:<10} {}",
+            "  {:<30} {:<40} {:<10} {}",
             rule.name, action_str, status, source
         );
     }

@@ -2,7 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
-use crate::config::BLOCKED_DESTINATION_PREFIXES;
+use crate::config::{BLOCKED_DESTINATION_PREFIXES, PathResolutionMode, resolve_for_prefix_check};
 use crate::rules::{ActionKind, CommandInvocation, RuleConfig};
 
 pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
@@ -126,46 +126,21 @@ impl ExecOps for SystemOps {
         }
 
         // Re-check blocked prefixes at execution time with fail-close canonicalize.
-        // Two-stage resolution: if dest exists (incl. symlink), canonicalize it directly
-        // to resolve symlinks to their real target. If dest is verified to exist as a
-        // non-symlink directory (checked above), canonicalize should always succeed here.
-        // For robustness, we also handle the theoretical case where it doesn't exist
-        // by falling back to parent canonicalization.
-        let canonical = if destination.exists() || destination.is_symlink() {
-            destination.canonicalize().map_err(|e| {
-                format!(
-                    "move-to directory `{}` cannot be verified: {e}",
-                    destination.display()
-                )
-            })?
-        } else {
-            // dest doesn't exist — canonicalize parent + join file_name
-            let parent = destination.parent().ok_or_else(|| {
-                format!(
-                    "move-to directory `{}` has no parent directory",
-                    destination.display()
-                )
-            })?;
-            let name = destination.file_name().ok_or_else(|| {
-                format!(
-                    "move-to directory `{}` has no file name component",
-                    destination.display()
-                )
-            })?;
-            let canonical_parent = parent.canonicalize().map_err(|e| {
-                format!(
-                    "move-to directory parent `{}` cannot be verified: {e}",
-                    parent.display()
-                )
-            })?;
-            canonical_parent.join(name)
-        };
-        let canonical_str = canonical.to_string_lossy();
+        // `destination.exists()` was already confirmed above, so the full path
+        // must canonicalize; any failure here (race: deleted since the check
+        // above) is a hard error, not a fallback (RequireFullExistence mode
+        // shares no leniency with validate-time `AllowMissingTail`).
+        let canonical =
+            resolve_for_prefix_check(destination, PathResolutionMode::RequireFullExistence)
+                .map_err(|reason| {
+                    format!("move-to directory `{}` {reason}", destination.display())
+                })?;
         for prefix in BLOCKED_DESTINATION_PREFIXES {
-            if canonical_str.starts_with(prefix) {
+            if canonical.starts_with(prefix) {
                 return Err(format!(
-                    "move-to directory `{}` resolves to blocked system path `{canonical_str}`",
-                    destination.display()
+                    "move-to directory `{}` resolves to blocked system path `{}`",
+                    destination.display(),
+                    canonical.display()
                 ));
             }
         }

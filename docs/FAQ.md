@@ -48,7 +48,7 @@ Use a time-limited bypass for the specific rule that fired. See [I need to bypas
 
    (`--action move-to` additionally requires `--destination <abs-path>`; omitting it is a usage error, not a silently-ignored flag.)
 
-   One honest caveat: a custom rule created this way (or written by hand) can't currently be toggled with `config disable` either — that subcommand only accepts built-in rule names. To change or remove a custom rule, edit `~/.config/omamori/config.toml` directly, then check it with `omamori config validate`.
+   `config disable`/`config enable` accept custom rule names too (not just built-ins) — `omamori config disable my-rule` toggles the rule you just scaffolded. One honest caveat: this only works when the rule is written in `[[rules]]` array-of-tables form (which is what `config add` writes). A custom rule written by hand as an inline array (`rules = [{ name = "my-rule", ... }]`) still can't be toggled via `config disable`/`enable` — those commands will refuse rather than risk corrupting the file. To change or remove a rule in that form, edit `~/.config/omamori/config.toml` directly, then check it with `omamori config validate`.
 
 ### Doctor says `awaiting first invocation` or `WARN last active`
 
