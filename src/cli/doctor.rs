@@ -950,7 +950,7 @@ fn run_install_repair(base_dir: &Path) -> Result<(), AppError> {
     let source_exe = installer::resolve_stable_exe_path(&source_exe);
     let options = installer::InstallOptions {
         base_dir: base_dir.to_path_buf(),
-        source_exe,
+        source: installer::SourceExe::Implicit(source_exe),
         generate_hooks: true,
         ..Default::default()
     };
