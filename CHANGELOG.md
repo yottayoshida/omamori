@@ -4,7 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
-## [Unreleased]
+## [0.13.0] - 2026-07-15
+
+**Summary**: `InstallOptions` provenance-carrying newtype (#378, breaking) plus automated coverage for `auto_setup_codex_if_needed`'s previously-untested ACCEPT path (#379, no behavior change).
 
 ### Changed
 
