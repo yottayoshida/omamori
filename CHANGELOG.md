@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING**: `installer::InstallOptions`'s `source_exe: PathBuf` and `source_is_explicit: bool` fields are replaced by a single `source: SourceExe` field — an enum (`SourceExe::Implicit(PathBuf)` / `SourceExe::Explicit(PathBuf)`) that carries a source path together with its provenance, instead of relying on callers to keep two separate fields in sync. `InstallOptions` is part of `omamori`'s public API (`pub mod installer`); downstream struct-literal construction of `InstallOptions` must be updated to set `source` instead of `source_exe`/`source_is_explicit`. Behavior is unchanged — the #354 dev-build provenance gate's logic is preserved verbatim. ([#378](https://github.com/yottayoshida/omamori/issues/378))
+
 ## [0.12.6] - 2026-07-14
 
 **Summary**: config-validation bug batch (#391, #389, #388). Fixes destination validation silently passing nonexistent paths under a blocked system prefix, `config disable`/`config add` diverging on non-`[[rules]]` TOML shapes, and `config disable`/`config enable` never accepting custom (non-built-in) rule names.

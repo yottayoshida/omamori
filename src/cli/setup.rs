@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::AppError;
 use crate::config;
-use crate::installer::{self, InstallOptions, SHIM_COMMANDS};
+use crate::installer::{self, InstallOptions, SHIM_COMMANDS, SourceExe};
 use crate::integrity::{self, CheckStatus};
 use crate::util::USAGE_HINT;
 
@@ -99,18 +99,14 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     println!("\nomamori setup \u{2014} one-command installation\n");
     println!("  [1/3] Installing shims and hooks...");
 
-    let (source_exe, source_is_explicit) = match source_override {
-        Some(path) => (path, true),
-        None => (
-            installer::resolve_stable_exe_path(&env::current_exe()?),
-            false,
-        ),
+    let source = match source_override {
+        Some(path) => SourceExe::Explicit(path),
+        None => SourceExe::Implicit(installer::resolve_stable_exe_path(&env::current_exe()?)),
     };
     let result = installer::install(&InstallOptions {
         base_dir: base_dir.clone(),
-        source_exe,
+        source,
         generate_hooks: true,
-        source_is_explicit,
         ..Default::default()
     })?;
 

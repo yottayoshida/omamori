@@ -48,15 +48,17 @@ hook/shim reference; neither implies the other.
      silent self-heal entry point (`run_shim`) right alongside `ensure_hooks_current`. Checked
      immediately after its own `current_exe()` resolution, before `setup_codex_hooks` ever runs;
      returns `false` (no auto-configure) rather than persisting the path into the Codex wrapper.
-   - `install()`, gated by a new `InstallOptions::source_is_explicit: bool` field — checked only
-     when `false` (the default), returning `Err(AppError::Config(...))` with a message pointing at
-     the `--source` escape hatch. `source_is_explicit: true` bypasses the check entirely.
+   - `install()`, gated by a new `InstallOptions::source: SourceExe` field (`SourceExe::Implicit`/
+     `SourceExe::Explicit`, refactored from a separate `source_is_explicit: bool` in #378) —
+     checked only when the variant is `Implicit` (the default), returning
+     `Err(AppError::Config(...))` with a message pointing at the `--source` escape hatch.
+     `SourceExe::Explicit` bypasses the check entirely.
    - Both `omamori install --hooks` (no `--source` given) and `omamori setup` (which gained a new
      `--source` flag, mirroring `install`'s existing one, precisely so this same explicit/implicit
      distinction is available to it) route through this shared gate.
 3. **Explicit `--source` is the recovery/dev-workflow escape hatch, not a bypass to close.**
-   Passing `--source <path>` (to `install` or the newly-added `setup --source`) sets
-   `source_is_explicit: true` and skips the check unconditionally — a human who names a specific
+   Passing `--source <path>` (to `install` or the newly-added `setup --source`) constructs
+   `SourceExe::Explicit` and skips the check unconditionally — a human who names a specific
    binary has already made the provenance judgment the check exists to make automatically. This
    mirrors #354's original design intent for `install()`'s pre-existing `--source` flag; the
    extension here is giving `setup` the same flag it previously lacked, rather than inventing a new
@@ -71,10 +73,13 @@ hook/shim reference; neither implies the other.
    without that control surfacing anywhere near the hook-persistence decision itself. That gap in
    auditability, not the mere fact that an agent could type it, is what makes an env-var knob a
    strictly larger attack surface than the footgun this ADR closes.
-5. **`doctor --fix`'s automatic `RunInstall` repair path (`run_install_repair`) requires no code
-   change.** It already resolves `source_exe` via `resolve_stable_exe_path(current_exe())` with
-   `InstallOptions::source_is_explicit` left at its `Default` (`false`), so it is automatically
-   subject to the same `install()` gate — the existing generic `Err(e) -> [FAILED] {e}` reporting
+5. **`doctor --fix`'s automatic `RunInstall` repair path (`run_install_repair`) requires no
+   behavior change.** It already resolves `source_exe` via `resolve_stable_exe_path(current_exe())`
+   and passes it as `SourceExe::Implicit` (originally `InstallOptions::source_is_explicit` left at
+   its `Default` of `false`; #378 replaced the bool with the `SourceExe` enum, which required this
+   call site to construct `SourceExe::Implicit(source_exe)` explicitly instead of leaving the
+   `source` field to its `Default` — the provenance is still implicit either way), so it is
+   automatically subject to the same `install()` gate — the existing generic `Err(e) -> [FAILED] {e}` reporting
    in `doctor.rs`'s repair loop already surfaces the new rejection message without modification.
 
 ## Alternatives Considered

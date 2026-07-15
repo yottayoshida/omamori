@@ -8,13 +8,12 @@ use super::policy_test::run_policy_tests;
 use crate::AppError;
 use crate::config::{self, load_config};
 use crate::engine::guard::guard_ai_config_modification;
-use crate::installer::{self, InstallOptions, default_base_dir, install, uninstall};
+use crate::installer::{self, InstallOptions, SourceExe, default_base_dir, install, uninstall};
 use crate::util::USAGE_HINT;
 
 pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut base_dir = default_base_dir();
-    let mut source_exe = installer::resolve_stable_exe_path(&env::current_exe()?);
-    let mut source_is_explicit = false;
+    let mut source = SourceExe::Implicit(installer::resolve_stable_exe_path(&env::current_exe()?));
     let mut generate_hooks = false;
     let mut index = 2usize;
 
@@ -31,8 +30,7 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
                 let value = args.get(index + 1).ok_or_else(|| {
                     AppError::Usage("install requires a path after --source".to_string())
                 })?;
-                source_exe = PathBuf::from(value);
-                source_is_explicit = true;
+                source = SourceExe::Explicit(PathBuf::from(value));
                 index += 2;
             }
             "--hooks" => {
@@ -50,9 +48,8 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
 
     let result = install(&InstallOptions {
         base_dir,
-        source_exe,
+        source,
         generate_hooks,
-        source_is_explicit,
         ..Default::default()
     })?;
 

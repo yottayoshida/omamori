@@ -12,12 +12,63 @@ const CODEX_STATUS_MESSAGE: &str = "omamori: checking command safety";
 
 pub const SHIM_COMMANDS: &[&str] = &["rm", "git", "chmod", "find", "rsync"];
 
+/// The provenance of an install source path: whether the caller named it
+/// explicitly (e.g. a `--source` flag) or it was implicitly resolved from
+/// `current_exe()` (#354). Carrying the path and its provenance in one value
+/// (rather than a separate `source_exe: PathBuf` + `source_is_explicit: bool`
+/// pair, as this type replaced — #378) makes an implicitly-resolved path
+/// with `Explicit` provenance unrepresentable by accident.
+///
+/// **Caller contract**: `Explicit` must only be constructed from a
+/// caller-supplied `--source` flag (see `cli/setup.rs` and `cli/install.rs`).
+/// Constructing it for a path derived from
+/// `current_exe()`/`resolve_stable_exe_path()` without direct user input
+/// reintroduces the implicit-resolution risk this type exists to prevent —
+/// see the dev-build provenance check in `install()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceExe {
+    /// Resolved without direct user input (`current_exe()` self-resolution).
+    /// Subject to the dev-build provenance check in `install()`.
+    Implicit(PathBuf),
+    /// Named explicitly by the caller (a `--source` flag). The documented
+    /// recovery path (e.g. developing omamori itself); bypasses the
+    /// dev-build provenance check.
+    Explicit(PathBuf),
+}
+
+impl SourceExe {
+    /// Must be a stable path (not a versioned Cellar path). Callers
+    /// constructing `Implicit` should pass the result of
+    /// `resolve_stable_exe_path()` when starting from `current_exe()`.
+    pub fn path(&self) -> &Path {
+        match self {
+            SourceExe::Implicit(p) | SourceExe::Explicit(p) => p,
+        }
+    }
+
+    pub fn is_explicit(&self) -> bool {
+        // Exhaustive match (no wildcard), matching `path()` above — a future
+        // third variant must be handled here explicitly rather than silently
+        // falling through `matches!`'s implicit `_ => false`.
+        match self {
+            SourceExe::Implicit(_) => false,
+            SourceExe::Explicit(_) => true,
+        }
+    }
+}
+
+impl Default for SourceExe {
+    /// Fail-close: a caller that forgets to set this field gets `Implicit`
+    /// (subject to the dev-build gate), never `Explicit` (which bypasses it).
+    fn default() -> Self {
+        SourceExe::Implicit(PathBuf::new())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InstallOptions {
     pub base_dir: PathBuf,
-    /// Path to the omamori binary. Must be a stable path (not a versioned Cellar path).
-    /// Callers should pass the result of `resolve_stable_exe_path()` when using `current_exe()`.
-    pub source_exe: PathBuf,
+    pub source: SourceExe,
     pub generate_hooks: bool,
     /// Override for the resolved `$HOME` used to locate `~/.claude` and
     /// `~/.codex`. `None` means production: resolve via `home_dir()`.
@@ -31,16 +82,6 @@ pub struct InstallOptions {
     /// in-process tests substitute a fixed status without spawning a real
     /// binary (the test process's own exe is never a genuine omamori binary).
     pub verify_override: Option<HookVerifier>,
-    /// Whether `source_exe` was explicitly named by the caller (e.g. a
-    /// `--source` flag), as opposed to implicitly resolved from
-    /// `current_exe()` (#354). `false` (the default) subjects `source_exe`
-    /// to the dev-build provenance check in `install()`; `true` is the
-    /// documented recovery path (a human explicitly pointing at a known
-    /// binary) and bypasses it. Never set this to `true` for a path that
-    /// was itself derived from `current_exe()`/`resolve_stable_exe_path()`
-    /// without direct user input — that reintroduces the implicit-resolution
-    /// risk this field exists to distinguish from.
-    pub source_is_explicit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -112,8 +153,8 @@ pub struct UninstallResult {
 pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
     // Resolve shim paths but do NOT canonicalize — Homebrew stable symlinks
     // like /opt/homebrew/bin/omamori must stay as-is (#42).
-    let source_exe =
-        shim_to_real_exe(&options.source_exe).unwrap_or_else(|| options.source_exe.clone());
+    let requested = options.source.path();
+    let source_exe = shim_to_real_exe(requested).unwrap_or_else(|| requested.to_path_buf());
 
     // Layer 1 (PATH shims) has no dependency on hook verification — link it
     // unconditionally so a hook-contract failure below can't also block
@@ -150,7 +191,7 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         // rejected here, before even probing the hook-check contract — a
         // fresh `cargo build` binary can be fully contract-compliant today
         // and still be the wrong thing to pin (see `is_dev_build_path`).
-        if !options.source_is_explicit && is_dev_build_path(&source_exe) {
+        if !options.source.is_explicit() && is_dev_build_path(&source_exe) {
             return Err(AppError::Config(format!(
                 "could not update hooks — resolved binary at {} {DEV_BUILD_PATH_DESCRIPTION}\n\
                  Layer 1 (PATH shims) was still updated; existing hooks (if any) are kept and protection remains active with the previously installed binary\n\
@@ -1731,6 +1772,38 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // --- SourceExe (#378) ---
+
+    #[test]
+    fn source_exe_default_is_implicit() {
+        // V-002: `InstallOptions` derives `Default`. `run_install_repair`
+        // (cli/doctor.rs) now sets `source` explicitly, but any future
+        // construction site that instead relies on `..Default::default()`
+        // to fill in `source` must not silently get `Explicit` — that would
+        // bypass the dev-build gate, a fail-open regression. Pin the exact
+        // variant, not just `is_explicit()`, so a mutation that swaps the
+        // variant but happens to also flip `is_explicit()`'s logic can't
+        // slip through.
+        assert_eq!(
+            SourceExe::default(),
+            SourceExe::Implicit(PathBuf::new()),
+            "SourceExe::default() must be Implicit — Explicit would bypass the dev-build gate by default"
+        );
+        assert!(!SourceExe::default().is_explicit());
+    }
+
+    #[test]
+    fn source_exe_path_and_is_explicit() {
+        // Distinct paths per variant so a constant-return or swapped-arm bug
+        // in the `Implicit(p) | Explicit(p) => p` binding can't slip through.
+        let implicit_p = PathBuf::from("/opt/homebrew/bin/omamori");
+        let explicit_p = PathBuf::from("/Users/dev/project/target/release/omamori");
+        assert_eq!(SourceExe::Implicit(implicit_p.clone()).path(), implicit_p);
+        assert_eq!(SourceExe::Explicit(explicit_p.clone()).path(), explicit_p);
+        assert!(!SourceExe::Implicit(implicit_p).is_explicit());
+        assert!(SourceExe::Explicit(explicit_p).is_explicit());
+    }
+
     // --- install() dev-build rejection (#354) ---
 
     #[test]
@@ -1746,13 +1819,12 @@ mod tests {
         let dev_exe = PathBuf::from("/Users/x/project/target/release/omamori");
         let result = install(&InstallOptions {
             base_dir: root.clone(),
-            source_exe: dev_exe.clone(),
+            source: SourceExe::Implicit(dev_exe.clone()),
             generate_hooks: true,
             home_override: Some(root.clone()),
             verify_override: Some(|_, _| {
                 panic!("verifier must not be called when the path is rejected as a dev build")
             }),
-            source_is_explicit: false,
         });
 
         let err = result.expect_err("install must reject an implicit dev-build source_exe");
@@ -1802,11 +1874,10 @@ mod tests {
         let dev_exe = PathBuf::from("/Users/x/project/target/release/omamori");
         let result = install(&InstallOptions {
             base_dir: root.clone(),
-            source_exe: dev_exe.clone(),
+            source: SourceExe::Explicit(dev_exe.clone()),
             generate_hooks: true,
             home_override: Some(root.clone()),
             verify_override: Some(|_, _| HookContractStatus::Ok),
-            source_is_explicit: true,
         });
 
         result.expect("install must accept an explicit dev-build source_exe");
@@ -1814,6 +1885,40 @@ mod tests {
             root.join("hooks").join("claude-pretooluse.sh").exists(),
             "hook script must be created when the dev-build path was explicitly named"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn install_accepts_explicit_stable_source() {
+        // Truth-table quadrant 4/4 (#378): explicit + non-dev-build path. The
+        // dev-build gate's `!is_explicit()` short-circuit means this was
+        // always accepted, but no test constructed this exact combination —
+        // add it so all four `(is_explicit, is_dev_build_path)` quadrants are
+        // pinned against `SourceExe` regressions, not just the two that
+        // involve a dev-build-shaped path.
+        let root = std::env::temp_dir().join(format!(
+            "omamori-install-explicit-stable-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("omamori");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, "binary").unwrap();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        fs::create_dir_all(root.join(".codex")).unwrap();
+
+        let result = install(&InstallOptions {
+            base_dir: root.clone(),
+            source: SourceExe::Explicit(source.clone()),
+            generate_hooks: true,
+            home_override: Some(root.clone()),
+            verify_override: Some(|_, _| HookContractStatus::Ok),
+        });
+
+        result.expect("install must accept an explicit non-dev-build source_exe");
+        assert!(root.join("hooks").join("claude-pretooluse.sh").exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1835,11 +1940,10 @@ mod tests {
 
         let result = install(&InstallOptions {
             base_dir: root.clone(),
-            source_exe: source.clone(),
+            source: SourceExe::Implicit(source.clone()),
             generate_hooks: true,
             home_override: Some(root.clone()),
             verify_override: Some(|_, _| HookContractStatus::Ok),
-            source_is_explicit: false,
         })
         .unwrap();
 
@@ -2612,11 +2716,10 @@ mod tests {
         let base = dir.join("base");
         let result = install(&InstallOptions {
             base_dir: base.clone(),
-            source_exe: shim_dir.join("git"),
+            source: SourceExe::Implicit(shim_dir.join("git")),
             generate_hooks: true,
             home_override: Some(dir.clone()),
             verify_override: Some(|_, _| HookContractStatus::Ok),
-            source_is_explicit: false,
         })
         .unwrap();
 
@@ -2625,6 +2728,99 @@ mod tests {
             !hook_content.contains("/shim/"),
             "install with shim source_exe must not embed shim path in Claude hook"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn install_rejects_implicit_dev_build_source_resolved_through_shim() {
+        // V-003 (#378): the dev-build gate runs against `source_exe` *after*
+        // `shim_to_real_exe` resolution (installer.rs:115), while provenance
+        // comes from the `SourceExe` variant on the pre-resolution
+        // `options.source`. A refactor bug that drops the variant during
+        // this reassignment (e.g. always treating the resolved path as a
+        // fresh, provenance-less value) would silently exempt a
+        // shim-resolved dev-build path from the gate — this test fails if
+        // that happens, unlike `install_with_shim_source_normalizes_hook_paths`
+        // above, which resolves through the same shim but to a
+        // non-dev-build-shaped target.
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-devbuild-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let dev_dir = dir.join("project").join("target").join("release");
+        fs::create_dir_all(&dev_dir).unwrap();
+        let real_bin = dev_dir.join("omamori");
+        fs::write(&real_bin, "binary").unwrap();
+
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        std::os::unix::fs::symlink(&real_bin, shim_dir.join("git")).unwrap();
+
+        let base = dir.join("base");
+        let result = install(&InstallOptions {
+            base_dir: base.clone(),
+            source: SourceExe::Implicit(shim_dir.join("git")),
+            generate_hooks: true,
+            home_override: Some(dir.clone()),
+            verify_override: Some(|_, _| {
+                panic!("verifier must not be called when the path is rejected as a dev build")
+            }),
+        });
+
+        let err = result.expect_err(
+            "install must reject a dev-build path reached via shim resolution, not just one passed directly",
+        );
+        assert!(
+            err.to_string().contains("cargo build artifact"),
+            "message should explain the rejection: {err}"
+        );
+        assert!(
+            !base.join("hooks").join("claude-pretooluse.sh").exists(),
+            "hook script must not be created for a shim-resolved dev-build path"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn install_accepts_explicit_dev_build_source_resolved_through_shim() {
+        // Sibling of `install_rejects_implicit_dev_build_source_resolved_through_shim`:
+        // same shim-resolved dev-build-shaped target, but `Explicit` provenance.
+        // Without this test, a refactor bug that loses `Explicit` provenance
+        // specifically during shim resolution (while preserving it on the
+        // direct-path `install_accepts_explicit_dev_build_source` test) would
+        // go undetected (Codex test-adversarial review, Round 1).
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-shim-devbuild-explicit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let dev_dir = dir.join("project").join("target").join("release");
+        fs::create_dir_all(&dev_dir).unwrap();
+        let real_bin = dev_dir.join("omamori");
+        fs::write(&real_bin, "binary").unwrap();
+
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        std::os::unix::fs::symlink(&real_bin, shim_dir.join("git")).unwrap();
+
+        let base = dir.join("base");
+        let result = install(&InstallOptions {
+            base_dir: base.clone(),
+            source: SourceExe::Explicit(shim_dir.join("git")),
+            generate_hooks: true,
+            home_override: Some(dir.clone()),
+            verify_override: Some(|_, _| HookContractStatus::Ok),
+        });
+
+        result.expect(
+            "install must accept a shim-resolved dev-build path when explicitly named, mirroring the direct-path case",
+        );
+        assert!(base.join("hooks").join("claude-pretooluse.sh").exists());
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -3497,11 +3693,10 @@ mod tests {
             let _guard = HomeGuard::set(None);
             install(&InstallOptions {
                 base_dir: root.clone(),
-                source_exe: source.clone(),
+                source: SourceExe::Implicit(source.clone()),
                 generate_hooks: true,
                 home_override: None,
                 verify_override: Some(|_, _| HookContractStatus::Ok),
-                source_is_explicit: false,
             })
         };
 
@@ -3539,11 +3734,10 @@ mod tests {
 
         let result = install(&InstallOptions {
             base_dir: root.clone(),
-            source_exe: source.clone(),
+            source: SourceExe::Implicit(source.clone()),
             generate_hooks: true,
             home_override: Some(root.clone()),
             verify_override: Some(|_, _| HookContractStatus::ExitNonZero(1)),
-            source_is_explicit: false,
         });
 
         let err = result.expect_err("install must fail loudly when verification fails");
@@ -3592,13 +3786,12 @@ mod tests {
 
         let result = install(&InstallOptions {
             base_dir: root.clone(),
-            source_exe: source.clone(),
+            source: SourceExe::Implicit(source.clone()),
             generate_hooks: false,
             home_override: Some(root.clone()),
             verify_override: Some(|_, _| {
                 panic!("verifier must not be called when generate_hooks is false")
             }),
-            source_is_explicit: false,
         });
 
         assert!(result.is_ok(), "install without --hooks must not verify");
