@@ -1505,6 +1505,20 @@ fn setup_codex_hooks(
 /// Non-fatal: all errors are logged to stderr and swallowed.
 /// Returns `true` if setup was performed.
 pub fn auto_setup_codex_if_needed(base_dir: &Path) -> bool {
+    auto_setup_codex_if_needed_with_exe(base_dir, None)
+}
+
+/// `auto_setup_codex_if_needed()` with an injectable exe path (#379),
+/// mirroring `engine::shim::ensure_hooks_current_at_with_verifier_and_exe`'s
+/// seam: `exe_override: None` is production behavior (real `current_exe()`
+/// resolution); `Some(path)` lets tests substitute a synthetic path — which
+/// still passes through `resolve_stable_exe_path()` and the dev-build gate
+/// below exactly as a real `current_exe()` result would, so injecting a path
+/// can't bypass anything this function checks. Unlike the shim's seam, only
+/// the `current_exe()` call itself is replaced (not the whole
+/// resolve-and-gate sequence), keeping the injected path on the same code
+/// path a production call would take.
+fn auto_setup_codex_if_needed_with_exe(base_dir: &Path, exe_override: Option<&Path>) -> bool {
     // Fast path: no CODEX_CI env → skip (0 cost)
     if std::env::var_os("CODEX_CI").is_none() {
         return false;
@@ -1523,10 +1537,14 @@ pub fn auto_setup_codex_if_needed(base_dir: &Path) -> bool {
     }
 
     // Codex detected but hooks not set up — auto-configure
-    let source_exe = match std::env::current_exe() {
-        Ok(exe) => resolve_stable_exe_path(&exe),
-        Err(_) => return false,
+    let exe = match exe_override {
+        Some(exe) => exe.to_path_buf(),
+        None => match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(_) => return false,
+        },
     };
+    let source_exe = resolve_stable_exe_path(&exe);
 
     // #354: this is the same silent shim self-heal entry point as
     // `ensure_hooks_current` (both are called back-to-back from `run_shim`),
@@ -3298,10 +3316,63 @@ mod tests {
 
     #[test]
     #[serial_test::serial(home_env)]
-    fn auto_setup_codex_skips_when_wrapper_exists() {
+    fn auto_setup_codex_skips_without_env_even_with_exe_override() {
+        // #379 (Codex test-adversarial review): proves an injected exe can't
+        // bypass the CODEX_CI fast-path check — the seam only replaces how
+        // the source exe is obtained, not any of the gates before it.
         // SAFETY: serial_test ensures no concurrent access to env vars
         let saved = std::env::var_os("CODEX_CI");
         unsafe { std::env::remove_var("CODEX_CI") };
+
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-codex-fastpath-inject-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let genuine_exe = PathBuf::from("/opt/homebrew/bin/omamori");
+        let result = auto_setup_codex_if_needed_with_exe(&dir, Some(&genuine_exe));
+        assert!(
+            !result,
+            "an injected exe must not bypass the CODEX_CI fast-path skip"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CODEX_CI", v) };
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn auto_setup_codex_skips_when_wrapper_exists() {
+        // CODEX_CI must be SET here (unlike the sibling `_skips_without_env`
+        // test above) — otherwise this test trivially passes via the
+        // earlier `CODEX_CI` fast-path check without ever reaching the
+        // wrapper-exists branch it claims to cover (Codex code review,
+        // Round 1: the previous version of this test removed CODEX_CI,
+        // so `!result` held regardless of whether the wrapper-exists
+        // check worked at all).
+        //
+        // A real `.codex` dir + a stable injected exe are also set up here
+        // (Codex test-adversarial review, Round 1: without these, every
+        // *other* guard in the function — Codex not detected, dev-build
+        // gate — would independently produce `false` too, so the assertion
+        // wouldn't actually pin down that the wrapper-exists check is what
+        // fired). This makes wrapper-exists the ONLY reason this call can
+        // return `false`.
+        // SAFETY: serial_test ensures no concurrent access to env vars
+        let saved = std::env::var_os("CODEX_CI");
+        unsafe { std::env::set_var("CODEX_CI", "1") };
+
+        let home = std::env::temp_dir().join(format!(
+            "omamori-codex-wrapexists-home-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _guard = HomeGuard::set(Some(home.as_os_str()));
 
         let dir = std::env::temp_dir().join(format!("omamori-codex-g12-2-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -3309,14 +3380,28 @@ mod tests {
         fs::create_dir_all(&hooks_dir).unwrap();
 
         // Pre-create the wrapper script
-        fs::write(hooks_dir.join("codex-pretooluse.sh"), "#!/bin/sh\n").unwrap();
+        let wrapper_path = hooks_dir.join("codex-pretooluse.sh");
+        let preexisting_content = "#!/bin/sh\n# pre-existing, must not be overwritten\n";
+        fs::write(&wrapper_path, preexisting_content).unwrap();
 
-        let result = auto_setup_codex_if_needed(&dir);
-        assert!(!result);
+        let genuine_exe = PathBuf::from("/opt/homebrew/bin/omamori");
+        let result = auto_setup_codex_if_needed_with_exe(&dir, Some(&genuine_exe));
+        assert!(
+            !result,
+            "must skip when the wrapper already exists, even though Codex is detected and the source is a genuine stable path"
+        );
+        assert_eq!(
+            fs::read_to_string(&wrapper_path).unwrap(),
+            preexisting_content,
+            "the pre-existing wrapper must not be overwritten"
+        );
 
+        let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&dir);
         if let Some(v) = saved {
             unsafe { std::env::set_var("CODEX_CI", v) };
+        } else {
+            unsafe { std::env::remove_var("CODEX_CI") };
         }
     }
 
@@ -3362,9 +3447,199 @@ mod tests {
         }
     }
 
-    // Note: Testing CODEX_CI=1 + no wrapper + a genuine (non-dev-build) source
-    // requires an injectable exe seam this function doesn't have. Covered by
-    // manual verification only; see PR description.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn auto_setup_codex_accepts_genuine_non_dev_build_source() {
+        // #379: exercises the ACCEPT path via the exe_override seam — CODEX_CI
+        // set, wrapper absent, Codex detected, and a genuine non-dev-build
+        // source — which the REJECT-path sibling test above never reaches.
+        // Asserts all three artifacts `setup_codex_hooks` writes, not just the
+        // boolean return value: the return value is `wrapper.is_some()`, so
+        // hooks.json/config.toml could silently end up `Skipped` while this
+        // still reported `true` (Codex code review, Round 2 finding).
+        // SAFETY: serial_test ensures no concurrent access to env vars
+        let saved = std::env::var_os("CODEX_CI");
+        unsafe { std::env::set_var("CODEX_CI", "1") };
+
+        let home =
+            std::env::temp_dir().join(format!("omamori-codex-accept-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let codex_dir = home.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("config.toml"), "model = \"gpt-5.3-codex\"\n").unwrap();
+        let _guard = HomeGuard::set(Some(home.as_os_str()));
+
+        let dir =
+            std::env::temp_dir().join(format!("omamori-codex-accept-base-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // A genuine, non-dev-build-shaped path. `render_codex_pretooluse_script`
+        // only renders this path into a string — it never spawns or reads it —
+        // so it need not exist on disk.
+        let genuine_exe = std::env::temp_dir()
+            .join(format!("omamori-fake-stable-{}", std::process::id()))
+            .join("omamori");
+
+        let result = auto_setup_codex_if_needed_with_exe(&dir, Some(&genuine_exe));
+        assert!(
+            result,
+            "must accept a genuine non-dev-build source and report success"
+        );
+
+        let wrapper_path = dir.join("hooks").join("codex-pretooluse.sh");
+        assert!(wrapper_path.exists(), "wrapper script must be written");
+        let wrapper_content = fs::read_to_string(&wrapper_path).unwrap();
+        assert!(
+            wrapper_content.contains(&genuine_exe.display().to_string()),
+            "wrapper must embed the injected source path: {wrapper_content}"
+        );
+
+        let hooks_content = fs::read_to_string(codex_dir.join("hooks.json")).unwrap();
+        let hooks_doc: serde_json::Value = serde_json::from_str(&hooks_content).unwrap();
+        assert!(
+            hooks_doc
+                .pointer("/hooks/PreToolUse/0/hooks/0/statusMessage")
+                .is_some(),
+            "hooks.json must contain the merged omamori entry: {hooks_content}"
+        );
+
+        let config_content = fs::read_to_string(codex_dir.join("config.toml")).unwrap();
+        assert!(
+            config_content.contains("codex_hooks = true"),
+            "config.toml must have codex_hooks = true: {config_content}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&dir);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CODEX_CI", v) };
+        } else {
+            unsafe { std::env::remove_var("CODEX_CI") };
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn auto_setup_codex_resolves_injected_shim_path() {
+        // #379 (Codex test-adversarial review, Round 2): the ACCEPT test
+        // above injects a plain path that `resolve_stable_exe_path` leaves
+        // unchanged, so it can't distinguish "the seam resolves the injected
+        // path" from "the seam uses the injected path as-is" — a mutation
+        // that skipped `resolve_stable_exe_path()` for the `Some(exe)` branch
+        // would still pass it. Inject a `*/shim/<cmd>` path instead (mirrors
+        // `resolve_stable_resolves_shim_path`'s fixture) and assert the
+        // wrapper embeds the RESOLVED real-binary path, not the shim path.
+        let saved = std::env::var_os("CODEX_CI");
+        unsafe { std::env::set_var("CODEX_CI", "1") };
+
+        let home = std::env::temp_dir().join(format!(
+            "omamori-codex-shimresolve-home-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        let codex_dir = home.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("config.toml"), "model = \"gpt-5.3-codex\"\n").unwrap();
+        let _guard = HomeGuard::set(Some(home.as_os_str()));
+
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-codex-shimresolve-base-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let real_bin_dir = std::env::temp_dir().join(format!(
+            "omamori-codex-shimresolve-real-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&real_bin_dir);
+        fs::create_dir_all(&real_bin_dir).unwrap();
+        let real_bin = real_bin_dir.join("omamori");
+        fs::write(&real_bin, "binary").unwrap();
+        let shim_dir = real_bin_dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        let shim_path = shim_dir.join("git");
+        std::os::unix::fs::symlink(&real_bin, &shim_path).unwrap();
+
+        let result = auto_setup_codex_if_needed_with_exe(&dir, Some(&shim_path));
+        assert!(
+            result,
+            "must accept a genuine source reached via a shim path"
+        );
+
+        let wrapper_content =
+            fs::read_to_string(dir.join("hooks").join("codex-pretooluse.sh")).unwrap();
+        assert!(
+            !wrapper_content.contains("/shim/"),
+            "wrapper must embed the resolved real binary path, not the shim path: {wrapper_content}"
+        );
+        assert!(
+            wrapper_content.contains(&real_bin.display().to_string()),
+            "wrapper must embed the resolved real binary path: {wrapper_content}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&real_bin_dir);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CODEX_CI", v) };
+        } else {
+            unsafe { std::env::remove_var("CODEX_CI") };
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn auto_setup_codex_rejects_injected_dev_build_source() {
+        // Negative control for the exe_override seam (#379): confirms the
+        // dev-build gate applies to an INJECTED path too, not just the real
+        // current_exe() path the `_rejects_implicit_dev_build_source` test
+        // above exercises. Without this, a gate bug that only fires for
+        // std::env::current_exe() (and not for exe_override) would let the
+        // ACCEPT test above pass for the wrong reason — it happens not to,
+        // since that test's path isn't dev-build-shaped, but this closes the
+        // gap explicitly rather than relying on that coincidence.
+        // SAFETY: serial_test ensures no concurrent access to env vars
+        let saved = std::env::var_os("CODEX_CI");
+        unsafe { std::env::set_var("CODEX_CI", "1") };
+
+        let home = std::env::temp_dir().join(format!(
+            "omamori-codex-inject-devbuild-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let _guard = HomeGuard::set(Some(home.as_os_str()));
+
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-codex-inject-devbuild-base-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let dev_exe = PathBuf::from("/Users/x/project/target/release/omamori");
+        let result = auto_setup_codex_if_needed_with_exe(&dir, Some(&dev_exe));
+        assert!(
+            !result,
+            "must reject an injected dev-build source, not just a real current_exe() one"
+        );
+        assert!(
+            !dir.join("hooks").join("codex-pretooluse.sh").exists(),
+            "codex wrapper must not be written for an injected dev-build source"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&dir);
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("CODEX_CI", v) };
+        } else {
+            unsafe { std::env::remove_var("CODEX_CI") };
+        }
+    }
 
     // ---------------------------------------------------------------------
     // Claude Code settings.json merge tests (#196)
