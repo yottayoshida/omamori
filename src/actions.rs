@@ -74,6 +74,90 @@ pub trait ExecOps {
     fn git_stash(&mut self) -> Result<(), String>;
 }
 
+/// Maximum number of exclusive-create retries for the staging subdirectory
+/// before failing closed. Bounds the cost of an attacker pre-occupying
+/// candidate names (#410) — with a random suffix, exhausting this many
+/// attempts by chance is astronomically unlikely; exhausting it by intent
+/// requires winning that many independent 64-bit-space collisions, which is
+/// itself an upper bound on the attacker's cost, not ours.
+const MAX_STAGING_DIR_ATTEMPTS: u32 = 8;
+
+/// Create the timestamped staging subdirectory that `move_to_dir` quarantines
+/// files into, guarding against symlink planting at the predictable
+/// `<destination>/<unix-secs>` path (#410).
+///
+/// `std::fs::create_dir` (exclusive — fails with `AlreadyExists` if anything
+/// is already there, and unlike `create_dir_all` never follows a symlink at
+/// the target path) is the core of the fix: a successful call is proof the
+/// returned directory was freshly created by this process, not something an
+/// attacker planted in advance. On `AlreadyExists`, retry with a fresh random
+/// suffix (`gen_suffix`, production caller wires in
+/// [`crate::atomic_file::random_hex_suffix`]) rather than a predictable
+/// sequential suffix (`_2`, `_3`, ...) — sequential names are just as
+/// guessable as the bare timestamp, so an attacker who pre-occupies the
+/// first candidate could simply pre-occupy the whole predictable sequence
+/// too, turning this into either a denial-of-service (every attempt hits
+/// `AlreadyExists`) or a planting attack that has merely slid one name over.
+///
+/// This closes pre-planted-symlink attacks only. It does not close a
+/// same-user race between this exclusive create and the caller's subsequent
+/// `rename` calls into the directory (an active watcher process could still
+/// delete and re-plant a symlink at the now-known real subdirectory path in
+/// that window) — full closure of that residual would require fd-relative
+/// operations (`openat`/`renameat`), deferred as future hardening. See
+/// SECURITY.md's move-to residual-risk notes.
+///
+/// Deliberately asymmetric with `destination`'s own symlink handling above:
+/// `destination` is user-configured, so a symlink there is treated as
+/// suspicious and hard-rejected. This subdirectory is created entirely by
+/// omamori itself, so a collision (real conflicting entry, planted symlink,
+/// or otherwise) is not user error — the fix is to try a different name, not
+/// to refuse the command. Do not "fix" this by making both paths reject
+/// symlinks identically; the two checks exist at different trust levels for
+/// a reason.
+fn create_staging_subdir(
+    destination: &Path,
+    timestamp: u64,
+    mut gen_suffix: impl FnMut() -> io::Result<String>,
+) -> Result<PathBuf, String> {
+    let mut last_err: Option<io::Error> = None;
+    for _ in 0..MAX_STAGING_DIR_ATTEMPTS {
+        let suffix = gen_suffix().map_err(|e| e.to_string())?;
+        let candidate = destination.join(format!("{timestamp}-{suffix}"));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                // Belt-and-suspenders: a successful exclusive create already
+                // guarantees `candidate` is a fresh real directory, so this
+                // can only fail on a very tight race. Defense-in-depth, not
+                // load-bearing.
+                let meta = std::fs::symlink_metadata(&candidate).map_err(|e| e.to_string())?;
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "move-to staging directory `{}` is a symlink; refusing for security",
+                        candidate.display()
+                    ));
+                }
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "failed to create staging directory `{}`: {e}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "failed to create a staging directory under `{}` after {MAX_STAGING_DIR_ATTEMPTS} attempts: {}",
+        destination.display(),
+        last_err.map(|e| e.to_string()).unwrap_or_default()
+    ))
+}
+
 pub struct SystemOps {
     real_program: PathBuf,
     detector_env_keys: Vec<String>,
@@ -145,14 +229,17 @@ impl ExecOps for SystemOps {
             }
         }
 
-        // Create timestamped subdirectory to avoid filename collisions
+        // Create a timestamped staging subdirectory to avoid filename
+        // collisions across invocations (#410).
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let sub_dir = destination.join(format!("{timestamp}"));
-        std::fs::create_dir_all(&sub_dir)
-            .map_err(|e| format!("failed to create subdirectory `{}`: {e}", sub_dir.display()))?;
+        let sub_dir = create_staging_subdir(
+            destination,
+            timestamp,
+            crate::atomic_file::random_hex_suffix,
+        )?;
 
         let mut moved = 0usize;
         let mut used_names = std::collections::HashSet::new();
@@ -759,6 +846,313 @@ mod tests {
         let mut ops = real_ops();
         let result = ops.move_to_dir(&[src.to_string_lossy().into_owned()], &dest);
         assert!(result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --- #410: create_staging_subdir seam tests ---
+    //
+    // `create_staging_subdir` takes an injectable suffix generator so these
+    // tests can pin deterministic candidate names instead of depending on
+    // real `SystemTime::now()` + `/dev/urandom` output — without the seam,
+    // the collision/symlink-planting/exhaustion branches below are not
+    // reachable from a test at all (the real timestamp+random name can't be
+    // predicted well enough to pre-occupy).
+
+    /// Fixed-sequence suffix generator: returns each string in order, then
+    /// panics if called more times than provided (a test bug, not a
+    /// production concern — production's `random_hex_suffix` never runs out).
+    fn fixed_suffixes(values: Vec<&'static str>) -> impl FnMut() -> io::Result<String> {
+        let mut iter = values.into_iter();
+        move || {
+            Ok(iter
+                .next()
+                .expect("fixed_suffixes exhausted — test provided too few values")
+                .to_string())
+        }
+    }
+
+    #[test]
+    fn create_staging_subdir_succeeds_on_first_try() {
+        let root = make_temp_dir("g04-staging-first");
+        let candidate = create_staging_subdir(&root, 1_700_000_000, fixed_suffixes(vec!["aaaa"]))
+            .expect("first candidate is free, must succeed");
+        assert_eq!(candidate, root.join("1700000000-aaaa"));
+        assert!(candidate.is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_staging_subdir_retries_past_an_existing_real_directory() {
+        let root = make_temp_dir("g04-staging-collide-dir");
+        // Pre-occupy the first candidate with an ordinary directory — the
+        // kind of collision that could happen from an unrelated concurrent
+        // move-to, not necessarily an attack. A sentinel file inside it
+        // proves the colliding entry is left alone, not cleared/reused.
+        let colliding = root.join("1700000000-aaaa");
+        std::fs::create_dir(&colliding).unwrap();
+        std::fs::write(colliding.join("sentinel"), "do not touch").unwrap();
+
+        let candidate =
+            create_staging_subdir(&root, 1_700_000_000, fixed_suffixes(vec!["aaaa", "bbbb"]))
+                .expect("second candidate is free, must succeed");
+        assert_eq!(candidate, root.join("1700000000-bbbb"));
+        assert!(candidate.is_dir());
+        assert!(
+            colliding.join("sentinel").exists(),
+            "the colliding directory's pre-existing contents must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_staging_subdir_retries_past_a_planted_symlink() {
+        // The attack #410 closes: a symlink pre-planted at the predictable
+        // first-candidate path must not be followed or reused — the function
+        // must move on to a different name, and the symlink itself (not just
+        // its target's contents) must remain exactly as planted, still
+        // pointing at the same target. A destructive implementation that
+        // deletes/replaces the symlink to make room would defeat forensics
+        // just as badly as following it would defeat the security property.
+        let root = make_temp_dir("g04-staging-symlink");
+        let evil_target = root.join("evil_target");
+        std::fs::create_dir(&evil_target).unwrap();
+        let planted = root.join("1700000000-aaaa");
+        std::os::unix::fs::symlink(&evil_target, &planted).unwrap();
+
+        let candidate =
+            create_staging_subdir(&root, 1_700_000_000, fixed_suffixes(vec!["aaaa", "bbbb"]))
+                .expect("must move past the planted symlink to the next candidate");
+        assert_eq!(candidate, root.join("1700000000-bbbb"));
+        assert!(
+            candidate.symlink_metadata().unwrap().is_dir(),
+            "returned directory must be real, not a symlink"
+        );
+        assert!(
+            std::fs::read_dir(&evil_target).unwrap().next().is_none(),
+            "the planted symlink's target must remain untouched — nothing should ever \
+             have been written through it"
+        );
+        let planted_meta = std::fs::symlink_metadata(&planted)
+            .expect("the planted symlink itself must still exist, untouched");
+        assert!(
+            planted_meta.file_type().is_symlink(),
+            "must not delete or replace the planted symlink to make room — only skip it"
+        );
+        assert_eq!(
+            std::fs::read_link(&planted).unwrap(),
+            evil_target,
+            "the planted symlink must still point at its original target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_staging_subdir_fails_closed_after_exhausting_attempts() {
+        // All MAX_STAGING_DIR_ATTEMPTS candidates pre-occupied — this must
+        // fail closed (Err) rather than fall back to a non-exclusive create
+        // (which would reintroduce the #410 vulnerability) or loop forever.
+        // Also assert no NINTH directory was created — a buggy
+        // implementation could create an extra fallback and still return
+        // Err, which a result-only assertion would not catch.
+        let root = make_temp_dir("g04-staging-exhausted");
+        let suffixes: Vec<&'static str> = vec!["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"];
+        assert_eq!(suffixes.len(), MAX_STAGING_DIR_ATTEMPTS as usize);
+        for s in &suffixes {
+            std::fs::create_dir(root.join(format!("1700000000-{s}"))).unwrap();
+        }
+
+        let result = create_staging_subdir(&root, 1_700_000_000, fixed_suffixes(suffixes));
+        assert!(
+            result.is_err(),
+            "must fail closed once every candidate is occupied, not fall back to \
+             create_dir_all or loop indefinitely"
+        );
+        let entries: std::collections::HashSet<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let expected: std::collections::HashSet<String> = (0..MAX_STAGING_DIR_ATTEMPTS)
+            .map(|i| format!("1700000000-s{i}"))
+            .collect();
+        assert_eq!(
+            entries, expected,
+            "exhausting all attempts must not create any directory beyond the \
+             pre-occupied ones"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_staging_subdir_propagates_suffix_generator_error() {
+        // If the suffix generator itself fails (e.g. random_hex_suffix's
+        // /dev/urandom open/read failing), that must fail closed too, not
+        // silently fall back to a predictable name.
+        let root = make_temp_dir("g04-staging-gen-error");
+        let result = create_staging_subdir(&root, 1_700_000_000, || {
+            Err(io::Error::other("simulated entropy source failure"))
+        });
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_staging_subdir_does_not_retry_on_non_already_exists_error() {
+        // A non-AlreadyExists create_dir failure (here: the parent
+        // `destination` itself does not exist, so every candidate under it
+        // hits NotFound) must fail closed on the FIRST attempt, not retry up
+        // to MAX_STAGING_DIR_ATTEMPTS times — retrying a persistent error
+        // (e.g. permission denied) would just waste attempts on a failure
+        // mode that can never succeed, and silently masks the real error
+        // behind a generic "attempts exhausted" message.
+        let root = make_temp_dir("g04-staging-notfound");
+        let missing_destination = root.join("does-not-exist");
+        let mut calls = 0u32;
+        let result = create_staging_subdir(&missing_destination, 1_700_000_000, || {
+            calls += 1;
+            Ok(format!("suffix{calls}"))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls, 1,
+            "a non-AlreadyExists create_dir error must fail closed after exactly one \
+             attempt, not retry"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Extracts and validates the `<timestamp>-<suffix>` staging dir name
+    /// created under `dest` by a single `move_to_dir` call, returning the
+    /// Parses a single staging directory's `<timestamp>-<suffix>` name,
+    /// asserts the timestamp falls within `[before, after]` and the suffix
+    /// has the real `random_hex_suffix()` shape (16 lowercase hex chars),
+    /// and returns the suffix for the caller to compare across directories.
+    fn validated_staging_suffix(staging_dir: &Path, before: u64, after: u64) -> String {
+        let name = staging_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let (ts_part, suffix_part) = name
+            .split_once('-')
+            .expect("staging dir name must be `<timestamp>-<suffix>`");
+        let ts: u64 = ts_part
+            .parse()
+            .expect("timestamp component must be a real unix-seconds integer");
+        assert!(
+            (before..=after).contains(&ts),
+            "staging dir timestamp {ts} must fall within the call's real time window \
+             [{before}, {after}]"
+        );
+        assert_eq!(
+            suffix_part.len(),
+            16,
+            "suffix must be the real random_hex_suffix() output (16 hex chars), got `{suffix_part}`"
+        );
+        assert!(
+            suffix_part
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "suffix must be lowercase hex (random_hex_suffix formats as `{{:02x}}`), got `{suffix_part}`"
+        );
+        suffix_part.to_string()
+    }
+
+    /// Returns the single staging subdirectory under `dest`, asserting
+    /// there is exactly one.
+    fn sole_staging_dir(dest: &Path) -> PathBuf {
+        let entries: Vec<_> = std::fs::read_dir(dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "exactly one staging subdirectory");
+        entries[0].path()
+    }
+
+    #[test]
+    fn move_to_dir_uses_real_timestamp_and_random_suffix_end_to_end() {
+        // Codex adversarial test review: prior tests only exercised
+        // `create_staging_subdir` directly via the injectable seam — none
+        // proved that `SystemOps::move_to_dir` actually wires the real
+        // `SystemTime::now()` timestamp and real
+        // `atomic_file::random_hex_suffix()` through to it. A wiring bug
+        // (wrong destination, stale timestamp, or a suffix generator that
+        // never got connected) would pass every seam-level test above while
+        // still being broken in production.
+        //
+        // Round 2 of the same review: checking the *shape* of one suffix
+        // (16 lowercase hex chars) is not enough — a hardcoded constant
+        // string of the right shape (e.g. sixteen `"0"` chars) would satisfy
+        // that check too. Move two different files into the SAME
+        // destination with two separate calls and assert the two resulting
+        // suffixes are DIFFERENT — a real random source produces distinct
+        // 16-hex-char values with overwhelming probability (2^-64 collision
+        // chance) on every call, while a hardcoded/fake generator would
+        // return the identical value both times. This is deterministic and
+        // not timing-dependent: it holds regardless of whether both calls
+        // land in the same UNIX second.
+        let root = make_temp_dir("g04-e2e-real-suffix");
+        let dest = root.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let src1 = root.join("file1.txt");
+        std::fs::write(&src1, "data1").unwrap();
+        let src2 = root.join("file2.txt");
+        std::fs::write(&src2, "data2").unwrap();
+
+        let mut ops = real_ops();
+
+        let before1 = now_secs();
+        assert!(
+            ops.move_to_dir(&[src1.to_string_lossy().into_owned()], &dest)
+                .is_ok()
+        );
+        let after1 = now_secs();
+        let staged1 = sole_staging_dir(&dest);
+        let suffix1 = validated_staging_suffix(&staged1, before1, after1);
+        assert!(
+            staged1.join("file1.txt").exists(),
+            "first move's file must be inside its real staging dir"
+        );
+
+        let before2 = now_secs();
+        assert!(
+            ops.move_to_dir(&[src2.to_string_lossy().into_owned()], &dest)
+                .is_ok()
+        );
+        let after2 = now_secs();
+
+        // Both staging dirs now coexist under dest — find the newly-added
+        // one (the one that wasn't there after the first call).
+        let entries: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(entries.len(), 2, "two staging subdirectories, one per call");
+        let staged2 = entries
+            .iter()
+            .map(|e| e.path())
+            .find(|p| p != &staged1)
+            .expect("the second call must have created a dir distinct from the first");
+        let suffix2 = validated_staging_suffix(&staged2, before2, after2);
+        assert!(
+            staged2.join("file2.txt").exists(),
+            "second move's file must be inside its real staging dir"
+        );
+
+        assert_ne!(
+            suffix1, suffix2,
+            "two real random_hex_suffix() calls must not produce the identical value — \
+             a hardcoded/fake suffix generator wired in by mistake would fail this"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
