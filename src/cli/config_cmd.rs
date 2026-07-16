@@ -317,7 +317,7 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     let config_path = resolve_config_path_checked()?;
     // `load_config` handles a missing path internally (falls back to
     // `Config::default()`, i.e. core rules only) — so `known_rule_names`
-    // is exactly the 14 core names when no config file exists yet. Every
+    // is exactly the 15 core names when no config file exists yet. Every
     // one of those is then caught by the `is_core_rule` redirect below,
     // and any other name fails `validate_rule_name` as unknown. There is
     // therefore no reachable case where a config file needs to be created

@@ -109,10 +109,10 @@ pub struct RuleConfig {
     /// When `Some(s)`, the rule matches only when `args[0] == s`.
     /// Prevents false positives like `omamori exec -- echo disable config`
     /// matching a generic `match_any=["disable"]` builtin rule.
-    /// Used by the 7 `omamori-*-block` self-protection rules.
+    /// Used by the 8 `omamori-*-block` self-protection rules.
     #[serde(default)]
     pub subcommand: Option<String>,
-    /// True for the 14 built-in core safety rules. Cannot be injected via config.toml.
+    /// True for the 15 built-in core safety rules. Cannot be injected via config.toml.
     #[serde(skip)]
     pub is_builtin: bool,
 }
