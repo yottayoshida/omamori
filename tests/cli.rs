@@ -680,7 +680,7 @@ fn config_disable_enable_blocked_in_ai_session_for_custom_rule_name() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// V-007 (QA gap): every one of the 14 core rule ids must be rejected by
+/// V-007 (QA gap): every one of the 15 core rule ids must be rejected by
 /// `config disable`, not just `git-push-force-block` (the one exercised by
 /// `config_disable_blocked_in_ai_session`, which additionally only checks
 /// the AI-guard path, not the actual core-rejection message).
@@ -719,7 +719,7 @@ fn config_disable_rejects_all_core_rule_ids() {
 
 /// V-007 companion: `config enable` on a fresh (never-disabled) core rule
 /// must be a safe, non-crashing "already enabled" no-op for every one of
-/// the 14 core ids — `enable` (unlike `disable`) does not unconditionally
+/// the 15 core ids — `enable` (unlike `disable`) does not unconditionally
 /// reject core names, since it also has to clean up a hand-written raw
 /// stub; this pins that every core id survives that path without error or
 /// an unintended write.
@@ -3505,7 +3505,7 @@ fn doctor_reports_hook_version_drift_in_human_and_json_output() {
 // config add tests (PR-C2, #325)
 // ---------------------------------------------------------------------------
 
-/// The 14 core (built-in) safety rule ids — mirrors `config::core_rule_names()`.
+/// The 15 core (built-in) safety rule ids — mirrors `config::core_rule_names()`.
 /// Hardcoded here (this file is a black-box binary test, no crate import) so a
 /// future addition to that list is caught by drift between this constant and
 /// the real one, not silently under-tested.
@@ -3524,6 +3524,7 @@ const CORE_RULE_IDS: &[&str] = &[
     "omamori-doctor-fix-block",
     "omamori-explain-block",
     "omamori-break-glass-block",
+    "omamori-audit-key-rotate-block",
 ];
 
 fn config_add_cmd(dir: &std::path::Path) -> Command {

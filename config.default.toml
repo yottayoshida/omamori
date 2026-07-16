@@ -156,6 +156,14 @@ action = "block"
 subcommand = "break-glass"
 message = "omamori blocked break-glass activation via AI"
 
+[[rules]]
+name = "omamori-audit-key-rotate-block"
+command = "omamori"
+action = "block"
+subcommand = "audit"
+match_all = ["key", "rotate"]
+message = "omamori blocked audit key rotation via AI — run it yourself in a plain terminal if you intended to rotate the signing key"
+
 # --- Example: move-to action (new in v0.2) ---
 # [[rules]]
 # name = "rm-to-backup"

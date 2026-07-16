@@ -659,6 +659,7 @@ const OMAMORI_SUBSHELL_PATTERNS: &[&str] = &[
     "omamori explain rm-recursive",
     "omamori config disable foo",
     "omamori config enable bar",
+    "omamori audit key rotate",
 ];
 
 fn arb_omamori_subshell_pattern() -> impl Strategy<Value = &'static str> {

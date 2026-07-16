@@ -939,10 +939,35 @@ pub fn default_rules() -> Vec<RuleConfig> {
         )
         .with_subcommand("break-glass")
         .with_builtin(true),
+        // #387: `audit key rotate` already has a runtime env-var guard
+        // (`guard_ai_config_modification`), but that guard is bypassed by
+        // stripping the detector env vars (e.g. `env -i`). This Phase 2
+        // backstop closes that gap the same way the other 7 omamori-*-block
+        // rules close it for their respective verbs.
+        //
+        // match_all=["key","rotate"] (not match_any=["key"], not
+        // match_all=["key"] alone): both tokens must appear as exact args,
+        // so `audit show --rule key` or `audit show --action rotate` do not
+        // false-block the AI-readable audit inspection commands. A future
+        // mutating `audit key <verb>` gets its own guard+backstop pair
+        // rather than being silently covered here.
+        RuleConfig::new(
+            "omamori-audit-key-rotate-block",
+            "omamori",
+            ActionKind::Block,
+            vec!["key".to_string(), "rotate".to_string()],
+            Vec::new(),
+            Some(
+                "omamori blocked audit key rotation via AI — run it yourself in a plain terminal if you intended to rotate the signing key"
+                    .to_string(),
+            ),
+        )
+        .with_subcommand("audit")
+        .with_builtin(true),
     ]
 }
 
-/// Names of the 14 core (built-in) safety rules: 7 generic + 7 omamori-* (DI-13).
+/// Names of the 15 core (built-in) safety rules: 7 generic + 8 omamori-* (DI-13).
 pub fn core_rule_names() -> Vec<&'static str> {
     vec![
         "rm-recursive-to-trash",
@@ -959,6 +984,7 @@ pub fn core_rule_names() -> Vec<&'static str> {
         "omamori-doctor-fix-block",
         "omamori-explain-block",
         "omamori-break-glass-block",
+        "omamori-audit-key-rotate-block",
     ]
 }
 
@@ -1741,7 +1767,7 @@ name = "malformed-no-command"
     /// subcommands; without these Phase 2 builtin rules a real `omamori
     /// config disable` invocation would not be caught.
     #[test]
-    fn default_rules_includes_omamori_self_protect_seven_rules() {
+    fn default_rules_includes_omamori_self_protect_eight_rules() {
         let rules = default_rules();
         let required: &[&str] = &[
             "omamori-config-modify-block",
@@ -1751,6 +1777,7 @@ name = "malformed-no-command"
             "omamori-doctor-fix-block",
             "omamori-explain-block",
             "omamori-break-glass-block",
+            "omamori-audit-key-rotate-block",
         ];
         for name in required {
             let rule = rules
@@ -1803,6 +1830,103 @@ name = "malformed-no-command"
         );
     }
 
+    /// #387 DI-13 parity: pin the exact `subcommand`/`match_all`/`match_any`/
+    /// `message` of `omamori-audit-key-rotate-block`, not just that the rule
+    /// exists (Codex adversarial test review, R1). A presence-only check
+    /// would not catch someone broadening `match_all` to `match_any`
+    /// (which would false-block `audit show --rule key`), or narrowing it
+    /// to `match_all=["key"]` alone (which would over-broadly cover every
+    /// future `audit key <verb>`), or dropping the `subcommand` gate.
+    #[test]
+    fn omamori_audit_key_rotate_block_has_exact_shape() {
+        let rules = default_rules();
+        let rule = rules
+            .iter()
+            .find(|r| r.name == "omamori-audit-key-rotate-block")
+            .expect("omamori-audit-key-rotate-block must exist");
+        assert_eq!(
+            rule.subcommand.as_deref(),
+            Some("audit"),
+            "must gate on args[0] == \"audit\""
+        );
+        assert_eq!(
+            rule.match_all,
+            vec!["key".to_string(), "rotate".to_string()],
+            "match_all must be exactly [key, rotate] — match_any would false-block \
+             read commands like `audit show --rule key`; match_all=[\"key\"] alone \
+             would over-broadly cover future non-mutating `audit key <verb>` commands"
+        );
+        assert!(
+            rule.match_any.is_empty(),
+            "match_any must stay empty — this rule is expressed entirely via match_all"
+        );
+        assert_eq!(
+            rule.message.as_deref(),
+            Some(
+                "omamori blocked audit key rotation via AI — run it yourself in a plain \
+                 terminal if you intended to rotate the signing key"
+            ),
+            "message must point AI readers at a plain-terminal escape hatch, not the \
+             `explain`/`break-glass` hints (both are dead ends for AI readers per #393)"
+        );
+    }
+
+    /// #387: `match_all` is position-independent by construction
+    /// (`rule_matches` checks token presence via `.any()`, not adjacency) —
+    /// pin that this is the intended contract for the new rule, not an
+    /// accident of the current implementation. `match_all=["key","rotate"]`
+    /// was chosen specifically because match_all's order-independence makes
+    /// a positional-adjacency primitive unnecessary here.
+    #[test]
+    fn omamori_audit_key_rotate_block_matches_regardless_of_token_order() {
+        use crate::rules::{CommandInvocation, match_rule};
+        let rules = default_rules();
+        let inv = CommandInvocation::new(
+            "omamori".to_string(),
+            vec!["audit".to_string(), "rotate".to_string(), "key".to_string()],
+        );
+        let matched = match_rule(&rules, &inv);
+        assert_eq!(
+            matched.map(|r| r.name.as_str()),
+            Some("omamori-audit-key-rotate-block"),
+            "match_all must match \"key\"/\"rotate\" regardless of their relative order"
+        );
+    }
+
+    /// #387 known limitation (documented, not fixed — same structural gap
+    /// the other 7 omamori-*-block rules accept): `match_all`'s
+    /// position-independent semantics mean a read-only command that happens
+    /// to carry both tokens as flag *values* also matches. No `RuleConfig`
+    /// primitive expresses "these two tokens must be the literal verb at
+    /// args[1]/args[2]" today. This test pins the current (accepted)
+    /// behavior explicitly rather than leaving it as an untested comment —
+    /// if a future change to `rule_matches` narrows this, this test should
+    /// be updated to assert non-match instead.
+    #[test]
+    fn omamori_audit_key_rotate_block_known_limitation_flag_value_collision() {
+        use crate::rules::{CommandInvocation, match_rule};
+        let rules = default_rules();
+        let inv = CommandInvocation::new(
+            "omamori".to_string(),
+            vec![
+                "audit".to_string(),
+                "show".to_string(),
+                "--rule".to_string(),
+                "key".to_string(),
+                "--action".to_string(),
+                "rotate".to_string(),
+            ],
+        );
+        let matched = match_rule(&rules, &inv);
+        assert_eq!(
+            matched.map(|r| r.name.as_str()),
+            Some("omamori-audit-key-rotate-block"),
+            "known limitation: `audit show --rule key --action rotate` false-matches \
+             because match_all does not distinguish the literal verb from flag values \
+             at this position — accepted, not a regression"
+        );
+    }
+
     /// Verify each `omamori-*-block` rule actually matches its target invocation
     /// via `match_rule`, independently of Phase 1A `command.contains`.
     #[test]
@@ -1838,6 +1962,11 @@ name = "malformed-no-command"
                 "omamori",
                 &["break-glass", "--rule", "rm-recursive-to-trash"],
                 "omamori-break-glass-block",
+            ),
+            (
+                "omamori",
+                &["audit", "key", "rotate"],
+                "omamori-audit-key-rotate-block",
             ),
         ];
         for (program, args, expected) in cases {
@@ -1888,7 +2017,25 @@ name = "malformed-no-command"
             ("omamori", &["report", "--note", "add a rule later"]),
             ("omamori", &["config", "list"]), // real config subcommand, but not "add"
             ("omamori", &["config", "validate"]),
+            // #387 V-387-1: audit read commands (show/verify/unknown) must
+            // stay allowed in AI environments — only "audit key rotate"
+            // (the mutating verb) should be blocked. match_all requires
+            // BOTH "key" and "rotate" as exact args, so a single token
+            // appearing as a flag *value* on a read command must not match.
+            ("omamori", &["audit", "show"]),
+            ("omamori", &["audit", "verify"]),
+            ("omamori", &["audit", "unknown"]),
+            ("omamori", &["audit", "show", "--rule", "key"]),
+            ("omamori", &["audit", "show", "--action", "rotate"]),
         ];
+        // Known limitation, tracked separately: `audit show --rule key
+        // --action rotate` (both tokens present as flag *values*, not the
+        // literal verb) DOES false-match `omamori-audit-key-rotate-block`
+        // under match_all's position-independent semantics. No `RuleConfig`
+        // primitive expresses "these two tokens must be adjacent, positional
+        // args[1]/args[2]" today — the same structural gap the other
+        // omamori-*-block rules accept for their own match_any fields. This
+        // is documented in the PR body rather than silently asserted here.
         for (program, args) in benign_cases {
             let inv = CommandInvocation::new(
                 program.to_string(),

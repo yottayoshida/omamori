@@ -451,6 +451,39 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "phase2-self-protect-explain-block",
     ),
+    // #387: `audit key rotate` backstop — the env-var runtime guard
+    // (`guard_ai_config_modification`) is bypassed by `env -i`; this Phase 2
+    // rule catches it at the hook layer regardless of ambient AI-tool env vars.
+    (
+        "omamori audit key rotate",
+        Decision::Block,
+        "phase2-self-protect-audit-key-rotate-block",
+    ),
+    // The PR thesis is specifically that the runtime env-var guard is
+    // bypassed by stripping detector env vars — pin the actual bypass shape,
+    // not just the bare command.
+    (
+        "env -i omamori audit key rotate",
+        Decision::Block,
+        "phase2-self-protect-audit-key-rotate-env-bypass-block",
+    ),
+    // #387 FP relief: audit read commands (show/verify/unknown) must stay
+    // allowed — only the mutating "audit key rotate" verb is blocked.
+    (
+        "omamori audit show",
+        Decision::Allow,
+        "phase2-self-protect-audit-show-allow",
+    ),
+    (
+        "omamori audit verify",
+        Decision::Allow,
+        "phase2-self-protect-audit-verify-allow",
+    ),
+    (
+        "omamori audit unknown",
+        Decision::Allow,
+        "phase2-self-protect-audit-unknown-allow",
+    ),
     // 15-fp. FP relief pins: commands that mentioned protected paths in
     //        data context were previously false-positive blocked by
     //        meta-pattern substring match. Now allowed.

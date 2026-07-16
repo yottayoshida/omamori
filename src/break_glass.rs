@@ -79,6 +79,7 @@ pub(crate) fn non_bypassable_rules() -> &'static [&'static str] {
         "omamori-doctor-fix-block",
         "omamori-explain-block",
         "omamori-break-glass-block",
+        "omamori-audit-key-rotate-block",
     ]
 }
 
@@ -575,6 +576,53 @@ mod tests {
                 "non-bypassable rule {rule} must never return true"
             );
         }
+    }
+
+    /// #387: `is_bypassed_non_bypassable_always_false` (above) proves
+    /// non-bypassability against an EMPTY state file — trivially true for
+    /// any rule ID, and it calls the public `is_bypassed()` gate but never
+    /// combines it with an actual on-disk entry. This test proves the
+    /// DI-13-critical case: even with an ACTIVE break-glass entry on disk
+    /// that names `omamori-audit-key-rotate-block` (e.g. a state file
+    /// crafted or corrupted to claim a bypass), the public `is_bypassed()`
+    /// still returns false — because its `is_non_bypassable` gate (line 98)
+    /// short-circuits before ever consulting the state file.
+    /// `is_bypassed_inner` alone does NOT enforce this gate (it is the
+    /// caller's — `is_bypassed()`'s — responsibility), so this test must
+    /// exercise the public function, not the inner helper the other
+    /// state-file-parsing tests in this module use.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn is_bypassed_audit_key_rotate_block_active_entry_still_false() {
+        let home = std::env::temp_dir().join(format!(
+            "omamori-bg-audit-key-rotate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).unwrap();
+
+        with_home(Some(home.to_str().unwrap()), || {
+            let now = OffsetDateTime::now_utc();
+            let expires = now + time::Duration::hours(1);
+            let state = BreakGlassState {
+                version: STATE_VERSION,
+                entries: vec![BreakGlassEntry {
+                    rule_id: "omamori-audit-key-rotate-block".to_string(),
+                    activated_at: now.format(&Rfc3339).unwrap(),
+                    expires_at: expires.format(&Rfc3339).unwrap(),
+                    reason: None,
+                }],
+            };
+            write_state(&state).unwrap();
+            assert!(
+                !is_bypassed("omamori-audit-key-rotate-block"),
+                "an active on-disk entry for omamori-audit-key-rotate-block must not \
+                 defeat the non-bypassable gate — an AI could otherwise disable the \
+                 #387 backstop via a crafted or corrupted state file"
+            );
+        });
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

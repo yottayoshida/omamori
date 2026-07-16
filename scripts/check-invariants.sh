@@ -404,6 +404,7 @@ required_omamori_rules=(
     "omamori-doctor-fix-block"
     "omamori-explain-block"
     "omamori-break-glass-block"
+    "omamori-audit-key-rotate-block"
 )
 cf=src/config.rs
 default_rules_body=$(awk '
