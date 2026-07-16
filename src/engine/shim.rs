@@ -1749,8 +1749,7 @@ mod tests {
         .unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
-                .unwrap();
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
         let saved_home = std::env::var_os("HOME");

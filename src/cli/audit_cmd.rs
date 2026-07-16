@@ -437,10 +437,8 @@ mod tests {
     #[test]
     #[serial_test::serial(home_env)]
     fn hash_cwd_returns_one_when_no_keyring_exists() {
-        let dir = std::env::temp_dir().join(format!(
-            "omamori-hashcwd-cli-none-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-hashcwd-cli-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -464,10 +462,8 @@ mod tests {
     #[test]
     #[serial_test::serial(home_env)]
     fn hash_cwd_returns_zero_when_keyring_exists() {
-        let dir = std::env::temp_dir().join(format!(
-            "omamori-hashcwd-cli-some-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-hashcwd-cli-some-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -477,8 +473,7 @@ mod tests {
             // path, mirroring what a real `omamori` invocation would have
             // done before an investigator ever runs `hash-cwd`.
             let config = audit_config(None);
-            let _logger =
-                audit::AuditLogger::from_config(&config).expect("logger constructs");
+            let _logger = audit::AuditLogger::from_config(&config).expect("logger constructs");
 
             let args: Vec<OsString> = vec![
                 "omamori".into(),

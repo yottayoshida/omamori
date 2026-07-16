@@ -143,8 +143,9 @@ pub fn hash_cwd_candidates(
 ) -> Option<Vec<(String, &'static str, String)>> {
     let audit_path = super::resolved_audit_path(audit_config)?;
     let secret_path = super::secret::secret_path_for(&audit_path);
-    let mut keyring: Vec<(String, [u8; 32])> =
-        super::secret::load_keyring(&secret_path).into_iter().collect();
+    let mut keyring: Vec<(String, [u8; 32])> = super::secret::load_keyring(&secret_path)
+        .into_iter()
+        .collect();
     if keyring.is_empty() {
         return None;
     }
@@ -181,13 +182,14 @@ fn get_ppid() -> Option<u32> {
     None
 }
 
-/// Resolve a pid's exec path via `proc_pidpath`. Returns `None` on any
-/// failure (invalid pid, permission denied, process already exited) — never
+/// Resolve a pid's exec path via `proc_pidpath` — a Darwin-only libproc
+/// call, not part of POSIX or Linux's libc. Returns `None` on any failure
+/// (invalid pid, permission denied, process already exited) — never
 /// panics, matching the fail-open collection contract. PID reuse between
 /// the `getppid()` call and this lookup is an inherent race in the
 /// same-process-tree model; snapshotting as early as possible (see
 /// `collect`'s doc comment) minimizes but cannot eliminate the window.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn proc_pidpath(pid: u32) -> Option<String> {
     let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let ret = unsafe {
@@ -203,7 +205,21 @@ fn proc_pidpath(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&buf[..ret as usize]).into_owned())
 }
 
-#[cfg(not(unix))]
+/// Linux equivalent of the macOS `proc_pidpath` lookup above: `/proc/<pid>/exe`
+/// is a symlink the kernel maintains to the process's resolved exec path.
+/// Reading it never requires the target process's cooperation and fails
+/// cleanly (`None`) if the pid is invalid, already exited, or unreadable —
+/// same fail-open contract as the macOS path. omamori itself only ships for
+/// macOS (see SECURITY.md / README); this exists so the crate still builds
+/// and tests pass in CI's Linux job, not as a supported deployment target.
+#[cfg(target_os = "linux")]
+fn proc_pidpath(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn proc_pidpath(_pid: u32) -> Option<String> {
     None
 }
@@ -240,10 +256,8 @@ mod tests {
     /// with no guarded-command execution in the path, same as the existing
     /// `audit::tests::test_dir` and `benches/audit_append.rs` precedent.
     fn hash_cwd_test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "omamori-hashcwd-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-hashcwd-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -364,7 +378,8 @@ mod tests {
     #[test]
     fn as_audit_fields_some_provenance_populates_pid_and_cwd_hash() {
         let prov = ProcessProvenance::collect();
-        let (pid, _, _, cwd_hash) = ProcessProvenance::as_audit_fields(Some(&prov), Some(&TEST_SECRET));
+        let (pid, _, _, cwd_hash) =
+            ProcessProvenance::as_audit_fields(Some(&prov), Some(&TEST_SECRET));
         assert_eq!(pid, Some(prov.pid));
         if prov.cwd.is_some() {
             assert!(cwd_hash.unwrap().starts_with("hmac-cwd:"));
@@ -394,10 +409,7 @@ mod tests {
             ProcessProvenance::as_audit_fields(Some(&prov), Some(&TEST_SECRET));
         assert_eq!(pid, Some(4242));
         assert_eq!(ppid, Some(1111));
-        assert_eq!(
-            parent_process,
-            Some("/usr/bin/known-launcher".to_string())
-        );
+        assert_eq!(parent_process, Some("/usr/bin/known-launcher".to_string()));
         assert_eq!(
             cwd_hash,
             Some(hmac_cwd(Some(&TEST_SECRET), OsStr::new("/tmp/known-cwd")))
@@ -498,8 +510,7 @@ mod tests {
             .expect("from_config must create a secret in a fresh dir");
         let original_key_id = logger_before.key_id.clone();
 
-        let rotation =
-            rotate_key(&config).expect("rotation succeeds against an existing secret");
+        let rotation = rotate_key(&config).expect("rotation succeeds against an existing secret");
         assert_ne!(
             rotation.new_key_id, original_key_id,
             "rotation must mint a new active key id distinct from the pre-rotation one"
