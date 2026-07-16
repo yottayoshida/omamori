@@ -7,10 +7,28 @@ This document covers omamori's security model, threat analysis, and known limita
 | If you are... | Read in this order |
 |---|---|
 | **An operator** evaluating omamori for your team | [Security Model](#security-model) → [What It Protects](#what-it-protects-v090) → [Defense Boundary Matrix](#defense-boundary-matrix-v0101) → [Structural Limits](#structural-limits) → [Safe Defaults](#safe-defaults) |
-| **A security researcher** auditing the design | [Design Invariants](#design-invariants-v090) → [Bypass Corpus Testing](#bypass-corpus-testing-v041) → [Audit Log](#audit-log-v070) → [Integrity Monitoring](#integrity-monitoring-v050) |
+| **A security researcher** auditing the design, or reporting a bypass | [Reporting a Vulnerability](#reporting-a-vulnerability) → [Design Invariants](#design-invariants-v090) → [Bypass Corpus Testing](#bypass-corpus-testing-v041) → [Audit Log](#audit-log-v070) → [Integrity Monitoring](#integrity-monitoring-v050) |
 | **A contributor** preparing a PR | [AI-assisted Contribution Invariants](#ai-assisted-contribution-invariants-v093) |
 
 For end-user installation and CLI usage, see [README.md](README.md). For known limitations classified by closure status — closed in v0.9.x / decided out of scope / structural — jump to [Bypass Corpus Testing → Known limitations (KNOWN_LIMIT)](#known-limitations-known_limit).
+
+---
+
+## Reporting a Vulnerability
+
+Found a way to bypass a guarantee this document claims omamori provides, or a way to defeat its self-defense (disabling or uninstalling it without the guard blocking that action)? Report it privately rather than filing a public issue.
+
+**Channel**: [GitHub Private Vulnerability Reporting](https://github.com/yottayoshida/omamori/security/advisories/new) (GitHub Security Advisories, enabled on this repository).
+
+**Response time**: omamori is a single-maintainer project. Response is best-effort; there is no fixed SLA.
+
+**In scope**: a bypass of a guarantee documented in the [Defense Boundary Matrix](#defense-boundary-matrix-v0101) or the README's [Verifiable Claims](README.md#verifiable-claims) table; a way to circumvent omamori's self-defense.
+
+**Out of scope**: anything already documented as a known-limit ([Structural Limits](#structural-limits), [Bypass Corpus Testing → Known limitations](#known-limitations-known_limit)) or a structural limit inherent to the PATH-shim + static-analysis approach (see README → [Scope and Limitations](README.md#scope-and-limitations)). These are welcome as regular GitHub issues, not private reports.
+
+A report that leads to a fix follows the [Known-bypass-becomes-row rule](#known-bypass-becomes-row-rule): a new Defense Boundary Matrix row, a corpus test, and — if applicable — a new known-limit entry.
+
+Please do not include exploit walkthroughs in public issues or PR descriptions; keep those in the private report.
 
 ---
 
