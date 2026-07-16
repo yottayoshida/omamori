@@ -500,6 +500,19 @@ pub(crate) fn run_command(
     let load_result = load_config(config_path)?;
     emit_config_warnings(&load_result);
 
+    // Collect process provenance (#420) as early as possible, before any
+    // child process runs — the real parent (the AI CLI or shell that
+    // invoked this shim) is only guaranteed to still be alive at this
+    // point; a dead parent can be reparented to launchd (ppid=1) by the
+    // time a later call site would otherwise collect it. Gated on audit
+    // being enabled: when it's off, every guarded command on the machine
+    // would otherwise pay the collection syscalls for no benefit.
+    let provenance = load_result
+        .config
+        .audit
+        .enabled
+        .then(crate::audit::provenance::ProcessProvenance::collect);
+
     let invocation =
         CommandInvocation::new(program.clone(), args.iter().map(clone_lossy).collect());
     let env_pairs = env::vars().collect::<Vec<_>>();
@@ -517,8 +530,13 @@ pub(crate) fn run_command(
             eprintln!("omamori warning: {warning}");
         }
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
-            let event =
-                logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
+            let event = logger.create_event(
+                &invocation,
+                None,
+                &detection.matched_detectors,
+                &outcome,
+                provenance.as_ref(),
+            );
             if let Some(code) = try_audit_append(&logger, event, load_result.config.audit.strict) {
                 return Ok(code);
             }
@@ -538,8 +556,13 @@ pub(crate) fn run_command(
             eprintln!("omamori warning: {warning}");
         }
         if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
-            let event =
-                logger.create_event(&invocation, None, &detection.matched_detectors, &outcome);
+            let event = logger.create_event(
+                &invocation,
+                None,
+                &detection.matched_detectors,
+                &outcome,
+                provenance.as_ref(),
+            );
             if let Some(code) = try_audit_append(&logger, event, load_result.config.audit.strict) {
                 return Ok(code);
             }
@@ -672,6 +695,8 @@ pub(crate) fn run_command(
                     &invocation.program,
                     &provider,
                     "layer1:break-glass",
+                    provenance.as_ref(),
+                    logger.secret_ref(),
                 );
                 if let Some(code) =
                     try_audit_append(&logger, event, load_result.config.audit.strict)
@@ -713,6 +738,7 @@ pub(crate) fn run_command(
             effective_rule,
             &detection.matched_detectors,
             &outcome,
+            provenance.as_ref(),
         );
         if let Some(code) = try_audit_append(&logger, event, load_result.config.audit.strict) {
             return Ok(code);
@@ -1045,6 +1071,7 @@ mod tests {
                 None,
                 &[],
                 &ActionOutcome::PassedThrough { exit_code: 0 },
+                None,
             );
             let result = try_audit_append(&logger, event, true);
             assert_eq!(
@@ -1069,6 +1096,7 @@ mod tests {
                 None,
                 &[],
                 &ActionOutcome::PassedThrough { exit_code: 0 },
+                None,
             );
             let result = try_audit_append(&logger, event, false);
             assert_eq!(
@@ -1681,6 +1709,154 @@ mod tests {
         assert!(
             content.contains("T"),
             "corrupt content with old mtime should be overwritten"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #420: process provenance actually reaches the audit log ---
+    //
+    // Every other provenance test in this codebase exercises create_event /
+    // create_bypass_event directly — none of them drive run_command() itself,
+    // so none of them can catch a dropped `provenance.as_ref()` at one of its
+    // four real call sites (a proxy adversarial review flagged this: silently
+    // changing shim.rs's Layer 1 block-path call site to pass `None` left
+    // every other test in the suite green). These tests close that gap by
+    // running the real end-to-end pipeline and reading back audit.jsonl.
+
+    /// Shared setup for the two provenance-wiring tests below: writes a
+    /// 0600 config.toml with audit enabled under `dir` (load_config()
+    /// silently falls back to Config::default() — dropping the `[audit]`
+    /// section entirely — for anything looser than 0600), points `HOME` at
+    /// `dir`, sets or clears `CLAUDECODE` per `ai_detected` to select
+    /// run_command's protected vs. fast path, runs it, restores both env
+    /// vars, and returns the last audit.jsonl entry.
+    fn run_command_and_read_last_audit_event(
+        dir: &Path,
+        ai_detected: bool,
+        program: &str,
+        args: &[OsString],
+    ) -> serde_json::Value {
+        let audit_path = dir.join("audit.jsonl");
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[audit]\nenabled = true\npath = \"{}\"\n",
+                audit_path.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        let saved_home = std::env::var_os("HOME");
+        let saved_claudecode = std::env::var_os("CLAUDECODE");
+        unsafe {
+            std::env::set_var("HOME", dir);
+            if ai_detected {
+                std::env::set_var("CLAUDECODE", "1");
+            } else {
+                std::env::remove_var("CLAUDECODE");
+            }
+        }
+
+        let result = run_command(program.to_string(), args, Some(&config_path));
+
+        match saved_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        match saved_claudecode {
+            Some(v) => unsafe { std::env::set_var("CLAUDECODE", v) },
+            None => unsafe { std::env::remove_var("CLAUDECODE") },
+        }
+
+        assert!(result.is_ok(), "run_command must not error: {result:?}");
+
+        let content = std::fs::read_to_string(&audit_path)
+            .expect("run_command must have appended an audit entry");
+        let last_line = content
+            .lines()
+            .next_back()
+            .expect("audit log must have at least one entry");
+        serde_json::from_str(last_line).unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_command_wires_provenance_into_the_layer1_block_audit_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-shim-provenance-wiring-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `rm -rf /` matches a default core rule and is Blocked — the
+        // executor never spawns a real process for a Blocked outcome, so
+        // this is safe to actually run through run_command(). AI-detected
+        // env drives the protected path (shim.rs:741) — the one this
+        // incident's #420 fields actually matter for.
+        let event = run_command_and_read_last_audit_event(
+            &dir,
+            true,
+            "rm",
+            &[OsString::from("-rf"), OsString::from("/")],
+        );
+
+        // Sanity: confirm this really is the blocked rm event, not some
+        // unrelated entry, before trusting its provenance fields.
+        // `AuditEvent.command` stores only the program name, not argv.
+        assert_eq!(event["command"], "rm");
+        assert!(
+            event.get("rule_id").and_then(|v| v.as_str()).is_some(),
+            "expected a matched core rule (blocked outcome), got: {event}"
+        );
+        assert!(
+            event.get("pid").and_then(|v| v.as_u64()).is_some(),
+            "Layer 1 audit event must carry real process provenance (pid) \
+             — got: {event}"
+        );
+        assert!(
+            event.get("ppid").is_some(),
+            "Layer 1 audit event must carry the ppid field (key present, \
+             even if the OS call happens to return null) — got: {event}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex proxy review Round 1 (P1): the block-path test above only
+    /// covers shim.rs:741 (protected path). shim.rs:564 (the non-protected
+    /// "human terminal" fast path — a distinct `create_event` call site
+    /// with its own `provenance.as_ref()`) had no positive test either.
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_command_wires_provenance_into_the_layer1_fast_path_audit_event() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-shim-provenance-fastpath-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // `true` always exits 0 and is safe to actually run. No AI CLI
+        // detected drives the fast (non-protected) path (shim.rs:564).
+        let event = run_command_and_read_last_audit_event(&dir, false, "true", &[]);
+
+        assert_eq!(event["command"], "true");
+        assert_eq!(
+            event["action"], "passthrough",
+            "sanity: the non-protected fast path always passes through, got: {event}"
+        );
+        assert!(
+            event.get("pid").and_then(|v| v.as_u64()).is_some(),
+            "Layer 1 fast-path audit event must carry real process provenance (pid) \
+             — got: {event}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -363,6 +363,10 @@ fn build_config_mutation_event(rule_name: &str, action: &str, command: String) -
         prev_hash: None,
         key_id: None,
         entry_hash: None,
+        pid: None,
+        ppid: None,
+        parent_process: None,
+        cwd_hash: None,
     }
 }
 

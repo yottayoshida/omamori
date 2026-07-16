@@ -5,6 +5,7 @@ use std::io::{self, IsTerminal, Write};
 
 use crate::AppError;
 use crate::audit::AuditLogger;
+use crate::audit::provenance::ProcessProvenance;
 use crate::break_glass::{
     self, ActivationError, DEFAULT_DURATION_SECS, format_duration_human, format_remaining,
 };
@@ -220,6 +221,10 @@ fn build_break_glass_event(
         prev_hash: None,
         key_id: None,
         entry_hash: None,
+        pid: None,
+        ppid: None,
+        parent_process: None,
+        cwd_hash: None,
     }
 }
 
@@ -256,6 +261,10 @@ fn create_activation_event(rule_id: &str, expires_at: &str) -> crate::audit::Aud
         prev_hash: None,
         key_id: None,
         entry_hash: None,
+        pid: None,
+        ppid: None,
+        parent_process: None,
+        cwd_hash: None,
     }
 }
 
@@ -279,6 +288,10 @@ fn create_deactivation_event(rule_id: &str) -> crate::audit::AuditEvent {
         prev_hash: None,
         key_id: None,
         entry_hash: None,
+        pid: None,
+        ppid: None,
+        parent_process: None,
+        cwd_hash: None,
     }
 }
 
@@ -358,12 +371,27 @@ fn create_expired_observed_event(
 // Audit event for bypass (used by shim and hook)
 // ---------------------------------------------------------------------------
 
+/// `provenance` is best-effort process context (#420). Layer 1 (shim) call
+/// sites pass real data; Layer 2 (hook) call sites deliberately pass `None`
+/// — out of scope for #420 (the motivating incident had zero Layer 2
+/// events). Unlike the other `AuditEvent` builders in this file (CLI-only
+/// events where provenance is meaningless), this one IS in scope on the
+/// Layer 1 path, so it does not simply hardcode `None`.
+///
+/// `secret` is the caller's `AuditLogger::secret_ref()` — needed to compute
+/// `cwd_hash` (see `ProcessProvenance::as_audit_fields`). Pass it regardless
+/// of what `provenance` is; only `provenance` being `None` should ever be
+/// the reason the four fields come out empty.
 pub(crate) fn create_bypass_event(
     rule_id: &str,
     command: &str,
     provider: &str,
     detection_layer: &str,
+    provenance: Option<&ProcessProvenance>,
+    secret: Option<&[u8; 32]>,
 ) -> crate::audit::AuditEvent {
+    let (pid, ppid, parent_process, cwd_hash) =
+        ProcessProvenance::as_audit_fields(provenance, secret);
     crate::audit::AuditEvent {
         timestamp: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -383,6 +411,10 @@ pub(crate) fn create_bypass_event(
         prev_hash: None,
         key_id: None,
         entry_hash: None,
+        pid,
+        ppid,
+        parent_process,
+        cwd_hash,
     }
 }
 
@@ -433,6 +465,58 @@ mod tests {
             "result must surface the state-derived expires_at: {}",
             event.result
         );
+    }
+
+    // -----------------------------------------------------------------
+    // create_bypass_event provenance wiring (#420, M3 / Phase 5 finding)
+    //
+    // The compiler enforces that some value is passed for `provenance` at
+    // every call site, but it cannot tell a deliberate `None` (hook.rs,
+    // Layer 2, out of scope) from an accidental one (shim.rs, Layer 1,
+    // should carry real data). These two tests pin the two directions
+    // directly against `create_bypass_event`'s own behavior.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn bypass_event_with_provenance_carries_real_fields() {
+        let provenance = ProcessProvenance::collect();
+        let event = create_bypass_event(
+            "rm-recursive-to-trash",
+            "rm -rf /tmp/x",
+            "claude-code",
+            "layer1:break-glass",
+            Some(&provenance),
+            None, // secret: absent is fine, only cwd_hash depends on it
+        );
+        // `ProcessProvenance`'s fields are `pub(super)` (audit-module-only),
+        // so this test — living in `cli::break_glass_cmd` — derives its
+        // expectations through the same public unpacking method the real
+        // call site uses, rather than reaching into private fields.
+        let (expected_pid, expected_ppid, expected_parent, _) =
+            ProcessProvenance::as_audit_fields(Some(&provenance), None);
+        assert_eq!(event.pid, expected_pid);
+        assert_eq!(event.ppid, expected_ppid);
+        // parent_process/cwd_hash are environment-dependent (may be None
+        // if collection failed in this environment), but they must match
+        // whatever collect() actually produced — not be silently dropped.
+        assert_eq!(event.parent_process, expected_parent);
+    }
+
+    #[test]
+    fn bypass_event_without_provenance_has_all_none_fields() {
+        // Mirrors the two hook.rs call sites (Layer 2, out of scope).
+        let event = create_bypass_event(
+            "rm-recursive-to-trash",
+            "rm -rf /tmp/x",
+            "claude-code",
+            "layer2:break-glass",
+            None,
+            None,
+        );
+        assert_eq!(event.pid, None);
+        assert_eq!(event.ppid, None);
+        assert_eq!(event.parent_process, None);
+        assert_eq!(event.cwd_hash, None);
     }
 
     #[test]

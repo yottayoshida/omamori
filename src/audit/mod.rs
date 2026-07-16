@@ -8,12 +8,14 @@
 //! - `report`: Aggregation for `omamori report` (since v0.10.0, #221)
 
 pub mod chain;
+pub mod provenance;
 pub mod report;
 pub mod retention;
 pub mod secret;
 pub mod verify;
 
 // --- Public re-exports (maintain `omamori::audit::*` API paths) ---
+pub use provenance::hash_cwd_candidates;
 pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, rotate_key};
 pub use verify::{
@@ -23,6 +25,7 @@ pub use verify::{
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
 use chain::{CHAIN_VERSION, compute_entry_hash, read_chain_state};
+use provenance::ProcessProvenance;
 use retention::{PRUNE_CHECK_INTERVAL, try_prune};
 use secret::{
     current_key_id, flock_exclusive, hmac_targets, load_or_create_secret, open_audit_rw,
@@ -121,6 +124,15 @@ impl AuditLogger {
         self.secret.is_some()
     }
 
+    /// Narrow crate-internal accessor for computing provenance fields
+    /// outside the `audit` module — currently only
+    /// `cli::break_glass_cmd::create_bypass_event`, which builds its own
+    /// `AuditEvent` rather than going through `create_event`. Not part of
+    /// the public API: intentionally `pub(crate)`, not `pub`.
+    pub(crate) fn secret_ref(&self) -> Option<&[u8; 32]> {
+        self.secret.as_ref()
+    }
+
     pub fn from_config(config: &AuditConfig) -> Option<Self> {
         if !config.enabled {
             return None;
@@ -137,14 +149,21 @@ impl AuditLogger {
         })
     }
 
+    /// `provenance` is best-effort process context (#420) — pass `None` for
+    /// call sites where it is intentionally not collected (Layer 2 hook
+    /// events are out of scope; see `engine::hook`) or was unavailable at
+    /// the call site.
     pub fn create_event(
         &self,
         invocation: &CommandInvocation,
         matched_rule: Option<&RuleConfig>,
         matched_detectors: &[String],
         outcome: &ActionOutcome,
+        provenance: Option<&ProcessProvenance>,
     ) -> AuditEvent {
         let targets = invocation.target_args();
+        let (pid, ppid, parent_process, cwd_hash) =
+            ProcessProvenance::as_audit_fields(provenance, self.secret.as_ref());
         AuditEvent {
             timestamp: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -169,6 +188,10 @@ impl AuditLogger {
             prev_hash: None,
             key_id: None,
             entry_hash: None,
+            pid,
+            ppid,
+            parent_process,
+            cwd_hash,
         }
     }
 
@@ -293,6 +316,17 @@ pub struct AuditEvent {
     pub key_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_hash: Option<String>,
+    // --- Process provenance fields (#420) ---
+    // Deliberately NOT added to `HashableEvent` (chain.rs) — Design A,
+    // see ADR-0006 and SECURITY.md's "Process Provenance" section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_process: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd_hash: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +486,10 @@ mod tests {
             prev_hash: None,
             key_id: None,
             entry_hash: None,
+            pid: None,
+            ppid: None,
+            parent_process: None,
+            cwd_hash: None,
         }
     }
 
@@ -533,6 +571,141 @@ mod tests {
         assert_eq!(events[0]["prev_hash"], genesis);
         assert_eq!(events[1]["prev_hash"], events[0]["entry_hash"]);
         assert_eq!(events[2]["prev_hash"], events[1]["entry_hash"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // #420 (Design A): provenance fields are outside `HashableEvent`, so
+    // an entry written before this feature (no provenance keys in the JSON
+    // at all) and one written after (real provenance data) must both
+    // verify cleanly in the *same* chain — this is the load-bearing claim
+    // behind "CHAIN_VERSION stays 1, existing chains are unaffected".
+    #[test]
+    fn verify_chain_mixes_pre_420_and_post_420_entries() {
+        let dir = test_dir("verify-mixed-420");
+        let logger = test_logger(&dir);
+
+        // Pre-#420 shaped entry: `make_event`'s provenance fields are all
+        // `None`, so `skip_serializing_if` omits the JSON keys entirely —
+        // indistinguishable from a real pre-#420 log line.
+        logger.append(make_event("pre-420-cmd")).unwrap();
+
+        // Post-#420 shaped entry: real provenance data present.
+        let provenance = ProcessProvenance::collect();
+        let (pid, ppid, parent_process, cwd_hash) =
+            ProcessProvenance::as_audit_fields(Some(&provenance), Some(&TEST_SECRET));
+        let mut post_event = make_event("post-420-cmd");
+        post_event.pid = pid;
+        post_event.ppid = ppid;
+        post_event.parent_process = parent_process;
+        post_event.cwd_hash = cwd_hash;
+        logger.append(post_event).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "mixed pre/post-#420 chain must verify cleanly"
+        );
+        assert_eq!(result.chain_entries, 2);
+
+        // Confirm the on-disk JSON actually differs in shape — otherwise
+        // this test would not be exercising the mixed-shape scenario at all.
+        let events = read_events(&logger.path);
+        assert!(
+            events[0].get("pid").is_none(),
+            "pre-420 entry must omit provenance keys entirely, not just be null"
+        );
+        assert!(
+            events[1].get("pid").is_some(),
+            "post-420 entry must carry provenance keys"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // #420 Design A's accepted cost, made concrete rather than left as a
+    // documentation claim: provenance fields sit outside `HashableEvent`,
+    // so *semantic* tampering (same JSON shape, different value) is
+    // chain-silent — verify_chain has no way to see it (ADR-0006). *Syntactic*
+    // corruption (breaks the JSON shape entirely) is a different failure
+    // mode: the line fails `AuditEvent` deserialization, is counted as
+    // torn, and the *next* line's prev_hash check then fails because
+    // `expected_prev` was never advanced past the torn line (see
+    // verify.rs's `serde_json::from_str` -> `torn_lines += 1; continue`
+    // path). This pair of tests pins that asymmetry directly.
+    fn provenance_tamper_fixture(dir: &Path) -> AuditLogger {
+        let logger = test_logger(dir);
+        let provenance = ProcessProvenance::collect();
+        let (pid, ppid, parent_process, cwd_hash) =
+            ProcessProvenance::as_audit_fields(Some(&provenance), Some(&TEST_SECRET));
+        let mut first_event = make_event("first-cmd");
+        first_event.pid = pid;
+        first_event.ppid = ppid;
+        first_event.parent_process = parent_process;
+        first_event.cwd_hash = cwd_hash;
+        logger.append(first_event).unwrap();
+        logger.append(make_event("second-cmd")).unwrap();
+        logger
+    }
+
+    #[test]
+    fn provenance_value_tampering_is_silent_under_design_a() {
+        let dir = test_dir("tamper-semantic-420");
+        let logger = provenance_tamper_fixture(&dir);
+
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        assert_eq!(lines.len(), 2);
+
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert!(
+            first.get("pid").is_some(),
+            "precondition: first line must actually carry a pid value to tamper with"
+        );
+        // Same JSON shape, different value — exactly what a same-user
+        // attacker with direct audit.jsonl write access could do.
+        first["pid"] = serde_json::json!(999_999);
+        lines[0] = serde_json::to_string(&first).unwrap();
+        fs::write(&logger.path, lines.join("\n") + "\n").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "Design A: a value-only edit to a provenance field must not be \
+             detectable via the hash chain — this is the accepted cost, not a bug"
+        );
+        assert_eq!(result.torn_lines, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provenance_type_corruption_causes_downstream_chain_break() {
+        let dir = test_dir("tamper-syntactic-420");
+        let logger = provenance_tamper_fixture(&dir);
+
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        assert_eq!(lines.len(), 2);
+
+        // Valid JSON syntax, but wrong type for `pid` (u32) — AuditEvent
+        // deserialization fails on this line entirely.
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        first["pid"] = serde_json::json!("not-a-number");
+        lines[0] = serde_json::to_string(&first).unwrap();
+        fs::write(&logger.path, lines.join("\n") + "\n").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.torn_lines, 1,
+            "the type-corrupted line must fail AuditEvent deserialization entirely"
+        );
+        assert!(
+            result.broken_at.is_some(),
+            "corruption surfaces downstream: the torn line is skipped without \
+             advancing expected_prev, so the next entry's prev_hash check fails \
+             — this is NOT silent, unlike the value-only tamper above"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1074,6 +1247,7 @@ mod tests {
             Some(&rule),
             &["claude-code".to_string()],
             &outcome,
+            None,
         );
 
         // target_hash should be present but target args should not appear in the event
@@ -1117,6 +1291,7 @@ mod tests {
             Some(&rule),
             &["claude-code".to_string(), "cursor".to_string()],
             &outcome,
+            None,
         );
 
         assert_eq!(event.provider, "claude-code"); // first detector
@@ -1141,7 +1316,7 @@ mod tests {
         };
         let invocation = CommandInvocation::new("ls".to_string(), vec![]);
         let outcome = ActionOutcome::PassedThrough { exit_code: 0 };
-        let event = logger.create_event(&invocation, None, &[], &outcome);
+        let event = logger.create_event(&invocation, None, &[], &outcome, None);
 
         assert_eq!(event.target_hash, "NO_HMAC_SECRET");
 
@@ -2495,6 +2670,10 @@ mod tests {
             prev_hash: Some("prev000".to_string()),
             key_id: Some("default".to_string()),
             entry_hash: None,
+            pid: None,
+            ppid: None,
+            parent_process: None,
+            cwd_hash: None,
         };
         let json = serde_json::to_string(&HashableEvent::from_event(&event)).unwrap();
 

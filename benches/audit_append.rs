@@ -76,7 +76,54 @@ fn make_event(logger: &AuditLogger) -> AuditEvent {
         message: "blocked by omamori".to_string(),
     };
     let detectors = vec!["claude_code".to_string()];
-    logger.create_event(&invocation, Some(&rule), &detectors, &outcome)
+    // `provenance: None` — this bench measures `append`'s cost (flock +
+    // tail-seek + HMAC + fs write), not provenance collection. See
+    // `bench_create_event_with_provenance` below for that cost.
+    logger.create_event(&invocation, Some(&rule), &detectors, &outcome, None)
+}
+
+/// Measures `AuditLogger::create_event` end-to-end *with* provenance
+/// collection (#420) — `getppid`/`proc_pidpath`/`current_dir` plus the
+/// domain-separated `cwd_hash` HMAC. The pre-existing `make_event` above
+/// does not exercise this path (it always passes `provenance: None`), so
+/// this is the only bench that reflects the fixed per-command cost #420
+/// adds to every guarded command on the machine.
+fn bench_create_event_with_provenance(c: &mut Criterion) {
+    static SETUP: OnceLock<AuditLogger> = OnceLock::new();
+    let logger = SETUP.get_or_init(|| {
+        let dir = bench_dir();
+        make_logger(&dir)
+    });
+
+    let invocation = CommandInvocation::new(
+        "rm".to_string(),
+        vec!["-rf".to_string(), "/tmp/omamori-bench-target".to_string()],
+    );
+    let rule = RuleConfig::new(
+        "rm-rf-root",
+        "rm",
+        ActionKind::Block,
+        vec!["-rf".to_string()],
+        vec![],
+        Some("rm -rf safeguard".to_string()),
+    );
+    let outcome = ActionOutcome::Blocked {
+        message: "blocked by omamori".to_string(),
+    };
+    let detectors = vec!["claude_code".to_string()];
+
+    c.bench_function("audit/create_event/with_provenance", |b| {
+        b.iter(|| {
+            let provenance = omamori::audit::provenance::ProcessProvenance::collect();
+            black_box(logger.create_event(
+                black_box(&invocation),
+                Some(&rule),
+                &detectors,
+                &outcome,
+                Some(&provenance),
+            ))
+        })
+    });
 }
 
 fn bench_append_single_event(c: &mut Criterion) {
@@ -112,5 +159,9 @@ fn bench_append_single_event(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_append_single_event);
+criterion_group!(
+    benches,
+    bench_append_single_event,
+    bench_create_event_with_provenance
+);
 criterion_main!(benches);

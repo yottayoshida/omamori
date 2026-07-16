@@ -661,11 +661,15 @@ fn run_hook_check_command(
                 .ok()
                 .and_then(|r| AuditLogger::from_config(&r.config.audit))
             {
+                // Layer 2 provenance is out of scope for #420 — pass None
+                // deliberately (see create_bypass_event's doc comment).
                 let event = crate::cli::break_glass_cmd::create_bypass_event(
                     &rule_name,
                     command,
                     provider,
                     "layer2:break-glass",
+                    None,
+                    logger.secret_ref(),
                 );
                 let strict = crate::config::load_config(None)
                     .map(|r| r.config.audit.strict)
@@ -977,7 +981,9 @@ fn audit_log_unknown_tool_fail_open(
     let detectors = vec![provider.to_string()];
     let outcome = crate::actions::ActionOutcome::PassedThrough { exit_code: 0 };
 
-    let mut event = logger.create_event(&invocation, None, &detectors, &outcome);
+    // Layer 2 provenance is out of scope for #420 (the motivating incident
+    // had zero Layer 2 events) — pass None deliberately, not by omission.
+    let mut event = logger.create_event(&invocation, None, &detectors, &outcome, None);
     // Override action label so `omamori audit unknown` (and SIEM filters)
     // can pick these out without parsing detection_layer. New string
     // value — old parsers treat it as opaque, no schema break, no
@@ -1277,7 +1283,8 @@ fn audit_log_materialize(
     let detectors = vec![provider.to_string()];
     let outcome = crate::actions::ActionOutcome::PassedThrough { exit_code: 0 };
 
-    let mut event = logger.create_event(&invocation, None, &detectors, &outcome);
+    // Layer 2 provenance is out of scope for #420 — pass None deliberately.
+    let mut event = logger.create_event(&invocation, None, &detectors, &outcome, None);
     event.action = "materialize".to_string();
     event.result = "allow".to_string();
     event.detection_layer = Some(detection_layer);
@@ -1378,7 +1385,8 @@ fn audit_log_hook_block(
         message: "blocked at Layer 2 hook".to_string(),
     };
 
-    let mut event = logger.create_event(&invocation, None, &detectors, &outcome);
+    // Layer 2 provenance is out of scope for #420 — pass None deliberately.
+    let mut event = logger.create_event(&invocation, None, &detectors, &outcome, None);
     // Override action/result/detection_layer to surface Layer 2 deny semantics.
     // `create_event` defaults to action = matched_rule.action or "passthrough"
     // and detection_layer = "layer1"; both are wrong for Layer 2 deny path.

@@ -13,6 +13,7 @@ pub(crate) fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
         Some("verify") => run_audit_verify(args),
         Some("show") => run_audit_show(args),
         Some("key") => run_audit_key(args),
+        Some("hash-cwd") => run_audit_hash_cwd(args),
         // PR6 (#182): surface unknown-tool fail-open events.
         // Sugar over `audit show --action unknown_tool_fail_open --all`.
         Some("unknown") => run_audit_unknown(args),
@@ -313,7 +314,51 @@ fn audit_usage() -> &'static str {
   omamori audit show --action <name>             Filter by action (exact match)
   omamori audit show --relaxed                   Filter to relaxed allows (legacy data-context flag; pre-v0.10.4 logs only)
   omamori audit unknown [--last N] [--json]      Show forward-compat fail-opens for unknown tools (#182)
-  omamori audit key rotate                       Rotate HMAC signing key"
+  omamori audit key rotate                       Rotate HMAC signing key
+  omamori audit hash-cwd <path>                  Hash a candidate directory to match against cwd_hash in the log (#420)"
+}
+
+/// `omamori audit hash-cwd <path>` — an investigator's forensic tool (#420).
+/// `cwd_hash` in the log is a domain-separated HMAC, so a candidate path
+/// can't be checked for a match by eye; this computes every hash a real
+/// entry could plausibly have used for that path and lets the investigator
+/// grep the log for any of them. "Every hash" spans two axes:
+///
+/// - **Key**: `secret::load_keyring` returns the active key plus any
+///   retired ones, since a key rotation could have happened between when
+///   the entry was written and now.
+/// - **Path form**: `AuditEvent.cwd_hash` is computed from
+///   `std::env::current_dir()`, which returns an already symlink-resolved
+///   path (e.g. macOS `/tmp` → `/private/tmp`). An investigator's hand-typed
+///   candidate is typically NOT resolved, so both the raw and canonicalized
+///   forms of the candidate are hashed — trying only one silently misses
+///   the other.
+fn run_audit_hash_cwd(args: &[OsString]) -> Result<i32, AppError> {
+    let path_arg = args.get(3).and_then(|item| item.to_str()).ok_or_else(|| {
+        AppError::Usage(format!(
+            "audit hash-cwd requires a path argument\n\n{AUDIT_USAGE_HINT}"
+        ))
+    })?;
+    let candidate = std::path::PathBuf::from(path_arg);
+
+    let load_result = load_config(None)?;
+    match audit::hash_cwd_candidates(&load_result.config.audit, &candidate) {
+        Some(candidates) => {
+            println!("Candidate cwd_hash values for {}:", candidate.display());
+            for (key_id, form, hash) in candidates {
+                println!("  [{key_id}, {form}] {hash}");
+            }
+            println!();
+            println!("Grep the audit log for any of the above cwd_hash values.");
+            Ok(0)
+        }
+        None => {
+            eprintln!(
+                "omamori audit hash-cwd: no audit path or HMAC secret available — nothing to hash against"
+            );
+            Ok(1)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +418,79 @@ mod tests {
         let err = run_audit_command(&args).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(AUDIT_USAGE_HINT));
+    }
+
+    // -----------------------------------------------------------------
+    // run_audit_hash_cwd (#420, Codex proxy review Round 1 P2 —
+    // args.get(3) extraction, missing-arg Usage branch, and the
+    // None -> Ok(1) branch had zero coverage prior to this PR)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hash_cwd_missing_path_arg_uses_hint() {
+        let args: Vec<OsString> = vec!["omamori".into(), "audit".into(), "hash-cwd".into()];
+        let err = run_audit_command(&args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(AUDIT_USAGE_HINT));
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn hash_cwd_returns_one_when_no_keyring_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-hashcwd-cli-none-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dir_str = dir.to_str().unwrap().to_string();
+        let code = crate::test_support::with_home(Some(&dir_str), || {
+            // Deliberately no AuditLogger::from_config call — no secret has
+            // ever been created under this HOME, so the keyring is empty.
+            let args: Vec<OsString> = vec![
+                "omamori".into(),
+                "audit".into(),
+                "hash-cwd".into(),
+                dir_str.clone().into(),
+            ];
+            run_audit_command(&args).unwrap()
+        });
+        assert_eq!(code, 1, "no keyring exists yet — must return exit code 1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn hash_cwd_returns_zero_when_keyring_exists() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-hashcwd-cli-some-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dir_str = dir.to_str().unwrap().to_string();
+        let code = crate::test_support::with_home(Some(&dir_str), || {
+            // Establish a real secret at the HOME-derived default audit
+            // path, mirroring what a real `omamori` invocation would have
+            // done before an investigator ever runs `hash-cwd`.
+            let config = audit_config(None);
+            let _logger =
+                audit::AuditLogger::from_config(&config).expect("logger constructs");
+
+            let args: Vec<OsString> = vec![
+                "omamori".into(),
+                "audit".into(),
+                "hash-cwd".into(),
+                dir_str.clone().into(),
+            ];
+            run_audit_command(&args).unwrap()
+        });
+        assert_eq!(code, 0, "keyring exists — must return exit code 0");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------
