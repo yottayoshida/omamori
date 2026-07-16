@@ -7,6 +7,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use crate::AppError;
+use crate::audit::{AuditEvent, AuditLogger};
 use crate::config::{self, load_config};
 use crate::engine::guard::guard_ai_config_modification;
 use crate::engine::shim::{emit_config_warnings, update_baseline_silent};
@@ -311,6 +312,81 @@ fn reject_if_duplicate_raw_entry(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Audit event helpers (#394)
+// ---------------------------------------------------------------------------
+
+/// Shared field layout for config-mutation audit events; only `rule_name`,
+/// `action`, and `command` vary per event kind. Mirrors
+/// `break_glass_cmd::build_break_glass_event`'s shape, but is NOT a copy of
+/// its semantics — see the "no rejection guard" note below.
+///
+/// `command` is deliberately minimal (`config <verb> <rule_name>` only).
+/// Never include `--command`/`--match-any`/`--destination`/`--message` here
+/// (relevant to `config add`): consistent with the existing privacy design
+/// where `target_hash` HMAC-hashes paths rather than logging them in the
+/// clear, a rule's *content* stays out of the audit log even though its
+/// *name* and the fact that it was mutated do not.
+///
+/// Unlike `create_expired_observed_event` (which validates `rule_id` against
+/// `core_rule_names()` before trusting it, because break-glass state is an
+/// unauthenticated file an AI could have written) this helper does not
+/// reject any `rule_name` shape. That asymmetry is intentional, not a
+/// missing check: by the time any caller here runs, `rule_name` has already
+/// been validated as a legal target for this specific mutation — for
+/// disable/enable, that means it passed `validate_rule_name` against the
+/// freshly-loaded config; for add, it means it passed the O2 core-rule
+/// shadow check and the raw-duplicate-name check instead (a brand new name
+/// is not "known" yet, so `validate_rule_name` does not apply there) — and
+/// the mutation this event describes has already been written to disk in
+/// either case. The event is an inline record of a completed,
+/// already-validated-for-its-own-purpose action, not a read of untrusted
+/// external state. Do not "fix" this by porting over a core-rule-name
+/// check; a legitimate custom rule's name would then be silently rejected.
+fn build_config_mutation_event(rule_name: &str, action: &str, command: String) -> AuditEvent {
+    AuditEvent {
+        timestamp: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+        provider: "cli".to_string(),
+        command,
+        rule_id: Some(rule_name.to_string()),
+        action: action.to_string(),
+        result: "config mutation succeeded".to_string(),
+        target_count: 0,
+        target_hash: String::new(),
+        detection_layer: Some("config-mutation".to_string()),
+        unwrap_chain: None,
+        raw_input_hash: None,
+        chain_version: None,
+        seq: None,
+        prev_hash: None,
+        key_id: None,
+        entry_hash: None,
+    }
+}
+
+/// Best-effort audit append for a successful config mutation (state-first +
+/// audit-best-effort, mirroring `break_glass_cmd`'s pattern): the mutation
+/// has already been written to disk by the time this is called, so an audit
+/// append failure here is a warning, never a reason to roll back or fail the
+/// command. `audit_config` is the already-loaded `precheck.config.audit`
+/// (reused rather than re-loading config a second time — the audit section
+/// is unaffected by the rule mutation this event describes).
+fn append_config_mutation_event(
+    audit_config: &crate::audit::AuditConfig,
+    rule_name: &str,
+    action: &str,
+    command: String,
+) {
+    if let Some(logger) = AuditLogger::from_config(audit_config) {
+        let event = build_config_mutation_event(rule_name, action, command);
+        if let Err(e) = logger.append(event) {
+            eprintln!("omamori warning: failed to audit-log config mutation: {e}");
+        }
+    }
+}
+
 fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     guard_ai_config_modification("config disable")?;
 
@@ -369,6 +445,12 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
         entry["enabled"] = toml_edit::value(false);
         Ok(())
     })?;
+    append_config_mutation_event(
+        &precheck.config.audit,
+        rule_name,
+        "config-disable",
+        format!("config disable {rule_name}"),
+    );
 
     eprintln!("Disabled: {rule_name}");
     run_config_list()
@@ -475,6 +557,12 @@ fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
         }
         Ok(())
     })?;
+    append_config_mutation_event(
+        &precheck.config.audit,
+        rule_name,
+        "config-enable",
+        format!("config enable {rule_name}"),
+    );
 
     if is_builtin {
         eprintln!("Enabled: {rule_name} (restored to built-in default)");
@@ -768,6 +856,18 @@ fn run_config_add(args: &[OsString]) -> Result<i32, AppError> {
         array.push(new_table);
         Ok(())
     })?;
+    // Recorded immediately after the atomic write, before O6's self-check:
+    // the mutation is already a physical fact on disk at this point (#394).
+    // Even if O6 below finds the config we just wrote doesn't load cleanly
+    // (an internal-error case that "should not happen"), the write itself
+    // still happened and belongs in the forensic record — mirrors
+    // break-glass's state-first-then-log ordering.
+    append_config_mutation_event(
+        &precheck.config.audit,
+        &parsed.rule_name,
+        "config-add",
+        format!("config add {}", parsed.rule_name),
+    );
 
     // O6: post-write self-check — the rule we just wrote must load cleanly,
     // AND any pre-existing unrelated warning in the same file must still
@@ -1114,5 +1214,511 @@ mod tests {
             "symlink target must not be overwritten"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #394: config mutation audit events ---
+
+    fn test_audit_config(dir: &Path) -> crate::audit::AuditConfig {
+        crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        }
+    }
+
+    fn read_audit_lines(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("audit.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// V-394-3: a successful config mutation actually reaches the real
+    /// audit chain (via `AuditLogger::append`), not just a struct with the
+    /// right-looking fields — mirrors `break_glass_cmd`'s
+    /// `log_expired_observed_events_appends_to_chain` pattern. A unit test
+    /// that only inspects `build_config_mutation_event`'s return value
+    /// would not catch an `append` call that got dropped or never wired in.
+    #[test]
+    fn append_config_mutation_event_reaches_the_real_chain() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cfg394-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_config = test_audit_config(&dir);
+
+        append_config_mutation_event(
+            &audit_config,
+            "my-custom-rule",
+            "config-disable",
+            "config disable my-custom-rule".to_string(),
+        );
+
+        let lines = read_audit_lines(&dir);
+        assert_eq!(lines.len(), 1, "exactly one event must be appended");
+        assert!(lines[0].contains("\"action\":\"config-disable\""));
+        assert!(lines[0].contains("\"rule_id\":\"my-custom-rule\""));
+        assert!(lines[0].contains("\"provider\":\"cli\""));
+        assert!(lines[0].contains("\"detection_layer\":\"config-mutation\""));
+        // action≠"block" is a hard requirement (audit/report.rs counts
+        // action=="block" into total_blocks — a config-mutation event must
+        // never inflate that count).
+        assert!(!lines[0].contains("\"action\":\"block\""));
+        assert!(!lines[0].contains("\"result\":\"block\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Privacy: `config add`'s event must record only the rule name, never
+    /// its content (command/match tokens/destination/message) — consistent
+    /// with `target_hash` HMAC-hashing paths elsewhere rather than logging
+    /// them in the clear.
+    #[test]
+    fn append_config_mutation_event_add_excludes_rule_content() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cfg394-privacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_config = test_audit_config(&dir);
+
+        append_config_mutation_event(
+            &audit_config,
+            "my-custom-rule",
+            "config-add",
+            "config add my-custom-rule".to_string(),
+        );
+
+        let lines = read_audit_lines(&dir);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"command\":\"config add my-custom-rule\""));
+        assert!(
+            !lines[0].contains("/Users") && !lines[0].contains("--destination"),
+            "event must not contain a destination path or raw add flags"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// V-394-1 / no-op paths: `run_config_disable`/`run_config_enable`
+    /// return `Ok(2)` (already disabled/enabled) *before* calling
+    /// `mutate_config` — this test pins that `append_config_mutation_event`
+    /// is never reached on that path by exercising the disable command
+    /// end-to-end against an already-disabled custom rule and asserting the
+    /// audit log stays empty. A regression that moved the append call
+    /// earlier (before the no-op early return) would fail this.
+    ///
+    /// Runs `run_config_disable` in-process (not spawned), so it goes
+    /// through the real `guard_ai_config_modification` reading this
+    /// process's live env vars — `with_clean_ai_env` is required or this
+    /// would spuriously fail whenever `cargo test` itself runs inside an AI
+    /// coding tool (which sets `CLAUDECODE=1` — true for this very session).
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_config_disable_no_op_does_not_append_audit_event() {
+        let dir = std::env::temp_dir().join(format!("omamori-cfg394-noop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join(".config").join("omamori");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        // Already-disabled custom rule (#388 shape): raw enabled=false.
+        // No explicit [audit].path — resolves to the default
+        // $HOME/.local/share/omamori/audit.jsonl via `context::data_dir()`.
+        std::fs::write(
+            &config_path,
+            "[audit]\nenabled = true\n\n[[rules]]\nname = \"my-rule\"\ncommand = \"rm\"\naction = \"block\"\nmatch_any = [\"-rf\"]\nenabled = false\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let audit_dir = dir.join(".local").join("share").join("omamori");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            crate::test_support::with_clean_ai_env(|| {
+                let result = run_config_disable("my-rule");
+                assert!(
+                    result.is_ok(),
+                    "no-op disable must still return Ok: {result:?}"
+                );
+            });
+        });
+
+        assert!(
+            !audit_dir.join("audit.jsonl").exists(),
+            "no-op disable must not create or append to the audit log"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sets up a fresh HOME with an existing custom rule (raw `[[rules]]`
+    /// entry, `enabled = true`) and `[audit] enabled = true`, returning
+    /// `(dir, config_path, audit_path)`. Shared by the three success-path
+    /// end-to-end tests below (Codex adversarial review, R1: the earlier
+    /// tests exercised `append_config_mutation_event` directly and the
+    /// no-op path end-to-end, but never drove an actual SUCCESSFUL `config
+    /// add`/`disable`/`enable` and inspected the resulting audit.jsonl — a
+    /// dropped or misplaced append call on any of the three success paths
+    /// would have passed every test that existed before this).
+    fn setup_home_with_existing_rule(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cfg394-e2e-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join(".config").join("omamori");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[audit]\nenabled = true\n\n[[rules]]\nname = \"my-rule\"\ncommand = \"rm\"\naction = \"block\"\nmatch_any = [\"-rf\"]\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let audit_dir = dir.join(".local").join("share").join("omamori");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        (dir, audit_dir.join("audit.jsonl"))
+    }
+
+    /// Codex R1: end-to-end success path for `config disable` — asserts the
+    /// appended event's actual on-disk JSON content, not just that
+    /// `append_config_mutation_event` produces the right struct in
+    /// isolation.
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_config_disable_success_appends_audit_event_end_to_end() {
+        let (dir, audit_path) = setup_home_with_existing_rule("disable");
+
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            crate::test_support::with_clean_ai_env(|| {
+                let result = run_config_disable("my-rule");
+                assert!(result.is_ok(), "disable must succeed: {result:?}");
+            });
+        });
+
+        let lines = read_audit_lines(audit_path.parent().unwrap());
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one event for one successful disable"
+        );
+        assert!(lines[0].contains("\"action\":\"config-disable\""));
+        assert!(lines[0].contains("\"rule_id\":\"my-rule\""));
+        assert!(lines[0].contains("\"provider\":\"cli\""));
+        assert!(lines[0].contains("\"detection_layer\":\"config-mutation\""));
+        assert!(lines[0].contains("\"command\":\"config disable my-rule\""));
+
+        let audit_config = test_audit_config(audit_path.parent().unwrap());
+        let verify = crate::audit::verify_chain(&audit_config);
+        assert!(
+            verify.is_ok(),
+            "the appended event must pass full chain verification"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex R1: end-to-end success path for `config enable`.
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_config_enable_success_appends_audit_event_end_to_end() {
+        let (dir, audit_path) = setup_home_with_existing_rule("enable");
+        // Disable it first (outside the measured window) so `enable` has a
+        // real state change to make, not another no-op.
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            crate::test_support::with_clean_ai_env(|| {
+                run_config_disable("my-rule").expect("setup: disable must succeed");
+            });
+        });
+        std::fs::remove_file(&audit_path).ok(); // isolate the enable event only
+
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            crate::test_support::with_clean_ai_env(|| {
+                let result = run_config_enable("my-rule");
+                assert!(result.is_ok(), "enable must succeed: {result:?}");
+            });
+        });
+
+        let lines = read_audit_lines(audit_path.parent().unwrap());
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one event for one successful enable"
+        );
+        assert!(lines[0].contains("\"action\":\"config-enable\""));
+        assert!(lines[0].contains("\"rule_id\":\"my-rule\""));
+        assert!(lines[0].contains("\"provider\":\"cli\""));
+        assert!(lines[0].contains("\"detection_layer\":\"config-mutation\""));
+        assert!(
+            lines[0].contains("\"command\":\"config enable my-rule\""),
+            "Codex R2: command field must say enable, not (e.g.) a stale/wrong \
+             copy-pasted disable string: {}",
+            lines[0]
+        );
+
+        let audit_config = test_audit_config(audit_path.parent().unwrap());
+        let verify = crate::audit::verify_chain(&audit_config);
+        assert!(
+            verify.is_ok(),
+            "the appended event must pass full chain verification"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex R1: end-to-end success path for `config add` — additionally
+    /// pins the privacy requirement that no rule content (command tokens,
+    /// match patterns, destination) leaks into the audit event, only the
+    /// rule name.
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_config_add_success_appends_audit_event_end_to_end() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cfg394-e2e-add-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join(".config").join("omamori");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "[audit]\nenabled = true\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let audit_dir = dir.join(".local").join("share").join("omamori");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+
+        let args: Vec<OsString> = [
+            "omamori",
+            "config",
+            "add",
+            "my-new-rule",
+            "--command",
+            "curl",
+            "--action",
+            "block",
+            "--match-any",
+            "--insecure",
+            "--message",
+            "a secret internal note that must not leak into the audit log",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            crate::test_support::with_clean_ai_env(|| {
+                let result = run_config_add(&args);
+                assert!(result.is_ok(), "add must succeed: {result:?}");
+            });
+        });
+
+        let lines = read_audit_lines(&audit_dir);
+        assert_eq!(lines.len(), 1, "exactly one event for one successful add");
+        assert!(lines[0].contains("\"action\":\"config-add\""));
+        assert!(lines[0].contains("\"rule_id\":\"my-new-rule\""));
+        assert!(lines[0].contains("\"command\":\"config add my-new-rule\""));
+        assert!(
+            !lines[0].contains("curl")
+                && !lines[0].contains("--insecure")
+                && !lines[0].contains("secret internal note"),
+            "the rule's command/match tokens/message must never appear in the audit \
+             event, only its name: {}",
+            lines[0]
+        );
+
+        let audit_config = test_audit_config(&audit_dir);
+        let verify = crate::audit::verify_chain(&audit_config);
+        assert!(
+            verify.is_ok(),
+            "the appended event must pass full chain verification"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex R2 (test-adversarial review): the no-op test above only proves
+    /// the early-return-before-mutate_config case never appends. This test
+    /// proves the *other* half of "state-first" — a `mutate_config` call
+    /// that actually reaches the write and FAILS (not just an early
+    /// no-op-return) must also not append an event. Forced by making the
+    /// config directory unwritable so `integrity::write_new_file` fails at
+    /// the atomic temp-file step, downstream of every no-op/validation
+    /// check `run_config_disable` performs (all of which only read).
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_config_disable_mutate_failure_does_not_append_audit_event() {
+        let (dir, audit_path) = setup_home_with_existing_rule("mutate-fail");
+        let config_dir = dir.join(".config").join("omamori");
+
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            crate::test_support::with_clean_ai_env(|| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o500))
+                    .unwrap();
+                let result = run_config_disable("my-rule");
+                // Restore write permission before any assertion/cleanup can
+                // fail and skip it.
+                std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                assert!(
+                    result.is_err(),
+                    "disable must fail when the config directory is unwritable: {result:?}"
+                );
+            });
+        });
+
+        assert!(
+            !audit_path.exists(),
+            "a failed mutate_config must not append any audit event"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex R2: `append_config_mutation_event` is explicitly best-effort
+    /// (state-first + audit-best-effort, mirroring break-glass) — an audit
+    /// append failure must be a warning only, never cause the config
+    /// mutation itself to be reported as failed. Forced by pointing
+    /// `[audit].path` at a location whose parent doesn't exist, so
+    /// `AuditLogger::append` fails while the config write itself succeeds.
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_config_disable_succeeds_even_when_audit_append_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cfg394-auditfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config_dir = dir.join(".config").join("omamori");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        // Codex R2 re-review: pointing `[audit].path` under a nonexistent
+        // directory is NOT privilege-independent — `AuditLogger::append`
+        // calls `create_dir_all` on the parent first (src/audit/mod.rs:181),
+        // so under a root/CI-privileged process that create could actually
+        // succeed, making this test pass for the wrong reason (or not at
+        // all). Use a REGULAR FILE where a directory component is expected
+        // instead: `create_dir_all` fails with ENOTDIR there regardless of
+        // privilege level — no user, not even root, can make a plain file
+        // behave as a directory.
+        let blocker = dir.join("blocker-not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let audit_path = blocker.join("subdir").join("audit.jsonl");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[audit]\nenabled = true\npath = \"{}\"\n\n\
+                 [[rules]]\nname = \"my-rule\"\ncommand = \"rm\"\naction = \"block\"\nmatch_any = [\"-rf\"]\n",
+                audit_path.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            crate::test_support::with_clean_ai_env(|| {
+                let result = run_config_disable("my-rule");
+                assert!(
+                    result.is_ok(),
+                    "config disable must still succeed when audit append fails \
+                     (best-effort, not a rollback condition): {result:?}"
+                );
+            });
+        });
+
+        // The actual config mutation must have gone through regardless.
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            content.contains("enabled = false"),
+            "the config mutation itself must have succeeded: {content}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex R2: the AI-guard rejection path runs before `mutate_config` is
+    /// ever reached — same structural guarantee as the no-op tests above,
+    /// but for the guard specifically rather than the no-op checks. Pins
+    /// that a blocked AI attempt never produces an audit-mutation event
+    /// (which would otherwise misrepresent a rejected attempt as a
+    /// successful change in the forensic record).
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_config_disable_blocked_by_ai_guard_does_not_append_audit_event() {
+        let (dir, audit_path) = setup_home_with_existing_rule("ai-guard");
+
+        crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
+            // Deliberately NOT wrapped in with_clean_ai_env — simulate an AI
+            // session by setting a detector var for the duration of this
+            // call only.
+            let _guard_scope = {
+                struct RestoreOnDrop;
+                impl Drop for RestoreOnDrop {
+                    fn drop(&mut self) {
+                        // SAFETY: serialized by #[serial_test::serial(ai_env)].
+                        unsafe {
+                            std::env::remove_var("CLAUDECODE");
+                        }
+                    }
+                }
+                // SAFETY: serialized by #[serial_test::serial(ai_env)].
+                unsafe {
+                    std::env::set_var("CLAUDECODE", "1");
+                }
+                RestoreOnDrop
+            };
+            let result = run_config_disable("my-rule");
+            assert!(
+                result.is_err(),
+                "disable must be blocked when an AI env var is detected: {result:?}"
+            );
+        });
+
+        assert!(
+            !audit_path.exists(),
+            "a guard-rejected attempt must not append any audit event"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #394: `with_clean_ai_env` is new shared test infrastructure — prove
+    /// it actually clears what it claims to clear and restores the prior
+    /// value afterward, rather than trusting it worked just because the
+    /// tests above happened to pass.
+    #[test]
+    #[serial_test::serial(ai_env)]
+    fn with_clean_ai_env_actually_clears_and_restores() {
+        // SAFETY: serialized by #[serial_test::serial(ai_env)].
+        unsafe {
+            std::env::set_var("CLAUDECODE", "1");
+        }
+        crate::test_support::with_clean_ai_env(|| {
+            assert!(
+                std::env::var("CLAUDECODE").is_err(),
+                "CLAUDECODE must be cleared inside the closure"
+            );
+            assert!(std::env::var("CODEX_CI").is_err());
+            assert!(std::env::var("CURSOR_AGENT").is_err());
+            assert!(std::env::var("GEMINI_CLI").is_err());
+            assert!(std::env::var("CLINE_ACTIVE").is_err());
+            assert!(std::env::var("AI_GUARD").is_err());
+        });
+        assert_eq!(
+            std::env::var("CLAUDECODE").as_deref(),
+            Ok("1"),
+            "the pre-existing value must be restored after the closure returns"
+        );
+        // SAFETY: serialized by #[serial_test::serial(ai_env)].
+        unsafe {
+            std::env::remove_var("CLAUDECODE");
+        }
     }
 }

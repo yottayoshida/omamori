@@ -591,6 +591,12 @@ Each JSONL entry contains:
 | `target_hash` | HMAC-SHA256 of target paths (privacy-preserving) |
 | `entry_hash` | HMAC-SHA256 of the entire entry (chain integrity) |
 
+### Config mutation events (v0.13.x, #394)
+
+`config disable`, `config enable`, and `config add` each append an audit event on success — `action` is `config-disable`/`config-enable`/`config-add`, `detection_layer` is `config-mutation`, `provider` is `cli` (these commands require passing `guard_ai_config_modification`'s runtime env-var check, but do not go through an interactive confirmation the way `break-glass` does, so they are not attributed `provider: "human"`). Only the rule name and command verb are recorded — never a rule's content (`--command`/`--match-any`/`--destination`/`--message` for `config add`), consistent with `target_hash` HMAC-hashing paths elsewhere rather than logging them in the clear. No-op invocations (e.g. disabling an already-disabled rule) do not append an event — only an actual on-disk mutation does. Appending is best-effort: the config write itself always takes priority, and a failure to append is a warning, never a reason to fail the command or roll back the write (state-first + audit-best-effort, mirroring `break-glass`'s pattern). These events reuse the existing `action`/`detection_layer` string fields — no schema change, no `chain_version` bump; `AuditEvent`'s `entry_hash` treats all field values as opaque data, so older and newer omamori versions can both parse and verify the same chain.
+
+`override disable`/`override enable` (which mutate core-rule overrides, a more consequential class of change than a custom rule's toggle) are not yet covered by this audit trail — tracked as a follow-up.
+
 ### HMAC Integrity
 
 - **Per-install secret**: 32 bytes from `/dev/urandom`, stored at `~/.local/share/omamori/audit-secret` (chmod 0600)
