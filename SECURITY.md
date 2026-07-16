@@ -590,12 +590,48 @@ Each JSONL entry contains:
 | `target_count` | Number of target arguments |
 | `target_hash` | HMAC-SHA256 of target paths (privacy-preserving) |
 | `entry_hash` | HMAC-SHA256 of the entire entry (chain integrity) |
+| `pid` | Process ID of the omamori shim process that recorded this entry (short-lived — see [Process Provenance](#process-provenance-v0131-420) below) |
+| `ppid` | Parent process ID at collection time — the process that launched the guarded command (the AI CLI or shell, not omamori itself) |
+| `parent_process` | Resolved exec path of the parent process (`proc_pidpath`), plaintext, control characters stripped |
+| `cwd_hash` | HMAC-SHA256 of the current working directory at collection time (privacy-preserving, same construction as `target_hash` but domain-separated) |
 
 ### Config mutation events (v0.13.x, #394)
 
 `config disable`, `config enable`, and `config add` each append an audit event on success — `action` is `config-disable`/`config-enable`/`config-add`, `detection_layer` is `config-mutation`, `provider` is `cli` (these commands require passing `guard_ai_config_modification`'s runtime env-var check, but do not go through an interactive confirmation the way `break-glass` does, so they are not attributed `provider: "human"`). Only the rule name and command verb are recorded — never a rule's content (`--command`/`--match-any`/`--destination`/`--message` for `config add`), consistent with `target_hash` HMAC-hashing paths elsewhere rather than logging them in the clear. No-op invocations (e.g. disabling an already-disabled rule) do not append an event — only an actual on-disk mutation does. Appending is best-effort: the config write itself always takes priority, and a failure to append is a warning, never a reason to fail the command or roll back the write (state-first + audit-best-effort, mirroring `break-glass`'s pattern). These events reuse the existing `action`/`detection_layer` string fields — no schema change, no `chain_version` bump; `AuditEvent`'s `entry_hash` treats all field values as opaque data, so older and newer omamori versions can both parse and verify the same chain.
 
 `override disable`/`override enable` (which mutate core-rule overrides, a more consequential class of change than a custom rule's toggle) are not yet covered by this audit trail — tracked as a follow-up.
+
+### Process Provenance (v0.13.1, #420)
+
+Layer 1 (PATH shim) audit events carry a best-effort process snapshot — `pid`, `ppid`, `parent_process`, `cwd_hash` — so a future incident's actor can be correlated across entries from the audit log alone, without cross-referencing shell history, hook configuration, or process tables by hand. This was added after a real incident (2026-07-16) where a repeating destructive command pair had to be traced using only `target_hash`, with no way to tell whether the same launcher fired all 16 occurrences.
+
+**Field definitions**:
+- **`pid`** is the short-lived omamori shim process itself — it changes on every invocation and is not useful for correlation on its own.
+- **`ppid`** is the process that launched the guarded command (the AI CLI, a shell, an editor's integrated terminal). This is the field that answers "did the same launcher fire this twice?" — group entries by `ppid` to find repeats.
+- **`parent_process`** is `ppid`'s resolved exec path from `proc_pidpath` — the kernel's record, never `argv[0]` (which is fully attacker-controlled at exec time on Darwin). It answers "which installed application was that launcher?" (e.g. distinguishing a Homebrew `node` from an Electron app's bundled one).
+- **`cwd_hash`** is an HMAC-SHA256 of the shim process's working directory at collection time, domain-separated from `target_hash` (see below). It answers "was this run from the directory I suspect?" — check with `omamori audit hash-cwd <path>` (below), never by eye.
+
+**Not an authenticated identity.** All four fields are forensic best-effort hints, not proof. Collection happens in the same-user OS model this entire threat model operates under (see [Defense Boundary](#defense-boundary)): a shell hop (`sh -c ...`), deliberate orphaning, a double-fork, or a crafted binary name can each launder or defeat correlation. `None` in any field means collection failed or was skipped — it is never evidence of anything on its own, and should not be read as such during an investigation.
+
+**Why `parent_process` is plaintext but `cwd_hash` is hashed**: this is a deliberate asymmetry, not an oversight. Identifying *which application* launched a command requires a human-readable path — hashing `parent_process` would make it useless for the investigation this feature exists to support. Confirming *whether a candidate directory matches* only requires equality testing, which a hash supports just as well as plaintext while limiting what a log reader (see [Audit Log Read Access](#audit-log-read-access-v097)) learns about directory layout. Both fields carry the same class of information a `pwd` or `ps` command would already reveal on the same machine to the same OS user — this does not cross the same-user threat boundary, it just makes what's already observable also *correlatable* from one file.
+
+**`cwd_hash` domain separation**: computed as `HMAC-SHA256(secret, "omamori-cwd-v1\0" ++ cwd_bytes)` — a distinct domain tag and output prefix (`hmac-cwd:`, vs. `target_hash`'s `hmac-sha256:`) from `target_hash`'s construction. Without this, a log reader without the secret could use `cwd_hash == target_hash` as an equality oracle between the two columns whenever a command's target argument happened to equal its cwd.
+
+**`omamori audit hash-cwd <path>` — matching a candidate directory against the log**: `cwd_hash` can't be checked against a suspected directory by eye. This command computes every hash a real log entry could plausibly carry for a given path and prints them for grepping. It spans two axes an investigator would otherwise have to reason about manually:
+- **Key**: hashes are computed against every key in the keyring — the active key plus any retired ones kept from a prior `omamori audit key rotate` — since a rotation could have happened between when the suspect entry was written and when the investigation runs.
+- **Path form**: `cwd_hash` is computed from `std::env::current_dir()`, which returns an already symlink-resolved path (e.g. macOS `/tmp` → `/private/tmp`). An investigator's hand-typed candidate is typically *not* resolved, so both the raw and canonicalized forms of the candidate are hashed — trying only one silently misses a real match.
+
+**Not folded into chain integrity (Design A — see ADR-0006)**: unlike `target_hash`, these four fields are deliberately **not** included in `HashableEvent` (the struct `entry_hash` is computed over — see [HMAC Integrity](#hmac-integrity) below), and `CHAIN_VERSION` stays at `1`. **This is a different guarantee from the forward-compat note above** (config mutation events, v0.13.x): that note holds because `entry_hash` treats *existing* `HashableEvent` fields as opaque values, so reusing them for a new purpose doesn't change what's hashed. Process provenance is the opposite case — four genuinely new fields that sit *outside* `HashableEvent` entirely. Concretely: a same-user attacker with direct write access to `audit.jsonl` can alter `pid`/`ppid`/`parent_process`/`cwd_hash` on any entry without breaking the hash chain — `omamori audit verify` will not flag it. This is an accepted, scoped cost: the incident that motivated this feature involved no log tampering (all 16 entries verified clean), so chain-integrity coverage for these fields was not the priority; it is tracked for a future `CHAIN_VERSION` bump (issue #177). Treat these four fields as corroborating signal to cross-reference against other evidence (shell history, hook configuration, process accounting), not as a standalone tamper-proof record.
+
+**Residual exposure via `--json`**: `parent_process` is sanitized once at collection time (control characters stripped — see below), which covers `omamori audit show --json` and any future display surface by construction. It does **not** cover a same-user attacker who writes a hand-crafted line directly to `audit.jsonl` bypassing omamori's own collection path entirely — Design A means that line's `parent_process` field is not chain-protected, so raw control bytes could be reintroduced there. An investigator piping `--json` output through `jq -r` or similar on a log of uncertain provenance should not assume every `parent_process` value is safe to render on a terminal without inspection.
+
+**Control character sanitization**: `parent_process` is stripped of ASCII/Unicode control characters (replaced with `U+FFFD`) and capped at 1024 characters once, at collection time — this covers every consumer (current and future) by construction rather than requiring each display site to sanitize separately. See the residual-exposure caveat immediately above for what this does and does not close.
+
+**Incident investigation runbook**:
+1. `omamori audit show --json | jq -r '.ppid' | sort | uniq -c | sort -rn` (add `--rule`/`--provider`/`--last N` to `show` first to narrow the entry set) to rank `ppid` values by how often they recur across suspicious entries — the same launcher firing more than once is the strongest correlation signal.
+2. Cross-reference `parent_process` for those entries against installed application paths to identify which tool or shell was the actual launcher.
+3. For directory correlation, run `omamori audit hash-cwd <suspected-path>` and grep the log for any of the printed candidate hashes.
+4. Treat every finding from steps 1-3 as corroborating, not conclusive — cross-check against shell history, hook configuration, and process accounting before attributing an incident to a specific tool or process tree. See "Not an authenticated identity" above for why.
 
 ### HMAC Integrity
 
@@ -643,6 +679,8 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 ### Audit Log Read Access (v0.9.7+)
 
 `audit.jsonl` is user-readable by design. On a shared user account, anything that can read the home directory can also infer AI tool usage patterns — tool names, timestamps, command columns (and, for `unknown_tool_fail_open` events, top-level `tool_input` key counts) — from the audit log. Target paths are HMAC-hashed (`target_hash`), so concrete file paths are not disclosed, but the existence and shape of activity is.
+
+**Process provenance fields (v0.13.1, #420)** add to this disclosure surface: `pid` and `ppid` are plaintext process IDs (low sensitivity — they are ephemeral and reused by the OS), but `parent_process` is a plaintext resolved exec path (e.g. `/Users/<name>/.nvm/versions/node/.../node` or `/Applications/Cursor.app/...`), which can reveal installed applications, username-bearing paths, or directory structure to anyone who can read the home directory. `cwd_hash` follows the same HMAC-hashing treatment as `target_hash` and does not add new plaintext disclosure. See [Process Provenance](#process-provenance-v0131-420) above for the full field-by-field rationale, including why `parent_process` is plaintext while `cwd_hash` is hashed.
 
 This is consistent with the same-user OS threat model: HMAC integrity protects against forgery and tampering, not against read access. Encryption-at-rest is out of scope; the secret would live in the same home directory the attacker is already presumed able to read, which would not change the threat surface.
 

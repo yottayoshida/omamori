@@ -181,6 +181,10 @@ pub(super) fn build_prune_point(
         prev_hash: Some(prune_genesis_hash(secret)),
         key_id: Some("default".to_string()),
         entry_hash: None,
+        pid: None,
+        ppid: None,
+        parent_process: None,
+        cwd_hash: None,
     };
     event.entry_hash = Some(compute_entry_hash(secret, &event));
     event
