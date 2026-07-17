@@ -353,7 +353,7 @@ omamori operates at the **semantic layer** — it understands *what* a command d
 - omamori catches `rm -rf src/` before it runs (semantic: "dangerous command").
 - A sandbox prevents damage if something slips through (boundary: "this process cannot write outside `/tmp`").
 
-For defense in depth, combine omamori with your AI tool's sandbox (Codex CLI sandbox (default-on), Claude Code `/sandbox`, Cursor agent sandbox) or [nono](https://github.com/always-further/nono).
+For defense in depth, combine omamori with your AI tool's sandbox (Codex CLI sandbox (default-on), Claude Code `/sandbox`, Cursor agent sandbox) or [nono](https://github.com/always-further/nono). For the responsibility boundary between the two layers, concrete examples of what each catches, and recommended per-tool setup order, see [docs/reference-architecture.md](docs/reference-architecture.md).
 
 ### Structural limitations
 
@@ -370,5 +370,7 @@ For what omamori **does not** catch — by design or by structural limit — and
 ## Contributing & License
 
 Bug reports and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, the SHA-pin policy, and the local pre-PR gate (`./scripts/pre-pr-check.sh`). For security vulnerabilities, see [SECURITY.md → Reporting a Vulnerability](SECURITY.md#reporting-a-vulnerability) instead of filing a public issue. Releases are reproducible: `Cargo.lock` is tracked, every CI `cargo` invocation runs with `--locked`, and every GitHub Action `uses:` ref is pinned to a 40-char SHA (Dependabot keeps them current). See [SECURITY.md](SECURITY.md#ai-assisted-contribution-invariants-v093) for the five invariants that govern AI-assisted contributions.
+
+Running omamori day-to-day and want to send back structured feedback? See [docs/evaluation-kit.md](docs/evaluation-kit.md) for a self-contained 30-day checklist and feedback template — a partial report from stopping early is a valid, useful submission too.
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

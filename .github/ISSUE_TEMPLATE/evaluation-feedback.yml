@@ -1,0 +1,68 @@
+name: Evaluation feedback (30-day kit)
+description: Report the results of a 30-day omamori evaluation — full report or early stop.
+title: "Evaluation feedback: "
+labels: ["evaluation-feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for running omamori's [30-day evaluation kit](https://github.com/yottayoshida/omamori/blob/main/docs/evaluation-kit.md). This form works for both a full 30-day report and an early-stop report — only the "disable/uninstall" question below is required.
+
+        **Privacy**: paste only aggregate output from `omamori report --last 30d` and `omamori doctor` on a healthy `OK` run. Never paste `omamori audit show` output, `audit.jsonl`, or literal commands you ran — see the [evaluation kit's privacy section](https://github.com/yottayoshida/omamori/blob/main/docs/evaluation-kit.md#privacy-upfront).
+
+  - type: textarea
+    id: setup_friction
+    attributes:
+      label: Setup friction
+      description: |
+        How long did it take to reach `Protection status: OK` from `omamori doctor`? Paste the final `doctor` output below — it is safe to paste on a healthy `OK` run; it does not include raw commands.
+      placeholder: |
+        Time to green: ~5 minutes
+
+        omamori doctor output:
+        Protection status: OK
+        ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: blocks_encountered
+    attributes:
+      label: Blocks encountered
+      description: |
+        Paste your `omamori report --last 30d` output below.
+        Before pasting: if you defined custom rules in config.toml, check the "by rule" line for any name that identifies a project or client, and redact it.
+        Example: `by rule: internal-project-x-guard: 3` → `by rule: <redacted-custom-rule>: 3`
+      placeholder: |
+        omamori report — last 30 days
+
+          Block events: 12
+            by layer: layer2: 10, layer1: 2
+            by provider: claude-code: 12
+            by rule: rm-recursive-to-trash: 8, git-reset-hard-stash: 4
+          Audit log: intact
+    validations:
+      required: false
+
+  - type: textarea
+    id: false_positives
+    attributes:
+      label: False positives
+      description: Did omamori block anything that wasn't actually dangerous? What did you do about it (break-glass, disabled the rule, tolerated it)? Describe in general terms — no need to paste the exact command.
+    validations:
+      required: false
+
+  - type: textarea
+    id: disabled_or_uninstalled
+    attributes:
+      label: Did you disable or uninstall omamori at any point, and why?
+      description: If you did, that is exactly the signal this evaluation exists to catch — please describe what triggered it, even briefly. There's no wrong answer here. If not, just say so.
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ### Missed accidents
+
+        If omamori failed to catch something it should have, do not describe it on this public form — even a general description of an unfixed gap can be enough to reconstruct it. Use SECURITY.md's private reporting channel instead: https://github.com/yottayoshida/omamori/security/advisories/new. There is no field on this form for reporting a miss.

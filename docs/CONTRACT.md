@@ -39,6 +39,8 @@ Different questions about omamori have different sources of truth. When two docu
 | What is omamori committing not to break, and until when? | **This document** |
 | Which tools is a guarantee contractually pinned to? | **This document** (see [Supported tier](#supported-tier)) — SECURITY.md's "supported" status describes *current test coverage*, not a contractual commitment; see the [known inconsistency note](#known-inconsistency-securitymd-releasemd-and-readmemd-vs-this-contract) below |
 | How do I recover from a false positive? | [docs/FAQ.md](FAQ.md) |
+| Do I still need a sandbox if I use omamori (or vice versa)? | [docs/reference-architecture.md](reference-architecture.md) |
+| How and when can I disclose a bypass I reported? | [SECURITY.md's Disclosure timeline](../SECURITY.md#disclosure-timeline) |
 
 ---
 
