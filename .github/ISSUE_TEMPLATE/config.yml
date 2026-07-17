@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/yottayoshida/omamori/security/advisories/new
+    about: Found a way to bypass a guarantee, or a way to defeat omamori's self-defense? Report it privately here instead of a public issue — see SECURITY.md's Reporting a Vulnerability section for scope and disclosure timeline.
