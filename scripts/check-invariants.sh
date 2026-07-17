@@ -546,6 +546,232 @@ else
     fail=1
 fi
 
+# ---------- Invariant: contract-doc-sync (#401) ----------
+# docs/CONTRACT.md must not rot against SECURITY.md, README.md, and the CLI
+# it points into. Mirrors faq-doc-sync above (#328) but is NOT wired through
+# check_omamori_ref() -- that function hardcodes `faq_fail=1` and FAQ-specific
+# messages, so reusing it here would misattribute a CONTRACT.md failure to
+# FAQ.md and silently leave contract_fail unset. check_omamori_ref_contract()
+# below duplicates its ~10-line case statement rather than risk touching the
+# already-shipped faq-doc-sync code path for the sake of DRY.
+#
+# Operations: (O1) omamori subcommand resolve, (O2) SECURITY.md anchor
+# resolve, (O3) README->CONTRACT link exists, (O4) forbidden-word scan, (O5)
+# G-ID uniqueness + sequence completeness, (O6) CONTRACT.md's own
+# same-document anchor links resolve -- plus an N1 guard closing a gap the
+# mirror source doesn't have to worry about: FAQ.md's non-```bash fences only
+# ever hold sample OUTPUT (safe to skip), but CONTRACT.md's Verify blocks are
+# commands -- a bare or wrongly-tagged fence would silently hide a real
+# command from resolution, so any `omamori ...`-shaped line inside ANY fence
+# must live inside a ```bash-tagged one specifically.
+contract_fail=0
+contract=docs/CONTRACT.md
+if [ ! -f "$contract" ]; then
+    echo "FAIL [invariant contract-doc-sync/#401]: $contract is missing"
+    contract_fail=1
+else
+    # Shared anchor-generation algorithm for O2 and O6 below -- identical to
+    # faq-doc-sync's (a) (GitHub's own rule: lowercase, strip to
+    # [a-z0-9 _-], spaces to hyphens, LC_ALL=C byte-mode so em-dashes etc.
+    # resolve the same way GitHub resolves them). Extracted into a function
+    # here (unlike check_omamori_ref_contract below, which deliberately
+    # duplicates rather than touches faq-doc-sync's existing
+    # check_omamori_ref) because both call sites are new code introduced by
+    # this PR -- there is no already-shipped behavior at risk from sharing it.
+    contract_generate_anchors() {
+        (grep -E '^#+ ' "$1" || true) | sed -E 's/^#+ //' \
+            | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+            | LC_ALL=C sed 's/[^a-z0-9 _-]//g; s/ /-/g'
+    }
+
+    # (O2) SECURITY.md anchors -- safe to recompute independently since
+    # CONTRACT.md is also in docs/ (same ../ depth).
+    contract_security_anchors=$(contract_generate_anchors SECURITY.md)
+    contract_sec_refs=$( (grep -oE 'SECURITY\.md#[a-z0-9_-]+' "$contract" || true) | sed 's/.*#//' | sort -u)
+    for a in $contract_sec_refs; do
+        if ! printf '%s\n' "$contract_security_anchors" | grep -qxF "$a"; then
+            echo "FAIL [invariant contract-doc-sync/#401]: CONTRACT.md references SECURITY.md#$a but no heading generates that anchor"
+            contract_fail=1
+        fi
+    done
+
+    # (O6) CONTRACT.md's own same-document anchor links (At-a-glance -> G-N
+    # headings, breaking-change-policy references, etc.) resolve to a real
+    # heading in CONTRACT.md itself. This was flagged as an optional,
+    # deferred operation during shape enumeration
+    # (plans/vivid-petting-yeti-pr1-shapes.md, N5) and is added for real here
+    # because a proxy adversarial test review pointed out the exact failure
+    # mode it closes -- rewording a guarantee's heading (as this PR's own G-2
+    # fix did, for an unrelated reason) silently breaks the At-a-glance link
+    # pointing at its old anchor slug unless a human remembers to update it
+    # by hand every time.
+    contract_own_anchors=$(contract_generate_anchors "$contract")
+    contract_own_refs=$( (grep -oE '\]\(#[a-z0-9_-]+\)' "$contract" || true) | sed -E 's/\]\(#//; s/\)//' | sort -u)
+    for a in $contract_own_refs; do
+        if ! printf '%s\n' "$contract_own_anchors" | grep -qxF "$a"; then
+            echo "FAIL [invariant contract-doc-sync/#401]: CONTRACT.md links to its own #$a but no heading in CONTRACT.md generates that anchor"
+            contract_fail=1
+        fi
+    done
+
+    # (O1) omamori subcommand references, extracted from the same two sites
+    # as faq-doc-sync: fenced ```bash blocks (indented fences included via
+    # the `[[:space:]]*` prefix) and backtick-quoted prose.
+    check_omamori_ref_contract() {
+        top=$1
+        sub=$2
+        if ! grep -qF "Some(\"$top\")" src/lib.rs; then
+            echo "FAIL [invariant contract-doc-sync/#401]: CONTRACT.md uses 'omamori $top' but src/lib.rs has no such subcommand"
+            contract_fail=1
+            return
+        fi
+        [ -z "$sub" ] && return
+        case "$top" in
+            config|override) subfile="src/cli/config_cmd.rs" ;;
+            audit) subfile="src/cli/audit_cmd.rs" ;;
+            *) subfile="" ;;
+        esac
+        if [ -z "$subfile" ]; then
+            echo "FAIL [invariant contract-doc-sync/#401]: CONTRACT.md uses 'omamori $top $sub' but this invariant doesn't know which file dispatches '$top' sub-verbs -- add '$top' to the case statement in scripts/check-invariants.sh"
+            contract_fail=1
+        elif ! grep -qF "Some(\"$sub\")" "$subfile"; then
+            echo "FAIL [invariant contract-doc-sync/#401]: CONTRACT.md uses 'omamori $top $sub' but $subfile has no '$sub' arm"
+            contract_fail=1
+        fi
+    }
+    contract_pairs=$( { \
+        awk '/^[[:space:]]*```bash/{inblock=1; next} /^[[:space:]]*```/{inblock=0} inblock' "$contract" \
+            | (grep -oE '(^|[ `(])omamori [a-z][a-z-]*( [a-z][a-z-]*)?' || true) | sed -E 's/.*omamori //'; \
+        (grep -oE '`omamori [a-z][a-z-]*( [a-z][a-z-]*)?' "$contract" || true) | sed -E 's/`omamori //'; \
+    } | sort -u)
+    while IFS= read -r pair; do
+        [ -z "$pair" ] && continue
+        top=${pair%% *}
+        if [ "$top" = "$pair" ]; then
+            check_omamori_ref_contract "$top" ""
+        else
+            check_omamori_ref_contract "$top" "${pair#* }"
+        fi
+    done <<CONTRACT_PAIRS_EOF
+$contract_pairs
+CONTRACT_PAIRS_EOF
+
+    # N1 guard: any fence (of ANY language tag, including bare) that contains
+    # an `omamori <verb>`-shaped line must have opened with ```bash
+    # specifically -- otherwise that command silently escapes the O1 scan
+    # above (mutation-tested below with a deliberately bare-fenced Verify).
+    contract_non_bash_fence_hits=$(awk '
+        /^[[:space:]]*```/ {
+            if (inblock) { inblock=0; next }
+            else { inblock=1; lang=$0; sub(/^[[:space:]]*```/, "", lang); next }
+        }
+        inblock && /omamori [a-z]/ && lang != "bash" { print NR": "$0 }
+    ' "$contract")
+    if [ -n "$contract_non_bash_fence_hits" ]; then
+        echo "FAIL [invariant contract-doc-sync/#401]: $contract has an 'omamori' command inside a fence that is not tagged \`\`\`bash -- Verify blocks must use \`\`\`bash so this invariant can resolve them:"
+        echo "$contract_non_bash_fence_hits"
+        contract_fail=1
+    fi
+
+    # (O3) README -> CONTRACT.md link exists. Reverse polarity from O1/O2
+    # (0-match = FAIL here, not success), so this stays inside an `if` rather
+    # than using the `(... || true)` idiom -- that idiom exists to stop a
+    # 0-match from aborting the script under `set -e`, which `if grep -q`
+    # already does safely on its own.
+    if grep -qE '\]\(\.?/?docs/CONTRACT\.md([)#]| )' README.md; then
+        : # OK: README links to CONTRACT.md
+    else
+        echo "FAIL [invariant contract-doc-sync/#401]: README.md has no link to docs/CONTRACT.md"
+        contract_fail=1
+    fi
+
+    # (O4) Forbidden-word scan -- reverse polarity from O1/O2/O3: a MATCH is
+    # the failure, so this is a forward `grep -q` with no `|| true` guard.
+    # Copying that guard here would be a bug: a clean guarantee document
+    # legitimately produces zero matches, and `|| true` exists to stop a
+    # 0-match from aborting under pipefail -- there is nothing to protect
+    # against in this direction. Newline-normalized first so a forbidden
+    # phrase split across a line wrap in a future edit is not missed.
+    contract_normalized=$(tr '\n' ' ' < "$contract")
+    if printf '%s' "$contract_normalized" | grep -qiE 'complete protection|comprehensive|fully protects|prevents all|blocks all|guarantees safety|tamper-proof'; then
+        echo "FAIL [invariant contract-doc-sync/#401]: $contract contains language that reads as an unbounded guarantee (e.g. 'complete protection', 'tamper-proof') -- see issue #401 acceptance criteria"
+        contract_fail=1
+    fi
+
+    # (O5) G-ID uniqueness -- restricted to definition (heading) sites only.
+    # At-a-glance / Authority Map cross-references to the same G-ID are not
+    # duplicates; counting every occurrence would false-positive on them.
+    contract_dup_ids=$(grep -oE '^#+ G-[0-9]+' "$contract" | sort | uniq -d)
+    if [ -n "$contract_dup_ids" ]; then
+        echo "FAIL [invariant contract-doc-sync/#401]: duplicate guarantee ID heading(s) in $contract:"
+        echo "$contract_dup_ids"
+        contract_fail=1
+    fi
+
+    # (O5b) G-ID sequence completeness -- catches accidental deletion of a
+    # guarantee (e.g. G-4 silently dropped, leaving G-1,G-2,G-3,G-5,G-6) as a
+    # gap in the sequence. Deliberately does NOT hardcode a fixed ceiling
+    # (e.g. "must be exactly G-1..G-6 forever") -- the breaking-change policy
+    # treats adding new coverage as non-breaking, so a legitimate future PR
+    # adding G-7 must not need to touch this invariant. Numbers are
+    # deduplicated before the contiguity walk so a duplicate already caught
+    # above does not also register as a spurious gap.
+    #
+    # Contiguity alone has a blind spot a proxy adversarial review round
+    # caught and this comment documents so it isn't reintroduced: deleting
+    # the TRAILING (highest-numbered) guarantee leaves the remaining set
+    # perfectly contiguous from 1 (deleting G-6 from G-1..G-6 leaves
+    # G-1..G-5, which has no gap) -- contiguity checking cannot distinguish
+    # "the list has always ended here" from "the last entry was silently
+    # removed". CONTRACT_MIN_GUARANTEE_COUNT below closes that blind spot as
+    # a floor, not a ceiling: exceeding it (future additions) never fails.
+    # Only bump it when a guarantee is deliberately retired -- itself a
+    # breaking change under this contract's own policy, so requiring a
+    # conscious edit here at that time is correct, not a maintenance trap.
+    contract_min_guarantee_count=6
+    contract_g_numbers=$(grep -oE '^#+ G-[0-9]+' "$contract" | grep -oE '[0-9]+' | sort -n -u)
+    if [ -z "$contract_g_numbers" ]; then
+        echo "FAIL [invariant contract-doc-sync/#401]: $contract has no guarantee (G-N) headings at all"
+        contract_fail=1
+    else
+        contract_expected=1
+        contract_gap=""
+        for n in $contract_g_numbers; do
+            if [ "$n" -ne "$contract_expected" ]; then
+                contract_gap="missing G-$contract_expected (next defined is G-$n)"
+                break
+            fi
+            contract_expected=$((contract_expected + 1))
+        done
+        if [ -n "$contract_gap" ]; then
+            echo "FAIL [invariant contract-doc-sync/#401]: guarantee ID sequence has a gap in $contract: $contract_gap"
+            contract_fail=1
+        fi
+        contract_g_count=$(printf '%s\n' "$contract_g_numbers" | wc -l | tr -d ' ')
+        if [ "$contract_g_count" -lt "$contract_min_guarantee_count" ]; then
+            echo "FAIL [invariant contract-doc-sync/#401]: $contract has only $contract_g_count guarantee(s), expected at least $contract_min_guarantee_count -- a guarantee (possibly the trailing/highest-numbered one) may have been silently deleted. If one was deliberately retired, update contract_min_guarantee_count in this script."
+            contract_fail=1
+        fi
+    fi
+fi
+if [ "$contract_fail" -eq 0 ]; then
+    # Scope note (mirrors faq-doc-sync's 1c above): this only pins structural
+    # references -- SECURITY.md anchor targets exist, CONTRACT.md's own
+    # same-document anchor targets exist, subcommand/sub-verb names exist,
+    # README links to CONTRACT.md, no forbidden phrase, G-IDs unique and
+    # gap-free. It does NOT verify: prose semantics (effective date, version
+    # ranges, revision-log accuracy, whether a guarantee's wording still
+    # matches actual behavior), or that CONTRACT.md's own links INTO
+    # README.md resolve to real README anchors (a deliberately accepted
+    # scope limit -- extending anchor resolution to README.md as well as
+    # SECURITY.md was considered and rejected during shape enumeration to
+    # avoid growing this invariant's scope further). Those still need a
+    # human to re-check on future CONTRACT.md changes.
+    echo "contract-doc-sync OK: docs/CONTRACT.md SECURITY.md anchors, CONTRACT.md's own anchors, omamori subcommand references, README link, forbidden-word scan, and G-ID uniqueness/completeness all pass (#401)"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"
