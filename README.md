@@ -47,6 +47,8 @@ What omamori claims, and how to verify each one:
 
 Bypass classes outside this coverage scope remain possible — this is inherent to the PATH-shim and static-analysis approach. See [SECURITY.md](SECURITY.md) for the full bypass corpus and defense boundary.
 
+For the frozen set of guarantees, non-guarantees, supported tier, and breaking-change policy, see [docs/CONTRACT.md](docs/CONTRACT.md).
+
 ## What It Blocks
 
 | Command | Pattern | Action |
@@ -90,6 +92,8 @@ All rules are customizable via TOML config. See [Configuration](#configuration) 
 | Any tool setting `AI_GUARD=1` | Fallback | Layer 1 only | Generic opt-in detection. |
 
 > The demo image above is a Claude Code capture; the same `block` / `log-only` / `trash` behavior applies on Codex CLI and Cursor when their env vars are detected.
+
+`Supported` above describes active hook/shim integration — it does not by itself mean every tool is held to the same level of ongoing verification. See [docs/CONTRACT.md → Supported tier](docs/CONTRACT.md#supported-tier) for which tools' behavior is contractually guaranteed versus expected-to-work.
 
 ### Platforms
 
