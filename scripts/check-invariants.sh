@@ -772,6 +772,197 @@ else
     fail=1
 fi
 
+# ---------- Invariant: extdocs-doc-sync (#407, #408) ----------
+# docs/reference-architecture.md and docs/evaluation-kit.md must not rot
+# against SECURITY.md, CONTRACT.md, README.md, and the CLI they point into.
+# Mirrors contract-doc-sync above (#401) but loops over two target files
+# instead of one, and is NOT wired through check_omamori_ref_contract() --
+# that function hardcodes contract_fail=1 and CONTRACT.md-specific messages,
+# so reusing it here would misattribute an extdocs failure to CONTRACT.md and
+# silently leave extdocs_fail unset. check_omamori_ref_extdocs() below
+# duplicates the case statement rather than risk touching the already-shipped
+# contract-doc-sync code path for the sake of DRY.
+#
+# Operations: (O1) omamori subcommand resolve, (O2s) SECURITY.md anchor
+# resolve, (O2c) CONTRACT.md anchor resolve, (O2r) README.md anchor resolve,
+# (O3) README->doc link exists, (O4) forbidden-word scan, (O6) each doc's own
+# same-document anchor links resolve. Deliberately NOT ported from
+# contract-doc-sync: (O5) G-ID uniqueness/sequence -- neither target document
+# has G-N guarantee headings; (N1) non-```bash fence guard -- O1 below scans
+# both fenced ```bash blocks and backtick-quoted prose (mirroring
+# contract-doc-sync's own two extraction sites), so a command inside a
+# properly-tagged ```bash fence is already covered without N1. The
+# remaining gap N1 would close is narrower here than in CONTRACT.md: a
+# command placed inside a fence tagged with something OTHER than bash (e.g.
+# ```console, or a bare ```) would still escape O1 silently. Neither target
+# document does this today (see plans/vivid-petting-yeti-pr1-shapes.md N1
+# for the full reasoning); port N1 if one later does.
+#
+# Scope limit inherited from O1's extraction regex: flags (anything starting
+# with `-`, `<`, or a digit) are invisible to subcommand resolution -- only
+# the verb (e.g. `report` in `omamori report --last 30d`) is checked to
+# exist. A typo'd or renamed flag is not caught here; running the documented
+# commands by hand is the only thing that catches that class.
+extdocs_fail=0
+extdocs_docs="docs/reference-architecture.md docs/evaluation-kit.md"
+
+# contract_generate_anchors() is defined by the contract-doc-sync block above,
+# but ONLY inside that block's `else` branch (i.e. only when docs/CONTRACT.md
+# exists). Gate on that same precondition here, as its own top-level check --
+# separate from the two target docs' own missing-file checks in the loop
+# below -- so that if docs/CONTRACT.md is ever deleted or renamed, this block
+# fails loudly with its own message instead of calling an undefined function
+# and aborting the whole script with a raw "command not found" under
+# `set -euo pipefail` (which would hide every other invariant's result).
+if [ ! -f docs/CONTRACT.md ]; then
+    echo "FAIL [invariant extdocs-doc-sync/#407,#408]: docs/CONTRACT.md is missing (required for CONTRACT.md anchor cross-checks; contract-doc-sync above also fails on this)"
+    extdocs_fail=1
+else
+    # Anchor sets are shared across both target docs (SECURITY.md,
+    # CONTRACT.md, and README.md do not change per target file), so generate
+    # them once outside the loop rather than recomputing per file.
+    #
+    # contract_security_anchors and contract_own_anchors were already
+    # computed by the contract-doc-sync block above, in the same script
+    # scope (no subshell/function boundary between the two blocks). Both
+    # blocks gate on the same precondition -- docs/CONTRACT.md existing --
+    # so reaching this `else` guarantees those variables are already set;
+    # reusing them here avoids re-forking the same grep|sed|tr|sed pipeline
+    # over SECURITY.md and CONTRACT.md a second time.
+    extdocs_security_anchors=$contract_security_anchors
+    extdocs_contract_anchors=$contract_own_anchors
+    extdocs_readme_anchors=$(contract_generate_anchors README.md)
+
+    check_omamori_ref_extdocs() {
+        doc=$1
+        top=$2
+        sub=$3
+        if ! grep -qF "Some(\"$top\")" src/lib.rs; then
+            echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $doc uses 'omamori $top' but src/lib.rs has no such subcommand"
+            extdocs_fail=1
+            return
+        fi
+        [ -z "$sub" ] && return
+        case "$top" in
+            config|override) subfile="src/cli/config_cmd.rs" ;;
+            audit) subfile="src/cli/audit_cmd.rs" ;;
+            *) subfile="" ;;
+        esac
+        if [ -z "$subfile" ]; then
+            echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $doc uses 'omamori $top $sub' but this invariant doesn't know which file dispatches '$top' sub-verbs -- add '$top' to the case statement in scripts/check-invariants.sh"
+            extdocs_fail=1
+        elif ! grep -qF "Some(\"$sub\")" "$subfile"; then
+            echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $doc uses 'omamori $top $sub' but $subfile has no '$sub' arm"
+            extdocs_fail=1
+        fi
+    }
+
+    for extdocs_doc in $extdocs_docs; do
+        # Per-file existence check, scoped to just this iteration -- if one
+        # target doc is missing, the sibling doc's checks below still run.
+        # (A shared pre-loop gate on both files was considered and rejected:
+        # it would silently skip real, independent breakage in the doc that
+        # DOES exist whenever the other one is merely missing.)
+        if [ ! -f "$extdocs_doc" ]; then
+            echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $extdocs_doc is missing"
+            extdocs_fail=1
+            continue
+        fi
+
+        # (O2s/O2c/O2r) Anchor references into SECURITY.md, CONTRACT.md, and
+        # README.md.
+        extdocs_sec_refs=$( (grep -oE 'SECURITY\.md#[a-z0-9_-]+' "$extdocs_doc" || true) | sed 's/.*#//' | sort -u)
+        for a in $extdocs_sec_refs; do
+            if ! printf '%s\n' "$extdocs_security_anchors" | grep -qxF "$a"; then
+                echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $extdocs_doc references SECURITY.md#$a but no heading generates that anchor"
+                extdocs_fail=1
+            fi
+        done
+        extdocs_contract_refs=$( (grep -oE 'CONTRACT\.md#[a-z0-9_-]+' "$extdocs_doc" || true) | sed 's/.*#//' | sort -u)
+        for a in $extdocs_contract_refs; do
+            if ! printf '%s\n' "$extdocs_contract_anchors" | grep -qxF "$a"; then
+                echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $extdocs_doc references CONTRACT.md#$a but no heading generates that anchor"
+                extdocs_fail=1
+            fi
+        done
+        extdocs_readme_refs=$( (grep -oE 'README\.md#[a-z0-9_-]+' "$extdocs_doc" || true) | sed 's/.*#//' | sort -u)
+        for a in $extdocs_readme_refs; do
+            if ! printf '%s\n' "$extdocs_readme_anchors" | grep -qxF "$a"; then
+                echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $extdocs_doc references README.md#$a but no heading generates that anchor"
+                extdocs_fail=1
+            fi
+        done
+
+        # (O6) Each doc's own same-document anchor links resolve to a real
+        # heading in that same doc.
+        extdocs_own_anchors=$(contract_generate_anchors "$extdocs_doc")
+        extdocs_own_refs=$( (grep -oE '\]\(#[a-z0-9_-]+\)' "$extdocs_doc" || true) | sed -E 's/\]\(#//; s/\)//' | sort -u)
+        for a in $extdocs_own_refs; do
+            if ! printf '%s\n' "$extdocs_own_anchors" | grep -qxF "$a"; then
+                echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $extdocs_doc links to its own #$a but no heading in $extdocs_doc generates that anchor"
+                extdocs_fail=1
+            fi
+        done
+
+        # (O1) omamori subcommand references, extracted from the same two
+        # sites as contract-doc-sync: fenced ```bash blocks and
+        # backtick-quoted prose. Both target docs currently only use the
+        # backtick-prose form, but this scans both sites (not just the one
+        # in current use) so a future edit that moves a command into a
+        # fenced block is still covered -- see the N1 scope note above for
+        # why the *fence-language* guard specifically is not ported.
+        extdocs_pairs=$( { \
+            awk '/^[[:space:]]*```bash/{inblock=1; next} /^[[:space:]]*```/{inblock=0} inblock' "$extdocs_doc" \
+                | (grep -oE '(^|[ `(])omamori [a-z][a-z-]*( [a-z][a-z-]*)?' || true) | sed -E 's/.*omamori //'; \
+            (grep -oE '`omamori [a-z][a-z-]*( [a-z][a-z-]*)?' "$extdocs_doc" || true) | sed -E 's/`omamori //'; \
+        } | sort -u)
+        while IFS= read -r pair; do
+            [ -z "$pair" ] && continue
+            top=${pair%% *}
+            if [ "$top" = "$pair" ]; then
+                check_omamori_ref_extdocs "$extdocs_doc" "$top" ""
+            else
+                check_omamori_ref_extdocs "$extdocs_doc" "$top" "${pair#* }"
+            fi
+        done <<EXTDOCS_PAIRS_EOF
+$extdocs_pairs
+EXTDOCS_PAIRS_EOF
+
+        # (O3) README -> doc link exists. Reverse polarity from O1/O2 (see
+        # contract-doc-sync's O3 comment above for why this stays inside an
+        # `if` rather than the `(... || true)` idiom). Unlike
+        # contract-doc-sync's O3 (which hardcodes the literal
+        # `docs/CONTRACT\.md`), this loop interpolates a basename that
+        # varies per iteration -- the `.` in e.g. `evaluation-kit.md` must be
+        # escaped before use in the ERE below, or it matches any character
+        # and would false-pass a malformed link like `evaluation-kitXmd`.
+        extdocs_basename=$(basename "$extdocs_doc")
+        extdocs_basename_escaped=$(printf '%s' "$extdocs_basename" | sed 's/\./\\./g')
+        if grep -qE "\]\(\.?/?docs/$extdocs_basename_escaped([)#]| )" README.md; then
+            : # OK: README links to this doc
+        else
+            echo "FAIL [invariant extdocs-doc-sync/#407,#408]: README.md has no link to docs/$extdocs_basename"
+            extdocs_fail=1
+        fi
+
+        # (O4) Forbidden-word scan -- reverse polarity, forward grep with no
+        # `|| true` guard (see contract-doc-sync's O4 comment above).
+        # Newline-normalized first so a forbidden phrase split across a line
+        # wrap is not missed.
+        extdocs_normalized=$(tr '\n' ' ' < "$extdocs_doc")
+        if printf '%s' "$extdocs_normalized" | grep -qiE 'complete protection|comprehensive|fully protects|prevents all|blocks all|guarantees safety|tamper-proof'; then
+            echo "FAIL [invariant extdocs-doc-sync/#407,#408]: $extdocs_doc contains language that reads as an unbounded guarantee (e.g. 'complete protection', 'tamper-proof')"
+            extdocs_fail=1
+        fi
+    done
+fi
+
+if [ "$extdocs_fail" -eq 0 ]; then
+    echo "extdocs-doc-sync OK: docs/reference-architecture.md and docs/evaluation-kit.md SECURITY/CONTRACT/README anchors, own anchors, omamori subcommand references, README links, and forbidden-word scan all pass (#407, #408)"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"
