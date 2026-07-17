@@ -97,6 +97,7 @@ Whether the PATH shim, hooks, config, and core policy baseline are installed and
 **Verify:**
 ```bash
 omamori doctor
+omamori status
 ```
 
 **Boundary**: [SECURITY.md → Integrity Monitoring](../SECURITY.md#integrity-monitoring-v050) for what the two-tier check does and does not detect.
@@ -123,9 +124,9 @@ The built-in rule set cannot be turned off through `config.toml`, and self-modif
 
 **Verify:**
 ```bash
-omamori --help
+CLAUDECODE=1 omamori config disable rm-recursive-to-trash
 ```
-(the `override <disable|enable> <rule>` line it prints is the only supported path to change core policy — a deliberate human-initiated action, not something an AI agent's `config.toml` edit can trigger)
+Setting `CLAUDECODE=1` simulates an AI-tool environment; the rejection cites the detected AI tool (`claude-code`), not the core-rule id. Drop the env var and the same command is still rejected, but now citing a "core safety rule" instead — that always-on layer holds regardless of AI detection. `omamori override disable <rule>` is the only supported path to change core policy, and it's part of what gets blocked while an AI environment is detected — a deliberate human-initiated action, not something an AI agent's `config.toml` edit can trigger.
 
 **Boundary**: [SECURITY.md → Core Policy Immutability](../SECURITY.md#core-policy-immutability-v050).
 
