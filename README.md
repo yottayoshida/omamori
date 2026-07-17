@@ -353,7 +353,7 @@ omamori operates at the **semantic layer** — it understands *what* a command d
 - omamori catches `rm -rf src/` before it runs (semantic: "dangerous command").
 - A sandbox prevents damage if something slips through (boundary: "this process cannot write outside `/tmp`").
 
-For defense in depth, combine omamori with your AI tool's sandbox (Codex CLI sandbox (default-on), Claude Code `/sandbox`, Cursor agent sandbox) or [nono](https://github.com/always-further/nono).
+For defense in depth, combine omamori with your AI tool's sandbox (Codex CLI sandbox (default-on), Claude Code `/sandbox`, Cursor agent sandbox) or [nono](https://github.com/always-further/nono). For the responsibility boundary between the two layers, concrete examples of what each catches, and recommended per-tool setup order, see [docs/reference-architecture.md](docs/reference-architecture.md).
 
 ### Structural limitations
 
