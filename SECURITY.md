@@ -30,6 +30,32 @@ A report that leads to a fix follows the [Known-bypass-becomes-row rule](#known-
 
 Please do not include exploit walkthroughs in public issues or PR descriptions; keep those in the private report.
 
+> Verified against omamori **v0.13.1**. If a claim here disagrees with current repository state, trust the repository.
+
+### Disclosure timeline
+
+Pre-fix, a confirmed in-scope bypass stays private until a fix ships.
+
+**Embargo upper bound**: 90 days from confirmation as an in-scope bypass. If 90 days pass with no fix, the reporter is free to disclose publicly.
+
+The clock starts at confirmation, not at initial submission, so a low-quality or out-of-scope report does not start it. An interim acknowledgment or status update from the maintainer does not reset or extend the clock. This is the reporter's right to disclose, not a maintainer commitment to fix within 90 days; it does not change the best-effort, no-SLA posture stated above.
+
+This right covers disclosing that the bypass exists, and how it was (or was not) mitigated — it is not an exception to this section's rule against exploit walkthroughs in public issues or PR descriptions: that rule applies regardless of embargo status, before and after the 90 days lapse.
+
+A report can also be resolved by documenting the bypass as a structural limit (see [Known-bypass-becomes-row rule](#known-bypass-becomes-row-rule)) instead of shipping a fix. Documenting a limit is a valid resolution, not a stall — it starts the same post-fix disclosure path described below.
+
+### Redaction policy
+
+No discretionary redaction tier exists for omamori's own behavior. Once a bypass is resolved — by fix or by documenting it as a structural limit — it follows the [Known-bypass-becomes-row rule](#known-bypass-becomes-row-rule) in full: a Defense Boundary Matrix row, a corpus entry in `tests/hook_integration.rs`, and a known-limit entry where applicable. This is unchanged and remains full public.
+
+**One narrow carve-out**: if a bypass is confirmed to chain through an unfixed third-party vulnerability (for example an unpatched OS or provider-sandbox flaw), the portion of the report that would disclose that third-party vulnerability is held until the third party ships a fix, or until the embargo above expires, whichever comes first. omamori's own mitigation, and the existence of the gap, are still disclosed on the normal timeline above — only the third-party exploit detail is withheld. Using this carve-out requires a known-limit entry recording the gap even while the detail is withheld, so the corpus stays honest about what it does not yet cover.
+
+Payload and exploit-walkthrough detail is never published verbatim under this policy; the corpus test captures the class of the bypass, not attacker-ready reproduction steps.
+
+### Corpus PR review criterion
+
+A public pull request that adds a Defense Boundary Matrix row or a `tests/hook_integration.rs` corpus entry must not include exploit walkthroughs or step-by-step reproduction detail in its description, commit messages, or code comments — only the class of bypass and the fix. A reviewer may request changes to, or reject, a PR that violates this, citing this section.
+
 ---
 
 ## Security Model

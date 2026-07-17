@@ -73,6 +73,11 @@ Run the local gate once. It is a thin wrapper around the CI jobs, with
 If `Cargo.lock` was updated during the run, commit it. Do not pass
 `--allow-dirty` or `--no-verify` to `cargo` or `git`.
 
+If your PR adds a Defense Boundary Matrix row or a `tests/hook_integration.rs`
+corpus entry, keep the description and commit messages free of exploit
+walkthroughs or step-by-step reproduction detail — see SECURITY.md's
+[Corpus PR review criterion](SECURITY.md#corpus-pr-review-criterion).
+
 ---
 
 ## Releasing (maintainer only)
