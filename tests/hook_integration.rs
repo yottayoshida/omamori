@@ -1850,6 +1850,52 @@ fn hook_materialize_pipe_to_shell_creates_audit_entry() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// V-017 (#403): BlockStructural path (static shell-expansion obfuscation,
+/// e.g. `$'rm'` ANSI-C quoting at the verb position) appends an audit event
+/// with `action="block"`, `result="block"`, and
+/// `detection_layer="layer2:obfuscated-expansion"`.
+///
+/// V-014/015/016 cover BlockMeta / BlockRule / Materialize; this is the
+/// fourth `HookCheckResult` variant that reaches `AuditEvent::append` and,
+/// before this test, was the only one without a direct assertion (found
+/// during #403's Verifiable Claims regression-vector analysis — the append
+/// call at `hook.rs:789` was already correct, only test coverage was
+/// missing). Deliberately NOT a pipe-to-shell command: those default to
+/// `StructuralAction::Materialize` (see V-016) and never reach
+/// `BlockStructural`. `rule_id` is `null` here because obfuscated-expansion
+/// detection is unwrap-stack based, not a named rule match.
+#[test]
+fn hook_deny_blockstructural_creates_audit_entry() {
+    let (base, hook_path, shim_dir) = setup_hook_env("v017-blockstructural");
+    let json = pretooluse_bash_json("$'rm' -rf /tmp/x");
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "V-017: BlockStructural verdict must Block"
+    );
+
+    let event = read_last_audit_event(&audit_path_for(&base));
+    assert_eq!(
+        event["action"], "block",
+        "V-017: action must be 'block' for BlockStructural (got event={event})"
+    );
+    assert_eq!(
+        event["result"], "block",
+        "V-017: result must be 'block' for BlockStructural"
+    );
+    assert_eq!(
+        event["detection_layer"], "layer2:obfuscated-expansion",
+        "V-017: detection_layer must be 'layer2:obfuscated-expansion' for BlockStructural verdict (got event={event})"
+    );
+    assert!(
+        event["rule_id"].is_null(),
+        "V-017: rule_id must be null for obfuscated-expansion (unwrap-stack detection, not a named rule) (got event={event})"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// V-018 / ADV-181-4: per-wrapper detection_layer format under materialize (#299).
 /// Each transparent wrapper emits `layer2:materialize:pipe-to-shell:{wrapper}`
 /// in the audit `detection_layer` value.
