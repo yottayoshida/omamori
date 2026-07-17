@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+**Summary**: Freezes omamori's 1.0 product contract in `docs/CONTRACT.md` (#401), plus an unrelated CI fix (#426) for a pre-existing clippy failure on `main`.
+
+### Added
+
+- **`docs/CONTRACT.md`**: the frozen 1.0 product contract consolidating omamori's guarantee statements — previously scattered across README and SECURITY.md — into one document. Six guarantees (`G-1`..`G-6`), each with a `Verify` command and a `Boundary` link into SECURITY.md; non-guarantees at the category level (links only, no bypass-payload enumeration); a Tier 1 (Claude Code, contractually pinned) / Tier 2 (Codex CLI + Cursor, expected-to-work but not contractually pinned) tool structure; a breaking-change policy across 3 surfaces (rule-matching behavior, CLI, audit-chain verification — `config.toml` schema explicitly excluded); and an explicit 1.0 out-of-scope list (Windows, LLM-based classification, hierarchical policy packs, exhaustive multi-tool support). The contract freezes semantics only — no schema values, API signatures, or `CHAIN_VERSION` numbers — so the already-planned breaking changes in [#177](https://github.com/yottayoshida/omamori/issues/177) and [#175](https://github.com/yottayoshida/omamori/issues/175) won't require rewording it. README now links to it, with a short note clarifying that the Tool Compatibility table's `Supported` status describes active integration, not a contractual commitment. A known, disclosed inconsistency: SECURITY.md's status legend, RELEASE.md's v1.0 gate, and README's Tool Compatibility table all currently describe Codex CLI with more confidence than Tier 2 implies — tracked in [#423](https://github.com/yottayoshida/omamori/issues/423), not silently left as a gap. ([#401](https://github.com/yottayoshida/omamori/issues/401))
+- **`contract-doc-sync` invariant** in `scripts/check-invariants.sh` (mirrored from the existing `faq-doc-sync` invariant): keeps `docs/CONTRACT.md` from rotting by resolving SECURITY.md anchors, CONTRACT.md's own same-document anchors, `omamori` CLI subcommand references, README→CONTRACT.md link existence, forbidden over-claim language, and guarantee-ID uniqueness plus sequence completeness (catches both a mid-sequence guarantee being silently dropped and the trailing/highest-numbered one being deleted, without capping how many guarantees can legitimately be added later).
+
+### Fixed
+
+- **CI: `Clippy (ubuntu-latest)` failing on every `main` run since #421 merged** — unrelated to that PR's own diff. The CI Ubuntu runner's stable Rust toolchain resolved to 1.97.0, which flags the pre-existing `wrapper_kind: _, ..` destructuring pattern in `src/cli/explain.rs` and `src/engine/hook.rs` under `clippy::unneeded_wildcard_pattern` (`..` alone already matches any remaining fields). Removed the redundant `wrapper_kind: _,` from both match arms — no behavior change. ([#426](https://github.com/yottayoshida/omamori/pull/426))
+
 ## [0.13.1] - 2026-07-16
 
 **Summary**: Process provenance on Layer 1 audit events for post-incident correlation (#420), plus four changes already merged to main since v0.13.0's tag that this release now ships: a Phase 2 backstop rule closing an `env -i` bypass of `audit key rotate` (#387), symlink-planting hardening for `move_to_dir`'s staging subdirectory (#410), audit-chain recording of `config disable`/`enable`/`add` mutations (#394), and GitHub Private Vulnerability Reporting setup (#402).
