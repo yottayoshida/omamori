@@ -6,6 +6,8 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-17
+
 **Summary**: Freezes omamori's 1.0 product contract in `docs/CONTRACT.md` (#401), plus an unrelated CI fix (#426) for a pre-existing clippy failure on `main`. Adds a disclosure timeline and redaction policy to SECURITY.md, a sandbox/omamori reference architecture, and a 30-day external evaluation kit (#404, #407, #408). Machine-verifies README's Verifiable Claims table against CI job ids, CONTRACT.md guarantee IDs, and named test citations, closing Epic #409's last open item (#403).
 
 ### Added
