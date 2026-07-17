@@ -1486,11 +1486,7 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
                 Some("This command was blocked by omamori safety guard. Use a safer alternative."),
             );
         }
-        HookCheckResult::BlockStructural {
-            message,
-            wrapper_kind: _,
-            ..
-        } => {
+        HookCheckResult::BlockStructural { message, .. } => {
             // `wrapper_kind` is forensic-side only and stays out of the
             // user-facing cursor response for the same v0.9.5 reason as the
             // claude-pretooluse path. v0.9.7 #181 C-1.
