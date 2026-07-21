@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/yottayoshida/omamori/blob/main/docs/defense-boundary.schema.json",
+  "title": "omamori Defense Boundary Matrix (machine-readable projection)",
+  "description": "Schema for docs/defense-boundary.json, a machine-readable projection of SECURITY.md's Defense Boundary Matrix. Consumers should ignore unknown top-level keys (schema_version growth) but MAY treat unknown keys inside an entries[] object as unexpected, since entries[] shape is closed per category.",
+  "type": "object",
+  "required": ["matrix_version", "generated_from", "canonical_source", "disclaimer", "status_vocabulary", "entries"],
+  "additionalProperties": true,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Relative pointer to this schema file."
+    },
+    "matrix_version": {
+      "type": "string",
+      "description": "The Defense Boundary Matrix heading's version tag in SECURITY.md (e.g. 'v0.10.1+'). This is the version the matrix FORMAT was introduced at, not a data-freshness timestamp — individual rows carry their own version notes (see entries[].layer1_note / layer2_note) where a specific capability landed later."
+    },
+    "generated_from": {
+      "type": "string",
+      "description": "Anchor into SECURITY.md this file is a projection of."
+    },
+    "canonical_source": {
+      "type": "string",
+      "description": "Template URL for fetching a version-matched copy of this file. Substitute the release tag you have installed to avoid staleness."
+    },
+    "disclaimer": {
+      "type": "string",
+      "description": "What CI does and does not verify about this file's relationship to SECURITY.md and to actual omamori behavior."
+    },
+    "status_vocabulary": {
+      "type": "object",
+      "description": "Authoritative status-term -> definition map, kept in sync with SECURITY.md's Defense Boundary Matrix legend by CI. This is NOT a closed enum of values that can appear in entries[].layer1 / entries[].layer2 — it also carries legend terms unused in any Caught-table cell (e.g. 'partial') and terms that surface as entries[].category rather than as a layer status (e.g. 'out of scope', 'structural limit').",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "entries": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entry" }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "required": ["id", "category", "surface"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "description": "Stable kebab-case identifier for this row, unique within entries[]."
+        },
+        "surface": {
+          "type": "string",
+          "description": "Verbatim projection of the matrix row's Surface cell: markdown backticks kept, markdown pipe-escapes (\\|) unescaped to a literal '|'. A row naming more than one command (joined by ' / ' in the source) is kept as a single opaque string, not split."
+        },
+        "category": {
+          "enum": ["caught", "out_of_scope", "structural_limit"],
+          "description": "Which of the matrix's 3 sub-tables this row came from: Caught, Not caught — by design, or Not caught — structural limit."
+        },
+        "layer1": {
+          "type": "string",
+          "description": "Caught-table Layer 1 (shim) status base token — the text before any parenthetical suffix. See status_vocabulary for term definitions. Present only when category=caught."
+        },
+        "layer1_note": {
+          "type": "string",
+          "description": "Free-text suffix from the Layer 1 status cell's parenthetical (e.g. 'env guard'), if the source cell had one. Not machine-verified against SECURITY.md."
+        },
+        "layer2": {
+          "type": "string",
+          "description": "Caught-table Layer 2 (hook) status base token. Present only when category=caught."
+        },
+        "layer2_note": {
+          "type": "string",
+          "description": "Free-text suffix from the Layer 2 status cell's parenthetical, if any. Not machine-verified against SECURITY.md."
+        },
+        "verified_by": {
+          "type": "string",
+          "description": "Prose pointer to the test(s)/CI backing this row's Caught status. Present only when category=caught. Not machine-verified for existence except where CI separately pins a named test symbol."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why this surface is out of scope by design. Present only when category=out_of_scope."
+        },
+        "reference": {
+          "type": "string",
+          "description": "Pointer (issue link, doc anchor, or prose) backing the reason. Present only when category=out_of_scope."
+        },
+        "why": {
+          "type": "string",
+          "description": "Why this surface cannot be addressed by static analysis. Present only when category=structural_limit."
+        },
+        "mitigation": {
+          "type": "string",
+          "description": "What closes the gap instead (e.g. sandbox isolation). Present only when category=structural_limit."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "category": { "const": "caught" } } },
+          "then": { "required": ["layer1", "layer2", "verified_by"] }
+        },
+        {
+          "if": { "properties": { "category": { "const": "out_of_scope" } } },
+          "then": { "required": ["reason", "reference"] }
+        },
+        {
+          "if": { "properties": { "category": { "const": "structural_limit" } } },
+          "then": { "required": ["why", "mitigation"] }
+        }
+      ]
+    }
+  }
+}

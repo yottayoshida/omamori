@@ -34,6 +34,10 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Enforce SECURITY.md AI-assisted contribution invariants
         run: ./scripts/check-invariants.sh
+      - name: Verify SECURITY.md Defense Boundary Matrix <-> defense-boundary.json sync
+        run: ./scripts/check-boundary-matrix.sh
+      - name: Prove the boundary-matrix drift check detects an injected violation
+        run: ./scripts/check-boundary-matrix.sh --self-test
 
   # #356: permanent inverted-control proof that the isolation canary's
   # detection logic actually fires (rather than vacuously always passing).

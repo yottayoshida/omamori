@@ -1,0 +1,208 @@
+{
+  "$schema": "./defense-boundary.schema.json",
+  "matrix_version": "v0.10.1+",
+  "generated_from": "SECURITY.md#defense-boundary-matrix-v0101",
+  "canonical_source": "https://raw.githubusercontent.com/yottayoshida/omamori/{tag}/docs/defense-boundary.json — replace {tag} with the omamori release tag you have installed (e.g. v0.14.0) to get the matrix that matches your binary's behavior",
+  "disclaimer": "This file's self-consistency with SECURITY.md (row identity, row counts, legend vocabulary, and the Caught table's layer1/layer2 base tokens) is enforced by CI (scripts/check-boundary-matrix.sh). It does NOT re-prove that the underlying coverage behaves correctly — that is the job of the Rust test corpus each row's verified_by field points at. Prose fields (reason, why, mitigation, reference, and the free-text portion of a status in parentheses) are not machine-verified for semantic drift against SECURITY.md. defense-boundary.schema.json's per-category required fields are NOT enforced against this file by CI — the schema documents the intended shape, but only this file's own JSON syntax (not conformance to the schema) is checked.",
+  "status_vocabulary": {
+    "supported": "tested, expected to work",
+    "partial": "covered in some but not all tool paths",
+    "not covered": "no protection at this layer, but another layer may cover it",
+    "not applicable": "this layer's mechanism does not apply to this surface",
+    "out of scope": "deliberate design decision",
+    "structural limit": "cannot be addressed by static analysis"
+  },
+  "entries": [
+    {
+      "id": "rm-rf",
+      "category": "caught",
+      "surface": "Destructive recursive removal (`rm -rf`)",
+      "layer1": "supported",
+      "layer2": "supported",
+      "verified_by": "`omamori test`, CI, hook integration"
+    },
+    {
+      "id": "git-reset-hard",
+      "category": "caught",
+      "surface": "`git reset --hard`",
+      "layer1": "supported",
+      "layer2": "supported",
+      "verified_by": "`omamori test`, CI, hook integration"
+    },
+    {
+      "id": "push-force-clean",
+      "category": "caught",
+      "surface": "`git push --force` / `git clean -f`",
+      "layer1": "supported",
+      "layer2": "supported",
+      "verified_by": "`omamori test`, CI, hook integration"
+    },
+    {
+      "id": "chmod-777",
+      "category": "caught",
+      "surface": "`chmod 777`",
+      "layer1": "supported",
+      "layer2": "supported",
+      "verified_by": "`omamori test`, CI, hook integration"
+    },
+    {
+      "id": "find-rsync-delete",
+      "category": "caught",
+      "surface": "`find -delete` / `rsync --delete` variants",
+      "layer1": "supported",
+      "layer2": "supported",
+      "verified_by": "`omamori test`, CI, hook integration"
+    },
+    {
+      "id": "full-path-execution",
+      "category": "caught",
+      "surface": "Full-path execution (`/bin/rm -rf`)",
+      "layer1": "not covered",
+      "layer2": "supported",
+      "verified_by": "Hook integration Phase 2 rule tests"
+    },
+    {
+      "id": "shell-wrapper-evasion",
+      "category": "caught",
+      "surface": "Shell wrapper evasion (`sudo env bash -c \"rm -rf\"`)",
+      "layer1": "not covered",
+      "layer2": "supported",
+      "verified_by": "Hook integration unwrap tests"
+    },
+    {
+      "id": "pipe-to-shell",
+      "category": "caught",
+      "surface": "Pipe-to-shell (`curl URL | bash` and wrapper variants)",
+      "layer1": "not covered",
+      "layer2": "supported",
+      "verified_by": "Hook integration pipe-to-shell corpus"
+    },
+    {
+      "id": "dynamic-command-generation",
+      "category": "caught",
+      "surface": "Dynamic command generation (`bash -c \"$(cmd)\"`)",
+      "layer1": "not covered",
+      "layer2": "supported",
+      "layer2_note": "fail-close",
+      "verified_by": "Hook integration"
+    },
+    {
+      "id": "path-override-bypass",
+      "category": "caught",
+      "surface": "PATH override bypass (`PATH=/usr/bin:$PATH rm`)",
+      "layer1": "not covered",
+      "layer2": "supported",
+      "layer2_note": "v0.10.1",
+      "verified_by": "Hook integration, acceptance test T-3'"
+    },
+    {
+      "id": "env-var-tampering",
+      "category": "caught",
+      "surface": "Env-var tampering (`unset CLAUDECODE`, `export -n`)",
+      "layer1": "not covered",
+      "layer2": "supported",
+      "verified_by": "Hook integration env-tampering corpus"
+    },
+    {
+      "id": "self-disablement",
+      "category": "caught",
+      "surface": "Self-disablement (`config disable`, `uninstall`)",
+      "layer1": "supported",
+      "layer1_note": "env guard",
+      "layer2": "supported",
+      "layer2_note": "Phase 2 builtin rules",
+      "verified_by": "Acceptance tests"
+    },
+    {
+      "id": "config-hook-file-editing",
+      "category": "caught",
+      "surface": "Config/hook file editing (Edit/Write operations)",
+      "layer1": "not applicable",
+      "layer2": "supported",
+      "layer2_note": "Claude Code, Codex CLI",
+      "verified_by": "Hook integration file-protection tests"
+    },
+    {
+      "id": "static-shell-expansion-obfuscation",
+      "category": "caught",
+      "surface": "Static shell expansion obfuscation (`$'rm'`, `$\"rm\"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`)",
+      "layer1": "not covered",
+      "layer2": "supported",
+      "layer2_note": "v0.10.2",
+      "verified_by": "Hook integration `obfuscated-*`, unit tests"
+    },
+    {
+      "id": "self-modification-commands",
+      "category": "caught",
+      "surface": "Self-modification commands in command context (`omamori config disable/enable/add`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`, `break-glass`, `audit key rotate`)",
+      "layer1": "supported",
+      "layer1_note": "env guard",
+      "layer2": "supported",
+      "layer2_note": "Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13",
+      "verified_by": "`tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests"
+    },
+    {
+      "id": "interpreter-commands",
+      "category": "out_of_scope",
+      "surface": "Interpreter commands (`python -c \"shutil.rmtree(...)\"`)",
+      "reason": "Zero real-world incidents in target tools; protocol-level enforcement (MCP) is the right layer",
+      "reference": "[#74](https://github.com/yottayoshida/omamori/issues/74)"
+    },
+    {
+      "id": "commands-outside-curated-rule-set",
+      "category": "out_of_scope",
+      "surface": "Commands outside the curated rule set",
+      "reason": "omamori guards a narrow set of known destructive patterns, not arbitrary commands",
+      "reference": "[Security Model](#security-model)"
+    },
+    {
+      "id": "ai-overwrites-user-files-native-tools",
+      "category": "out_of_scope",
+      "surface": "AI overwrites/destroys user source files via native Write/Edit tools",
+      "reason": "Command-guard scope: omamori observes Bash commands and protects its own files only; native editor-tool writes are outside the interception layer",
+      "reference": "Git hygiene (`git diff` before commit), AI tool file sandbox"
+    },
+    {
+      "id": "obfuscated-commands-runtime",
+      "category": "structural_limit",
+      "surface": "Obfuscated commands (base64, hex, runtime variable indirection `X=rm; $X -rf`)",
+      "why": "Static analysis cannot decode runtime-constructed commands. Note: *static* expansion (`$'rm'`, `${IFS}rm`, brace expansion) IS caught since v0.10.2; this row covers runtime-evaluated forms only",
+      "mitigation": "Sandbox isolation"
+    },
+    {
+      "id": "mid-word-brace-expansion",
+      "category": "structural_limit",
+      "surface": "Mid-word brace expansion at verb position (`r{m,}`)",
+      "why": "`{` in mid-word is FP-prone (`file{.bak}`); prefix-only brace detection",
+      "mitigation": "Sandbox isolation"
+    },
+    {
+      "id": "bash-c-var",
+      "category": "structural_limit",
+      "surface": "`bash -c \"$VAR\"` (variable set earlier in shell)",
+      "why": "Requires runtime evaluation",
+      "mitigation": "Sandbox isolation"
+    },
+    {
+      "id": "alias-rm",
+      "category": "structural_limit",
+      "surface": "`alias rm='/bin/rm'`",
+      "why": "Alias overrides bypass string matching",
+      "mitigation": "Layer 2 hooks cover AI tool paths"
+    },
+    {
+      "id": "heredoc-encoded-payloads",
+      "category": "structural_limit",
+      "surface": "Heredoc / encoded payloads decoded at execution time",
+      "why": "Static analysis boundary",
+      "mitigation": "Sandbox isolation"
+    },
+    {
+      "id": "fd-dup-stdin-alias",
+      "category": "structural_limit",
+      "surface": "`source /dev/fd/N N<&0` (standalone fd-dup stdin alias)",
+      "why": "Standalone: requires parsing `N<&0`-style redirections and fd equivalence tracking. However, when used after a pipe (e.g. `curl … | bash -c 'source /dev/fd/3' 3<&0`), pipe-to-shell detection catches the `bash` launcher on the pipe RHS regardless of inner fd-dup content",
+      "mitigation": "Sandbox isolation (standalone); pipe-to-shell catches piped variant"
+    }
+  ]
+}

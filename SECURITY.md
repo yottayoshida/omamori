@@ -75,7 +75,11 @@ A public pull request that adds a Defense Boundary Matrix row or a `tests/hook_i
 
 ### Defense Boundary Matrix (v0.10.1+)
 
-What is caught, what is not, and why. Status values: **supported** (tested, expected to work) · **partial** (covered in some but not all tool paths) · **out of scope** (deliberate design decision) · **structural limit** (cannot be addressed by static analysis).
+<!-- boundary-matrix:start -->
+
+What is caught, what is not, and why. Status values: **supported** (tested, expected to work) · **partial** (covered in some but not all tool paths) · **not covered** (no protection at this layer, but another layer may cover it) · **not applicable** (this layer's mechanism does not apply to this surface) · **out of scope** (deliberate design decision) · **structural limit** (cannot be addressed by static analysis).
+
+A machine-readable projection of this matrix (surface list + per-layer status, one object per row) is published at [`docs/defense-boundary.json`](docs/defense-boundary.json) (schema: [`docs/defense-boundary.schema.json`](docs/defense-boundary.schema.json)), kept row-for-row in sync by the `invariants-check` CI job. This is step 4 of the [Known-bypass-becomes-row rule](#known-bypass-becomes-row-rule).
 
 #### Caught
 
@@ -118,6 +122,8 @@ What is caught, what is not, and why. Status values: **supported** (tested, expe
 
 For per-tool hook coverage (Claude Code vs Codex CLI vs Cursor), see [Hook Coverage (Layer 2)](#hook-coverage-layer-2). For the full closure history, see [Known limitations (KNOWN_LIMIT)](#known-limitations-known_limit).
 
+<!-- boundary-matrix:end -->
+
 ### Known-bypass-becomes-row rule
 
 When a new bypass surfaces, the response is not just a code fix. It is also:
@@ -125,6 +131,7 @@ When a new bypass surfaces, the response is not just a code fix. It is also:
 1. A row added to the Defense Boundary Matrix above.
 2. A corpus entry added to `tests/hook_integration.rs`.
 3. An entry in the [Known limitations](#known-limitations-known_limit) section (if closed) or Structural limits table (if not closable).
+4. A mirrored entry in [`docs/defense-boundary.json`](docs/defense-boundary.json) (enforced by the `invariants-check` CI job).
 
 This rule ensures that the boundary matrix and test corpus grow together and that bypass discovery is treated as a documentation event, not just a code event.
 
