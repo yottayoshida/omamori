@@ -38,6 +38,13 @@
 # Invariant enforcer itself — if this file is weakened the whole gate collapses.
 /scripts/check-invariants.sh   @yottayoshida
 
+# Machine-readable Defense Boundary Matrix + its drift enforcer (#405). Same
+# rationale as check-invariants.sh above: a weakened check here lets the
+# audit-facing JSON silently diverge from SECURITY.md.
+/scripts/check-boundary-matrix.sh    @yottayoshida
+/docs/defense-boundary.json          @yottayoshida
+/docs/defense-boundary.schema.json   @yottayoshida
+
 # Additional policy-adjacent sources (v0.9.4+)
 # src/unwrap.rs: command tokenization / PATH bypass detection — a regression
 # here silently widens the Allow surface without touching hook.rs or rules.rs.

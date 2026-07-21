@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/defense-boundary.json`** and **`docs/defense-boundary.schema.json`**: a machine-readable strict projection of SECURITY.md's Defense Boundary Matrix (24 rows across the Caught / Not caught — by design / Not caught — structural limit tables), for external tooling and dashboards. Status values are split into a base token and a free-text note (e.g. `supported (v0.10.1)` → `layer1: "supported"`, `layer1_note: "v0.10.1"`); prose columns (Reason/Why/Mitigation/Verified by) are carried verbatim but not machine-verified against SECURITY.md. `scripts/check-boundary-matrix.sh` (new `invariants-check` CI steps) enforces both directions of drift: row-count parity per table, Surface-cell set equality, Caught-table status base-token equality, legend-vocabulary sync, and `matrix_version` sync with the SECURITY.md heading — all derived from the markdown each run, never hardcoded. `--self-test` mode injects one violation per check into a temp copy and asserts the exact resulting FAIL label — 16 passes, mirroring `verify-claims.sh`'s inverted-control pattern. SECURITY.md's legend gained the `not covered` / `not applicable` terms it was already using in cells but never defined, and the Known-bypass-becomes-row rule gained a 4th step pointing at this file. ([#405](https://github.com/yottayoshida/omamori/issues/405))
+
 ## [0.14.0] - 2026-07-17
 
 **Summary**: Freezes omamori's 1.0 product contract in `docs/CONTRACT.md` (#401), plus an unrelated CI fix (#426) for a pre-existing clippy failure on `main`. Adds a disclosure timeline and redaction policy to SECURITY.md, a sandbox/omamori reference architecture, and a 30-day external evaluation kit (#404, #407, #408). Machine-verifies README's Verifiable Claims table against CI job ids, CONTRACT.md guarantee IDs, and named test citations, closing Epic #409's last open item (#403).

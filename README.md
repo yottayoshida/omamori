@@ -47,7 +47,7 @@ What omamori claims, and how to verify each one. The **CI** column is a job id i
 | AI-driven self-disablement attempts are blocked in supported tool paths | `CLAUDECODE=1 omamori config disable rm-recursive-to-trash` (expect: blocked) | test | G-5 |
 <!-- claims:end -->
 
-Bypass classes outside this coverage scope remain possible — this is inherent to the PATH-shim and static-analysis approach. See [SECURITY.md](SECURITY.md) for the full bypass corpus and defense boundary.
+Bypass classes outside this coverage scope remain possible — this is inherent to the PATH-shim and static-analysis approach. See [SECURITY.md](SECURITY.md) for the full bypass corpus and defense boundary — also published as a machine-readable JSON projection for tooling at [docs/defense-boundary.json](docs/defense-boundary.json).
 
 For the frozen set of guarantees, non-guarantees, supported tier, and breaking-change policy, see [docs/CONTRACT.md](docs/CONTRACT.md).
 
