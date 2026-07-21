@@ -188,10 +188,7 @@ fn ensure_hooks_current_at_with_verifier_and_exe(
     };
 
     let regen = |base_dir: &Path| -> Result<installer::HookOutcome, std::io::Error> {
-        match exe_override {
-            Some(exe) => installer::regenerate_hooks_for_exe(base_dir, exe, verify),
-            None => installer::regenerate_hooks_with_verifier(base_dir, verify),
-        }
+        installer::regenerate_hooks_for_exe(base_dir, exe_override, verify)
     };
 
     let hook_version = installer::parse_hook_version(&content);
@@ -840,6 +837,44 @@ mod tests {
         assert_eq!(
             content, old_hook,
             "old hook must be left untouched when verification fails"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hooks_current_rejects_dev_build_path_injected_via_exe_override() {
+        // #376: `exe_override` is a DI seam for tests, not a way to bypass
+        // #354's dev-build rejection — mirrors installer.rs's
+        // `regenerate_hooks_for_exe_rejects_dev_build_path` for this seam
+        // specifically (Codex proxy R2 finding: this negative control was
+        // missing, only indirectly implied by delegation to
+        // `regenerate_hooks_for_exe`).
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-hooks-devbuild-exe-override-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let hooks_dir = setup_hooks_dir(&dir);
+
+        let old_hook = "#!/bin/sh\n# omamori hook v0.0.1\nset -eu\nexit 0\n";
+        std::fs::write(hooks_dir.join("claude-pretooluse.sh"), old_hook).unwrap();
+
+        let dev_exe = PathBuf::from("/Users/x/project/target/debug/omamori");
+        let result = ensure_hooks_current_at_with_verifier_and_exe(
+            &dir,
+            |_, _| panic!("verifier must not be called when the path is rejected as a dev build"),
+            Some(&dev_exe),
+        );
+        assert!(
+            !result,
+            "must not report success when exe_override points at a dev-build path"
+        );
+
+        let content = std::fs::read_to_string(hooks_dir.join("claude-pretooluse.sh")).unwrap();
+        assert_eq!(
+            content, old_hook,
+            "old hook must be left untouched when exe_override is a rejected dev-build path"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

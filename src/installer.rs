@@ -498,36 +498,46 @@ pub(crate) fn regenerate_hooks_with_verifier(
     base_dir: &Path,
     verify: HookVerifier,
 ) -> Result<HookOutcome, std::io::Error> {
-    // Resolve exe path once, shared by Claude/Cursor/Codex hooks.
-    // Fail-close: if resolution fails, skip all hook regeneration rather than
-    // falling back to bare `omamori` which would reintroduce PATH vulnerability (#315).
-    let stable_exe = match resolved_current_omamori_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            eprintln!(
-                "omamori warning: failed to resolve current exe ({}); hooks not regenerated",
-                e
-            );
-            return Ok(HookOutcome::KeptExisting(
-                HookKeptReason::ExeResolutionFailed,
-            ));
-        }
-    };
-
-    regenerate_hooks_for_exe(base_dir, &stable_exe, verify)
+    regenerate_hooks_for_exe(base_dir, None, verify)
 }
 
 /// `regenerate_hooks_with_verifier()` with the resolved exe path also
-/// injectable, so tests can exercise the dev-build-path/contract-verification
-/// logic against a synthetic path instead of the test binary's own
-/// `current_exe()` — which is itself always a `target/debug`/`target/release`
-/// path under `cargo test` and would otherwise trip the #354 check below
-/// before the test even gets to what it's actually checking.
+/// injectable via `exe_override`, so tests can exercise the dev-build-path/
+/// contract-verification logic against a synthetic path instead of the test
+/// binary's own `current_exe()` — which is itself always a
+/// `target/debug`/`target/release` path under `cargo test` and would
+/// otherwise trip the #354 check below before the test even gets to what
+/// it's actually checking. `None` is production behavior (real
+/// `current_exe()` resolution, matching `shim.rs`'s
+/// `ensure_hooks_current_at_with_verifier_and_exe` DI-seam shape — #376).
 pub(crate) fn regenerate_hooks_for_exe(
     base_dir: &Path,
-    stable_exe: &Path,
+    exe_override: Option<&Path>,
     verify: HookVerifier,
 ) -> Result<HookOutcome, std::io::Error> {
+    // Resolve exe path once, shared by Claude/Cursor/Codex hooks.
+    // Fail-close: if resolution fails, skip all hook regeneration rather than
+    // falling back to bare `omamori` which would reintroduce PATH vulnerability (#315).
+    let resolved_exe;
+    let stable_exe: &Path = match exe_override {
+        Some(exe) => exe,
+        None => {
+            resolved_exe = match resolved_current_omamori_exe() {
+                Ok(exe) => exe,
+                Err(e) => {
+                    eprintln!(
+                        "omamori warning: failed to resolve current exe ({}); hooks not regenerated",
+                        e
+                    );
+                    return Ok(HookOutcome::KeptExisting(
+                        HookKeptReason::ExeResolutionFailed,
+                    ));
+                }
+            };
+            &resolved_exe
+        }
+    };
+
     let hooks_dir = base_dir.join("hooks");
 
     // #354: this path is always implicitly resolved (regenerate_hooks_with_verifier
@@ -1774,7 +1784,7 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let dev_exe = Path::new("/Users/x/project/target/debug/omamori");
-        let outcome = regenerate_hooks_for_exe(&root, dev_exe, |_, _| {
+        let outcome = regenerate_hooks_for_exe(&root, Some(dev_exe), |_, _| {
             panic!("verifier must not be called when the path is rejected as a dev build")
         })
         .unwrap();
@@ -2156,7 +2166,8 @@ mod tests {
         let fake_exe = root.join("omamori");
         fs::write(&fake_exe, "binary").unwrap();
         let outcome =
-            regenerate_hooks_for_exe(&root, &fake_exe, |_, _| HookContractStatus::Ok).unwrap();
+            regenerate_hooks_for_exe(&root, Some(&fake_exe), |_, _| HookContractStatus::Ok)
+                .unwrap();
         assert_eq!(outcome, HookOutcome::Written);
 
         let hook_path = root.join("hooks/claude-pretooluse.sh");
@@ -2199,8 +2210,9 @@ mod tests {
         // exe-injectable seam rather than a `target/debug` test-binary path.
         let fake_exe = root.join("omamori");
         fs::write(&fake_exe, "binary").unwrap();
-        let result =
-            regenerate_hooks_for_exe(&root, &fake_exe, |_, _| HookContractStatus::ExitNonZero(1));
+        let result = regenerate_hooks_for_exe(&root, Some(&fake_exe), |_, _| {
+            HookContractStatus::ExitNonZero(1)
+        });
         assert_eq!(
             result.unwrap(),
             HookOutcome::KeptExisting(HookKeptReason::VerificationFailed(
