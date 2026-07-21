@@ -194,7 +194,7 @@ fn log_denied_activation(rule_id: &str) {
 }
 
 /// Shared field layout for break-glass audit events; only `provider`,
-/// `action`, and `result` vary per event kind.
+/// `command`, `action`, and `result` vary per event kind.
 fn build_break_glass_event(
     rule_id: &str,
     provider: &str,
@@ -242,57 +242,23 @@ fn create_denied_activation_event(rule_id: &str) -> crate::audit::AuditEvent {
 }
 
 fn create_activation_event(rule_id: &str, expires_at: &str) -> crate::audit::AuditEvent {
-    crate::audit::AuditEvent {
-        timestamp: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
-        provider: "human".to_string(),
-        command: format!("break-glass --rule {rule_id}"),
-        rule_id: Some(rule_id.to_string()),
-        action: "break-glass-activate".to_string(),
-        result: format!("activated (expires {expires_at})"),
-        target_count: 0,
-        target_hash: String::new(),
-        detection_layer: Some("break-glass".to_string()),
-        unwrap_chain: None,
-        raw_input_hash: None,
-        chain_version: None,
-        seq: None,
-        prev_hash: None,
-        key_id: None,
-        entry_hash: None,
-        pid: None,
-        ppid: None,
-        parent_process: None,
-        cwd_hash: None,
-    }
+    build_break_glass_event(
+        rule_id,
+        "human",
+        format!("break-glass --rule {rule_id}"),
+        "break-glass-activate",
+        format!("activated (expires {expires_at})"),
+    )
 }
 
 fn create_deactivation_event(rule_id: &str) -> crate::audit::AuditEvent {
-    crate::audit::AuditEvent {
-        timestamp: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
-        provider: "human".to_string(),
-        command: format!("break-glass --clear --rule {rule_id}"),
-        rule_id: Some(rule_id.to_string()),
-        action: "break-glass-deactivate".to_string(),
-        result: "deactivated".to_string(),
-        target_count: 0,
-        target_hash: String::new(),
-        detection_layer: Some("break-glass".to_string()),
-        unwrap_chain: None,
-        raw_input_hash: None,
-        chain_version: None,
-        seq: None,
-        prev_hash: None,
-        key_id: None,
-        entry_hash: None,
-        pid: None,
-        ppid: None,
-        parent_process: None,
-        cwd_hash: None,
-    }
+    build_break_glass_event(
+        rule_id,
+        "human",
+        format!("break-glass --clear --rule {rule_id}"),
+        "break-glass-deactivate",
+        "deactivated".to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +412,61 @@ mod tests {
             expires_at: expires_at.to_string(),
             reason: None,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // create_activation_event / create_deactivation_event (#375)
+    //
+    // Characterization tests pinning the exact field values before
+    // migrating these two constructors onto the shared
+    // `build_break_glass_event` helper. `build_break_glass_event`'s
+    // signature has two adjacent `&str` params (`provider`, `action`) and
+    // two adjacent `String` params (`command`, `result`) — a transposed
+    // argument during migration would compile cleanly, would not change
+    // the HMAC audit chain's internal consistency (it hashes whatever
+    // values it's given), and would go undetected by any existing test.
+    // These assertions are the only safety net.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn activation_event_preserves_human_provenance_and_shape() {
+        let event = create_activation_event("rm-recursive-to-trash", "2020-01-01T01:00:00Z");
+        assert_eq!(event.provider, "human");
+        assert_eq!(event.action, "break-glass-activate");
+        assert_eq!(event.command, "break-glass --rule rm-recursive-to-trash");
+        assert_eq!(event.rule_id.as_deref(), Some("rm-recursive-to-trash"));
+        assert_eq!(event.result, "activated (expires 2020-01-01T01:00:00Z)");
+        assert_eq!(event.detection_layer.as_deref(), Some("break-glass"));
+        assert_eq!(event.target_count, 0);
+        assert_eq!(event.target_hash, "");
+        assert!(event.unwrap_chain.is_none());
+        assert!(event.raw_input_hash.is_none());
+        assert!(event.pid.is_none());
+        assert!(event.ppid.is_none());
+        assert!(event.parent_process.is_none());
+        assert!(event.cwd_hash.is_none());
+    }
+
+    #[test]
+    fn deactivation_event_preserves_human_provenance_and_shape() {
+        let event = create_deactivation_event("rm-recursive-to-trash");
+        assert_eq!(event.provider, "human");
+        assert_eq!(event.action, "break-glass-deactivate");
+        assert_eq!(
+            event.command,
+            "break-glass --clear --rule rm-recursive-to-trash"
+        );
+        assert_eq!(event.rule_id.as_deref(), Some("rm-recursive-to-trash"));
+        assert_eq!(event.result, "deactivated");
+        assert_eq!(event.detection_layer.as_deref(), Some("break-glass"));
+        assert_eq!(event.target_count, 0);
+        assert_eq!(event.target_hash, "");
+        assert!(event.unwrap_chain.is_none());
+        assert!(event.raw_input_hash.is_none());
+        assert!(event.pid.is_none());
+        assert!(event.ppid.is_none());
+        assert!(event.parent_process.is_none());
+        assert!(event.cwd_hash.is_none());
     }
 
     // -----------------------------------------------------------------
