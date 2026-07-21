@@ -1,6 +1,6 @@
 # ADR-0004: Hook exec path provenance policy (reject implicit dev-build paths)
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-07-11
 - **Plan**: `.claude/plans/2026-07-11-omamori-batch-b-security-hardening.md`
 
@@ -103,7 +103,7 @@ hook/shim reference; neither implies the other.
   ADR rejects by design. This is not a workaround for the tests specifically — it is the same
   escape hatch a real developer running `cargo run -- setup` from a checkout would need to use.
 - `regenerate_hooks_with_verifier` was split into a thin exe-resolving wrapper plus an
-  exe-injectable `regenerate_hooks_for_exe(base_dir, stable_exe, verify)`, and `shim.rs`'s
+  exe-injectable `regenerate_hooks_for_exe(base_dir, exe_override, verify)`, and `shim.rs`'s
   `ensure_hooks_current_at_with_verifier_and_exe(base_dir, verify, exe_override)` gained the same
   exe-injection parameter directly (the old 2-arg `ensure_hooks_current_at_with_verifier` wrapper
   was removed as dead weight once every caller moved to the 3-arg form — /simplify review). Both
@@ -112,11 +112,27 @@ hook/shim reference; neither implies the other.
   `target/debug`/`target/release` path under `cargo test`, and would otherwise trip this ADR's own
   check before those tests reach what they're actually exercising (version/hash-mismatch detection,
   verification-failure handling, throttling). This extends the *spirit* of #349's contract-verifier
-  injection seam to the exe-path dimension, not its exact shape: across `InstallOptions.verify_override`
-  (an `Option` struct field), `regenerate_hooks_for_exe`'s mandatory `stable_exe` parameter, and
-  `..._and_exe`'s `Option<&Path>` parameter, this PR introduces two more DI conventions rather than
-  reusing #349's exactly (/simplify reuse review) — noted as a real but non-blocking inconsistency;
-  unifying all of them into one seam shape would be a larger refactor than this PR's scope.
+  injection seam to the exe-path dimension. At introduction, `regenerate_hooks_for_exe` used a
+  mandatory `stable_exe: &Path` parameter — a third DI-injection shape alongside
+  `InstallOptions.verify_override` (an `Option` struct field) and `..._and_exe`'s `Option<&Path>`
+  parameter — noted as a real but non-blocking inconsistency. **#376 unified this**:
+  `regenerate_hooks_for_exe` now takes `exe_override: Option<&Path>`, matching `..._and_exe`'s
+  shape exactly, with `regenerate_hooks_with_verifier` reduced to a one-line
+  `regenerate_hooks_for_exe(base_dir, None, verify)` wrapper. `InstallOptions.verify_override`
+  remains a separate, intentionally-distinct convention (#349's precedent, orthogonal axis —
+  verifier injection, not exe-path injection). A third exe-injection seam exists —
+  `auto_setup_codex_if_needed_with_exe` (#379) — already `Option<&Path>`-shaped before #376, so
+  it needed no signature change here. Its *behavior* stays intentionally different from the other
+  two: `Some(path)` is passed through `resolve_stable_exe_path()` before the dev-build check (this
+  function's own doc comment explains why — it mirrors only the `current_exe()` call, not the
+  whole resolve-and-gate sequence), whereas `regenerate_hooks_for_exe` and `..._and_exe` use an
+  injected path as-is. #376 unifies 2 of these 3 seams' *shape*; the third already matched and its
+  behavioral divergence is a deliberate, pre-existing design choice, not something #376 introduces
+  or leaves unaddressed by oversight. /simplify review on #376 flagged that the resolution logic
+  itself (`Some(exe) => exe.to_path_buf(), None => <resolve>`) is now hand-duplicated across three
+  call sites (`regenerate_hooks_for_exe`, `shim.rs`'s Level-2 hash-check branch, and
+  `auto_setup_codex_if_needed_with_exe`) — extracting a shared resolver was judged out of scope for
+  #376 (shape unification, not implementation sharing) and is tracked as a follow-up candidate.
 - `CARGO_TARGET_DIR` customization (building outside the default `target/` directory name) is a
   known, accepted limitation — it evades the path-component check. This is a safety guard against
   the common case, not a hard security boundary; the actual security boundary (which binary a user
