@@ -248,16 +248,6 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
     }
 }
 
-/// `audit::rotate_key` falls back to `secret::default_audit_path`
-/// internally when `config.path` is unset (that fallback lives in a file
-/// this codebase cannot edit — see #306/#323). That fallback resolves
-/// against the current working directory when `HOME` is unset, empty, or
-/// relative. Returns `true` when rotation would hit that CWD-relative
-/// fallback, so the caller can refuse up front instead.
-fn rotate_key_would_use_cwd_fallback(config: &audit::AuditConfig) -> bool {
-    config.path.is_none() && crate::context::home_dir().is_none()
-}
-
 fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(3).and_then(|item| item.to_str()) {
         Some("rotate") => {
@@ -265,16 +255,16 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
 
             let load_result = load_config(None)?;
 
-            if rotate_key_would_use_cwd_fallback(&load_result.config.audit) {
+            let Some(path) = audit::resolved_audit_path(&load_result.config.audit) else {
                 eprintln!("omamori: cannot resolve audit path — HOME is unset, empty, or relative");
                 eprintln!("  set audit.path explicitly in config.toml, or fix HOME, and retry");
                 return Ok(1);
-            }
+            };
 
             eprintln!("omamori: rotating audit HMAC key...");
             eprintln!("  Old entries will still verify against the retired key backup.");
 
-            match audit::rotate_key(&load_result.config.audit) {
+            match audit::rotate_key(&path) {
                 Ok(result) => {
                     eprintln!("omamori: key rotation complete.");
                     eprintln!("  New key ID: {}", result.new_key_id);
@@ -488,12 +478,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // -----------------------------------------------------------------
-    // rotate_key_would_use_cwd_fallback (#306/#323 residual — Codex R1 P0)
-    // -----------------------------------------------------------------
-
-    use crate::test_support::with_home;
-
     fn audit_config(path: Option<std::path::PathBuf>) -> audit::AuditConfig {
         audit::AuditConfig {
             enabled: true,
@@ -501,36 +485,6 @@ mod tests {
             retention_days: 0,
             strict: false,
         }
-    }
-
-    #[test]
-    #[serial_test::serial(home_env)]
-    fn rotate_guard_true_when_no_override_and_home_unusable() {
-        let config = audit_config(None);
-        assert!(with_home(Some(""), || rotate_key_would_use_cwd_fallback(
-            &config
-        )));
-        assert!(with_home(None, || rotate_key_would_use_cwd_fallback(
-            &config
-        )));
-    }
-
-    #[test]
-    #[serial_test::serial(home_env)]
-    fn rotate_guard_false_when_explicit_path_set() {
-        let config = audit_config(Some(std::path::PathBuf::from("/explicit/audit.jsonl")));
-        assert!(!with_home(Some(""), || rotate_key_would_use_cwd_fallback(
-            &config
-        )));
-    }
-
-    #[test]
-    #[serial_test::serial(home_env)]
-    fn rotate_guard_false_when_home_absolute() {
-        let config = audit_config(None);
-        assert!(!with_home(Some("/tmp/omamori-rotate-guard-test"), || {
-            rotate_key_would_use_cwd_fallback(&config)
-        }));
     }
 
     #[test]
