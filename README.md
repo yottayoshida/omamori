@@ -115,15 +115,15 @@ All rules are customizable via TOML config. See [Configuration](#configuration) 
 
 | Tool | Status | Coverage | Notes |
 |------|--------|----------|-------|
-| Claude Code | Supported | Layer 1 + Layer 2 | PreToolUse hook installed automatically. Auto Mode compatible. |
-| Codex CLI | Supported | Layer 1 + Layer 2 | Hooks and config auto-configured during install. |
-| Cursor | Supported | Layer 1 + Layer 2 | Re-merge generated hook snippet after upgrade. |
+| Claude Code | Supported (Tier 1) | Layer 1 + Layer 2 | PreToolUse hook installed automatically. Auto Mode compatible. |
+| Codex CLI | Supported (Tier 2) | Layer 1 + Layer 2 | Hooks and config auto-configured during install. |
+| Cursor | Supported (Tier 2) | Layer 1 + Layer 2 | Re-merge generated hook snippet after upgrade. |
 | Gemini CLI, Cline, others | Community | Layer 1 only | Not E2E tested. |
 | Any tool setting `AI_GUARD=1` | Fallback | Layer 1 only | Generic opt-in detection. |
 
 > The demo image above is a Claude Code capture; the same `block` / `log-only` / `trash` behavior applies on Codex CLI and Cursor when their env vars are detected.
 
-`Supported` above describes active hook/shim integration — it does not by itself mean every tool is held to the same level of ongoing verification. See [docs/CONTRACT.md → Supported tier](docs/CONTRACT.md#supported-tier) for which tools' behavior is contractually guaranteed versus expected-to-work.
+See [docs/CONTRACT.md → Supported tier](docs/CONTRACT.md#supported-tier) for what Tier 1 (contractually guaranteed) versus Tier 2 (expected to work, no continuous verification) means.
 
 ### Platforms
 

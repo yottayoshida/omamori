@@ -37,7 +37,7 @@ Different questions about omamori have different sources of truth. When two docu
 | What does omamori currently catch or not catch, in full detail? | [SECURITY.md's Defense Boundary Matrix](../SECURITY.md#defense-boundary-matrix-v0101) |
 | How do I verify a specific claim right now? | [README's Verifiable Claims table](../README.md#verifiable-claims) |
 | What is omamori committing not to break, and until when? | **This document** |
-| Which tools is a guarantee contractually pinned to? | **This document** (see [Supported tier](#supported-tier)) — SECURITY.md's "supported" status describes *current test coverage*, not a contractual commitment; see the [known inconsistency note](#known-inconsistency-securitymd-releasemd-and-readmemd-vs-this-contract) below |
+| Which tools is a guarantee contractually pinned to? | **This document** (see [Supported tier](#supported-tier)) — SECURITY.md's "supported" status describes *current test coverage*, not a contractual commitment |
 | How do I recover from a false positive? | [docs/FAQ.md](FAQ.md) |
 | Do I still need a sandbox if I use omamori (or vice versa)? | [docs/reference-architecture.md](reference-architecture.md) |
 | How and when can I disclose a bypass I reported? | [SECURITY.md's Disclosure timeline](../SECURITY.md#disclosure-timeline) |
@@ -172,13 +172,9 @@ Not planned for 1.0, independent of the guarantees above:
 
 **Tier 2 — expected to work, not contractually guaranteed**: Codex CLI, Cursor. The detection mechanism is tool-agnostic (it keys off environment variables any of these tools can set), so the guarantees above are expected to hold in practice — but there is no continuous acceptance verification against these tools today, so a regression specific to one of them is not treated as a breaking change under this contract.
 
-Tier membership is **not frozen by this contract** — which tools currently sit in which tier is a living fact, tracked in [README's Tool Compatibility table](../README.md#tool-compatibility), not pinned here. That table's `Supported` status describes active hook/shim integration, not a contractual commitment on its own — it does not distinguish Tier 1 from Tier 2 by itself, which is why README cross-references this section rather than the table alone being the last word on tiering. What *is* frozen is the tier structure's meaning: moving a tool from Tier 1 to Tier 2 (removing a contractual commitment) is a breaking change; moving a tool from Tier 2 to Tier 1 (adding one, backed by verification) is not.
+Tier membership is **not frozen by this contract** — which tools currently sit in which tier is a living fact, tracked in [README's Tool Compatibility table](../README.md#tool-compatibility), not pinned here. That table's `Supported (Tier 1)` / `Supported (Tier 2)` cells reference the tiering for convenience; the meaning of each tier — what it does and does not commit to — is defined here, not there, which is why README cross-references this section rather than the table cell alone being the last word on what "Tier 2" implies. What *is* frozen is the tier structure's meaning: moving a tool from Tier 1 to Tier 2 (removing a contractual commitment) is a breaking change; moving a tool from Tier 2 to Tier 1 (adding one, backed by verification) is not.
 
 This tier structure applies only on macOS — omamori has no runtime behavior on any other platform.
-
-### Known inconsistency: SECURITY.md, RELEASE.md, and README.md vs. this contract
-
-As of this contract's effective date, three other documents describe Codex CLI with more confidence than Tier 2 implies: SECURITY.md's status legend defines "supported" as "tested, expected to work" and lists several rows as `supported (Claude Code, Codex CLI)`; RELEASE.md's v1.0 release gate lists live-path acceptance for Codex CLI as a 1.0 shipping requirement; and README's Tool Compatibility table lists Codex CLI's Status as plain `Supported`, the same word it uses for Claude Code, without a tier distinction (README does cross-reference this section for the distinction — see [Supported tier](#supported-tier) above — but the table cell itself is unchanged). None of the three is rewritten by this PR. This is a known, tracked inconsistency — tracked in [#423](https://github.com/yottayoshida/omamori/issues/423) — the intent is to bring all three in line with the tiering above, not to silently let the gap stand.
 
 ---
 
@@ -203,6 +199,7 @@ Two changes are already planned before 1.0 and are accounted for by this policy 
 | Contract version | Crate versions | Notes |
 |---|---|---|
 | v1 | `0.13.1` onward | Initial publication |
+| v1 | (pending next release) | [#423](https://github.com/yottayoshida/omamori/issues/423): SECURITY.md/RELEASE.md/README.md's Codex CLI language reconciled with the Tier 2 definition above ("expected to work, not contractually guaranteed"), closing the "Known inconsistency" this document previously disclosed. Wording clarification only — no guarantee's scope changed, no contract version bump. |
 
 Revisions are appended below, never rewritten in place, so the history of what changed and why stays visible.
 

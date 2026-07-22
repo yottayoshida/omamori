@@ -5,7 +5,7 @@
   "canonical_source": "https://raw.githubusercontent.com/yottayoshida/omamori/{tag}/docs/defense-boundary.json — replace {tag} with the omamori release tag you have installed (e.g. v0.14.0) to get the matrix that matches your binary's behavior",
   "disclaimer": "This file's self-consistency with SECURITY.md (row identity, row counts, legend vocabulary, and the Caught table's layer1/layer2 base tokens) is enforced by CI (scripts/check-boundary-matrix.sh). It does NOT re-prove that the underlying coverage behaves correctly — that is the job of the Rust test corpus each row's verified_by field points at. Prose fields (reason, why, mitigation, reference, and the free-text portion of a status in parentheses) are not machine-verified for semantic drift against SECURITY.md. defense-boundary.schema.json's per-category required fields are NOT enforced against this file by CI — the schema documents the intended shape, but only this file's own JSON syntax (not conformance to the schema) is checked.",
   "status_vocabulary": {
-    "supported": "tested, expected to work",
+    "supported": "tested on Tier 1 (see docs/CONTRACT.md#supported-tier); expected to work on Tier 2 — no continuous acceptance verification",
     "partial": "covered in some but not all tool paths",
     "not covered": "no protection at this layer, but another layer may cover it",
     "not applicable": "this layer's mechanism does not apply to this surface",
@@ -119,7 +119,7 @@
       "surface": "Config/hook file editing (Edit/Write operations)",
       "layer1": "not applicable",
       "layer2": "supported",
-      "layer2_note": "Claude Code, Codex CLI",
+      "layer2_note": "Claude Code Tier 1; Codex CLI Tier 2",
       "verified_by": "Hook integration file-protection tests"
     },
     {
