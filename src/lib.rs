@@ -202,14 +202,16 @@ mod tests {
         // is NOT hook-check, must enter shim mode (not omamori dispatch).
         // "git status" via shim should not hit "unknown subcommand" error.
         //
-        // run_shim() unconditionally calls ensure_settings_current() (#356:
-        // discovered via the test-isolation-canary), which resolves
-        // ~/.claude via the ambient HOME env var and may write a re-synced
-        // settings.json into it. This test runs run() in-process (not a
-        // subprocess), so without pinning HOME here it would resolve the
-        // real developer/CI-runner HOME, not an isolated one — the exact
-        // #210 incident class. Pin HOME to a throwaway dir for the
-        // duration of this test only.
+        // run_shim() calls ensure_settings_current_at() (#356: discovered
+        // via the test-isolation-canary; #373: now gated on a resolved
+        // base_dir rather than unconditional, but still reached whenever
+        // HOME is valid, as it is here), which resolves ~/.claude via the
+        // ambient HOME env var and may write a re-synced settings.json into
+        // it. This test runs run() in-process (not a subprocess), so
+        // without pinning HOME here it would resolve the real
+        // developer/CI-runner HOME, not an isolated one — the exact #210
+        // incident class. Pin HOME to a throwaway dir for the duration of
+        // this test only.
         let home =
             std::env::temp_dir().join(format!("omamori-shim-argv0-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);

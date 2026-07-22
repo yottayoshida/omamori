@@ -2995,6 +2995,298 @@ fn setup_unknown_flag_errors() {
 }
 
 // ---------------------------------------------------------------------------
+// HOME resolver unification (#373, V-005/V-006)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn setup_non_interactive_with_explicit_base_dir_succeeds_when_home_unset() {
+    // #373 V-005: --base-dir recovers from an unusable HOME (the arg-loop
+    // override, checked after the loop, must win over the eager default).
+    let base = unique_dir("setup-nohome-explicit-basedir");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive", "--base-dir"])
+        .arg(&base)
+        .args(["--source"])
+        .arg(binary())
+        .env_remove("HOME")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup --non-interactive --base-dir");
+
+    // Do not assert overall exit success: with HOME unset, the unrelated
+    // [3/3] doctor verification step (integrity::full_check) legitimately
+    // reports failures (no ~/.claude / ~/.codex to check), which yields
+    // exit=1. What V-005 pins is that base_dir resolution itself does not
+    // error — install must actually run and place shims under --base-dir.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("cannot resolve a base directory"),
+        "explicit --base-dir must bypass the HOME resolution error entirely: {stderr}"
+    );
+    assert!(
+        base.join("shim").join("rm").exists(),
+        "shim must be installed under the explicit --base-dir; stderr: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn setup_non_interactive_without_base_dir_errors_actionably_when_home_unset() {
+    // #373 V-005/V-006: no --base-dir override and an unusable HOME must be
+    // a loud, actionable error (not a silent CWD-relative install).
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--non-interactive", "--source"])
+        .arg(binary())
+        .env_remove("HOME")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run setup --non-interactive");
+
+    assert!(
+        !output.status.success(),
+        "setup without --base-dir must fail when HOME is unset"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HOME is unset, empty, or relative") && stderr.contains("--base-dir"),
+        "error must name the cause and the recovery flag: {stderr}"
+    );
+
+    let cwd_omamori = std::env::current_dir().unwrap().join(".omamori");
+    assert!(
+        !cwd_omamori.exists(),
+        "must not fall back to a CWD-relative ./.omamori install"
+    );
+}
+
+/// #373 V-006: runs `omamori <subcommand-args>` with `--base-dir` omitted and
+/// `HOME` unset, asserting the shared "cannot resolve a base directory"
+/// error fires before any base_dir-dependent work runs. Shared by
+/// install/uninstall/doctor/status — all four resolve `base_dir` via the
+/// identical `default_base_dir().ok_or_else(...)` pattern (see
+/// src/cli/{install,doctor,status}.rs).
+fn assert_base_dir_resolution_errors_when_home_unset(subcommand_args: &[&str]) {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(subcommand_args)
+        .env_remove("HOME")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {subcommand_args:?}: {e}"));
+
+    assert!(
+        !output.status.success(),
+        "{subcommand_args:?} without --base-dir must fail when HOME is unset"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot resolve a base directory")
+            && stderr.contains("HOME is unset, empty, or relative")
+            && stderr.contains("--base-dir"),
+        "{subcommand_args:?} error must name cause + recovery flag: {stderr}"
+    );
+}
+
+#[test]
+fn install_without_base_dir_errors_actionably_when_home_unset() {
+    assert_base_dir_resolution_errors_when_home_unset(&["install"]);
+}
+
+#[test]
+fn uninstall_without_base_dir_errors_actionably_when_home_unset() {
+    assert_base_dir_resolution_errors_when_home_unset(&["uninstall"]);
+}
+
+#[test]
+fn doctor_without_base_dir_errors_actionably_when_home_unset() {
+    assert_base_dir_resolution_errors_when_home_unset(&["doctor"]);
+}
+
+#[test]
+fn status_without_base_dir_errors_actionably_when_home_unset() {
+    assert_base_dir_resolution_errors_when_home_unset(&["status"]);
+}
+
+/// #373 adversarial review (test-adversarial-review agent, gap confirmed via
+/// mutation testing: a deliberate `--base-dir`/`HOME` inversion in doctor.rs
+/// went undetected by the V-006 error-path tests above — they only cover the
+/// no-`--base-dir` direction). Explicit `--base-dir` must recover from an
+/// unusable `HOME` for all 4 Class A commands, not just `setup` (which
+/// already has this covered by
+/// `setup_non_interactive_with_explicit_base_dir_succeeds_when_home_unset`).
+/// Shared by `status`/`doctor` below — both exit non-zero when health checks
+/// fail (expected for a bare base_dir with nothing installed); what matters
+/// here is only that `--base-dir` resolution itself didn't error. (`install`
+/// and `uninstall` need their own tests — extra `--source`/prior-install
+/// steps make them not a byte-for-byte match with this shape.)
+fn assert_explicit_base_dir_recovers_from_unset_home(subcommand: &str) {
+    let base = unique_dir(&format!("{subcommand}-nohome-explicit-basedir"));
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args([subcommand, "--base-dir"])
+        .arg(&base)
+        .env_remove("HOME")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {subcommand} --base-dir: {e}"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("cannot resolve a base directory"),
+        "{subcommand}: explicit --base-dir must bypass the HOME resolution error: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn status_with_explicit_base_dir_succeeds_when_home_unset() {
+    assert_explicit_base_dir_recovers_from_unset_home("status");
+}
+
+#[test]
+fn doctor_with_explicit_base_dir_succeeds_when_home_unset() {
+    assert_explicit_base_dir_recovers_from_unset_home("doctor");
+}
+
+#[test]
+fn install_with_explicit_base_dir_succeeds_when_home_unset() {
+    let base = unique_dir("install-nohome-explicit-basedir");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["install", "--base-dir"])
+        .arg(&base)
+        .args(["--source"])
+        .arg(binary())
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run install --base-dir");
+
+    assert!(
+        output.status.success(),
+        "install --base-dir must succeed despite unset HOME; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        base.join("shim").join("rm").exists(),
+        "shim must be installed under the explicit --base-dir"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn uninstall_with_explicit_base_dir_succeeds_when_home_unset() {
+    let base = unique_dir("uninstall-nohome-explicit-basedir");
+
+    // Install first (needs a resolvable HOME for its own default_base_dir
+    // eager-init path to be harmless either way — pin one for the install
+    // step, then remove it for the uninstall step under test).
+    let home = unique_dir("uninstall-nohome-explicit-basedir-home");
+    install_with_hooks(&base, &home);
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["uninstall", "--base-dir"])
+        .arg(&base)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run uninstall --base-dir");
+
+    assert!(
+        output.status.success(),
+        "uninstall --base-dir must succeed despite unset HOME; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&base);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn config_add_succeeds_when_home_unset_but_xdg_config_home_set() {
+    // #373 V-007 (Class B): `config add`'s mutate_config path (line 241,
+    // src/cli/config_cmd.rs) does a best-effort `default_base_dir()` baseline
+    // update after the config write already succeeded via XDG_CONFIG_HOME
+    // alone. An unusable HOME must silently skip that baseline update, NOT
+    // fail the config mutation that already landed on disk. Also covers the
+    // adversarial-review blind spot that `init`'s equivalent skip (line 135)
+    // had no CWD non-pollution assertion, unlike install/run_shim's.
+    let cwd_omamori = std::env::current_dir().unwrap().join(".omamori");
+    let cwd_omamori_existed_before = cwd_omamori.exists();
+    let dir = unique_dir("config-add-nohome");
+
+    let mut init_cmd = Command::new(binary());
+    clean_ai_env(&mut init_cmd);
+    let init_output = init_cmd
+        .args(["init"])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run omamori init");
+    assert!(
+        init_output.status.success(),
+        "init stderr: {}",
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+    assert_eq!(
+        cwd_omamori.exists(),
+        cwd_omamori_existed_before,
+        "init's best-effort baseline skip must not create a CWD-relative ./.omamori"
+    );
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args([
+            "config",
+            "add",
+            "my-nohome-rule",
+            "--command",
+            "curl",
+            "--action",
+            "block",
+            "--match-any",
+            "--insecure",
+        ])
+        .env("XDG_CONFIG_HOME", &dir)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run config add");
+
+    assert!(
+        output.status.success(),
+        "config add must succeed on XDG_CONFIG_HOME alone despite unusable HOME; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_path = dir.join("omamori").join("config.toml");
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        content.contains("my-nohome-rule"),
+        "add mutation must have landed on disk: {content}"
+    );
+    assert_eq!(
+        cwd_omamori.exists(),
+        cwd_omamori_existed_before,
+        "config add's best-effort baseline skip must not create a CWD-relative ./.omamori"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
 // break-glass TTY tests (#319)
 // ---------------------------------------------------------------------------
 

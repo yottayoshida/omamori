@@ -349,11 +349,42 @@ pub fn uninstall(base_dir: &Path) -> Result<UninstallResult, AppError> {
     })
 }
 
-pub fn default_base_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".omamori")
+/// Resolves `~/.omamori`. Returns `None` when `HOME` is unset, empty, or
+/// relative — delegates to `context::home_dir()` (#373, single source of
+/// truth). Callers MUST treat this as "no usable HOME" and never fall back
+/// to a CWD-relative path: the previous `PathBuf::from(".")` fallback here
+/// meant an unusable `HOME` silently redirected installs/uninstalls/shim
+/// housekeeping into whatever `./.omamori` happened to exist in the current
+/// working directory.
+pub fn default_base_dir() -> Option<PathBuf> {
+    crate::context::home_dir().map(|h| h.join(".omamori"))
+}
+
+/// Shared `AppError::Config` for the 5 Class A call sites (install,
+/// uninstall, status, doctor, setup) that require a resolvable `base_dir`
+/// and have no `--base-dir` override to fall back on. Centralized so the
+/// wording can't drift across sites (#373 review).
+pub(crate) fn base_dir_resolution_error() -> AppError {
+    AppError::Config(
+        "cannot resolve a base directory — HOME is unset, empty, or relative (must be absolute)\n  \
+         pass --base-dir <path>, or set HOME to an absolute path, and retry"
+            .to_string(),
+    )
+}
+
+/// Resolves the Class A `base_dir`: `explicit` (a parsed `--base-dir` flag)
+/// wins if present, otherwise falls back to [`default_base_dir`]; a loud
+/// [`base_dir_resolution_error`] if neither resolves. Shared by all 5 Class
+/// A call sites so the resolution *pattern* — not just its error message —
+/// can't drift across them (#373 `/simplify` altitude review: the error
+/// helper alone left two inconsistent shapes in place — eager-default-then-
+/// override in install/uninstall/status/doctor vs. override-then-fallback in
+/// setup — that produced identical results through accidentally different
+/// code).
+pub(crate) fn resolve_base_dir(explicit: Option<PathBuf>) -> Result<PathBuf, AppError> {
+    explicit
+        .or_else(default_base_dir)
+        .ok_or_else(base_dir_resolution_error)
 }
 
 fn recreate_symlink(source: &Path, link_path: &Path) -> Result<(), AppError> {
@@ -927,21 +958,15 @@ fn render_settings_snippet(script_path: &Path) -> String {
 // Claude Code settings.json merge support (#196)
 // ---------------------------------------------------------------------------
 
-/// Resolves `$HOME`. Returns `None` when unset or empty — callers MUST
-/// treat this as "not detected" and never fall back to a CWD-relative path
-/// (#210: a `.` fallback here previously let test runs merge dead hook
-/// paths into whatever `./.claude`/`./.codex` happened to exist in the
-/// current working directory).
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-}
-
-/// Default Claude Code config directory (`~/.claude`). See `home_dir` for
-/// the `None` contract.
+/// Default Claude Code config directory (`~/.claude`). Delegates to
+/// `context::home_dir()` (#373, single source of truth) — `None` when `HOME`
+/// is unset, empty, or relative. Callers MUST treat this as "not detected"
+/// and never fall back to a CWD-relative path (#210: a `.` fallback here
+/// previously let test runs merge dead hook paths into whatever
+/// `./.claude`/`./.codex` happened to exist in the current working
+/// directory).
 pub(crate) fn claude_home_dir() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".claude"))
+    crate::context::home_dir().map(|h| h.join(".claude"))
 }
 
 /// In-place merge of omamori's PreToolUse hook entry into
@@ -1213,10 +1238,10 @@ fn is_legacy_matcher(matcher: &str) -> bool {
 // Codex CLI hook support (#66)
 // ---------------------------------------------------------------------------
 
-/// Default Codex CLI config directory (`~/.codex`). See `home_dir` for the
-/// `None` contract.
+/// Default Codex CLI config directory (`~/.codex`). See `claude_home_dir` for
+/// the `None` contract (both delegate to `context::home_dir()`, #373).
 fn codex_home_dir() -> Option<PathBuf> {
-    home_dir().map(|h| h.join(".codex"))
+    crate::context::home_dir().map(|h| h.join(".codex"))
 }
 
 /// True only if `path` is a real directory (not a symlink to one).
@@ -3976,6 +4001,18 @@ mod tests {
 
     #[test]
     #[serial_test::serial(home_env)]
+    fn claude_home_dir_is_none_when_home_relative() {
+        // #373: unified onto context::home_dir(), which is stricter than the
+        // old installer::home_dir() — it now also rejects a relative HOME
+        // (previously Some("relative/path/.claude"), a #210-class CWD-write
+        // risk) rather than allowing only unset/empty through.
+        let _guard = HomeGuard::set(Some(std::ffi::OsStr::new("relative/path")));
+
+        assert_eq!(claude_home_dir(), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
     fn codex_home_dir_is_none_when_home_unset() {
         let _guard = HomeGuard::set(None);
 
@@ -3988,6 +4025,48 @@ mod tests {
         let _guard = HomeGuard::set(Some(std::ffi::OsStr::new("")));
 
         assert_eq!(codex_home_dir(), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn codex_home_dir_is_none_when_home_relative() {
+        // #373: same rationale as claude_home_dir_is_none_when_home_relative.
+        let _guard = HomeGuard::set(Some(std::ffi::OsStr::new("relative/path")));
+
+        assert_eq!(codex_home_dir(), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // default_base_dir() Option<PathBuf> contract (#373, V-003)
+    //
+    // Previously returned a bare PathBuf with a `.` (CWD-relative) fallback
+    // when HOME was unusable — the fail-open bug #373 exists to close.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn default_base_dir_none_when_home_unusable() {
+        // #373 `/simplify` review: collapses the former 3 separate
+        // unset/empty/relative tests into the same loop shape context.rs's
+        // sibling tilde-expansion test already uses for this identical
+        // matrix.
+        for home in [None, Some(""), Some("relative/path")] {
+            let _guard = HomeGuard::set(home.map(std::ffi::OsStr::new));
+            assert_eq!(default_base_dir(), None, "HOME={home:?}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn default_base_dir_some_when_home_absolute() {
+        let _guard = HomeGuard::set(Some(std::ffi::OsStr::new(
+            "/tmp/omamori-default-base-dir-test",
+        )));
+
+        assert_eq!(
+            default_base_dir(),
+            Some(PathBuf::from("/tmp/omamori-default-base-dir-test/.omamori"))
+        );
     }
 
     #[test]
@@ -4119,6 +4198,11 @@ mod tests {
             std::env::temp_dir().join(format!("omamori-uninstall-nohome-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
 
+        let cwd_claude = std::env::current_dir().unwrap().join(".claude");
+        let cwd_codex = std::env::current_dir().unwrap().join(".codex");
+        let cwd_claude_existed_before = cwd_claude.exists();
+        let cwd_codex_existed_before = cwd_codex.exists();
+
         let result = {
             let _guard = HomeGuard::set(None);
             uninstall(&root)
@@ -4127,6 +4211,20 @@ mod tests {
         assert!(
             result.is_ok(),
             "uninstall must succeed (not panic) even when HOME is unset: {result:?}"
+        );
+        // #373 adversarial review: uninstall walks the same
+        // claude_home_dir()/codex_home_dir() fail-close contract as install
+        // (via remove_claude_settings_entry/remove_codex_hooks_entry) — must
+        // not touch a CWD-relative ./.claude or ./.codex either.
+        assert_eq!(
+            cwd_claude.exists(),
+            cwd_claude_existed_before,
+            "uninstall with HOME unset must not touch a CWD-relative ./.claude"
+        );
+        assert_eq!(
+            cwd_codex.exists(),
+            cwd_codex_existed_before,
+            "uninstall with HOME unset must not touch a CWD-relative ./.codex"
         );
     }
 

@@ -100,6 +100,11 @@ pub const NEVER_REGENERABLE: &[&str] = &["src", "lib", "app", ".git", ".env", ".
 /// resolution: expand `~`, resolve relative paths against `base`, remove `.` and
 /// `..`. Does NOT access the filesystem (no symlink resolution).
 ///
+/// `~` expansion uses [`home_dir`] (fail-close, #373): if `HOME` is unset,
+/// empty, or relative, `~/foo` is left untouched rather than falling back to
+/// a CWD-relative resolution of `foo` — an unusable `HOME` must not silently
+/// change which path a `protected_paths`/`regenerable_paths` match evaluates.
+///
 /// Internal callers that need to pin a specific base (to avoid races with
 /// concurrent `env::set_current_dir` elsewhere in the process) use this
 /// directly. Public callers that want process CWD semantics use
@@ -107,10 +112,9 @@ pub const NEVER_REGENERABLE: &[&str] = &["src", "lib", "app", ".git", ".env", ".
 pub(crate) fn normalize_path_with_base(path: &str, base: &Path) -> PathBuf {
     // Step 1: ~ expansion
     let path = if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = env::var_os("HOME") {
-            PathBuf::from(home).join(rest)
-        } else {
-            PathBuf::from(path)
+        match home_dir() {
+            Some(home) => home.join(rest),
+            None => PathBuf::from(path),
         }
     } else {
         PathBuf::from(path)
@@ -1301,6 +1305,40 @@ mod tests {
         assert_eq!(
             with_home(Some("/tmp/omamori-home-dir-test"), home_dir),
             Some(PathBuf::from("/tmp/omamori-home-dir-test"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn normalize_path_with_base_leaves_tilde_untouched_when_home_unusable() {
+        // #373: an unusable HOME (unset/empty/relative) must not silently
+        // fall back to a CWD-relative resolution of the tilde-stripped
+        // remainder — that would let `~/protected-dir` resolve to a
+        // completely different path than intended, potentially missing a
+        // protected_paths/regenerable_paths match (evaluate_context_with_base
+        // consumes this via resolve_path_with_base). Instead `~/foo` is left
+        // as a literal (non-existent) path relative to `base`.
+        let base = Path::new("/base");
+        for home in [None, Some(""), Some("relative")] {
+            let result = with_home(home, || normalize_path_with_base("~/protected-dir", base));
+            assert_eq!(
+                result,
+                PathBuf::from("/base/~/protected-dir"),
+                "HOME={home:?} should leave ~/ untouched, not resolve it to a CWD-relative path"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn normalize_path_with_base_expands_tilde_when_home_absolute() {
+        let base = Path::new("/base");
+        let result = with_home(Some("/tmp/omamori-tilde-test"), || {
+            normalize_path_with_base("~/protected-dir", base)
+        });
+        assert_eq!(
+            result,
+            PathBuf::from("/tmp/omamori-tilde-test/protected-dir")
         );
     }
 

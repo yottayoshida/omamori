@@ -20,6 +20,19 @@ use crate::util::USAGE_HINT;
 // config subcommand
 // ---------------------------------------------------------------------------
 
+/// #373 Class B: best-effort integrity-baseline refresh after a config
+/// write that already succeeded (via `write_default_config`/`mutate_config`,
+/// resolved independently through `XDG_CONFIG_HOME`/`HOME`) — silently
+/// skipped when `HOME` is unusable rather than erroring a write that already
+/// landed. Shared by both `init` and `config add`/`disable`/`enable`'s
+/// `mutate_config` so this rationale lives in one place (`/simplify`
+/// altitude review: previously duplicated byte-for-byte at both call sites).
+fn update_baseline_best_effort() {
+    if let Some(base_dir) = default_base_dir() {
+        update_baseline_silent(&base_dir);
+    }
+}
+
 pub(crate) fn run_config_command(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(2).and_then(|item| item.to_str()) {
         Some("list") => run_config_list(),
@@ -128,7 +141,7 @@ pub(crate) fn run_init_command(args: &[OsString]) -> Result<i32, AppError> {
         Ok(result) => {
             eprintln!("Created {}", result.path.display());
             eprintln!("Run `omamori test` to verify your setup.");
-            update_baseline_silent(&default_base_dir());
+            update_baseline_best_effort();
             Ok(0)
         }
         Err(AppError::Config(msg)) if msg.contains("already exists") => {
@@ -230,7 +243,7 @@ where
     // plant a symlink at.
     config::reject_symlink_public(config_path, "config path")?;
     integrity::write_new_file(config_path, &new_content)?;
-    update_baseline_silent(&default_base_dir());
+    update_baseline_best_effort();
     Ok(())
 }
 

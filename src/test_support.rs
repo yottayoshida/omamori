@@ -12,13 +12,13 @@
 /// unwind, so a panicking `f()` inside `with_home`/`with_home_and_xdg`
 /// still leaves the env var correctly restored for whatever test runs
 /// next under the same `serial(home_env)` lock.
-struct EnvVarGuard {
+pub(crate) struct EnvVarGuard {
     key: &'static str,
     saved: Option<std::ffi::OsString>,
 }
 
 impl EnvVarGuard {
-    fn set(key: &'static str, value: Option<&str>) -> Self {
+    pub(crate) fn set(key: &'static str, value: Option<&str>) -> Self {
         let saved = std::env::var_os(key);
         // SAFETY: serialized by #[serial_test::serial(home_env)] on every caller.
         unsafe {
