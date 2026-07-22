@@ -33,6 +33,20 @@ impl ShellKind {
     }
 }
 
+/// Builds the `SourceExe` a `--source` override (or its absence) implies,
+/// resolving `current_exe()` when none is given. Shared by the real install
+/// path and `setup --dry-run`'s preview (#380) so the two can't diverge on
+/// what "no --source" means — each caller applies its own error-handling
+/// policy on top (`?`-propagation for the real path, a fail-close fallback
+/// for the preview-only dry-run path).
+fn resolve_source_exe(source_override: Option<&Path>) -> io::Result<SourceExe> {
+    match source_override {
+        Some(path) => Ok(SourceExe::Explicit(path.to_path_buf())),
+        None => env::current_exe()
+            .map(|exe| SourceExe::Implicit(installer::resolve_stable_exe_path(&exe))),
+    }
+}
+
 pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     // --- Preflight: determine execution mode BEFORE any mutations ---
     let mut dry_run = false;
@@ -92,17 +106,21 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     let profile = shell.and_then(detect_profile_path);
 
     if dry_run {
-        return print_dry_run(&base_dir, shell, profile.as_deref(), custom_base, ai_env);
+        return print_dry_run(
+            &base_dir,
+            shell,
+            profile.as_deref(),
+            custom_base,
+            ai_env,
+            source_override.as_deref(),
+        );
     }
 
     // --- [1/3] Install shims and hooks ---
     println!("\nomamori setup \u{2014} one-command installation\n");
     println!("  [1/3] Installing shims and hooks...");
 
-    let source = match source_override {
-        Some(path) => SourceExe::Explicit(path),
-        None => SourceExe::Implicit(installer::resolve_stable_exe_path(&env::current_exe()?)),
-    };
+    let source = resolve_source_exe(source_override.as_deref())?;
     let result = installer::install(&InstallOptions {
         base_dir: base_dir.clone(),
         source,
@@ -357,15 +375,44 @@ fn print_dry_run(
     profile: Option<&Path>,
     custom_base: bool,
     ai_env: bool,
+    source_override: Option<&Path>,
 ) -> Result<i32, AppError> {
     println!("\nomamori setup --dry-run (preview only, no changes)\n");
+
+    // #380: preview the #354 implicit-dev-build-path rejection. `current_exe()`
+    // resolution failure is swallowed (never `?`-propagated) rather than
+    // changing dry-run's exit code — a resolution failure this preview-only
+    // path can't recover from falls back to `SourceExe`'s fail-close `Default`
+    // (`Implicit(PathBuf::new())`), which never matches a real dev-build path,
+    // so the preview below simply shows the unwarned case.
+    let source_for_preview = resolve_source_exe(source_override).unwrap_or_default();
+    let resolved_for_preview = installer::resolve_source_target(&source_for_preview);
+    let would_reject =
+        installer::would_reject_implicit_dev_build(&source_for_preview, &resolved_for_preview);
 
     println!("  [1/3] Would install shims and hooks");
     println!("    Base dir:  {}", base_dir.display());
     println!("    Shims:     {}", SHIM_COMMANDS.join(", "));
-    println!("    Hooks:     enabled");
+    if would_reject {
+        println!(
+            "    Hooks:     WARNING: resolved binary at {} {}",
+            resolved_for_preview.display(),
+            installer::DEV_BUILD_PATH_DESCRIPTION
+        );
+        println!(
+            "\n  Note: hooks would not be installed without --source \u{2014} steps below are shown for reference and would not be reached"
+        );
+    } else {
+        println!("    Hooks:     enabled");
+    }
 
-    println!("\n  [2/3] Shell profile");
+    // #380 /simplify (Altitude): labeling each section instead of just the
+    // advisory line above keeps the preview from contradicting itself —
+    // without this, a run reporting "steps below would not be reached"
+    // immediately followed by a detailed [2/3]/[3/3] preview read as if those
+    // steps still happen.
+    let not_reached_suffix = if would_reject { " (not reached)" } else { "" };
+    println!("\n  [2/3] Shell profile{not_reached_suffix}");
     if ai_env {
         println!("    Would skip: AI environment detected");
     } else if custom_base {
@@ -385,7 +432,7 @@ fn print_dry_run(
         println!("    Would skip: shell profile not found");
     }
 
-    println!("\n  [3/3] Would run doctor verification");
+    println!("\n  [3/3] Would run doctor verification{not_reached_suffix}");
     println!("\nNo changes made.");
     Ok(0)
 }
