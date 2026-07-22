@@ -2587,6 +2587,97 @@ fn setup_dry_run_no_mutations() {
     let _ = fs::remove_dir_all(&base);
 }
 
+// #380: `setup --dry-run` previews the #354 implicit-dev-build-path rejection
+// instead of silently reporting "would install hooks" for a run that would
+// actually be rejected.
+
+#[test]
+fn setup_dry_run_from_dev_build_warns_and_advises_without_source() {
+    // The test binary itself (`CARGO_BIN_EXE_omamori`) is always a
+    // `target/debug`/`target/release` path under `cargo test` — exactly the
+    // implicit-dev-build shape #354 rejects. No `--source` is passed, so
+    // `install()` would reject this at real-run time; the dry-run preview
+    // must say so.
+    let base = unique_dir("setup-dry-devbuild");
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--dry-run", "--base-dir"])
+        .arg(&base)
+        .env("SHELL", "/bin/zsh")
+        .output()
+        .expect("failed to run setup --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "dry-run must keep exit 0 even when it would preview a rejection; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("WARNING")
+            && stdout.contains("cargo build artifact")
+            && stdout.contains("--source"),
+        "expected a dev-build warning naming --source as the recovery path, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("steps below are shown for reference and would not be reached"),
+        "expected the reachability advisory line, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("[2/3] Shell profile (not reached)")
+            && stdout.contains("[3/3] Would run doctor verification (not reached)"),
+        "expected each unreached section to be labeled, avoiding a preview that \
+         says 'would not be reached' and then details those steps anyway, stdout: {stdout}"
+    );
+
+    let shim_dir = base.join("shim");
+    assert!(!shim_dir.exists(), "dry-run should not create shim dir");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn setup_dry_run_with_explicit_source_suppresses_dev_build_warning() {
+    // Deliberately a dev-build-*shaped* path (contains target/release), not a
+    // stable-looking one — proving `--source` bypasses the gate rather than
+    // merely observing that a stable path never triggers it in the first
+    // place (Codex proxy Phase 6-B mutation testing: a stable-path fixture
+    // here would pass even with the Explicit early-return deleted).
+    let base = unique_dir("setup-dry-explicit-source");
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["setup", "--dry-run", "--base-dir"])
+        .arg(&base)
+        .args(["--source", "/some/project/target/release/omamori"])
+        .env("SHELL", "/bin/zsh")
+        .output()
+        .expect("failed to run setup --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("WARNING"),
+        "explicit --source must bypass the dev-build gate with no warning, stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("steps below are shown for reference and would not be reached"),
+        "explicit --source must not show the reachability advisory, stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(not reached)"),
+        "explicit --source must not label any section as unreached, stdout: {stdout}"
+    );
+    assert!(stdout.contains("Hooks:     enabled"), "stdout: {stdout}");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 #[test]
 fn setup_non_interactive_installs_and_appends() {
     let home = unique_dir("setup-ni-home");

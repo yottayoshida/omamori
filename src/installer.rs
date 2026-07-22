@@ -151,10 +151,7 @@ pub struct UninstallResult {
 }
 
 pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
-    // Resolve shim paths but do NOT canonicalize — Homebrew stable symlinks
-    // like /opt/homebrew/bin/omamori must stay as-is (#42).
-    let requested = options.source.path();
-    let source_exe = shim_to_real_exe(requested).unwrap_or_else(|| requested.to_path_buf());
+    let source_exe = resolve_source_target(&options.source);
 
     // Layer 1 (PATH shims) has no dependency on hook verification — link it
     // unconditionally so a hook-contract failure below can't also block
@@ -191,7 +188,7 @@ pub fn install(options: &InstallOptions) -> Result<InstallResult, AppError> {
         // rejected here, before even probing the hook-check contract — a
         // fresh `cargo build` binary can be fully contract-compliant today
         // and still be the wrong thing to pin (see `is_dev_build_path`).
-        if !options.source.is_explicit() && is_dev_build_path(&source_exe) {
+        if would_reject_implicit_dev_build(&options.source, &source_exe) {
             return Err(AppError::Config(format!(
                 "could not update hooks — resolved binary at {} {DEV_BUILD_PATH_DESCRIPTION}\n\
                  Layer 1 (PATH shims) was still updated; existing hooks (if any) are kept and protection remains active with the previously installed binary\n\
@@ -483,6 +480,35 @@ fn is_dev_build_path(path: &Path) -> bool {
 /// can't drift out of sync across the four sites.
 pub(crate) const DEV_BUILD_PATH_DESCRIPTION: &str =
     "looks like a cargo build artifact (target/debug or target/release), not a stable install";
+
+/// Resolves `source`'s requested path through a possible shim symlink to the
+/// real underlying binary — do NOT canonicalize — Homebrew stable symlinks
+/// like `/opt/homebrew/bin/omamori` must stay as-is (#42). This is the same
+/// resolution `install()` performs before linking/writing anything; shared
+/// with `setup --dry-run`'s preview (#380) so both compute `source_exe`
+/// identically rather than each calling `shim_to_real_exe` on their own.
+pub(crate) fn resolve_source_target(source: &SourceExe) -> PathBuf {
+    let requested = source.path();
+    shim_to_real_exe(requested).unwrap_or_else(|| requested.to_path_buf())
+}
+
+/// Returns `true` if `source` would be rejected by `install()`'s #354
+/// implicit-dev-build-path gate — `false` if it would be allowed (either
+/// because `source` is `Explicit`, which bypasses the gate entirely, or
+/// because `resolved` isn't a dev-build artifact).
+///
+/// `resolved` is the caller's already-computed shim-resolved exe path (never
+/// re-resolved here) — every caller (`install()` below, `setup --dry-run`'s
+/// preview at #380) already has this value on hand, so re-deriving it inside
+/// this predicate would just be a second `shim_to_real_exe` call on the same
+/// input.
+///
+/// Single source of truth for `install()`'s actual enforcement and
+/// `setup --dry-run`'s preview — resolving the same predicate in two places
+/// would let them drift out of sync, silently under- or over-warning.
+pub(crate) fn would_reject_implicit_dev_build(source: &SourceExe, resolved: &Path) -> bool {
+    !source.is_explicit() && is_dev_build_path(resolved)
+}
 
 /// Regenerate hooks only (no shim recreation, no config touch).
 /// Called from shim when version mismatch detected.

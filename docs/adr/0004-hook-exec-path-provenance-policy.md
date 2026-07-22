@@ -146,12 +146,22 @@ hook/shim reference; neither implies the other.
   non-Cargo path shaped like `target/<anything>/release/...` now also matches, which only means a
   legitimate stable install gets asked to pass `--source` explicitly — a safety-guard false
   positive, not a bypass.
-- `omamori setup --dry-run` does not preview this check: the dry-run branch returns before
-  `source_exe` resolution happens, so a dry run from a dev checkout (no `--source`) reports "would
-  install hooks" even though the real run would be rejected. Known, accepted gap — fixing it would
-  require resolving `source_exe` earlier in `run_setup_command` purely to annotate the preview
-  output, adding real-path-resolution side effects to what is otherwise a pure preview path. Left
-  as a follow-up if the discrepancy proves confusing in practice.
+- **#380 closed this gap**: `omamori setup --dry-run` now resolves the same rejection predicate
+  (`would_reject_implicit_dev_build`, shared with `install()`'s actual enforcement via a common
+  `resolve_source_target` resolution step too — a single source of truth for both the path and the
+  verdict, so the two can't drift out of sync) purely to annotate the preview output. A dry run
+  from a dev checkout with no `--source` now shows a `WARNING` on the `[1/3]` Hooks line, a one-line
+  advisory that the steps below won't be reached, and each of `[2/3]`/`[3/3]`'s own headings labeled
+  `(not reached)` — the label was added during `/simplify` review, which flagged that an advisory
+  line followed by an unqualified detailed preview of "unreachable" steps read as self-contradictory.
+  `--source` explicit still bypasses the gate with no warning, matching `install()`'s own bypass.
+  `current_exe()` resolution failure is swallowed (never `?`-propagated) — not because propagating
+  it would have side effects (it wouldn't; this is still a pure preview path either way), but because
+  dry-run's exit-0 contract is a deliberate product decision independent of this resolution: the
+  preview falls back to the unwarned output if resolution can't complete. This intentionally does
+  not implement full `[2/3]`/`[3/3]` reachability *branching* (issue #380's stated scope is
+  annotating the preview, not rewriting it) — the `(not reached)` labels are a labeling addition on
+  top of the existing unconditional preview logic, not a reachability engine.
 - `auto_setup_codex_if_needed` (the shim's Codex-specific auto-configure step, called alongside
   `ensure_hooks_current` from the same silent self-heal entry point) is also gated by the same
   `is_dev_build_path` check, for the same reason: it resolves `current_exe()` implicitly and would
