@@ -77,7 +77,7 @@ A public pull request that adds a Defense Boundary Matrix row or a `tests/hook_i
 
 <!-- boundary-matrix:start -->
 
-What is caught, what is not, and why. Status values: **supported** (tested, expected to work) · **partial** (covered in some but not all tool paths) · **not covered** (no protection at this layer, but another layer may cover it) · **not applicable** (this layer's mechanism does not apply to this surface) · **out of scope** (deliberate design decision) · **structural limit** (cannot be addressed by static analysis).
+What is caught, what is not, and why. Status values: **supported** (tested on Tier 1 — see [CONTRACT.md → Supported tier](docs/CONTRACT.md#supported-tier) — expected to work on Tier 2, since the underlying detection mechanism is tool-agnostic) · **partial** (covered in some but not all tool paths) · **not covered** (no protection at this layer, but another layer may cover it) · **not applicable** (this layer's mechanism does not apply to this surface) · **out of scope** (deliberate design decision) · **structural limit** (cannot be addressed by static analysis).
 
 A machine-readable projection of this matrix (surface list + per-layer status, one object per row) is published at [`docs/defense-boundary.json`](docs/defense-boundary.json) (schema: [`docs/defense-boundary.schema.json`](docs/defense-boundary.schema.json)), kept row-for-row in sync by the `invariants-check` CI job. This is step 4 of the [Known-bypass-becomes-row rule](#known-bypass-becomes-row-rule).
 
@@ -97,7 +97,7 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 | PATH override bypass (`PATH=/usr/bin:$PATH rm`) | not covered | supported (v0.10.1) | Hook integration, acceptance test T-3' |
 | Env-var tampering (`unset CLAUDECODE`, `export -n`) | not covered | supported | Hook integration env-tampering corpus |
 | Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (Phase 2 builtin rules) | Acceptance tests |
-| Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code, Codex CLI) | Hook integration file-protection tests |
+| Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code Tier 1; Codex CLI Tier 2) | Hook integration file-protection tests |
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
 | Self-modification commands in command context (`omamori config disable/enable/add`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`, `break-glass`, `audit key rotate`) | supported (env guard) | supported (Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
 

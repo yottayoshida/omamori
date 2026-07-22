@@ -37,9 +37,10 @@ When the release closes a bypass or changes defense behavior, additionally:
 v1.0 ships when:
 
 - [ ] No open P0 / P1 known bypass in supported surfaces
-- [ ] Live-path acceptance for Claude Code and Codex CLI (all acceptance test rows PASS)
+- [ ] Live-path acceptance for Claude Code (Tier 1) — all acceptance test rows PASS
+  - Tier 2 tools (Codex CLI, Cursor) are expected-to-work, not gated on live-path acceptance — see [CONTRACT.md → Supported tier](docs/CONTRACT.md#supported-tier). A regression specific to a Tier 2 tool is not a 1.0 blocker.
 - [ ] `omamori doctor` covers all supported install targets
-- [ ] Defense Boundary Matrix published and live-verified for all supported cells
+- [ ] Defense Boundary Matrix published and live-verified for all Tier 1 supported cells
 - [ ] Fallback / unsupported paths documented in SECURITY.md
 - [ ] `omamori report` covers all supported providers
 - [ ] README bounded claims match actual verified state
