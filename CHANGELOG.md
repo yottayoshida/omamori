@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-07-22
+
+**Summary**: Batch E cleanup (3 internal-refactor closures), unifies the last two divergent HOME resolvers onto one fail-close source (#373, breaking), removes `rotate_key`'s CWD-fallback bandaid (#371, breaking), and reconciles Codex CLI Tier claims across SECURITY.md/RELEASE.md/README with `docs/CONTRACT.md`'s Tier 1/2 model (#423).
+
 ### Changed
 
 - **`break_glass_cmd.rs`**: `create_activation_event`/`create_deactivation_event` now build their `AuditEvent` through the shared `build_break_glass_event` helper instead of hand-writing all 15 fields, closing the duplication `create_expired_observed_event` and `create_denied_activation_event` already avoided. Two new characterization tests (`activation_event_preserves_human_provenance_and_shape`, `deactivation_event_preserves_human_provenance_and_shape`) pin the exact field values per call site — the only regression net against an accidental `provider`/`action` argument swap, since neither function previously had unit or CLI-level test coverage and the HMAC audit chain cannot detect a semantically-wrong-but-well-formed field. ([#375](https://github.com/yottayoshida/omamori/issues/375))
