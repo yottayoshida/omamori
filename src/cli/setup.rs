@@ -88,7 +88,7 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
     }
 
     let custom_base = base_dir.is_some();
-    let base_dir = base_dir.unwrap_or_else(installer::default_base_dir);
+    let base_dir = installer::resolve_base_dir(base_dir)?;
     let ai_env = is_ai_environment();
 
     if ai_env {

@@ -27,7 +27,7 @@ use super::checks_display::{DoctorSection, group_by_section};
 // ---------------------------------------------------------------------------
 
 pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
-    let mut base_dir = installer::default_base_dir();
+    let mut base_dir: Option<PathBuf> = None;
     let mut fix = false;
     let mut verbose = false;
     let mut json = false;
@@ -51,7 +51,7 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
                 let value = args.get(index + 1).ok_or_else(|| {
                     AppError::Usage("doctor requires a path after --base-dir".to_string())
                 })?;
-                base_dir = PathBuf::from(value);
+                base_dir = Some(PathBuf::from(value));
                 index += 2;
             }
             _ => {
@@ -61,6 +61,8 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
             }
         }
     }
+
+    let base_dir = installer::resolve_base_dir(base_dir)?;
 
     // DI-7: --fix is blocked in AI environments
     if fix {

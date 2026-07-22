@@ -8,11 +8,11 @@ use super::policy_test::run_policy_tests;
 use crate::AppError;
 use crate::config::{self, load_config};
 use crate::engine::guard::guard_ai_config_modification;
-use crate::installer::{self, InstallOptions, SourceExe, default_base_dir, install, uninstall};
+use crate::installer::{self, InstallOptions, SourceExe, install, uninstall};
 use crate::util::USAGE_HINT;
 
 pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
-    let mut base_dir = default_base_dir();
+    let mut base_dir: Option<PathBuf> = None;
     let mut source = SourceExe::Implicit(installer::resolve_stable_exe_path(&env::current_exe()?));
     let mut generate_hooks = false;
     let mut index = 2usize;
@@ -23,7 +23,7 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
                 let value = args.get(index + 1).ok_or_else(|| {
                     AppError::Usage("install requires a path after --base-dir".to_string())
                 })?;
-                base_dir = PathBuf::from(value);
+                base_dir = Some(PathBuf::from(value));
                 index += 2;
             }
             "--source" => {
@@ -45,6 +45,8 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
             }
         }
     }
+
+    let base_dir = installer::resolve_base_dir(base_dir)?;
 
     let result = install(&InstallOptions {
         base_dir,
@@ -203,7 +205,7 @@ fn aggregate_layer2_status(result: &installer::InstallResult) -> Layer2Status {
 
 pub(crate) fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> {
     guard_ai_config_modification("uninstall")?;
-    let mut base_dir = default_base_dir();
+    let mut base_dir: Option<PathBuf> = None;
     let mut index = 2usize;
 
     while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
@@ -212,7 +214,7 @@ pub(crate) fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> 
                 let value = args.get(index + 1).ok_or_else(|| {
                     AppError::Usage("uninstall requires a path after --base-dir".to_string())
                 })?;
-                base_dir = PathBuf::from(value);
+                base_dir = Some(PathBuf::from(value));
                 index += 2;
             }
             _ => {
@@ -223,6 +225,8 @@ pub(crate) fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> 
             }
         }
     }
+
+    let base_dir = installer::resolve_base_dir(base_dir)?;
 
     let result = uninstall(&base_dir)?;
     println!(

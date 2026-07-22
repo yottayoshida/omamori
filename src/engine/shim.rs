@@ -25,39 +25,49 @@ use crate::util::{clone_lossy, resolve_real_command, should_block_for_sudo};
 // ---------------------------------------------------------------------------
 
 pub(crate) fn run_shim(program: &str, args: &[OsString]) -> Result<i32, AppError> {
-    let base_dir = installer::default_base_dir();
-
-    // Step 1: Lightweight integrity canary (stat + readlink, ~0.05ms)
-    if let Some(warning) = integrity::canary(&base_dir, program) {
-        eprintln!("omamori[health]: {warning}");
-    }
-
-    // Step 1a: Heartbeat — record shim activity (at most once per UTC day)
+    // Step 1a: Heartbeat — record shim activity (at most once per UTC day).
+    // Resolves via context::data_dir() independently of default_base_dir()
+    // (#373), so it always runs regardless of whether HOME yields a usable
+    // base_dir below.
     touch_heartbeat();
 
-    // Step 1b: v0.4 → v0.5 migration — create baseline if missing
-    if !integrity::baseline_path(&base_dir).exists() && base_dir.join("shim").exists() {
-        update_baseline_silent(&base_dir);
-        eprintln!(
-            "omamori[health]: integrity baseline created. Run `omamori status` for full check."
-        );
+    // Steps 1/1b/2/2b/2c/3 are best-effort self-heal/housekeeping — skipped
+    // entirely when HOME is unset, empty, or relative (#373: no CWD-relative
+    // `./.omamori` fallback). Step 4 (the actual protection pipeline) is
+    // NEVER gated on base_dir — see below.
+    if let Some(base_dir) = installer::default_base_dir() {
+        // Step 1: Lightweight integrity canary (stat + readlink, ~0.05ms)
+        if let Some(warning) = integrity::canary(&base_dir, program) {
+            eprintln!("omamori[health]: {warning}");
+        }
+
+        // Step 1b: v0.4 → v0.5 migration — create baseline if missing
+        if !integrity::baseline_path(&base_dir).exists() && base_dir.join("shim").exists() {
+            update_baseline_silent(&base_dir);
+            eprintln!(
+                "omamori[health]: integrity baseline created. Run `omamori status` for full check."
+            );
+        }
+
+        // Step 2: Hook version + content hash check, regenerate if needed
+        let hooks_regenerated = ensure_hooks_current_at(&base_dir);
+
+        // Step 2b: Auto-setup Codex hooks if CODEX_CI detected but not configured
+        let codex_setup = installer::auto_setup_codex_if_needed(&base_dir);
+
+        // Step 2c: Re-merge ~/.claude/settings.json if version stale or matcher legacy (#196)
+        let settings_synced = ensure_settings_current_at(&base_dir);
+
+        // Step 3: If anything was regenerated, update baseline
+        if hooks_regenerated || codex_setup || settings_synced {
+            update_baseline_silent(&base_dir);
+        }
     }
 
-    // Step 2: Hook version + content hash check, regenerate if needed
-    let hooks_regenerated = ensure_hooks_current();
-
-    // Step 2b: Auto-setup Codex hooks if CODEX_CI detected but not configured
-    let codex_setup = installer::auto_setup_codex_if_needed(&base_dir);
-
-    // Step 2c: Re-merge ~/.claude/settings.json if version stale or matcher legacy (#196)
-    let settings_synced = ensure_settings_current();
-
-    // Step 3: If anything was regenerated, update baseline
-    if hooks_regenerated || codex_setup || settings_synced {
-        update_baseline_silent(&base_dir);
-    }
-
-    // Step 4: Run the actual command
+    // Step 4: Run the actual command. Protection judgment resolves its own
+    // config independently (default_config_path(), already fail-closed via
+    // context::home_dir()) — it does not depend on base_dir at all, so an
+    // unusable HOME degrades only self-heal above, never enforcement here.
     run_command(program.to_string(), args, None)
 }
 
@@ -121,12 +131,10 @@ fn write_heartbeat_file(path: &Path, now: &OffsetDateTime) -> Option<()> {
 // Hook integrity checking
 // ---------------------------------------------------------------------------
 
-/// Check if hooks are current; if not, regenerate them.
-fn ensure_hooks_current() -> bool {
-    ensure_hooks_current_at(&installer::default_base_dir())
-}
-
-/// Testable version that accepts a base directory.
+/// Testable version that accepts a base directory. `run_shim` calls this
+/// directly with its already-resolved `base_dir` (#373) — there is no
+/// zero-argument wrapper, since `default_base_dir()` now returns
+/// `Option<PathBuf>` and `run_shim` is the only production caller.
 ///
 /// Two-level check:
 /// 1. Version mismatch → regenerate
@@ -277,12 +285,9 @@ fn ensure_hooks_current_at_with_verifier_and_exe(
 // Claude Code settings.json auto-sync (#196, UX R3)
 // ---------------------------------------------------------------------------
 
-/// Check if `~/.claude/settings.json` is current; if not, re-merge omamori entry.
-fn ensure_settings_current() -> bool {
-    ensure_settings_current_at(&installer::default_base_dir())
-}
-
-/// Testable version that accepts a base directory.
+/// Testable version that accepts a base directory. `run_shim` calls this
+/// directly with its already-resolved `base_dir` (#373) — there is no
+/// zero-argument wrapper, for the same reason as `ensure_hooks_current_at`.
 ///
 /// Two re-sync triggers:
 /// 1. omamori entry's `x-omamori-version` field != current omamori version
@@ -395,13 +400,13 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
 /// (`~/.local/share/omamori`) — the warning this throttles fires precisely
 /// when the audit data dir is unwritable, so co-locating the sentinel there
 /// would make the sentinel itself unwritable in the same failure and the
-/// warning would repeat on every shimmed command. Resolves independently of
-/// `installer::default_base_dir()` (which still has a `.` CWD fallback,
-/// out of scope for this PR) so an unusable `HOME` skips the FS sentinel
-/// entirely rather than writing to the CWD.
+/// warning would repeat on every shimmed command. Delegates to
+/// `installer::default_base_dir()`, which is now fail-closed (#373, #372) —
+/// bit-identical to the previous direct `context::home_dir()` resolution
+/// (`Some(home/.omamori/...)` when HOME is absolute, `None` otherwise), so
+/// this is a single-source-of-truth cleanup, not a behavior change.
 fn audit_warn_sentinel_path() -> Option<PathBuf> {
-    let home = context::home_dir()?;
-    Some(home.join(".omamori").join("audit-warn-throttle"))
+    Some(installer::default_base_dir()?.join("audit-warn-throttle"))
 }
 
 fn should_emit_audit_warning() -> bool {
@@ -777,6 +782,77 @@ mod tests {
     /// actually exercising (version/hash-mismatch regen, throttling, etc.).
     fn fake_stable_exe() -> PathBuf {
         PathBuf::from("/opt/homebrew/bin/omamori")
+    }
+
+    // --- run_shim: protection continues when HOME is unusable (#373 T1, V-001/V-002) ---
+
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_shim_still_blocks_dangerous_command_when_home_unset() {
+        // #373 T1 (release-blocker per plan): an unusable HOME must degrade
+        // self-heal/housekeeping (Steps 1-3) only, never the protection
+        // pipeline itself (Step 4, run_command). With HOME unset, both
+        // default_base_dir() and default_config_path() are None —
+        // load_config(None) falls through to Config::default(), which still
+        // carries the built-in git-push-force-block core rule
+        // (ActionKind::Block — the executor never spawns a real `git`
+        // process for a Blocked outcome, unlike Trash-kind rules, so this is
+        // safe to actually run through run_shim()). `git push --force` must
+        // still be Blocked end-to-end, proving Step 4 was reached rather
+        // than skipped alongside Steps 1-3's housekeeping.
+        //
+        // CLAUDECODE is pinned deterministically (not left to the ambient
+        // shell) because run_command()'s rule evaluation only runs on the
+        // `detection.protected` path (#373 adversarial review, both Codex
+        // proxy and test-adversarial-review independently): with no detector
+        // env var set, run_command takes the "Non-protected fast path" and
+        // execs the REAL `git` binary instead of evaluating Block rules —
+        // exactly what CI's test-isolation-canary.sh environment looks like
+        // (no AI-detector vars set), which would have made this test spawn a
+        // live `git push --force` subprocess instead of pinning the
+        // fail-close invariant it claims to. Both env vars go through the
+        // panic-safe `EnvVarGuard` (restores on unwind too), not a manual
+        // save/match/restore — a `/simplify` reuse pass flagged the manual
+        // form as duplicating this same file's existing `with_home`-backed
+        // pattern without its panic safety.
+        let _home_guard = crate::test_support::EnvVarGuard::set("HOME", None);
+        let _claudecode_guard = crate::test_support::EnvVarGuard::set("CLAUDECODE", Some("1"));
+
+        let result = run_shim("git", &[OsString::from("push"), OsString::from("--force")]);
+        let result_debug = format!("{result:?}");
+
+        assert_eq!(
+            result.ok(),
+            Some(1),
+            "git push --force must still be Blocked (exit 1) when HOME is unset, proving \
+             run_command() was reached rather than skipped alongside housekeeping: {result_debug}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env, ai_env)]
+    fn run_shim_skips_housekeeping_without_cwd_writes_when_home_unset() {
+        // #373 T2: the flip side of the test above — Steps 1-3 (housekeeping)
+        // must be skipped cleanly (no CWD-relative `./.omamori` writes) when
+        // HOME is unusable, rather than the old fail-open `.` fallback.
+        // CLAUDECODE is pinned for the same determinism reason as the sibling
+        // test above (routes run_shim through the protected evaluation path
+        // instead of leaving it to whatever the ambient shell happens to have).
+        let cwd_omamori = std::env::current_dir().unwrap().join(".omamori");
+        let cwd_omamori_existed_before = cwd_omamori.exists();
+
+        let _home_guard = crate::test_support::EnvVarGuard::set("HOME", None);
+        let _claudecode_guard = crate::test_support::EnvVarGuard::set("CLAUDECODE", Some("1"));
+
+        // A harmless, non-matching command — no rule fires, so any CWD write
+        // observed afterward can only have come from Steps 1-3 housekeeping.
+        let _ = run_shim("git", &[OsString::from("status")]);
+
+        assert_eq!(
+            cwd_omamori.exists(),
+            cwd_omamori_existed_before,
+            "run_shim must not create ./.omamori in the CWD when HOME is unset"
+        );
     }
 
     // --- G-02: ensure_hooks_current_at ---

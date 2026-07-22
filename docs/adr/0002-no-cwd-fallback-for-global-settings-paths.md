@@ -161,3 +161,25 @@ ways learned from getting it actually working:
   CLI's `merge_codex_hooks` orphans entries from prior install roots on multi-root duplication
   (existing behavior, no regression), and `remove_codex_hooks_entry` lacks the symlink guard
   `remove_claude_settings_entry` has. Both are candidates for follow-up issues.
+
+### Follow-up (#373): `default_base_dir()`'s `.` fallback closed
+
+The Consequences section above states `default_base_dir()` "retain[s] its own `.` fallback for
+`HOME` unset" as deliberately out of scope — true when written (2026-07-05), no longer true.
+#373 closed that fallback: `default_base_dir()` now returns `Option<PathBuf>` (`None` on
+unset/empty/relative `HOME`, via the same fail-close `context::home_dir()` this ADR's step 1
+established for `claude_home_dir()`/`codex_home_dir()`), instead of falling back to CWD-relative
+`./.omamori`. The original out-of-scope reasoning — "resolves omamori's own install root,
+doesn't merge into a file another tool owns, so the cross-tool-corruption failure mode this ADR
+closes doesn't apply" — was correct as far as it went, but missed a second, narrower failure
+mode this ADR didn't originally name: an unusable `HOME` making *any* omamori CLI command
+(`install`/`uninstall`/`status`/`doctor`/`setup`) silently write into whatever directory
+happened to be the current working directory, rather than erroring. #373 treats that as its own
+`.`-fallback bug (the same #210 class, one layer down) and closes it the same way: `None`
+propagates to a loud, actionable `AppError::Config` instead of a silent CWD write.
+Separately, `hook.rs`'s staging-dir resolution — named alongside `default_base_dir()` in the
+Consequences section above as retaining a `.` fallback — is untouched by #373 but, checked
+against the current code, is *also* no longer accurate: `staging_dir()` already resolves via
+`context::data_dir()` (fail-close, `None` on unusable `HOME`) rather than a CWD fallback,
+per its own doc comment. That drift predates #373 and is out of this PR's scope to chase down;
+noted here rather than left for a reader to trip over.

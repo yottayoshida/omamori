@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use crate::AppError;
 use crate::audit;
 use crate::config::load_config;
-use crate::installer::default_base_dir;
+use crate::installer::resolve_base_dir;
 use crate::integrity;
 use crate::util::USAGE_HINT;
 
 pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
-    let mut base_dir = default_base_dir();
+    let mut base_dir: Option<PathBuf> = None;
     let mut refresh = false;
     let mut index = 2usize;
 
@@ -21,7 +21,7 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
                 let value = args.get(index + 1).ok_or_else(|| {
                     AppError::Usage("status requires a path after --base-dir".to_string())
                 })?;
-                base_dir = PathBuf::from(value);
+                base_dir = Some(PathBuf::from(value));
                 index += 2;
             }
             "--refresh" => {
@@ -36,6 +36,8 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
             }
         }
     }
+
+    let base_dir = resolve_base_dir(base_dir)?;
 
     println!("\nomamori v{} — health check\n", env!("CARGO_PKG_VERSION"));
 
