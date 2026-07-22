@@ -1,13 +1,16 @@
 //! Audit HMAC secret management, symlink-safe file I/O, and key rotation.
 //!
-//! SECURITY: Functions in this module handle cryptographic key material.
-//! All functions are `pub(super)` — they must NEVER be `pub(crate)` or `pub`.
+//! SECURITY: Functions that touch raw key material (`[u8; 32]` secret bytes)
+//! are `pub(super)` — they must NEVER be `pub(crate)` or `pub`. `rotate_key`
+//! is the sole, intentional exception: it crosses the module boundary into
+//! `cli::audit_cmd` as the sanctioned rotation entry point, but never
+//! returns key bytes — only `RotationResult { new_key_id: String,
+//! retired_path: PathBuf }` — so it doesn't violate the invariant above.
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::AuditConfig;
 use super::verify::AuditError;
 
 // ---------------------------------------------------------------------------
@@ -251,20 +254,6 @@ fn eloop_message(e: std::io::Error, path: &Path) -> std::io::Error {
 }
 
 // ---------------------------------------------------------------------------
-// Default paths
-// ---------------------------------------------------------------------------
-
-pub(super) fn default_audit_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local")
-        .join("share")
-        .join("omamori")
-        .join("audit.jsonl")
-}
-
-// ---------------------------------------------------------------------------
 // Key rotation
 // ---------------------------------------------------------------------------
 
@@ -276,13 +265,18 @@ pub struct RotationResult {
 
 /// Rotate the audit HMAC key.
 ///
+/// `path` is the resolved audit log path (`audit.jsonl`), e.g. from
+/// `super::resolved_audit_path` — this function never resolves a path
+/// itself (#371: the old `config: &AuditConfig`-taking signature fell back
+/// to a CWD-relative default when `HOME` was unusable; callers now must
+/// resolve fail-closed before calling).
+///
 /// 1. Rename current secret to audit-secret.N.retired
 /// 2. Generate a new secret at audit-secret
 /// 3. New entries will use the new key_id
 /// 4. verify_chain uses keyring to verify old entries with old key
-pub fn rotate_key(config: &AuditConfig) -> Result<RotationResult, AuditError> {
-    let path = config.path.clone().unwrap_or_else(default_audit_path);
-    let secret_path = secret_path_for(&path);
+pub fn rotate_key(path: &Path) -> Result<RotationResult, AuditError> {
+    let secret_path = secret_path_for(path);
 
     // Verify current secret exists
     read_secret(&secret_path).map_err(|_| AuditError::SecretUnavailable)?;

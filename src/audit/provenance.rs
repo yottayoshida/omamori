@@ -496,9 +496,10 @@ mod tests {
     #[test]
     fn hash_cwd_candidates_covers_active_and_retired_keys_after_rotation() {
         let dir = hash_cwd_test_dir("rotation");
+        let audit_path = dir.join("audit.jsonl");
         let config = AuditConfig {
             enabled: true,
-            path: Some(dir.join("audit.jsonl")),
+            path: Some(audit_path.clone()),
             retention_days: 0,
             strict: false,
         };
@@ -510,7 +511,8 @@ mod tests {
             .expect("from_config must create a secret in a fresh dir");
         let original_key_id = logger_before.key_id.clone();
 
-        let rotation = rotate_key(&config).expect("rotation succeeds against an existing secret");
+        let rotation =
+            rotate_key(&audit_path).expect("rotation succeeds against an existing secret");
         assert_ne!(
             rotation.new_key_id, original_key_id,
             "rotation must mint a new active key id distinct from the pre-rotation one"

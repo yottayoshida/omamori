@@ -795,6 +795,243 @@ fn audit_key_rotate_blocked_in_ai_session() {
     );
 }
 
+/// #371 (V-002): `run_audit_key`'s rotate arm must actually call
+/// `resolved_audit_path` and branch on `None` — not just have the right
+/// predicate logic somewhere in the codebase. `XDG_CONFIG_HOME` is pinned to
+/// an isolated empty dir (not just removed) so an ambient value on the
+/// runner/dev machine can't make `config.path` (loaded from a stray
+/// config.toml) resolve to `Some` for the wrong reason — the exact hazard
+/// `install_with_hooks`'s doc comment already documents for this file.
+/// `XDG_DATA_HOME` is pinned alongside it defensively (`resolved_audit_path`
+/// itself never reads it — only `HOME`, via `context::data_dir()` — but
+/// pinning both keeps this test's isolation posture uniform with
+/// `install_with_hooks`'s, per Phase 8 QA review). The sandboxed CWD is
+/// checked for zero `audit-secret*` files afterward — the #210-class CWD
+/// pollution this refactor closes. Shared by the two tests below (`HOME`
+/// unset vs. `HOME=""`, `/simplify` review: Reuse and Simplification
+/// independently flagged the pre-extraction copy-paste, following this
+/// file's own `install_with_hooks` precedent for de-duplicating a
+/// repeated assertion block).
+fn assert_rotate_rejects_unresolvable_home(home: Option<&str>) {
+    let sandbox = unique_dir("audit-rotate-nohome-cwd");
+    let xdg = unique_dir("audit-rotate-nohome-xdg");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(["audit", "key", "rotate"])
+        .current_dir(&sandbox)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("XDG_DATA_HOME", &xdg);
+    match home {
+        Some(v) => {
+            cmd.env("HOME", v);
+        }
+        None => {
+            cmd.env_remove("HOME");
+        }
+    }
+    let output = cmd.output().expect("failed to run audit key rotate");
+
+    assert!(
+        !output.status.success(),
+        "rotate must fail when HOME is unresolvable ({home:?}) and no audit.path override exists"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot resolve audit path")
+            && stderr.contains("HOME is unset, empty, or relative")
+            && stderr.contains("set audit.path explicitly"),
+        "error must name the cause and the recovery options: {stderr}"
+    );
+
+    let entries: Vec<_> = fs::read_dir(&sandbox)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("audit-secret"))
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "no audit-secret* file may be created in the CWD sandbox: {entries:?}"
+    );
+
+    let _ = fs::remove_dir_all(&sandbox);
+    let _ = fs::remove_dir_all(&xdg);
+}
+
+#[test]
+fn audit_key_rotate_errors_actionably_and_leaves_cwd_clean_when_home_unset() {
+    assert_rotate_rejects_unresolvable_home(None);
+}
+
+/// `HOME=""` is a distinct failure shape from unset `HOME` — `context::home_dir()`'s
+/// own unit tests flag this as historically hazardous (a bare `?`/`map` chain
+/// would treat `Some("")` as usable). Pins the sibling case at the
+/// CLI-integration layer instead of only at `context::home_dir()`'s unit-test
+/// layer.
+#[test]
+fn audit_key_rotate_errors_actionably_when_home_is_empty_string() {
+    assert_rotate_rejects_unresolvable_home(Some(""));
+}
+
+/// #371 Phase 6-B (test-adversarial-review blind spot, highest priority):
+/// no test anywhere ran `omamori audit key rotate`'s success path through
+/// the compiled binary before this — `provenance.rs`'s unit test calls
+/// `rotate_key` directly, bypassing the CLI layer, `guard_ai_config_modification`,
+/// and `resolved_audit_path` entirely. Seeds a real `audit-secret` file under
+/// an isolated `HOME`, then verifies the CLI actually rotates it end-to-end:
+/// exit 0, the new-key-id/retired-key confirmation message, and a
+/// `audit-secret.1.retired` file landing next to the fresh `audit-secret`.
+#[test]
+fn audit_key_rotate_succeeds_end_to_end_with_absolute_home() {
+    let home = unique_dir("audit-rotate-happy-home");
+    let secret_dir = home.join(".local").join("share").join("omamori");
+    fs::create_dir_all(&secret_dir).unwrap();
+    let secret_path = secret_dir.join("audit-secret");
+    fs::write(&secret_path, "0".repeat(64)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["audit", "key", "rotate"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("failed to run audit key rotate");
+
+    assert!(
+        output.status.success(),
+        "rotate must succeed with an absolute HOME and an existing secret; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("key rotation complete") && stderr.contains("New key ID:"),
+        "stderr must confirm rotation: {stderr}"
+    );
+    assert!(
+        secret_dir.join("audit-secret.1.retired").exists(),
+        "the pre-rotation secret must be renamed to the retired slot"
+    );
+    assert!(
+        secret_path.exists(),
+        "a fresh secret must be generated at the active path"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #371 Phase 8 QA finding (V-007): `rotate_key`'s missing-secret path
+/// (`read_secret` fails before any `fs::rename`/`create_secret` mutation,
+/// so `SecretUnavailable` propagates with zero filesystem side effects) was
+/// previously verified only by code inspection, never through the compiled
+/// binary. HOME resolves successfully here (unlike the sibling
+/// HOME-unusable tests above) — the failure is specifically "no secret
+/// exists yet", not "path unresolvable".
+#[test]
+fn audit_key_rotate_reports_missing_secret_without_partial_files() {
+    let home = unique_dir("audit-rotate-nosecret-home");
+    let secret_dir = home.join(".local").join("share").join("omamori");
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["audit", "key", "rotate"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("failed to run audit key rotate");
+
+    assert!(
+        !output.status.success(),
+        "rotate must fail when no secret exists yet"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no audit secret found"),
+        "error must name the cause: {stderr}"
+    );
+
+    let leftover: Vec<_> = fs::read_dir(&secret_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "no partial audit-secret* file may be left behind: {leftover:?}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #371 Phase 6-B blind spot: the HOME-unset error message tells the user
+/// to "set audit.path explicitly in config.toml" as the recovery — but
+/// nothing proved that recovery path actually works end-to-end through the
+/// CLI. Seeds a config.toml with an explicit absolute `audit.path` (and a
+/// matching secret), unsets HOME entirely, and confirms rotation succeeds.
+#[test]
+fn audit_key_rotate_succeeds_via_explicit_audit_path_when_home_unset() {
+    let workdir = unique_dir("audit-rotate-explicit-path");
+    let config_home = workdir.join("config-home");
+    let audit_dir = workdir.join("audit-data");
+    fs::create_dir_all(config_home.join("omamori")).unwrap();
+    fs::create_dir_all(&audit_dir).unwrap();
+
+    let audit_path = audit_dir.join("audit.jsonl");
+    let secret_path = audit_dir.join("audit-secret");
+    fs::write(&secret_path, "1".repeat(64)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let config_path = config_home.join("omamori").join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[audit]\nenabled = true\npath = \"{}\"\n",
+            audit_path.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["audit", "key", "rotate"])
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env_remove("HOME")
+        .output()
+        .expect("failed to run audit key rotate");
+
+    assert!(
+        output.status.success(),
+        "explicit audit.path must recover rotation even when HOME is unset; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        audit_dir.join("audit-secret.1.retired").exists(),
+        "rotation must have used the explicit audit.path directory"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
 // `omamori audit show --relaxed` parser reachability (PR1d, DI-16 closure).
 // Pins the gap between symbol-existence (DI-16 grep) and end-to-end CLI wiring.
 #[test]

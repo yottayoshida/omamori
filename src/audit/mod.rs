@@ -95,12 +95,15 @@ fn default_true() -> bool {
 /// the default under `$HOME/.local/share/omamori/audit.jsonl`. `None`
 /// when neither is available — no override configured and `HOME` is
 /// unusable (unset/empty/relative) — callers must treat audit logging as
-/// unavailable rather than falling through to `secret::default_audit_path`.
+/// unavailable rather than falling back to a CWD-relative path.
 ///
-/// Deliberately bypasses `default_audit_path`'s CWD fallback: since
-/// `AuditConfig.path` defaults to `None`, that fallback fires on every
-/// default install where `HOME` happens to be unusable, scattering the
-/// audit log (and its HMAC secret) into the process's working directory.
+/// Historical note (#306/#371): `secret.rs` used to have its own
+/// `default_audit_path()` with a CWD fallback (`AuditConfig.path` defaults
+/// to `None`, so that fallback fired on every default install where `HOME`
+/// happened to be unusable, scattering the audit log and its HMAC secret
+/// into the process's working directory). #371 deleted it and routed
+/// `rotate_key` through this fail-close resolver instead — this is now the
+/// sole path-resolution function in the audit subsystem.
 pub(crate) fn resolved_audit_path(config: &AuditConfig) -> Option<PathBuf> {
     config
         .path
@@ -2894,7 +2897,8 @@ mod tests {
     // resolved_audit_path() reroute (#306): explicit config.path always
     // wins; the default fires only through `context::data_dir()`, which
     // fails closed on an unusable HOME rather than falling back to CWD
-    // (secret::default_audit_path's behavior, which this reroute bypasses).
+    // (the pre-#371 `secret::default_audit_path()` CWD fallback this
+    // reroute bypasses — that function has since been deleted entirely).
     // -----------------------------------------------------------------
 
     use crate::test_support::with_home;
@@ -2904,10 +2908,11 @@ mod tests {
     fn resolved_audit_path_matches_data_dir_when_home_absolute() {
         // Happy-path pin: with an absolute HOME, the default resolves to
         // exactly `$HOME/.local/share/omamori/audit.jsonl` — the same
-        // location `secret::default_audit_path()` used before this reroute
-        // existed. Guards against `resolved_audit_path` accidentally being
-        // wired to `context::home_dir()` directly (which would move
-        // audit.jsonl for every user with a normal, working HOME).
+        // location the pre-#371 `secret::default_audit_path()` used before
+        // this reroute existed (and before that function was deleted).
+        // Guards against `resolved_audit_path` accidentally being wired to
+        // `context::home_dir()` directly (which would move audit.jsonl for
+        // every user with a normal, working HOME).
         let config = AuditConfig {
             enabled: true,
             path: None,
