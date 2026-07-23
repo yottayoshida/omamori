@@ -753,6 +753,33 @@ CONTRACT_PAIRS_EOF
             contract_fail=1
         fi
     fi
+
+    # (O7 version header sync) Contract version in CONTRACT.md's header table
+    # must equal the CONTRACT_VERSION constant the CLI emits via
+    # `omamori --version` (#422).
+    contract_doc_ver=$( (grep -E '^\| Contract version \| ' "$contract" || true) \
+        | sed -E 's/^\| Contract version \| *([^ |]+).*/\1/' | head -n1)
+    # Identifier + assignment + quoted value only -- deliberately not
+    # anchored to `pub(crate)`/`const`/`&str`/line-start (unlike an earlier
+    # draft) so a rustfmt-driven reformat of the declaration (added
+    # lifetime, wrapped line, reordered modifiers) doesn't break this check
+    # for reasons unrelated to the actual invariant it guards (doc/code
+    # value agreement). Matches this file's existing O1-style presence
+    # checks against src/lib.rs (see the `Some("$top")` greps above), which
+    # are similarly loose. Fails loud (below) rather than silently passing
+    # if the constant is ever renamed or removed.
+    contract_code_ver=$( (grep -oE 'CONTRACT_VERSION[^=]*=[[:space:]]*"v[0-9]+"' src/lib.rs || true) \
+        | sed -E 's/.*"(v[0-9]+)".*/\1/' | head -n1)
+    if [ -z "$contract_doc_ver" ]; then
+        echo "FAIL [invariant contract-doc-sync/#422]: CONTRACT.md header table has no 'Contract version' row"
+        contract_fail=1
+    elif [ -z "$contract_code_ver" ]; then
+        echo "FAIL [invariant contract-doc-sync/#422]: CONTRACT_VERSION constant definition not found in src/lib.rs"
+        contract_fail=1
+    elif [ "$contract_doc_ver" != "$contract_code_ver" ]; then
+        echo "FAIL [invariant contract-doc-sync/#422]: CONTRACT.md header says Contract version '$contract_doc_ver' but src/lib.rs CONTRACT_VERSION is '$contract_code_ver'"
+        contract_fail=1
+    fi
 fi
 if [ "$contract_fail" -eq 0 ]; then
     # Scope note (mirrors faq-doc-sync's 1c above): this only pins structural
@@ -767,7 +794,7 @@ if [ "$contract_fail" -eq 0 ]; then
     # SECURITY.md was considered and rejected during shape enumeration to
     # avoid growing this invariant's scope further). Those still need a
     # human to re-check on future CONTRACT.md changes.
-    echo "contract-doc-sync OK: docs/CONTRACT.md SECURITY.md anchors, CONTRACT.md's own anchors, omamori subcommand references, README link, forbidden-word scan, and G-ID uniqueness/completeness all pass (#401)"
+    echo "contract-doc-sync OK: docs/CONTRACT.md SECURITY.md anchors, CONTRACT.md's own anchors, omamori subcommand references, README link, forbidden-word scan, G-ID uniqueness/completeness, and CONTRACT_VERSION sync all pass (#401, #422)"
 else
     fail=1
 fi
