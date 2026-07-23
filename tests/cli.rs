@@ -1540,15 +1540,11 @@ fn any_single_ai_env_var_blocks() {
 /// invariant (scripts/check-invariants.sh) is what pins the actual value
 /// against docs/CONTRACT.md.
 fn assert_version_output(output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
     assert!(
         output.stderr.is_empty(),
-        "expected no stderr, got: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "expected no stderr, got: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected_prefix = format!("omamori {} (Contract v", env!("CARGO_PKG_VERSION"));
@@ -1559,7 +1555,7 @@ fn assert_version_output(output: &std::process::Output) {
         .strip_suffix(")\n")
         .unwrap_or_else(|| panic!("expected output to end with ')\\n', got: {stdout}"));
     assert!(
-        !contract_digits.is_empty() && contract_digits.chars().all(|c| c.is_ascii_digit()),
+        contract_digits.parse::<u32>().is_ok(),
         "expected contract version to be numeric digits after 'v', got: {contract_digits:?} in {stdout}"
     );
 }

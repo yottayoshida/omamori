@@ -759,7 +759,16 @@ CONTRACT_PAIRS_EOF
     # `omamori --version` (#422).
     contract_doc_ver=$( (grep -E '^\| Contract version \| ' "$contract" || true) \
         | sed -E 's/^\| Contract version \| *([^ |]+).*/\1/' | head -n1)
-    contract_code_ver=$( (grep -oE '^[[:space:]]*pub\(crate\)[[:space:]]+const[[:space:]]+CONTRACT_VERSION[[:space:]]*:[[:space:]]*&str[[:space:]]*=[[:space:]]*"v[0-9]+"' src/lib.rs || true) \
+    # Identifier + assignment + quoted value only -- deliberately not
+    # anchored to `pub(crate)`/`const`/`&str`/line-start (unlike an earlier
+    # draft) so a rustfmt-driven reformat of the declaration (added
+    # lifetime, wrapped line, reordered modifiers) doesn't break this check
+    # for reasons unrelated to the actual invariant it guards (doc/code
+    # value agreement). Matches this file's existing O1-style presence
+    # checks against src/lib.rs (see the `Some("$top")` greps above), which
+    # are similarly loose. Fails loud (below) rather than silently passing
+    # if the constant is ever renamed or removed.
+    contract_code_ver=$( (grep -oE 'CONTRACT_VERSION[^=]*=[[:space:]]*"v[0-9]+"' src/lib.rs || true) \
         | sed -E 's/.*"(v[0-9]+)".*/\1/' | head -n1)
     if [ -z "$contract_doc_ver" ]; then
         echo "FAIL [invariant contract-doc-sync/#422]: CONTRACT.md header table has no 'Contract version' row"
