@@ -1089,6 +1089,14 @@ fn shim_ignores_relative_audit_path_and_does_not_scatter_into_cwd() {
         .args(["-rf", target.to_str().unwrap()])
         .current_dir(&sandbox)
         .env("HOME", &fake_home)
+        // CI failure (post-merge Phase 9 discovery): an ambient `XDG_CONFIG_HOME`
+        // on the runner (this file's own `install_with_hooks` doc comment already
+        // documents this exact hazard) makes `default_config_path()` resolve
+        // outside `fake_home` entirely, silently missing the config.toml this
+        // test plants — the relative-path warning never fires because the
+        // config never loads. Pin it explicitly, matching every other
+        // config-planting test in this file.
+        .env("XDG_CONFIG_HOME", fake_home.join(".config"))
         // `resolve_real_command`'s PATH search runs unconditionally (both the
         // fast path and the protected path), so an inherited PATH containing
         // a *real*, already-installed omamori shim directory (as on a
