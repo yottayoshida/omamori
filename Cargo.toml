@@ -37,6 +37,8 @@ include = [
     "LICENSE-MIT",
     "LICENSE-APACHE",
     "config.default.toml",
+    "docs/CONTRACT.md",
+    "docs/FAQ.md",
 ]
 
 [dependencies]
