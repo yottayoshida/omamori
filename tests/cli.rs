@@ -68,6 +68,26 @@ fn install_with_hooks(base_dir: &std::path::Path, home: &std::path::Path) {
     );
 }
 
+/// Writes a `config.toml` with a relative `[audit] path` under `config_dir`
+/// (created if missing) and chmods it 0600. Shared by #439's relative-
+/// audit-path tests (`/simplify` finding: this 7-line block was copy-pasted
+/// across 4 tests; mirrors this file's own `install_with_hooks` precedent
+/// for de-duplicating a repeated setup block).
+fn write_relative_audit_path_config(config_dir: &std::path::Path) {
+    fs::create_dir_all(config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(
+        &config_path,
+        "[audit]\nenabled = true\npath = \"audit.jsonl\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 #[test]
 fn omamori_test_command_succeeds_with_defaults() {
     let output = Command::new(binary())
@@ -1030,6 +1050,207 @@ fn audit_key_rotate_succeeds_via_explicit_audit_path_when_home_unset() {
     );
 
     let _ = fs::remove_dir_all(&workdir);
+}
+
+/// #439 (V-002b): a relative `[audit] path` in config.toml must not resolve
+/// against the process CWD — the exact CWD-scatter hazard #371 closed for
+/// the unset-path case, reintroduced through an explicit-but-unvalidated
+/// override. Runs a real guarded command through the shim (symlink named
+/// "rm" → omamori binary → `run_shim` → `run_command`, same wiring as
+/// `shim_invocation_runs_canary_and_rule_evaluation` above) from a sandboxed
+/// CWD distinct from `HOME`, with a relative `audit.path` configured, and
+/// asserts the sandbox CWD ends up with zero `audit.jsonl`/`audit-secret*`
+/// files — `AuditConfig::validate()` must have normalized the relative
+/// override away before any audit I/O happened.
+#[cfg(unix)]
+#[test]
+fn shim_ignores_relative_audit_path_and_does_not_scatter_into_cwd() {
+    use std::os::unix::fs::symlink;
+
+    let workdir = unique_dir("shim-relpath-audit");
+    let fake_home = workdir.join("fakehome");
+    let shim_dir = fake_home.join(".omamori").join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+
+    write_relative_audit_path_config(&fake_home.join(".config").join("omamori"));
+
+    // A sandbox CWD distinct from `fake_home` — this is where a relative
+    // `audit.path` would scatter the log/secret if the hazard were still open.
+    let sandbox = workdir.join("cwd-sandbox");
+    fs::create_dir_all(&sandbox).unwrap();
+    let target = sandbox.join("victim");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("file.txt"), "data").unwrap();
+
+    let shim_rm = shim_dir.join("rm");
+    symlink(binary(), &shim_rm).unwrap();
+
+    let output = Command::new(&shim_rm)
+        .args(["-rf", target.to_str().unwrap()])
+        .current_dir(&sandbox)
+        .env("HOME", &fake_home)
+        // CI failure (post-merge Phase 9 discovery): an ambient `XDG_CONFIG_HOME`
+        // on the runner (this file's own `install_with_hooks` doc comment already
+        // documents this exact hazard) makes `default_config_path()` resolve
+        // outside `fake_home` entirely, silently missing the config.toml this
+        // test plants — the relative-path warning never fires because the
+        // config never loads. Pin it explicitly, matching every other
+        // config-planting test in this file.
+        .env("XDG_CONFIG_HOME", fake_home.join(".config"))
+        // `resolve_real_command`'s PATH search runs unconditionally (both the
+        // fast path and the protected path), so an inherited PATH containing
+        // a *real*, already-installed omamori shim directory (as on a
+        // developer machine that dogfoods omamori for daily use) would
+        // resolve "rm" to that production shim instead of the real `/bin/rm`
+        // — a false "command failed" from unrelated recursion into a
+        // different omamori install, not from anything this PR touches.
+        // Pinned to the two directories the real `rm` can plausibly live in
+        // on the CI matrix (macOS, Ubuntu) so this test is deterministic
+        // regardless of what else is on the host's PATH.
+        .env("PATH", "/bin:/usr/bin")
+        .env_remove("CLAUDECODE")
+        .env_remove("CODEX_CI")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("GEMINI_CLI")
+        .env_remove("CLINE_ACTIVE")
+        .env_remove("AI_GUARD")
+        .output()
+        .expect("failed to run shim");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit.path") && stderr.contains("is not an absolute path"),
+        "relative audit.path warning must reach stderr via the shim's run_command hot path, got: {stderr}"
+    );
+
+    // Phase 6-B (test-adversarial-review): the warning alone only proves
+    // `load_config`/`emit_config_warnings` ran, not that the guarded command
+    // actually executed and reached the audit-append code path. No AI
+    // detector env var is set, so this takes the non-protected fast path
+    // (PassedThrough) and execs the real `/bin/rm` rather than evaluating
+    // the Trash rule — still enough to prove the run continued past config
+    // loading. Assert the command succeeded and the target is actually
+    // gone, and that the HOME-derived default audit log was actually
+    // written to (proving the audit append happened via the HOME fallback
+    // rather than silently no-op'ing).
+    assert!(
+        output.status.success(),
+        "shim rm must succeed, stderr: {stderr}"
+    );
+    assert!(
+        !target.exists(),
+        "victim dir must be gone after the guarded command ran, not left in place"
+    );
+    let home_audit_log = fake_home
+        .join(".local")
+        .join("share")
+        .join("omamori")
+        .join("audit.jsonl");
+    assert!(
+        home_audit_log.exists(),
+        "audit append must have used the HOME-derived default, not silently no-op'd: expected {}",
+        home_audit_log.display()
+    );
+
+    let scattered: Vec<_> = fs::read_dir(&sandbox)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("audit.jsonl") || name.starts_with("audit-secret"))
+        .collect();
+    assert!(
+        scattered.is_empty(),
+        "no audit.jsonl/audit-secret* file may be scattered into the CWD sandbox: {scattered:?}"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// #439 (V-json): the relative-`audit.path` warning must reach stderr for
+/// `audit show --json`, the exact JSON-output CLI surface issue #439 names,
+/// without leaking into stdout (which callers may pipe into a JSON parser).
+#[test]
+fn audit_show_json_relative_path_warning_stays_on_stderr() {
+    let workdir = unique_dir("audit-show-json-relpath");
+    let config_home = workdir.join("config-home");
+    write_relative_audit_path_config(&config_home.join("omamori"));
+    let home = workdir.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["audit", "show", "--json"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .output()
+        .expect("failed to run audit show --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Phase 6-B: pin exit status too — without it, a command that failed
+    // outright (empty stdout, warning still on stderr for an unrelated
+    // reason) could pass the assertions below vacuously.
+    assert!(
+        output.status.success(),
+        "audit show --json should exit 0 on an empty log, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("audit.path") && stderr.contains("is not an absolute path"),
+        "relative audit.path warning must reach stderr for `audit show --json`, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("omamori warning:"),
+        "warning must not leak into stdout, got: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+}
+
+/// #439 (Phase 6-B blind spot): the `emit_config_warnings` wiring touches 5
+/// separate call sites in `audit_cmd.rs` (`verify`/`show`/`unknown`/`key
+/// rotate`/`hash-cwd`); the test above only exercised `show --json`.
+/// Reverting the wiring on any single one of the other 4 would not have been
+/// caught. Table-driven so all 5 are pinned in one place. `clean_ai_env` is
+/// called unconditionally for every case — it only strips AI-detector env
+/// vars, which `verify`/`show`/`unknown`/`hash-cwd` never read, so it's a
+/// no-op for them and required only for `key rotate`'s AI-session guard
+/// (`/simplify` finding: a per-case opt-in boolean added indirection for no
+/// behavioral difference).
+#[test]
+fn audit_subcommands_all_warn_on_relative_audit_path() {
+    let cases: [&[&str]; 5] = [
+        &["audit", "verify"],
+        &["audit", "show"],
+        &["audit", "unknown"],
+        &["audit", "key", "rotate"],
+        &["audit", "hash-cwd", "/tmp/some/candidate"],
+    ];
+
+    for args in cases {
+        let workdir = unique_dir("audit-allcmds-relpath");
+        let config_home = workdir.join("config-home");
+        write_relative_audit_path_config(&config_home.join("omamori"));
+        let home = workdir.join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let mut cmd = Command::new(binary());
+        clean_ai_env(&mut cmd);
+        let output = cmd
+            .args(args)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run {args:?}: {e}"));
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("audit.path") && stderr.contains("is not an absolute path"),
+            "{args:?} must warn about the relative audit.path override, got stderr: {stderr}"
+        );
+
+        let _ = fs::remove_dir_all(&workdir);
+    }
 }
 
 // `omamori audit show --relaxed` parser reachability (PR1d, DI-16 closure).
