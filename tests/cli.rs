@@ -4177,8 +4177,11 @@ fn doctor_fix_shows_shim_activity_footer_when_healthy() {
     // real directory (its signal for "Claude Code is installed") — without
     // this, `check_claude_settings_integration` stays WARN and `problems`
     // is never empty, so the "nothing to repair" fast path this test targets
-    // would be unreachable.
+    // would be unreachable. Same reasoning applies to `~/.codex` (#381):
+    // `install --hooks` only writes `codex-pretooluse.sh` when `~/.codex`
+    // exists, and `check_codex_hook_hash` now WARNs permanently otherwise.
     fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
     install_with_hooks(&base_dir, &home);
 
     // `check_path_order` reads the live `PATH` env var — the shim dir is
@@ -4232,7 +4235,12 @@ fn doctor_fix_shows_shim_activity_footer_after_an_actual_repair() {
     // test` IS a `target/debug` path).
     let base_dir = unique_dir("doctor-fix-repair-base");
     let home = unique_dir("doctor-fix-repair-home");
+    // Both `~/.claude` and `~/.codex` (#381) must exist so `install --hooks`
+    // writes both wrappers — otherwise `check_codex_hook_hash` WARNs
+    // permanently and this test's exit-0 assertion below fails regardless
+    // of whether the targeted chmod repair itself succeeded.
     fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
     install_with_hooks(&base_dir, &home);
 
     let config_dir = home.join(".config").join("omamori");
