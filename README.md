@@ -178,7 +178,7 @@ Protection status: OK
 
   [Layer 1] PATH shims 6/6
     last active: today
-  [Layer 2] Hook defense 4/4
+  [Layer 2] Hook defense 5/5
   [Integrity] Config & baseline 3/3
   [Risk signals] Last 30 days: quiet
 
