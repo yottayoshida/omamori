@@ -1532,22 +1532,45 @@ fn any_single_ai_env_var_blocks() {
 // --version subcommand
 // ---------------------------------------------------------------------------
 
+/// Asserts the exact `omamori --version`-family output contract: crate
+/// version + `(Contract vN)` + a single trailing newline, entirely on
+/// stdout with stderr empty (#422). Checks structure (`Contract v` followed
+/// by digits), not a hardcoded contract version literal, so a future
+/// contract bump doesn't require touching this test -- the `contract-doc-sync`
+/// invariant (scripts/check-invariants.sh) is what pins the actual value
+/// against docs/CONTRACT.md.
+fn assert_version_output(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "expected no stderr, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected_prefix = format!("omamori {} (Contract v", env!("CARGO_PKG_VERSION"));
+    let rest = stdout.strip_prefix(&expected_prefix).unwrap_or_else(|| {
+        panic!("expected output to start with '{expected_prefix}', got: {stdout}")
+    });
+    let contract_digits = rest
+        .strip_suffix(")\n")
+        .unwrap_or_else(|| panic!("expected output to end with ')\\n', got: {stdout}"));
+    assert!(
+        !contract_digits.is_empty() && contract_digits.chars().all(|c| c.is_ascii_digit()),
+        "expected contract version to be numeric digits after 'v', got: {contract_digits:?} in {stdout}"
+    );
+}
+
 #[test]
 fn version_flag_prints_version() {
     let output = Command::new(binary())
         .arg("--version")
         .output()
         .expect("failed to run omamori --version");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.starts_with("omamori "),
-        "expected 'omamori <version>', got: {stdout}"
-    );
-    assert!(
-        stdout.contains(env!("CARGO_PKG_VERSION")),
-        "version mismatch: {stdout}"
-    );
+    assert_version_output(&output);
 }
 
 #[test]
@@ -1556,9 +1579,7 @@ fn version_short_flag_works() {
         .arg("-V")
         .output()
         .expect("failed to run omamori -V");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("omamori "));
+    assert_version_output(&output);
 }
 
 #[test]
@@ -1567,9 +1588,7 @@ fn version_subcommand_works() {
         .arg("version")
         .output()
         .expect("failed to run omamori version");
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with("omamori "));
+    assert_version_output(&output);
 }
 
 // ---------------------------------------------------------------------------

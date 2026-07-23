@@ -72,6 +72,12 @@ impl From<std::io::Error> for AppError {
     }
 }
 
+/// Current product-contract version, mirrored in docs/CONTRACT.md's header
+/// table (`| Contract version | vN |`). The contract-doc-sync invariant in
+/// scripts/check-invariants.sh pins these two in lockstep so `omamori
+/// --version` can surface it as an anti-drift observable (#422).
+pub(crate) const CONTRACT_VERSION: &str = "v1";
+
 pub fn run(args: &[OsString]) -> Result<i32, AppError> {
     let argv0 = args
         .first()
@@ -106,7 +112,11 @@ pub fn run(args: &[OsString]) -> Result<i32, AppError> {
         Some("cursor-hook") => run_cursor_hook(),
         Some("hook-check") => run_hook_check(args),
         Some("version") | Some("--version") | Some("-V") => {
-            println!("omamori {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "omamori {} (Contract {})",
+                env!("CARGO_PKG_VERSION"),
+                CONTRACT_VERSION
+            );
             Ok(0)
         }
         Some("help") | Some("--help") | Some("-h") | None => {
