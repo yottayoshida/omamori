@@ -1596,12 +1596,16 @@ mod tests {
 
     #[test]
     fn hook_version_drift_suffix_flags_unknown_when_comment_missing() {
-        let suffix = hook_version_drift_suffix(installer::parse_hook_version("#!/bin/sh\nexit 0\n"));
+        let suffix =
+            hook_version_drift_suffix(installer::parse_hook_version("#!/bin/sh\nexit 0\n"));
         assert!(suffix.contains("unknown"), "suffix: {suffix}");
         // Neutralized wording (#382 Phase 5 Codex review P2): shared with the
         // JSON (Cursor) path now, so "hook script" language was replaced with
         // format-agnostic "version metadata".
-        assert!(suffix.contains("no version metadata found"), "suffix: {suffix}");
+        assert!(
+            suffix.contains("no version metadata found"),
+            "suffix: {suffix}"
+        );
     }
 
     #[test]
@@ -1609,7 +1613,8 @@ mod tests {
         // /code-review finding: a script with a version comment that was
         // specifically flagged as suspicious (SEC-1) must not read
         // identically to a legacy script with no comment at all.
-        let missing = hook_version_drift_suffix(installer::parse_hook_version("#!/bin/sh\nexit 0\n"));
+        let missing =
+            hook_version_drift_suffix(installer::parse_hook_version("#!/bin/sh\nexit 0\n"));
         let rejected = hook_version_drift_suffix(installer::parse_hook_version(
             "#!/bin/sh\n# omamori hook v0.0.1\x1b[31m\rCLOAKED\nexit 0\n",
         ));
@@ -1832,7 +1837,8 @@ mod tests {
 
     #[test]
     fn check_codex_hook_hash_ok_when_hash_matches_no_drift_noise() {
-        let dir = std::env::temp_dir().join(format!("omamori-codexdrift-t1-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-codexdrift-t1-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let exe = installer::resolved_current_omamori_exe().unwrap();
@@ -1859,7 +1865,8 @@ mod tests {
         // *writes* the wrapper when `~/.codex` is a real directory, so a
         // fresh install without it leaves this Warn permanently — mirroring
         // check_claude_hook_hash's CheckItem-presence behavior exactly.
-        let dir = std::env::temp_dir().join(format!("omamori-codexdrift-t6-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-codexdrift-t6-{}", std::process::id()));
         let shim_dir = dir.join("shim");
         fs::create_dir_all(&shim_dir).unwrap();
 
@@ -1904,7 +1911,8 @@ mod tests {
     #[test]
     fn parse_cursor_snippet_version_extracts_current() {
         // V-008
-        let content = installer::render_cursor_hooks_snippet(Path::new("/opt/homebrew/bin/omamori"));
+        let content =
+            installer::render_cursor_hooks_snippet(Path::new("/opt/homebrew/bin/omamori"));
         assert_eq!(
             parse_cursor_snippet_version(&content).as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
@@ -2014,7 +2022,8 @@ mod tests {
         // P1: that path doesn't exist on every runner, so `dangling` could
         // silently flip to `true` and this test would exercise the wrong
         // branch — see `cursor_snippet_with_version`'s doc comment).
-        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t1-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cursordrift-t1-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let existing_exe = std::env::current_exe().unwrap();
@@ -2050,7 +2059,8 @@ mod tests {
         // is stale — must surface a drift suffix too, not just the
         // exe-resolution-failure branch above. An earlier draft only covered
         // that branch, silently missing this far more common case.
-        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t2-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cursordrift-t2-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         // Dangling status is irrelevant here — `(Some(false), _)` fires
@@ -2086,7 +2096,8 @@ mod tests {
         // dangling — the only way to reach `(Some(true), true)` without
         // `resolved_current_omamori_exe` (which never resolves to a path
         // that doesn't exist).
-        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t3-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cursordrift-t3-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let content = installer::render_cursor_hooks_snippet(Path::new("/nonexistent/bin/omamori"));
@@ -2117,7 +2128,8 @@ mod tests {
         // be conflated with the (None, false) branch above, which DOES want
         // the suffix — this is the one dangling-priority combination that
         // wasn't previously pinned by its own test.
-        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t4-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("omamori-cursordrift-t4-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let content = installer::render_cursor_hooks_snippet(Path::new("/nonexistent/bin/omamori"));
