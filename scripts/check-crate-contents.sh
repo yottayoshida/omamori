@@ -35,6 +35,8 @@ ALLOWED_EXACT=(
     "LICENSE-MIT"
     "LICENSE-APACHE"
     "config.default.toml"
+    "docs/CONTRACT.md"
+    "docs/FAQ.md"
 )
 
 # Path patterns (bash regex) for whole subtrees that are OK.
