@@ -268,17 +268,17 @@ fn hook_script_exe_path(content: &str) -> Option<PathBuf> {
     (!exe.is_empty()).then(|| PathBuf::from(exe))
 }
 
-/// Result of comparing a hook script's embedded `# omamori hook v{X}`
-/// version comment against the running binary's version (#327). An enum
-/// rather than `Option<String>` so "versions agree" and "no comparable
-/// version found" can't be collapsed into the same `None` and silently
-/// treated as "ok" — the plan invariant is that missing/unparseable version
-/// comments never read as a false green. `Missing` and `Rejected` are kept
-/// distinct (rather than one `Unknown`) so the displayed message can say
-/// which happened: a script with no comment at all reads differently from
-/// one whose comment was specifically flagged as suspicious (/code-review
-/// finding — the SEC-1 adversarial case deserves its own message, not the
-/// same text as a pre-#327 legacy script).
+/// Result of comparing an already-extracted "installed" version string
+/// (shell hook comment or Cursor snippet `_comment`, #327/#381/#382) against
+/// the running binary's version. An enum rather than `Option<String>` so
+/// "versions agree" and "no comparable version found" can't be collapsed
+/// into the same `None` and silently treated as "ok" — the plan invariant is
+/// that missing/unparseable version comments never read as a false green.
+/// `Missing` and `Rejected` are kept distinct (rather than one `Unknown`) so
+/// the displayed message can say which happened: no comment at all reads
+/// differently from one whose comment was specifically flagged as suspicious
+/// (/code-review finding — the SEC-1 adversarial case deserves its own
+/// message, not the same text as a pre-#327 legacy script).
 enum HookVersionDrift {
     Matches,
     Missing,
@@ -286,20 +286,26 @@ enum HookVersionDrift {
     Drift { installed: String },
 }
 
-/// Compares a hook script's version comment against `CARGO_PKG_VERSION`,
+/// Compares an already-extracted version string against `CARGO_PKG_VERSION`,
 /// independent of exe resolution succeeding — deliberately so, since a
 /// failed exe resolution (e.g. a broken Homebrew Cellar symlink) is exactly
 /// the scenario that otherwise masks staleness (the motivating incident for
 /// #327): the hash-comparison check that depends on exe resolution skips
-/// entirely in that case, so this reads the script's own version comment
+/// entirely in that case, so this reads the hook's own embedded version
 /// instead of needing a resolved exe to render an expected comparison.
-fn detect_hook_version_drift(script_content: &str) -> HookVersionDrift {
-    match installer::parse_hook_version(script_content) {
+/// `installed` is `None` when the caller found no version string at all
+/// (file/field absent) and `Some(v)` when one was extracted — extraction
+/// itself is format-specific and lives in the caller (`installer::parse_hook_version`
+/// for the shell-comment format, `parse_cursor_snippet_version` for the JSON
+/// `_comment` format, #381/#382).
+fn detect_hook_version_drift(installed: Option<&str>) -> HookVersionDrift {
+    match installed {
         None => HookVersionDrift::Missing,
         // An empty version string (malformed comment, e.g. `# omamori hook
-        // v` with nothing after `v`) is unparseable in practice even though
-        // `parse_hook_version` returns `Some("")` for it — treat it the same
-        // as a missing comment rather than displaying a blank version.
+        // v` with nothing after `v`, or a Cursor `_comment` reading
+        // `"...omamori v. Merge..."`) is unparseable in practice even though
+        // the caller's extractor returns `Some("")` for it — treat it the
+        // same as a missing comment rather than displaying a blank version.
         Some("") => HookVersionDrift::Missing,
         // A hook file with a tampered version comment already fails the
         // hash comparison independently (that content differs from any
@@ -334,15 +340,14 @@ fn is_plausible_version_string(s: &str) -> bool {
 /// one call site rather than stored on `HookVersionDrift::Drift` — it's
 /// always exactly `CARGO_PKG_VERSION`, a compile-time constant with no
 /// independent value to carry through the enum (/code-review finding).
-fn hook_version_drift_suffix(script_content: &str) -> String {
-    match detect_hook_version_drift(script_content) {
+fn hook_version_drift_suffix(installed: Option<&str>) -> String {
+    match detect_hook_version_drift(installed) {
         HookVersionDrift::Matches => String::new(),
         HookVersionDrift::Missing => {
-            " [version drift: unknown \u{2014} hook script has no version comment]".to_string()
+            " [version drift: unknown \u{2014} no version metadata found]".to_string()
         }
         HookVersionDrift::Rejected => {
-            " [version drift: unknown \u{2014} hook script's version comment is unparseable]"
-                .to_string()
+            " [version drift: unknown \u{2014} version metadata is unparseable]".to_string()
         }
         HookVersionDrift::Drift { installed } => format!(
             " [version drift: hooks rendered by v{installed}, binary is v{} \u{2014} run \
@@ -361,10 +366,33 @@ fn cursor_snippet_exe_path(content: &str) -> Option<PathBuf> {
     (!exe.is_empty()).then(|| PathBuf::from(exe))
 }
 
+/// Extract the version from a Cursor hooks snippet's `_comment` field
+/// (`render_cursor_hooks_snippet()` writes `"Generated by omamori v{X}. Merge
+/// into .cursor/hooks.json"`, #382). The Cursor JSON format has no dedicated
+/// version field — unlike the shell hooks' `# omamori hook v{X}` comment
+/// line (`installer::parse_hook_version`) — so this mirrors that extractor's
+/// role for the free-text `_comment` shape instead. Returns `None` for any
+/// failure (invalid JSON, missing/non-string `_comment`, no `"omamori v"` or
+/// `". "` boundary) rather than distinguishing them: all collapse to
+/// `detect_hook_version_drift`'s `Missing` arm on the caller side, same as an
+/// absent shell version comment.
+fn parse_cursor_snippet_version(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let comment = v.get("_comment")?.as_str()?;
+    let after = comment.split_once("omamori v")?.1;
+    let version = after.split_once(". ")?.0;
+    Some(version.to_string())
+}
+
 /// Validate cursor hooks snippet: hash comparison + dangling path detection.
 /// Byte-exact comparison against `render_cursor_hooks_snippet()` output;
 /// any difference (including formatting) is treated as a mismatch (#56, T8).
-fn check_cursor_snippet(path: &Path) -> CheckItem {
+/// `resolve_exe` is injectable (#382, mirroring `check_claude_hook_hash`'s
+/// `ExeResolver` seam) so tests can drive the exe-resolution-failure branch
+/// directly — previously this used an inline `std::env::current_exe()` call
+/// that no test double could intercept, leaving that branch's version-drift
+/// suffix (added below) unexercisable.
+fn check_cursor_snippet(path: &Path, resolve_exe: ExeResolver) -> CheckItem {
     let name = "cursor-hooks.snippet.json".to_string();
     let category = "Hooks";
 
@@ -391,9 +419,10 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
         }
     };
 
-    // Hash comparison: generate expected content from current stable exe path
-    let hash_ok = std::env::current_exe().ok().map(|exe| {
-        let stable = installer::resolve_stable_exe_path(&exe);
+    let installed = parse_cursor_snippet_version(&actual);
+
+    // Hash comparison: generate expected content from the resolved omamori exe
+    let hash_ok = resolve_exe().ok().map(|stable| {
         let expected = installer::render_cursor_hooks_snippet(&stable);
         installer::hook_content_hash(&expected) == installer::hook_content_hash(&actual)
     });
@@ -401,22 +430,47 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
     // Dangling path detection: check if the exe in the snippet actually exists
     let dangling = cursor_snippet_exe_path(&actual).is_some_and(|p| !p.exists());
 
+    // Drift suffix is injected on exactly the two branches where a stale
+    // version is the likeliest explanation: exe resolution failing outright,
+    // and a resolved-but-mismatching hash (the common post-upgrade case,
+    // #382 Phase 5 Codex review P1 — an earlier draft only covered the
+    // former, which meant the most common upgrade scenario never surfaced a
+    // drift hint). The two dangling-priority branches deliberately omit it:
+    // a dangling exe path is itself the more actionable diagnosis, and
+    // `installed` there Missing/Rejected/Drift'ing over the underlying exe
+    // problem would seed the empty commented case in Cursor as false noise
+    // (#382 shape enumeration Δ6 — `_comment` is advisory-only, so users
+    // deleting it is expected steady state, not an anomaly worth a suffix
+    // once we already know the exe path is broken).
     let (status, detail, remediation) = match (hash_ok, dangling) {
-        (Some(true), false) => (CheckStatus::Ok, "(hash match)", None),
+        (Some(true), false) => (CheckStatus::Ok, "(hash match)".to_string(), None),
         (Some(true), true) => (
             CheckStatus::Warn,
-            "(path dangling — run `omamori install --hooks`)",
+            "(path dangling — run `omamori install --hooks`)".to_string(),
             Some(Remediation::RunInstall),
         ),
-        (Some(false), _) => (
-            CheckStatus::Fail,
-            "(hash MISMATCH — run `omamori install --hooks`)",
-            Some(Remediation::RegenerateHooks),
+        (Some(false), _) => {
+            // Reuses `hash_mismatch_fail`'s message-building rather than
+            // duplicating its literal + suffix format inline (#382
+            // `/simplify` finding), then destructures back into this
+            // match's tuple shape since the other arms don't build a full
+            // `CheckItem` (they need `category`/`name` supplied once below).
+            let item = hash_mismatch_fail(
+                category,
+                name.clone(),
+                "(hash MISMATCH — run `omamori install --hooks`)",
+                installed.as_deref(),
+            );
+            (item.status, item.detail, item.remediation)
+        }
+        (None, false) => (
+            CheckStatus::Warn,
+            exe_unresolved_detail(installed.as_deref()),
+            Some(Remediation::RunInstall),
         ),
-        (None, false) => (CheckStatus::Warn, "(present, hash check skipped)", None),
         (None, true) => (
             CheckStatus::Warn,
-            "(path dangling — run `omamori install --hooks`)",
+            "(path dangling — run `omamori install --hooks`)".to_string(),
             Some(Remediation::RunInstall),
         ),
     };
@@ -425,7 +479,7 @@ fn check_cursor_snippet(path: &Path) -> CheckItem {
         category,
         name,
         status,
-        detail: detail.to_string(),
+        detail,
         remediation,
     }
 }
@@ -632,7 +686,8 @@ fn check_claude_settings_integration_with_verifier(
             };
         }
     };
-    let omamori_exe = match resolve_exe_or_warn(resolve_exe, category, name.clone(), &actual) {
+    let installed = installer::parse_hook_version(&actual);
+    let omamori_exe = match resolve_exe_or_warn(resolve_exe, category, name.clone(), installed) {
         Ok(exe) => exe,
         Err(item) => return item,
     };
@@ -643,7 +698,7 @@ fn check_claude_settings_integration_with_verifier(
             category,
             name,
             "(script content hash mismatch — possible tampering)",
-            &actual,
+            installed,
         );
     }
 
@@ -714,57 +769,82 @@ fn shim_matches_baseline(
 /// surface instead of silently skipping.
 type ExeResolver = fn() -> std::io::Result<PathBuf>;
 
+/// The "(cannot resolve omamori exe — hash check skipped)" detail string
+/// with drift suffix appended — shared by `resolve_exe_or_warn` (which
+/// early-returns a `CheckItem` the moment resolution fails) and
+/// `check_cursor_snippet` (which can't early-return here: it still needs to
+/// compute `dangling` regardless of whether resolution succeeded, so it
+/// builds this same detail inline for its `(None, false)` branch instead of
+/// going through `resolve_exe_or_warn`'s `Result`-based control flow,
+/// #382 `/simplify` finding).
+fn exe_unresolved_detail(installed: Option<&str>) -> String {
+    format!(
+        "(cannot resolve omamori exe — hash check skipped){}",
+        hook_version_drift_suffix(installed)
+    )
+}
+
 /// Resolves the running omamori exe, or a fully-formed "(cannot resolve
 /// omamori exe — hash check skipped)" `CheckItem` if resolution fails —
-/// shared by `check_claude_hook_hash` and
-/// `check_claude_settings_integration_with_verifier`, which both hit this
-/// exact failure mode and message. `script_content` is only read to compute
-/// the version-drift suffix when resolution actually fails (#327's masked-skip
+/// shared by `check_claude_hook_hash`, `check_codex_hook_hash`, and
+/// `check_claude_settings_integration_with_verifier`, which all hit this
+/// exact failure mode and message. `installed` is only read to compute the
+/// version-drift suffix when resolution actually fails (#327's masked-skip
 /// branch), not on the common path where resolution succeeds.
 fn resolve_exe_or_warn(
     resolve_exe: ExeResolver,
     category: &'static str,
     name: String,
-    script_content: &str,
+    installed: Option<&str>,
 ) -> Result<PathBuf, CheckItem> {
     resolve_exe().map_err(|_| CheckItem {
         category,
         name,
         status: CheckStatus::Warn,
-        detail: format!(
-            "(cannot resolve omamori exe — hash check skipped){}",
-            hook_version_drift_suffix(script_content)
-        ),
+        detail: exe_unresolved_detail(installed),
         remediation: Some(Remediation::RunInstall),
     })
 }
 
 /// Builds the `Fail`/`RegenerateHooks` `CheckItem` for a hash mismatch, with
-/// the version-drift suffix appended — shared by `check_claude_hook_hash`
-/// and `check_claude_settings_integration_with_verifier`, whose mismatch
-/// branches otherwise differ only in `base_detail` (/code-review finding:
-/// this pair was left duplicated while the parallel `resolve_exe_or_warn`
-/// case, one function above, was deduped in the same diff).
+/// the version-drift suffix appended — shared by `check_claude_hook_hash`,
+/// `check_codex_hook_hash`, `check_claude_settings_integration_with_verifier`,
+/// and `check_cursor_snippet` (the last destructures the result back into a
+/// tuple, since it builds its `CheckItem` once at the end of a 5-way match
+/// rather than early-returning), whose mismatch branches otherwise differ
+/// only in `base_detail` (/code-review finding: this pair was left
+/// duplicated while the parallel `resolve_exe_or_warn` case, one function
+/// above, was deduped in the same diff).
 fn hash_mismatch_fail(
     category: &'static str,
     name: String,
     base_detail: &str,
-    script_content: &str,
+    installed: Option<&str>,
 ) -> CheckItem {
     CheckItem {
         category,
         name,
         status: CheckStatus::Fail,
-        detail: format!("{base_detail}{}", hook_version_drift_suffix(script_content)),
+        detail: format!("{base_detail}{}", hook_version_drift_suffix(installed)),
         remediation: Some(Remediation::RegenerateHooks),
     }
 }
 
-/// `full_check()`'s hash-comparison check for `claude-pretooluse.sh`.
-/// Extracted so `resolve_exe` can be swapped for a failing stub in tests.
-fn check_claude_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckItem {
-    let name = "claude-pretooluse.sh".to_string();
-    let hook_path = hooks_dir.join("claude-pretooluse.sh");
+/// `full_check()`'s hash-comparison check for a shell-comment-versioned hook
+/// wrapper (`claude-pretooluse.sh` / `codex-pretooluse.sh`, #381). Shared
+/// body for `check_claude_hook_hash`/`check_codex_hook_hash`, which differ
+/// only in which file they check and which `installer::render_*` function
+/// produces the expected content — both scripts embed the same `# omamori
+/// hook v{X}` comment line, so `installer::parse_hook_version` covers both.
+/// `resolve_exe` is injectable so tests can swap in a failing stub.
+fn check_hook_hash(
+    hooks_dir: &Path,
+    file_name: &str,
+    render: fn(&Path) -> String,
+    resolve_exe: ExeResolver,
+) -> CheckItem {
+    let name = file_name.to_string();
+    let hook_path = hooks_dir.join(file_name);
 
     if !hook_path.exists() {
         return CheckItem {
@@ -799,11 +879,12 @@ fn check_claude_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckIt
             };
         }
     };
-    let omamori_exe = match resolve_exe_or_warn(resolve_exe, "Hooks", name.clone(), &actual) {
+    let installed = installer::parse_hook_version(&actual);
+    let omamori_exe = match resolve_exe_or_warn(resolve_exe, "Hooks", name.clone(), installed) {
         Ok(exe) => exe,
         Err(item) => return item,
     };
-    let expected = installer::render_hook_script(&omamori_exe);
+    let expected = render(&omamori_exe);
     let expected_hash = installer::hook_content_hash(&expected);
     let actual_hash = installer::hook_content_hash(&actual);
 
@@ -820,9 +901,36 @@ fn check_claude_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckIt
             "Hooks",
             name,
             "(hash MISMATCH — run `omamori install --hooks`)",
-            &actual,
+            installed,
         )
     }
+}
+
+/// `full_check()`'s hash-comparison check for `claude-pretooluse.sh`.
+fn check_claude_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckItem {
+    check_hook_hash(
+        hooks_dir,
+        "claude-pretooluse.sh",
+        installer::render_hook_script,
+        resolve_exe,
+    )
+}
+
+/// `full_check()`'s hash-comparison check for `codex-pretooluse.sh` (#381).
+/// `check_hook_hash`'s not-installed branch fires unconditionally when the
+/// file is absent from omamori's own hooks dir — independent of whether
+/// Codex CLI itself is detected on the system, mirroring
+/// `check_claude_hook_hash`'s CheckItem-presence behavior exactly. This
+/// differs from `install --hooks`, which only *writes* the Codex wrapper
+/// when `~/.codex` exists (`installer.rs`) — so a fresh install with no
+/// `~/.codex` directory will show a permanent Warn here, not a false green.
+fn check_codex_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckItem {
+    check_hook_hash(
+        hooks_dir,
+        "codex-pretooluse.sh",
+        installer::render_codex_pretooluse_script,
+        resolve_exe,
+    )
 }
 
 /// Run a full integrity check of all defense layers.
@@ -884,6 +992,12 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
         installer::resolved_current_omamori_exe,
     ));
 
+    // codex-pretooluse.sh — hash comparison + version drift (#381)
+    items.push(check_codex_hook_hash(
+        &hooks_dir,
+        installer::resolved_current_omamori_exe,
+    ));
+
     // claude-settings.snippet.json — existence check only
     let settings_snippet = hooks_dir.join("claude-settings.snippet.json");
     items.push(if settings_snippet.exists() {
@@ -907,9 +1021,12 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     // claude-code-settings — verify ~/.claude/settings.json is wired up (#196)
     items.push(check_claude_settings_integration(base_dir));
 
-    // cursor-hooks.snippet.json — hash comparison + dangling path detection (#56, T8)
+    // cursor-hooks.snippet.json — hash comparison + dangling path detection (#56, T8, #382)
     let cursor_snippet = hooks_dir.join("cursor-hooks.snippet.json");
-    items.push(check_cursor_snippet(&cursor_snippet));
+    items.push(check_cursor_snippet(
+        &cursor_snippet,
+        installer::resolved_current_omamori_exe,
+    ));
 
     // --- Config ---
     if let Some(entry) = read_config_entry() {
@@ -1359,7 +1476,7 @@ mod tests {
         let current = env!("CARGO_PKG_VERSION");
         let content = format!("#!/bin/sh\n# omamori hook v{current} — wrapper\nexit 0\n");
         assert!(matches!(
-            detect_hook_version_drift(&content),
+            detect_hook_version_drift(installer::parse_hook_version(&content)),
             HookVersionDrift::Matches
         ));
     }
@@ -1367,7 +1484,7 @@ mod tests {
     #[test]
     fn detect_hook_version_drift_flags_older_installed_version() {
         let content = "#!/bin/sh\n# omamori hook v0.0.1 — wrapper\nexit 0\n";
-        match detect_hook_version_drift(content) {
+        match detect_hook_version_drift(installer::parse_hook_version(content)) {
             HookVersionDrift::Drift { installed } => assert_eq!(installed, "0.0.1"),
             _ => panic!("expected Drift, got a different shape"),
         }
@@ -1378,7 +1495,7 @@ mod tests {
         // A "future" version (e.g. binary was downgraded) must also be
         // flagged — drift is symmetric, not just staleness detection.
         let content = "#!/bin/sh\n# omamori hook v99.0.0 — wrapper\nexit 0\n";
-        match detect_hook_version_drift(content) {
+        match detect_hook_version_drift(installer::parse_hook_version(content)) {
             HookVersionDrift::Drift { installed } => assert_eq!(installed, "99.0.0"),
             _ => panic!("expected Drift for a newer installed version"),
         }
@@ -1388,7 +1505,7 @@ mod tests {
     fn detect_hook_version_drift_missing_when_comment_absent() {
         let content = "#!/bin/sh\nexit 0\n";
         assert!(matches!(
-            detect_hook_version_drift(content),
+            detect_hook_version_drift(installer::parse_hook_version(content)),
             HookVersionDrift::Missing
         ));
     }
@@ -1399,7 +1516,19 @@ mod tests {
         // nothing after `v` — must not be displayed as a blank-version drift.
         let content = "#!/bin/sh\n# omamori hook v\nexit 0\n";
         assert!(matches!(
-            detect_hook_version_drift(content),
+            detect_hook_version_drift(installer::parse_hook_version(content)),
+            HookVersionDrift::Missing
+        ));
+    }
+
+    #[test]
+    fn detect_hook_version_drift_missing_when_installed_is_none() {
+        // The JSON (Cursor) extraction path returns `None` — a distinct
+        // origin from the shell path's `Some("")` above, but both must
+        // collapse to the same `Missing` shape (#382 Mirror handoff Δ2,
+        // shape enumeration V3/M1).
+        assert!(matches!(
+            detect_hook_version_drift(None),
             HookVersionDrift::Missing
         ));
     }
@@ -1417,7 +1546,7 @@ mod tests {
         // finding).
         let content = "#!/bin/sh\n# omamori hook v0.0.1\x1b[31m\rCLOAKED\nexit 0\n";
         assert!(matches!(
-            detect_hook_version_drift(content),
+            detect_hook_version_drift(installer::parse_hook_version(content)),
             HookVersionDrift::Rejected
         ));
     }
@@ -1426,7 +1555,7 @@ mod tests {
     fn detect_hook_version_drift_rejected_when_comment_too_long() {
         let content = format!("#!/bin/sh\n# omamori hook v{}\nexit 0\n", "9".repeat(64));
         assert!(matches!(
-            detect_hook_version_drift(&content),
+            detect_hook_version_drift(installer::parse_hook_version(&content)),
             HookVersionDrift::Rejected
         ));
     }
@@ -1435,7 +1564,7 @@ mod tests {
     fn detect_hook_version_drift_accepts_prerelease_and_build_metadata() {
         // Real semver shapes must not be rejected by the shape check.
         let content = "#!/bin/sh\n# omamori hook v1.2.3-beta.1+build.456\nexit 0\n";
-        match detect_hook_version_drift(content) {
+        match detect_hook_version_drift(installer::parse_hook_version(content)) {
             HookVersionDrift::Drift { installed } => {
                 assert_eq!(installed, "1.2.3-beta.1+build.456")
             }
@@ -1447,13 +1576,16 @@ mod tests {
     fn hook_version_drift_suffix_empty_when_matches() {
         let current = env!("CARGO_PKG_VERSION");
         let content = format!("#!/bin/sh\n# omamori hook v{current} — wrapper\nexit 0\n");
-        assert_eq!(hook_version_drift_suffix(&content), "");
+        assert_eq!(
+            hook_version_drift_suffix(installer::parse_hook_version(&content)),
+            ""
+        );
     }
 
     #[test]
     fn hook_version_drift_suffix_names_both_versions_when_drift() {
         let content = "#!/bin/sh\n# omamori hook v0.0.1 — wrapper\nexit 0\n";
-        let suffix = hook_version_drift_suffix(content);
+        let suffix = hook_version_drift_suffix(installer::parse_hook_version(content));
         assert!(suffix.contains("v0.0.1"), "suffix: {suffix}");
         assert!(
             suffix.contains(env!("CARGO_PKG_VERSION")),
@@ -1464,9 +1596,12 @@ mod tests {
 
     #[test]
     fn hook_version_drift_suffix_flags_unknown_when_comment_missing() {
-        let suffix = hook_version_drift_suffix("#!/bin/sh\nexit 0\n");
+        let suffix = hook_version_drift_suffix(installer::parse_hook_version("#!/bin/sh\nexit 0\n"));
         assert!(suffix.contains("unknown"), "suffix: {suffix}");
-        assert!(suffix.contains("no version comment"), "suffix: {suffix}");
+        // Neutralized wording (#382 Phase 5 Codex review P2): shared with the
+        // JSON (Cursor) path now, so "hook script" language was replaced with
+        // format-agnostic "version metadata".
+        assert!(suffix.contains("no version metadata found"), "suffix: {suffix}");
     }
 
     #[test]
@@ -1474,10 +1609,10 @@ mod tests {
         // /code-review finding: a script with a version comment that was
         // specifically flagged as suspicious (SEC-1) must not read
         // identically to a legacy script with no comment at all.
-        let missing = hook_version_drift_suffix("#!/bin/sh\nexit 0\n");
-        let rejected = hook_version_drift_suffix(
+        let missing = hook_version_drift_suffix(installer::parse_hook_version("#!/bin/sh\nexit 0\n"));
+        let rejected = hook_version_drift_suffix(installer::parse_hook_version(
             "#!/bin/sh\n# omamori hook v0.0.1\x1b[31m\rCLOAKED\nexit 0\n",
-        );
+        ));
         assert_ne!(missing, rejected);
         assert!(rejected.contains("unparseable"), "suffix: {rejected}");
     }
@@ -1629,7 +1764,7 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        let item = check_cursor_snippet(&path);
+        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
         assert_eq!(item.status, CheckStatus::Ok);
         assert!(item.detail.contains("hash match"));
 
@@ -1649,7 +1784,7 @@ mod tests {
         )
         .unwrap();
 
-        let item = check_cursor_snippet(&path);
+        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
         assert_eq!(item.status, CheckStatus::Fail);
         assert!(item.detail.contains("MISMATCH"));
 
@@ -1667,7 +1802,7 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        let item = check_cursor_snippet(&path);
+        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
         // Either FAIL (hash mismatch) or WARN (dangling) — either way, not Ok
         assert_ne!(item.status, CheckStatus::Ok);
 
@@ -1677,9 +1812,337 @@ mod tests {
     #[test]
     fn check_cursor_snippet_missing_returns_warn() {
         let path = Path::new("/nonexistent/cursor-hooks.snippet.json");
-        let item = check_cursor_snippet(path);
+        let item = check_cursor_snippet(path, installer::resolved_current_omamori_exe);
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(item.detail.contains("not installed"));
+    }
+
+    // --- check_codex_hook_hash tests (#381) ---
+    //
+    // `check_codex_hook_hash` is a thin wrapper around the shared
+    // `check_hook_hash` body — its branch logic (hash match/mismatch, not
+    // installed, exe-resolution-failure, unreadable) is exhaustively pinned
+    // once already by `check_claude_hook_hash_*` above, since both wrappers
+    // delegate to the identical shared function. Re-running all five
+    // scenarios through the Codex wrapper would exercise no code path the
+    // Claude-side tests don't already cover (#382 `/simplify` finding) — the
+    // one thing genuinely specific to this wrapper is that it's wired to
+    // the RIGHT filename and render function, which the hash-match test
+    // below and `full_check_includes_codex_hook_check_item` together prove.
+
+    #[test]
+    fn check_codex_hook_hash_ok_when_hash_matches_no_drift_noise() {
+        let dir = std::env::temp_dir().join(format!("omamori-codexdrift-t1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let exe = installer::resolved_current_omamori_exe().unwrap();
+        fs::write(
+            dir.join("codex-pretooluse.sh"),
+            installer::render_codex_pretooluse_script(&exe),
+        )
+        .unwrap();
+
+        let item = check_codex_hook_hash(&dir, installer::resolved_current_omamori_exe);
+
+        assert_eq!(item.status, CheckStatus::Ok);
+        assert_eq!(item.detail, "(hash match)");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_check_includes_codex_hook_check_item() {
+        // V-006/V-006b: full_check wires check_codex_hook_hash in
+        // unconditionally — a fresh dir with no codex-pretooluse.sh always
+        // surfaces a Warn CheckItem for it, independent of whether Codex CLI
+        // (or `~/.codex`) is present on this machine. `install --hooks` only
+        // *writes* the wrapper when `~/.codex` is a real directory, so a
+        // fresh install without it leaves this Warn permanently — mirroring
+        // check_claude_hook_hash's CheckItem-presence behavior exactly.
+        let dir = std::env::temp_dir().join(format!("omamori-codexdrift-t6-{}", std::process::id()));
+        let shim_dir = dir.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+
+        let report = full_check(&dir);
+        let codex_item = report
+            .items
+            .iter()
+            .find(|i| i.name == "codex-pretooluse.sh")
+            .expect("full_check should include a codex-pretooluse.sh CheckItem");
+        assert_eq!(codex_item.status, CheckStatus::Warn);
+        assert_eq!(codex_item.category, "Hooks");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- parse_cursor_snippet_version tests (#382) ---
+
+    /// Renders a real Cursor snippet (embedding `exe`) then substitutes the
+    /// embedded version, mirroring `script_with_version()`'s approach for
+    /// the shell format — there is no static fixture (#382 shape
+    /// enumeration finding), the snippet is always generated at runtime.
+    /// `exe` is caller-supplied rather than hardcoded (Codex Phase 6 review
+    /// P1: a hardcoded `/opt/homebrew/bin/omamori` made the dangling-path
+    /// check nondeterministic across runners — whether that path exists is
+    /// environment-dependent, and dangling-detection tests specifically
+    /// need control over it).
+    fn cursor_snippet_with_version(exe: &Path, fake_version: &str) -> String {
+        let current = env!("CARGO_PKG_VERSION");
+        let real = installer::render_cursor_hooks_snippet(exe);
+        let replaced = real.replacen(
+            &format!("Generated by omamori v{current}."),
+            &format!("Generated by omamori v{fake_version}."),
+            1,
+        );
+        assert_ne!(
+            replaced, real,
+            "fixture setup bug: version substitution did not change the snippet"
+        );
+        replaced
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_extracts_current() {
+        // V-008
+        let content = installer::render_cursor_hooks_snippet(Path::new("/opt/homebrew/bin/omamori"));
+        assert_eq!(
+            parse_cursor_snippet_version(&content).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_handles_prerelease() {
+        // V-009
+        let content = cursor_snippet_with_version(
+            Path::new("/opt/homebrew/bin/omamori"),
+            "1.2.3-beta.1+build.456",
+        );
+        assert_eq!(
+            parse_cursor_snippet_version(&content).as_deref(),
+            Some("1.2.3-beta.1+build.456")
+        );
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_returns_none_when_comment_absent() {
+        // V-010 / V-012b origin 1: `_comment` field itself missing.
+        let content = r#"{"hooks":{"beforeShellExecution":[{"command":"exit 0"}]}}"#;
+        assert_eq!(parse_cursor_snippet_version(content), None);
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_returns_none_when_comment_not_string() {
+        // Phase 6 Codex review P2: `_comment` present but not a JSON string
+        // (e.g. hand-edited to a number) — `.as_str()?` must reject it
+        // gracefully rather than panicking.
+        let content = r#"{"_comment": 123}"#;
+        assert_eq!(parse_cursor_snippet_version(content), None);
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_returns_none_when_marker_absent() {
+        // Phase 6 Codex review P2: `_comment` is a well-formed string, but
+        // not one omamori wrote (no "omamori v" marker at all) — distinct
+        // from the "boundary present but incomplete" case below.
+        let content = r#"{"_comment":"Generated by another tool"}"#;
+        assert_eq!(parse_cursor_snippet_version(content), None);
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_returns_none_when_json_broken() {
+        // V-011 / V-012b origin 2: not valid JSON at all — no panic.
+        let content = "{not valid json";
+        assert_eq!(parse_cursor_snippet_version(content), None);
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_returns_none_when_no_boundary() {
+        // V-012b origin 3: `omamori v` marker present but no `". "` sentence
+        // boundary to close the extraction.
+        let content = r#"{"_comment":"Generated by omamori v1.2.3 without the expected boundary"}"#;
+        assert_eq!(parse_cursor_snippet_version(content), None);
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_returns_empty_when_version_blank() {
+        // V-012b origin 4 (#382 shape enumeration V3): `_comment` present
+        // with the `omamori v` marker but nothing before the `. ` boundary
+        // — extracts as `Some("")`, which `detect_hook_version_drift` then
+        // normalizes to Missing rather than a blank-version Drift.
+        let content = r#"{"_comment":"Generated by omamori v. Merge into .cursor/hooks.json"}"#;
+        assert_eq!(parse_cursor_snippet_version(content).as_deref(), Some(""));
+        assert!(matches!(
+            detect_hook_version_drift(parse_cursor_snippet_version(content).as_deref()),
+            HookVersionDrift::Missing
+        ));
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_rejected_when_control_chars() {
+        // V-012 (Critical, SEC-1 regression guard): the shared gate in
+        // detect_hook_version_drift (not the extractor) is what rejects a
+        // control-character version string — Shape A means this JSON path
+        // gets the same is_plausible_version_string protection as the shell
+        // path for free. Pins that the raw value round-trips through the
+        // extractor unmodified so the shared gate is actually reached.
+        // Uses JSON `\u` / `\r` escapes (not raw bytes) — raw unescaped
+        // control characters inside a JSON string are themselves invalid
+        // JSON, which would make this a `_comment`-is-not-valid-JSON test
+        // instead of the intended is_plausible_version_string rejection.
+        let content = r#"{"_comment":"Generated by omamori v0.0.1\u001b[31m\r. Merge"}"#;
+        let extracted = parse_cursor_snippet_version(content);
+        assert_eq!(extracted.as_deref(), Some("0.0.1\u{1b}[31m\r"));
+        assert!(matches!(
+            detect_hook_version_drift(extracted.as_deref()),
+            HookVersionDrift::Rejected
+        ));
+    }
+
+    // --- check_cursor_snippet ExeResolver + drift suffix tests (#382) ---
+
+    #[test]
+    fn check_cursor_snippet_reports_drift_when_exe_resolution_fails() {
+        // V-007 (Critical): previously check_cursor_snippet resolved the exe
+        // inline via std::env::current_exe(), a seam no test double could
+        // intercept — this branch was undrivable before the ExeResolver
+        // injection added in this PR.
+        //
+        // Must drive exactly the `(hash_ok=None, dangling=false)` branch —
+        // embeds this test binary's own (guaranteed-existing) path rather
+        // than a hardcoded `/opt/homebrew/bin/omamori` (Codex Phase 6 review
+        // P1: that path doesn't exist on every runner, so `dangling` could
+        // silently flip to `true` and this test would exercise the wrong
+        // branch — see `cursor_snippet_with_version`'s doc comment).
+        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let existing_exe = std::env::current_exe().unwrap();
+        let content = cursor_snippet_with_version(&existing_exe, "0.0.1");
+        let path = dir.join("cursor-hooks.snippet.json");
+        fs::write(&path, &content).unwrap();
+
+        fn always_fails() -> std::io::Result<PathBuf> {
+            Err(std::io::Error::other("simulated exe resolution failure"))
+        }
+        let item = check_cursor_snippet(&path, always_fails);
+
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(
+            item.detail.contains("cannot resolve omamori exe"),
+            "detail: {}",
+            item.detail
+        );
+        assert!(item.detail.contains("0.0.1"), "detail: {}", item.detail);
+        assert!(
+            item.detail.contains(env!("CARGO_PKG_VERSION")),
+            "detail: {}",
+            item.detail
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_cursor_snippet_hash_mismatch_includes_drift_suffix() {
+        // V-016 (Critical, Phase 5 Codex review P1): the most common
+        // post-upgrade scenario — exe resolves fine but the on-disk snippet
+        // is stale — must surface a drift suffix too, not just the
+        // exe-resolution-failure branch above. An earlier draft only covered
+        // that branch, silently missing this far more common case.
+        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Dangling status is irrelevant here — `(Some(false), _)` fires
+        // regardless, since the resolved-exe path differs from this fixture
+        // path either way (making the hash mismatch) — so an arbitrary path
+        // is fine, unlike the exe-resolution-failure test above.
+        let content = cursor_snippet_with_version(Path::new("/opt/homebrew/bin/omamori"), "0.0.1");
+        let path = dir.join("cursor-hooks.snippet.json");
+        fs::write(&path, &content).unwrap();
+
+        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
+
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert!(item.detail.contains("MISMATCH"), "detail: {}", item.detail);
+        assert!(item.detail.contains("0.0.1"), "detail: {}", item.detail);
+        assert!(
+            item.detail.contains(env!("CARGO_PKG_VERSION")),
+            "detail: {}",
+            item.detail
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_cursor_snippet_dangling_with_resolvable_exe_omits_drift_suffix() {
+        // dangling-priority branch (Some(true), true): a snippet pointing at
+        // a dangling exe path reports the dangling path, not a
+        // version-drift suffix, even though hash comparison succeeded. The
+        // resolve_exe stub deliberately returns the SAME nonexistent path
+        // used to render the snippet, so the hash comparison matches (both
+        // sides render from that path) while the embedded path itself is
+        // dangling — the only way to reach `(Some(true), true)` without
+        // `resolved_current_omamori_exe` (which never resolves to a path
+        // that doesn't exist).
+        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let content = installer::render_cursor_hooks_snippet(Path::new("/nonexistent/bin/omamori"));
+        let path = dir.join("cursor-hooks.snippet.json");
+        fs::write(&path, &content).unwrap();
+
+        fn resolves_to_dangling_path() -> std::io::Result<PathBuf> {
+            Ok(PathBuf::from("/nonexistent/bin/omamori"))
+        }
+        let item = check_cursor_snippet(&path, resolves_to_dangling_path);
+
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(item.detail.contains("dangling"), "detail: {}", item.detail);
+        assert!(
+            !item.detail.contains("version drift"),
+            "detail: {}",
+            item.detail
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_cursor_snippet_dangling_with_unresolvable_exe_omits_drift_suffix() {
+        // V-016b (#382 shape enumeration finding): (None, true) — exe
+        // resolution ALSO fails, but the dangling path already tells the
+        // more actionable story than a version-drift hint would. Must not
+        // be conflated with the (None, false) branch above, which DOES want
+        // the suffix — this is the one dangling-priority combination that
+        // wasn't previously pinned by its own test.
+        let dir = std::env::temp_dir().join(format!("omamori-cursordrift-t4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let content = installer::render_cursor_hooks_snippet(Path::new("/nonexistent/bin/omamori"));
+        let path = dir.join("cursor-hooks.snippet.json");
+        fs::write(&path, &content).unwrap();
+
+        fn always_fails() -> std::io::Result<PathBuf> {
+            Err(std::io::Error::other("simulated exe resolution failure"))
+        }
+        let item = check_cursor_snippet(&path, always_fails);
+
+        assert_eq!(item.status, CheckStatus::Warn);
+        assert!(item.detail.contains("dangling"), "detail: {}", item.detail);
+        assert!(
+            !item.detail.contains("version drift"),
+            "detail: {}",
+            item.detail
+        );
+        assert!(
+            !item.detail.contains("cannot resolve"),
+            "detail: {}",
+            item.detail
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // --- G-08: write_baseline ---
