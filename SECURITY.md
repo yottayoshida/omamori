@@ -709,6 +709,8 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 
 **Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `PROTECTED_FILE_PATTERNS` and Phase 2 rules operate at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing — use your AI tool's sandbox (Codex CLI sandbox (on by default), Claude Code `/sandbox`, Cursor agent sandbox) or a dedicated tool like [nono](https://github.com/always-further/nono).
 
+**`audit.path` and `HOME` are trust roots, not further validated** (#439): a relative or empty `audit.path` in config.toml is ignored (`AuditConfig::validate()` normalizes it away, closing the #210-class CWD-scatter hazard where the audit log and its HMAC secret land in the process's working directory). An *absolute* `audit.path`, and `HOME` itself, are trusted verbatim — a same-user attacker who can write config.toml or set `HOME` can still redirect where the log and secret are written (e.g. into their own writable directory to co-locate the secret). This is the same same-user structural limitation as the rest of this section, not a new gap.
+
 ### Audit Log Read Access (v0.9.7+)
 
 `audit.jsonl` is user-readable by design. On a shared user account, anything that can read the home directory can also infer AI tool usage patterns — tool names, timestamps, command columns (and, for `unknown_tool_fail_open` events, top-level `tool_input` key counts) — from the audit log. Target paths are HMAC-hashed (`target_hash`), so concrete file paths are not disclosed, but the existence and shape of activity is.

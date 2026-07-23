@@ -70,7 +70,18 @@ impl Default for AuditConfig {
 }
 
 impl AuditConfig {
-    /// Validate and clamp retention_days. Returns warnings if adjusted.
+    /// Validate and normalize the audit config. Clamps `retention_days` and
+    /// neutralizes a relative `path` override. Returns warnings if adjusted.
+    ///
+    /// A relative `audit.path` (e.g. `path = "audit.jsonl"`) would make every
+    /// audit operation resolve against the process CWD — the same #210-class
+    /// CWD-scatter hazard #371 closed for the `path = None` case, reintroduced
+    /// through an explicit override `resolved_audit_path()` never validated.
+    /// We drop it to `None` here so the resolver falls through to the
+    /// HOME-derived default (or fails closed when HOME is unusable too),
+    /// mirroring the `is_absolute()` filter `context::home_dir()` applies to
+    /// HOME and the warn-and-disable policy `config::validate_destination`
+    /// applies to a rule's relative `destination`.
     pub fn validate(&self) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let mut config = self.clone();
@@ -83,6 +94,33 @@ impl AuditConfig {
             ));
             config.retention_days = retention::MIN_RETENTION_DAYS;
         }
+        if let Some(ref path) = config.path
+            && !path.is_absolute()
+        {
+            // Phase 8 QA+UX (independently converged) + Security findings:
+            // (a) an empty `path = ""` rendered as confusing empty
+            // backticks — special-cased to `<empty>`; (b) `config.path` is
+            // attacker-controlled (config.toml is explicitly AI-editable
+            // per this issue's own threat model) and was interpolated
+            // unsanitized into a terminal warning, allowing ANSI/control-
+            // character injection — stripped here, mirroring the same
+            // control-character sanitization `provenance::sanitize`
+            // already applies to `parent_process` before it reaches a
+            // terminal or `--json` output.
+            let shown = if path.as_os_str().is_empty() {
+                "<empty>".to_string()
+            } else {
+                path.display()
+                    .to_string()
+                    .chars()
+                    .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+                    .collect()
+            };
+            warnings.push(format!(
+                "audit.path `{shown}` is not an absolute path; ignoring the override — set an absolute path to use a custom audit log location"
+            ));
+            config.path = None;
+        }
         (config, warnings)
     }
 }
@@ -91,11 +129,12 @@ fn default_true() -> bool {
     true
 }
 
-/// Resolve the effective audit log path: an explicit config override, or
-/// the default under `$HOME/.local/share/omamori/audit.jsonl`. `None`
-/// when neither is available — no override configured and `HOME` is
-/// unusable (unset/empty/relative) — callers must treat audit logging as
-/// unavailable rather than falling back to a CWD-relative path.
+/// Resolve the effective audit log path: an explicit config override
+/// (honored only when absolute), or the default under
+/// `$HOME/.local/share/omamori/audit.jsonl`. `None` when neither is
+/// available — no absolute override and `HOME` is unusable (unset/empty/
+/// relative) — callers must treat audit logging as unavailable rather than
+/// falling back to a CWD-relative path.
 ///
 /// Historical note (#306/#371): `secret.rs` used to have its own
 /// `default_audit_path()` with a CWD fallback (`AuditConfig.path` defaults
@@ -104,10 +143,17 @@ fn default_true() -> bool {
 /// into the process's working directory). #371 deleted it and routed
 /// `rotate_key` through this fail-close resolver instead — this is now the
 /// sole path-resolution function in the audit subsystem.
+///
+/// A non-absolute `config.path` is already normalized to `None` by
+/// `AuditConfig::validate()` (#439) — every caller is expected to pass a
+/// validated config. The `.filter()` below is a second, silent
+/// defense-in-depth layer against a future caller that constructs an
+/// `AuditConfig` without going through `validate()`.
 pub(crate) fn resolved_audit_path(config: &AuditConfig) -> Option<PathBuf> {
     config
         .path
         .clone()
+        .filter(|p| p.is_absolute())
         .or_else(|| crate::context::data_dir().map(|d| d.join("audit.jsonl")))
 }
 
@@ -2384,6 +2430,122 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
+    // -----------------------------------------------------------------
+    // AuditConfig::validate() — relative `audit.path` normalization (#439)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn config_validate_keeps_absolute_path() {
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("/var/log/omamori/audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        let (validated, warnings) = config.validate();
+        assert_eq!(
+            validated.path,
+            Some(PathBuf::from("/var/log/omamori/audit.jsonl"))
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn config_validate_empty_path_cleared_with_warning() {
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("")),
+            retention_days: 0,
+            strict: false,
+        };
+        let (validated, warnings) = config.validate();
+        assert_eq!(validated.path, None);
+        // Phase 8 QA+UX (independently converged): must not render as
+        // confusing empty backticks (`audit.path `` is not...`).
+        assert!(
+            warnings.iter().any(|w| w.contains("<empty>")),
+            "empty path should render as `<empty>`, not blank backticks: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_relative_path_control_chars_sanitized() {
+        // Phase 8 Security finding: config.path is attacker-controlled
+        // (config.toml is explicitly AI-editable) and must not be
+        // interpolated raw into a terminal warning — an ANSI/control-
+        // character payload must not survive into the warning text.
+        let hostile = format!("\u{1b}[2Ksneaky{}payload", '\u{7}');
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from(&hostile)),
+            retention_days: 0,
+            strict: false,
+        };
+        let (validated, warnings) = config.validate();
+        assert_eq!(validated.path, None);
+        assert!(
+            warnings
+                .iter()
+                .all(|w| !w.contains('\u{1b}') && !w.contains('\u{7}')),
+            "warning must not carry raw control characters through: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("sneaky") && w.contains("payload")),
+            "warning should still show the sanitized (non-control) parts of the value: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn config_validate_relative_boundary_paths_all_cleared() {
+        // `/simplify` finding: this loop subsumes the single-case
+        // `"audit.jsonl"` test that used to sit next to it — same
+        // assertions (cleared + warning content), one fewer near-duplicate
+        // test.
+        for relative in [
+            "audit.jsonl",
+            ".",
+            "..",
+            "sub/x",
+            "./audit.jsonl",
+            "../audit.jsonl",
+        ] {
+            let config = AuditConfig {
+                enabled: true,
+                path: Some(PathBuf::from(relative)),
+                retention_days: 0,
+                strict: false,
+            };
+            let (validated, warnings) = config.validate();
+            assert_eq!(validated.path, None, "expected `{relative}` to be cleared");
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("audit.path") && w.contains("is not an absolute path")),
+                "expected a warning naming audit.path for relative path `{relative}`, got: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_validate_is_idempotent_on_already_normalized_path() {
+        // A config that already went through validate() once (path == None)
+        // must not re-warn or otherwise misbehave on a second pass — this is
+        // what `AuditLogger::from_config`'s internal re-validate relies on.
+        let config = AuditConfig {
+            enabled: true,
+            path: None,
+            retention_days: 0,
+            strict: false,
+        };
+        let (once, warnings_once) = config.validate();
+        let (twice, warnings_twice) = once.validate();
+        assert_eq!(twice.path, None);
+        assert!(warnings_once.is_empty());
+        assert!(warnings_twice.is_empty());
+    }
+
     #[test]
     fn summary_includes_retention() {
         let dir = test_dir("summary-retention");
@@ -2969,6 +3131,83 @@ mod tests {
         assert!(
             with_home(Some(""), || AuditLogger::from_config(&config)).is_none(),
             "logger creation must fail closed (unavailable), not write into CWD"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Relative `audit.path` override — CWD-scatter hazard closure (#439)
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn resolved_audit_path_ignores_relative_override_falls_through_to_home_default() {
+        // The second-layer defense-in-depth filter in `resolved_audit_path`
+        // itself: even an unvalidated config carrying a relative override
+        // must not be honored verbatim — it must fall through to the same
+        // HOME-derived default as an unset override.
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        let result = with_home(Some("/tmp/omamori-relative-audit-path-test"), || {
+            resolved_audit_path(&config)
+        });
+        assert_eq!(
+            result,
+            Some(PathBuf::from(
+                "/tmp/omamori-relative-audit-path-test/.local/share/omamori/audit.jsonl"
+            )),
+            "relative override must be dropped and the HOME default used, not resolved against CWD"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn resolved_audit_path_none_when_relative_override_and_home_unusable() {
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(with_home(Some(""), || resolved_audit_path(&config)), None);
+        assert_eq!(with_home(None, || resolved_audit_path(&config)), None);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn from_config_relative_override_falls_through_to_home_default() {
+        // End-to-end proof through the real choke point (`validate()` runs
+        // inside `from_config`): a relative override must still produce a
+        // working logger anchored under HOME, never under the process CWD.
+        let home = test_dir("v439-relpath-home");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        let logger = with_home(home.to_str(), || AuditLogger::from_config(&config))
+            .expect("relative override + usable HOME must still produce a working logger");
+        assert_eq!(logger.path, home.join(".local/share/omamori/audit.jsonl"));
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn from_config_none_when_relative_override_and_home_unusable() {
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(PathBuf::from("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert!(
+            with_home(Some(""), || AuditLogger::from_config(&config)).is_none(),
+            "relative override + unusable HOME must fail closed, not write into CWD"
         );
     }
 }

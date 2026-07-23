@@ -6,6 +6,7 @@ use crate::AppError;
 use crate::audit;
 use crate::config::load_config;
 use crate::engine::guard::guard_ai_config_modification;
+use crate::engine::shim::emit_config_warnings;
 use crate::util::parse_config_flag;
 
 pub(crate) fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
@@ -30,6 +31,7 @@ pub(crate) fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
 fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
     let config_path = parse_config_flag(&args[3..])?;
     let load_result = load_config(config_path.as_deref())?;
+    emit_config_warnings(&load_result);
 
     match audit::verify_chain(&load_result.config.audit) {
         Ok(result) => {
@@ -176,6 +178,7 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
     }
 
     let load_result = load_config(None)?;
+    emit_config_warnings(&load_result);
     let mut stdout = std::io::stdout().lock();
     match audit::show_entries(&load_result.config.audit, &opts, &mut stdout) {
         Ok(()) => Ok(0),
@@ -234,6 +237,7 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
     }
 
     let load_result = load_config(None)?;
+    emit_config_warnings(&load_result);
     let mut stdout = std::io::stdout().lock();
     match audit::show_entries(&load_result.config.audit, &opts, &mut stdout) {
         Ok(()) => Ok(0),
@@ -254,6 +258,7 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
             guard_ai_config_modification("audit key rotate")?;
 
             let load_result = load_config(None)?;
+            emit_config_warnings(&load_result);
 
             let Some(path) = audit::resolved_audit_path(&load_result.config.audit) else {
                 eprintln!("omamori: cannot resolve audit path — HOME is unset, empty, or relative");
@@ -332,6 +337,7 @@ fn run_audit_hash_cwd(args: &[OsString]) -> Result<i32, AppError> {
     let candidate = std::path::PathBuf::from(path_arg);
 
     let load_result = load_config(None)?;
+    emit_config_warnings(&load_result);
     match audit::hash_cwd_candidates(&load_result.config.audit, &candidate) {
         Some(candidates) => {
             println!("Candidate cwd_hash values for {}:", candidate.display());
