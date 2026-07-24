@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal**: `full_check()` now resolves the running omamori exe once and threads the result into `check_claude_hook_hash`/`check_codex_hook_hash`/`check_claude_settings_integration`/`check_cursor_snippet`, instead of each independently re-resolving it (up to 4 redundant resolutions per `omamori doctor`/`omamori status` run). Known trade-off: on a fresh/uninstalled setup running from a Homebrew Cellar path whose stable symlink is missing, this can now print one extra `omamori warning: Cellar path detected...` line that previously wasn't reached (since no check needed resolution yet) — accepted as a narrow edge case rather than adding a lazy/memoizing resolver. ([#446](https://github.com/yottayoshida/omamori/issues/446))
+
 ## [0.15.1] - 2026-07-23
 
 **Summary**: Extends #327's hook version-drift detection to Codex CLI and Cursor, surfaces the product-contract version in `--version`, closes a relative-`audit.path` CWD-scatter hazard, and includes two previously-missing docs in the published crate.

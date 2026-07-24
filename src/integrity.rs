@@ -387,12 +387,12 @@ fn parse_cursor_snippet_version(content: &str) -> Option<String> {
 /// Validate cursor hooks snippet: hash comparison + dangling path detection.
 /// Byte-exact comparison against `render_cursor_hooks_snippet()` output;
 /// any difference (including formatting) is treated as a mismatch (#56, T8).
-/// `resolve_exe` is injectable (#382, mirroring `check_claude_hook_hash`'s
-/// `ExeResolver` seam) so tests can drive the exe-resolution-failure branch
-/// directly — previously this used an inline `std::env::current_exe()` call
-/// that no test double could intercept, leaving that branch's version-drift
-/// suffix (added below) unexercisable.
-fn check_cursor_snippet(path: &Path, resolve_exe: ExeResolver) -> CheckItem {
+/// `resolved_exe` is caller-supplied (#382, #446 — mirroring
+/// `check_claude_hook_hash`'s seam) so tests can drive the
+/// exe-resolution-failure branch directly — previously this used an inline
+/// `std::env::current_exe()` call that no test double could intercept,
+/// leaving that branch's version-drift suffix (added below) unexercisable.
+fn check_cursor_snippet(path: &Path, resolved_exe: &ResolvedExe) -> CheckItem {
     let name = "cursor-hooks.snippet.json".to_string();
     let category = "Hooks";
 
@@ -422,8 +422,8 @@ fn check_cursor_snippet(path: &Path, resolve_exe: ExeResolver) -> CheckItem {
     let installed = parse_cursor_snippet_version(&actual);
 
     // Hash comparison: generate expected content from the resolved omamori exe
-    let hash_ok = resolve_exe().ok().map(|stable| {
-        let expected = installer::render_cursor_hooks_snippet(&stable);
+    let hash_ok = resolved_exe.as_ref().ok().map(|stable| {
+        let expected = installer::render_cursor_hooks_snippet(stable);
         installer::hook_content_hash(&expected) == installer::hook_content_hash(&actual)
     });
 
@@ -497,23 +497,30 @@ fn check_cursor_snippet(path: &Path, resolve_exe: ExeResolver) -> CheckItem {
 ///
 /// Closes the "doctor 12/12 green but Layer 2 dormant" gap from #196:
 /// a green doctor report now guarantees Layer 2 is active.
+///
+/// Test-only convenience wrapper (#446 item 3): `full_check` calls
+/// `check_claude_settings_integration_with_verifier` directly so it can
+/// share the exe resolved once for all of its checks, rather than going
+/// through this wrapper's own independent resolution.
+#[cfg(test)]
 fn check_claude_settings_integration(base_dir: &Path) -> CheckItem {
     check_claude_settings_integration_with_verifier(
         base_dir,
         installer::verify_hook_contract,
-        installer::resolved_current_omamori_exe,
+        &installer::resolved_current_omamori_exe(),
     )
 }
 
 /// `check_claude_settings_integration()` with an injectable contract verifier
-/// (#349) and exe resolver (#327), so tests can exercise the hash-match
-/// "wired up" path without the production verifier rejecting the test binary
-/// as a non-omamori exe, and can drive the "exe cannot be resolved" branch
-/// directly.
+/// (#349) and a caller-supplied resolved exe (#327/#446), so tests can
+/// exercise the hash-match "wired up" path without the production verifier
+/// rejecting the test binary as a non-omamori exe, and can drive the "exe
+/// cannot be resolved" branch directly. `full_check` passes the same
+/// `resolved_exe` value it resolved once for all of its checks (#446 item 3).
 fn check_claude_settings_integration_with_verifier(
     base_dir: &Path,
     verify: installer::HookVerifier,
-    resolve_exe: ExeResolver,
+    resolved_exe: &ResolvedExe,
 ) -> CheckItem {
     let name = "claude-code-settings".to_string();
     let category = "Hooks";
@@ -687,7 +694,7 @@ fn check_claude_settings_integration_with_verifier(
         }
     };
     let installed = installer::parse_hook_version(&actual);
-    let omamori_exe = match resolve_exe_or_warn(resolve_exe, category, name.clone(), installed) {
+    let omamori_exe = match resolve_exe_or_warn(resolved_exe, category, name.clone(), installed) {
         Ok(exe) => exe,
         Err(item) => return item,
     };
@@ -762,12 +769,18 @@ fn shim_matches_baseline(
     actual == expected
 }
 
-/// A fn-pointer seam for resolving "the currently running omamori exe",
-/// mirroring `HookVerifier`'s injection pattern so tests can drive the
-/// "exe cannot be resolved" branch directly — the exact failure mode (e.g. a
-/// broken Homebrew Cellar symlink) that #327's version-drift suffix exists to
-/// surface instead of silently skipping.
-type ExeResolver = fn() -> std::io::Result<PathBuf>;
+/// Result of resolving "the currently running omamori exe" — resolved once
+/// per `full_check()` run and threaded by reference into every check that
+/// needs it, rather than each one independently calling
+/// `installer::resolved_current_omamori_exe()` (#446 item 3: up to 4
+/// redundant resolutions per run of a value that's invariant for the
+/// process's lifetime). Tests construct their own `Ok`/`Err` value directly
+/// to drive a given branch — e.g. the "exe cannot be resolved" branch (the
+/// exact failure mode, such as a broken Homebrew Cellar symlink, that #327's
+/// version-drift suffix exists to surface instead of silently skipping) —
+/// rather than injecting a re-callable resolver function as the prior
+/// `ExeResolver` fn-pointer seam did.
+type ResolvedExe = std::io::Result<PathBuf>;
 
 /// The "(cannot resolve omamori exe — hash check skipped)" detail string
 /// with drift suffix appended — shared by `resolve_exe_or_warn` (which
@@ -792,12 +805,12 @@ fn exe_unresolved_detail(installed: Option<&str>) -> String {
 /// version-drift suffix when resolution actually fails (#327's masked-skip
 /// branch), not on the common path where resolution succeeds.
 fn resolve_exe_or_warn(
-    resolve_exe: ExeResolver,
+    resolved_exe: &ResolvedExe,
     category: &'static str,
     name: String,
     installed: Option<&str>,
 ) -> Result<PathBuf, CheckItem> {
-    resolve_exe().map_err(|_| CheckItem {
+    resolved_exe.as_ref().cloned().map_err(|_| CheckItem {
         category,
         name,
         status: CheckStatus::Warn,
@@ -836,12 +849,12 @@ fn hash_mismatch_fail(
 /// only in which file they check and which `installer::render_*` function
 /// produces the expected content — both scripts embed the same `# omamori
 /// hook v{X}` comment line, so `installer::parse_hook_version` covers both.
-/// `resolve_exe` is injectable so tests can swap in a failing stub.
+/// `resolved_exe` is caller-supplied so tests can pass a failing `Err`.
 fn check_hook_hash(
     hooks_dir: &Path,
     file_name: &str,
     render: fn(&Path) -> String,
-    resolve_exe: ExeResolver,
+    resolved_exe: &ResolvedExe,
 ) -> CheckItem {
     let name = file_name.to_string();
     let hook_path = hooks_dir.join(file_name);
@@ -880,7 +893,7 @@ fn check_hook_hash(
         }
     };
     let installed = installer::parse_hook_version(&actual);
-    let omamori_exe = match resolve_exe_or_warn(resolve_exe, "Hooks", name.clone(), installed) {
+    let omamori_exe = match resolve_exe_or_warn(resolved_exe, "Hooks", name.clone(), installed) {
         Ok(exe) => exe,
         Err(item) => return item,
     };
@@ -907,12 +920,12 @@ fn check_hook_hash(
 }
 
 /// `full_check()`'s hash-comparison check for `claude-pretooluse.sh`.
-fn check_claude_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckItem {
+fn check_claude_hook_hash(hooks_dir: &Path, resolved_exe: &ResolvedExe) -> CheckItem {
     check_hook_hash(
         hooks_dir,
         "claude-pretooluse.sh",
         installer::render_hook_script,
-        resolve_exe,
+        resolved_exe,
     )
 }
 
@@ -924,12 +937,12 @@ fn check_claude_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckIt
 /// differs from `install --hooks`, which only *writes* the Codex wrapper
 /// when `~/.codex` exists (`installer.rs`) — so a fresh install with no
 /// `~/.codex` directory will show a permanent Warn here, not a false green.
-fn check_codex_hook_hash(hooks_dir: &Path, resolve_exe: ExeResolver) -> CheckItem {
+fn check_codex_hook_hash(hooks_dir: &Path, resolved_exe: &ResolvedExe) -> CheckItem {
     check_hook_hash(
         hooks_dir,
         "codex-pretooluse.sh",
         installer::render_codex_pretooluse_script,
-        resolve_exe,
+        resolved_exe,
     )
 }
 
@@ -986,17 +999,31 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     }
 
     // --- Hooks (implementation-derived hash comparison) ---
+    // Resolved once and threaded into every check below that needs it
+    // (#446 item 3) — the exe path is invariant for this process's
+    // lifetime, so re-resolving per check was 4x redundant work.
+    //
+    // Known trade-off (Codex review, P3): this now resolves unconditionally,
+    // even when none of the four checks below end up needing it (e.g. a
+    // completely fresh/uninstalled setup where every check early-returns
+    // "not installed" before reaching its own resolution point, which is
+    // where the previous per-check `ExeResolver` fn-pointer seam deferred
+    // resolution to). On a Homebrew Cellar install whose stable symlink is
+    // missing, `resolve_stable_exe_path` (installer.rs) emits an `eprintln!`
+    // warning as a side effect of resolution — a narrow edge case (fresh
+    // install + broken stable link, simultaneously) that previously never
+    // triggered resolution at all and so never printed that line. A fully
+    // lazy, memoizing resolver would preserve the old "only resolve if truly
+    // needed" property, but requires promoting `ExeResolver` from a bare `fn`
+    // pointer to a closure/trait-object type (`&dyn Fn`) with `OnceCell`-based
+    // caching — real added complexity for a single extra stderr line in a
+    // narrow scenario. Accepted as-is.
+    let resolved_exe = installer::resolved_current_omamori_exe();
     let hooks_dir = base_dir.join("hooks");
-    items.push(check_claude_hook_hash(
-        &hooks_dir,
-        installer::resolved_current_omamori_exe,
-    ));
+    items.push(check_claude_hook_hash(&hooks_dir, &resolved_exe));
 
     // codex-pretooluse.sh — hash comparison + version drift (#381)
-    items.push(check_codex_hook_hash(
-        &hooks_dir,
-        installer::resolved_current_omamori_exe,
-    ));
+    items.push(check_codex_hook_hash(&hooks_dir, &resolved_exe));
 
     // claude-settings.snippet.json — existence check only
     let settings_snippet = hooks_dir.join("claude-settings.snippet.json");
@@ -1019,14 +1046,18 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     });
 
     // claude-code-settings — verify ~/.claude/settings.json is wired up (#196)
-    items.push(check_claude_settings_integration(base_dir));
+    // Calls `_with_verifier` directly (not the `check_claude_settings_integration`
+    // convenience wrapper) so it shares `resolved_exe` above instead of
+    // resolving its own copy.
+    items.push(check_claude_settings_integration_with_verifier(
+        base_dir,
+        installer::verify_hook_contract,
+        &resolved_exe,
+    ));
 
     // cursor-hooks.snippet.json — hash comparison + dangling path detection (#56, T8, #382)
     let cursor_snippet = hooks_dir.join("cursor-hooks.snippet.json");
-    items.push(check_cursor_snippet(
-        &cursor_snippet,
-        installer::resolved_current_omamori_exe,
-    ));
+    items.push(check_cursor_snippet(&cursor_snippet, &resolved_exe));
 
     // --- Config ---
     if let Some(entry) = read_config_entry() {
@@ -1635,10 +1666,9 @@ mod tests {
         )
         .unwrap();
 
-        fn always_fails() -> std::io::Result<PathBuf> {
-            Err(std::io::Error::other("simulated exe resolution failure"))
-        }
-        let item = check_claude_hook_hash(&dir, always_fails);
+        let always_fails: ResolvedExe =
+            Err(std::io::Error::other("simulated exe resolution failure"));
+        let item = check_claude_hook_hash(&dir, &always_fails);
 
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(
@@ -1667,7 +1697,7 @@ mod tests {
         )
         .unwrap();
 
-        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+        let item = check_claude_hook_hash(&dir, &installer::resolved_current_omamori_exe());
 
         assert_eq!(item.status, CheckStatus::Fail);
         assert!(item.detail.contains("MISMATCH"), "detail: {}", item.detail);
@@ -1688,7 +1718,7 @@ mod tests {
         )
         .unwrap();
 
-        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+        let item = check_claude_hook_hash(&dir, &installer::resolved_current_omamori_exe());
 
         assert_eq!(item.status, CheckStatus::Ok);
         assert_eq!(item.detail, "(hash match)");
@@ -1702,7 +1732,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+        let item = check_claude_hook_hash(&dir, &installer::resolved_current_omamori_exe());
 
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(
@@ -1723,7 +1753,7 @@ mod tests {
         // read as a file — triggers the "(unreadable)" branch.
         fs::create_dir_all(dir.join("claude-pretooluse.sh")).unwrap();
 
-        let item = check_claude_hook_hash(&dir, installer::resolved_current_omamori_exe);
+        let item = check_claude_hook_hash(&dir, &installer::resolved_current_omamori_exe());
 
         assert_eq!(item.status, CheckStatus::Fail);
         assert_eq!(item.detail, "(unreadable)");
@@ -1745,10 +1775,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(dir.join("claude-pretooluse.sh")).unwrap();
 
-        fn always_fails() -> std::io::Result<PathBuf> {
-            Err(std::io::Error::other("simulated exe resolution failure"))
-        }
-        let item = check_claude_hook_hash(&dir, always_fails);
+        let always_fails: ResolvedExe =
+            Err(std::io::Error::other("simulated exe resolution failure"));
+        let item = check_claude_hook_hash(&dir, &always_fails);
 
         assert_eq!(item.status, CheckStatus::Fail);
         assert_eq!(item.detail, "(unreadable)");
@@ -1769,7 +1798,7 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
+        let item = check_cursor_snippet(&path, &installer::resolved_current_omamori_exe());
         assert_eq!(item.status, CheckStatus::Ok);
         assert!(item.detail.contains("hash match"));
 
@@ -1789,7 +1818,7 @@ mod tests {
         )
         .unwrap();
 
-        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
+        let item = check_cursor_snippet(&path, &installer::resolved_current_omamori_exe());
         assert_eq!(item.status, CheckStatus::Fail);
         assert!(item.detail.contains("MISMATCH"));
 
@@ -1807,7 +1836,7 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
+        let item = check_cursor_snippet(&path, &installer::resolved_current_omamori_exe());
         // Either FAIL (hash mismatch) or WARN (dangling) — either way, not Ok
         assert_ne!(item.status, CheckStatus::Ok);
 
@@ -1817,7 +1846,7 @@ mod tests {
     #[test]
     fn check_cursor_snippet_missing_returns_warn() {
         let path = Path::new("/nonexistent/cursor-hooks.snippet.json");
-        let item = check_cursor_snippet(path, installer::resolved_current_omamori_exe);
+        let item = check_cursor_snippet(path, &installer::resolved_current_omamori_exe());
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(item.detail.contains("not installed"));
     }
@@ -1848,7 +1877,7 @@ mod tests {
         )
         .unwrap();
 
-        let item = check_codex_hook_hash(&dir, installer::resolved_current_omamori_exe);
+        let item = check_codex_hook_hash(&dir, &installer::resolved_current_omamori_exe());
 
         assert_eq!(item.status, CheckStatus::Ok);
         assert_eq!(item.detail, "(hash match)");
@@ -2007,6 +2036,76 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn parse_cursor_snippet_version_rejected_when_overlong() {
+        // #446 item 1: `_comment` extracts cleanly (valid JSON, marker,
+        // boundary all present) but the version itself exceeds
+        // `is_plausible_version_string`'s 32-char cap. A prior test only
+        // exercised the shell-comment path's equivalent (`detect_hook_version_drift_rejected_when_comment_too_long`)
+        // — this pins that the JSON path reaches the same gate.
+        let content = format!(
+            r#"{{"_comment":"Generated by omamori v{}. Merge into .cursor/hooks.json"}}"#,
+            "9".repeat(64)
+        );
+        let extracted = parse_cursor_snippet_version(&content);
+        assert_eq!(extracted.as_deref(), Some("9".repeat(64).as_str()));
+        assert!(matches!(
+            detect_hook_version_drift(extracted.as_deref()),
+            HookVersionDrift::Rejected
+        ));
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_rejected_when_backtick_injected() {
+        // #446 item 1: a version string containing a shell metacharacter
+        // (backtick, command substitution) must be rejected rather than
+        // flowing into the drift-suffix detail line unsanitized.
+        let content =
+            r#"{"_comment":"Generated by omamori v0.0.1`whoami`. Merge into .cursor/hooks.json"}"#;
+        let extracted = parse_cursor_snippet_version(content);
+        assert_eq!(extracted.as_deref(), Some("0.0.1`whoami`"));
+        assert!(matches!(
+            detect_hook_version_drift(extracted.as_deref()),
+            HookVersionDrift::Rejected
+        ));
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_uses_first_marker_when_comment_has_two() {
+        // #446 item 1: a `_comment` containing "omamori v" twice (e.g. a
+        // hand-edited or adversarially crafted file) must not panic or pick
+        // an unexpected half — `split_once` takes the first occurrence, and
+        // the extraction proceeds from there deterministically.
+        let content = r#"{"_comment":"Generated by omamori v1.0.0. Generated by omamori v2.0.0. Merge into .cursor/hooks.json"}"#;
+        assert_eq!(
+            parse_cursor_snippet_version(content).as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_rejected_when_non_ascii_digits() {
+        // #446 item 1: full-width/non-ASCII digit spoofing (e.g. U+FF10
+        // FULLWIDTH DIGIT ZERO) must not be accepted as a plausible version
+        // — `is_plausible_version_string` only allows ASCII alphanumerics.
+        let content = "{\"_comment\":\"Generated by omamori v\u{FF10}.\u{FF11}.\u{FF10}. Merge into .cursor/hooks.json\"}";
+        let extracted = parse_cursor_snippet_version(content);
+        assert_eq!(extracted.as_deref(), Some("\u{FF10}.\u{FF11}.\u{FF10}"));
+        assert!(matches!(
+            detect_hook_version_drift(extracted.as_deref()),
+            HookVersionDrift::Rejected
+        ));
+    }
+
+    #[test]
+    fn parse_cursor_snippet_version_returns_none_for_empty_content() {
+        // #446 item 1: empty file (zero bytes) is invalid JSON, same code
+        // path as `_returns_none_when_json_broken` above but a distinct
+        // shape worth pinning explicitly — a truncated/zeroed-out snippet
+        // file is a plausible real-world failure mode.
+        assert_eq!(parse_cursor_snippet_version(""), None);
+    }
+
     // --- check_cursor_snippet ExeResolver + drift suffix tests (#382) ---
 
     #[test]
@@ -2031,10 +2130,9 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        fn always_fails() -> std::io::Result<PathBuf> {
-            Err(std::io::Error::other("simulated exe resolution failure"))
-        }
-        let item = check_cursor_snippet(&path, always_fails);
+        let always_fails: ResolvedExe =
+            Err(std::io::Error::other("simulated exe resolution failure"));
+        let item = check_cursor_snippet(&path, &always_fails);
 
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(
@@ -2071,7 +2169,7 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        let item = check_cursor_snippet(&path, installer::resolved_current_omamori_exe);
+        let item = check_cursor_snippet(&path, &installer::resolved_current_omamori_exe());
 
         assert_eq!(item.status, CheckStatus::Fail);
         assert!(item.detail.contains("MISMATCH"), "detail: {}", item.detail);
@@ -2104,10 +2202,8 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        fn resolves_to_dangling_path() -> std::io::Result<PathBuf> {
-            Ok(PathBuf::from("/nonexistent/bin/omamori"))
-        }
-        let item = check_cursor_snippet(&path, resolves_to_dangling_path);
+        let resolves_to_dangling_path: ResolvedExe = Ok(PathBuf::from("/nonexistent/bin/omamori"));
+        let item = check_cursor_snippet(&path, &resolves_to_dangling_path);
 
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(item.detail.contains("dangling"), "detail: {}", item.detail);
@@ -2136,10 +2232,9 @@ mod tests {
         let path = dir.join("cursor-hooks.snippet.json");
         fs::write(&path, &content).unwrap();
 
-        fn always_fails() -> std::io::Result<PathBuf> {
-            Err(std::io::Error::other("simulated exe resolution failure"))
-        }
-        let item = check_cursor_snippet(&path, always_fails);
+        let always_fails: ResolvedExe =
+            Err(std::io::Error::other("simulated exe resolution failure"));
+        let item = check_cursor_snippet(&path, &always_fails);
 
         assert_eq!(item.status, CheckStatus::Warn);
         assert!(item.detail.contains("dangling"), "detail: {}", item.detail);
@@ -2757,7 +2852,7 @@ mod tests {
         let item = check_claude_settings_integration_with_verifier(
             &dir.join(".omamori"),
             |_, _| installer::HookContractStatus::Ok,
-            installer::resolved_current_omamori_exe,
+            &installer::resolved_current_omamori_exe(),
         );
         assert_eq!(item.status, CheckStatus::Ok, "details: {}", item.detail);
         // #327 test-adversarial finding: a matching-version fixture proves
@@ -2837,7 +2932,7 @@ mod tests {
         let item = check_claude_settings_integration_with_verifier(
             &dir.join(".omamori"),
             panics_if_called,
-            installer::resolved_current_omamori_exe,
+            &installer::resolved_current_omamori_exe(),
         );
         assert_eq!(item.status, CheckStatus::Fail, "details: {}", item.detail);
         assert!(
@@ -2909,7 +3004,7 @@ mod tests {
         let item = check_claude_settings_integration_with_verifier(
             &dir.join(".omamori"),
             |_, _| installer::HookContractStatus::ExitNonZero(1),
-            installer::resolved_current_omamori_exe,
+            &installer::resolved_current_omamori_exe(),
         );
         assert_eq!(item.status, CheckStatus::Fail, "details: {}", item.detail);
         assert!(
@@ -2980,13 +3075,12 @@ mod tests {
         let saved = std::env::var_os("HOME");
         unsafe { std::env::set_var("HOME", &dir) };
 
-        fn always_fails() -> std::io::Result<PathBuf> {
-            Err(std::io::Error::other("simulated exe resolution failure"))
-        }
+        let always_fails: ResolvedExe =
+            Err(std::io::Error::other("simulated exe resolution failure"));
         let item = check_claude_settings_integration_with_verifier(
             &dir.join(".omamori"),
             |_, _| installer::HookContractStatus::Ok,
-            always_fails,
+            &always_fails,
         );
         assert_eq!(item.status, CheckStatus::Warn, "details: {}", item.detail);
         assert!(
@@ -3006,6 +3100,126 @@ mod tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn hook_version_drift_suffix_consistent_across_all_three_callers() {
+        // #446 item 2: check_claude_hook_hash, check_codex_hook_hash, and
+        // check_claude_settings_integration_with_verifier all delegate to the
+        // same shared `hook_version_drift_suffix` — consistency across the
+        // three currently holds by construction (one shared function) plus
+        // all passing individually, not an explicit cross-cutting assertion.
+        // Drives all three into their exe-resolution-failure branch with the
+        // same fake installed version and asserts the `[version drift: ...]`
+        // suffix text is byte-identical across all three CheckItem details.
+        let always_fails: ResolvedExe =
+            Err(std::io::Error::other("simulated exe resolution failure"));
+
+        // claude-pretooluse.sh
+        let claude_hooks_dir =
+            std::env::temp_dir().join(format!("omamori-crosscaller-claude-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&claude_hooks_dir);
+        fs::create_dir_all(&claude_hooks_dir).unwrap();
+        fs::write(
+            claude_hooks_dir.join("claude-pretooluse.sh"),
+            script_with_version("0.0.1"),
+        )
+        .unwrap();
+        let claude_item = check_claude_hook_hash(&claude_hooks_dir, &always_fails);
+
+        // codex-pretooluse.sh
+        let codex_hooks_dir =
+            std::env::temp_dir().join(format!("omamori-crosscaller-codex-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&codex_hooks_dir);
+        fs::create_dir_all(&codex_hooks_dir).unwrap();
+        let codex_real =
+            installer::render_codex_pretooluse_script(Path::new("/opt/homebrew/bin/omamori"));
+        let codex_stale = codex_real.replacen(
+            &format!("# omamori hook v{}", env!("CARGO_PKG_VERSION")),
+            "# omamori hook v0.0.1",
+            1,
+        );
+        assert_ne!(
+            codex_stale, codex_real,
+            "fixture setup bug: version substitution did not change the codex script"
+        );
+        fs::write(codex_hooks_dir.join("codex-pretooluse.sh"), &codex_stale).unwrap();
+        let codex_item = check_codex_hook_hash(&codex_hooks_dir, &always_fails);
+
+        // claude-code-settings (settings-integration)
+        let settings_dir = std::env::temp_dir().join(format!(
+            "omamori-crosscaller-settings-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&settings_dir);
+        let claude_home = settings_dir.join(".claude");
+        fs::create_dir_all(&claude_home).unwrap();
+        let omamori_hooks = settings_dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let settings_script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(&settings_script, script_with_version("0.0.1")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&settings_script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let omamori_cmd = shell_words::quote(&settings_script.display().to_string()).into_owned();
+        let settings_json = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
+                }]
+            }
+        });
+        fs::write(
+            claude_home.join("settings.json"),
+            serde_json::to_string_pretty(&settings_json).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &settings_dir) };
+        let settings_item = check_claude_settings_integration_with_verifier(
+            &settings_dir.join(".omamori"),
+            |_, _| installer::HookContractStatus::Ok,
+            &always_fails,
+        );
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // Extract the `[version drift: ...]` suffix substring from each detail.
+        fn drift_suffix(detail: &str) -> &str {
+            let start = detail
+                .find(" [version drift:")
+                .expect("detail should contain a version-drift suffix");
+            &detail[start..]
+        }
+        let claude_suffix = drift_suffix(&claude_item.detail);
+        let codex_suffix = drift_suffix(&codex_item.detail);
+        let settings_suffix = drift_suffix(&settings_item.detail);
+
+        assert_eq!(
+            claude_suffix, codex_suffix,
+            "claude vs codex suffix mismatch"
+        );
+        assert_eq!(
+            claude_suffix, settings_suffix,
+            "claude vs settings suffix mismatch"
+        );
+        assert!(claude_suffix.contains("0.0.1"), "suffix: {claude_suffix}");
+        assert!(
+            claude_suffix.contains(env!("CARGO_PKG_VERSION")),
+            "suffix: {claude_suffix}"
+        );
+
+        let _ = fs::remove_dir_all(&claude_hooks_dir);
+        let _ = fs::remove_dir_all(&codex_hooks_dir);
+        let _ = fs::remove_dir_all(&settings_dir);
     }
 
     // V-007: Doctor detects duplicate/stale omamori entries
