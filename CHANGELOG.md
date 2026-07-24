@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-07-24
+
+**Summary**: Internal cleanup release — closes out the CLI-flag-value-parsing helper migration (#392/#377/#451) across all 19 call sites, extends the `faq-doc-sync` CI invariant to catch numeric prose drift (#396/#397), and reduces redundant exe resolution in `doctor`/`status` (#446). No user-facing behavior change.
+
 ### Added
 
 - **`faq-doc-sync` CI invariant now also verifies numeric claims in `docs/FAQ.md` prose** (break-glass duration default/range, concurrency cap, staging retention days/file cap) against their source constants in `src/break_glass.rs`/`src/config.rs`, closing a blind spot the invariant's own scope-note previously called out explicitly. A future constant change without a matching FAQ edit now fails CI instead of shipping silently stale. ([#396](https://github.com/yottayoshida/omamori/issues/396))
