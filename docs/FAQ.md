@@ -38,7 +38,7 @@ Use a time-limited bypass for the specific rule that fired. See [I need to bypas
    omamori override disable <rule-name>
    ```
 
-   You'll notice `omamori config disable <rule-name>` also exists: it's the command for non-core rules, while `override disable` is specifically for core (safety-critical) rules. Right now every built-in rule ships as core, so `config disable` will reject any built-in name you try ("is a core safety rule and cannot be disabled") — `override disable` is what actually works on a built-in today.
+   You'll also see `omamori config disable <rule-name>` — that's for non-core rules. Every built-in rule currently ships as core, so it rejects any built-in name ("is a core safety rule and cannot be disabled"); `override disable`, used above, is what actually works on a built-in today.
 
 3. Or scope the behavior more precisely with a custom rule instead of disabling a built-in — again, **in a plain terminal**, since `config add` mutates config too and is blocked when run through an AI agent:
 

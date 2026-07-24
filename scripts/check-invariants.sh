@@ -448,7 +448,10 @@ echo "DI-16 RETIRED (v0.10.4): relaxed_by audit path removed with meta-pattern i
 #       src/lib.rs, and, for the commands that have their own sub-verbs
 #       (config/override/audit), the second word against the file that
 #       actually dispatches it -- a one-word check alone would pass
-#       "omamori config bogus-verb" as long as "config" itself is real.
+#       "omamori config bogus-verb" as long as "config" itself is real;
+#   (c) every numeric default the FAQ states in prose (break-glass duration
+#       bounds/concurrency cap, staging retention/cap) must match its
+#       source constant in src/break_glass.rs / src/config.rs (#396).
 faq_fail=0
 faq=docs/FAQ.md
 if [ ! -f "$faq" ]; then
@@ -470,12 +473,23 @@ else
         | LC_ALL=C tr '[:upper:]' '[:lower:]' \
         | LC_ALL=C sed 's/[^a-z0-9 _-]//g; s/ /-/g')
     faq_anchors=$( (grep -oE 'SECURITY\.md#[a-z0-9_-]+' "$faq" || true) | sed 's/.*#//' | sort -u)
-    for a in $faq_anchors; do
-        if ! printf '%s\n' "$security_anchors" | grep -qxF "$a"; then
+    # Single-pass set-difference (#397) instead of a printf+grep fork per
+    # anchor. `comm -23 A B` requires both inputs sorted: `faq_anchors` is
+    # already `sort -u`'d above, but `security_anchors` (above) is in
+    # SECURITY.md heading order, so it gets an explicit `sort -u` here too --
+    # skipping it would make comm misreport present anchors as missing.
+    if [ -n "$faq_anchors" ]; then
+        missing_anchors=$(comm -23 \
+            <(printf '%s\n' "$faq_anchors") \
+            <(printf '%s\n' "$security_anchors" | sort -u))
+        while IFS= read -r a; do
+            [ -z "$a" ] && continue
             echo "FAIL [invariant faq-doc-sync/#328]: FAQ references SECURITY.md#$a but no heading generates that anchor"
             faq_fail=1
-        fi
-    done
+        done <<MISSING_ANCHORS_EOF
+$missing_anchors
+MISSING_ANCHORS_EOF
+    fi
 
     # (b) omamori subcommand references. check_omamori_ref verifies `top` is
     # a real src/lib.rs dispatch arm and, if `sub` is non-empty, that `sub`
@@ -483,24 +497,50 @@ else
     # A top-level command with no entry in the case below fails loudly on a
     # two-word reference instead of silently passing -- that's a prompt to
     # extend the case statement, not a bug.
+    #
+    # Each source file's `Some("...")` occurrences are cached once (#397)
+    # rather than re-read per FAQ pair -- mirrors Invariant #9's
+    # extract-once-into-a-variable style (TRANSPARENT_WRAPPERS, above) and
+    # DI-13's default_rules() extraction (below). The extraction is a
+    # context-independent substring match (equivalent to
+    # `grep -F "Some(\"$top\")"` against the whole file, not just real match
+    # arms), so the cache deliberately keeps non-dispatch-arm occurrences
+    # too (e.g. the `args.get(1) == Some("hook-check")` guard near the top
+    # of src/lib.rs) -- narrowing that would silently change which FAQ
+    # references pass.
+    lib_arms=$( (grep -oE 'Some\("[a-z][a-z-]*"\)' src/lib.rs || true) | sort -u)
+    if [ -z "$lib_arms" ]; then
+        echo "FAIL [invariant faq-doc-sync/#397]: no Some(\"...\") occurrences found in src/lib.rs -- extraction pattern may be stale"
+        faq_fail=1
+    fi
+    config_arms=$( (grep -oE 'Some\("[a-z][a-z-]*"\)' src/cli/config_cmd.rs || true) | sort -u)
+    if [ -z "$config_arms" ]; then
+        echo "FAIL [invariant faq-doc-sync/#397]: no Some(\"...\") occurrences found in src/cli/config_cmd.rs -- extraction pattern may be stale"
+        faq_fail=1
+    fi
+    audit_arms=$( (grep -oE 'Some\("[a-z][a-z-]*"\)' src/cli/audit_cmd.rs || true) | sort -u)
+    if [ -z "$audit_arms" ]; then
+        echo "FAIL [invariant faq-doc-sync/#397]: no Some(\"...\") occurrences found in src/cli/audit_cmd.rs -- extraction pattern may be stale"
+        faq_fail=1
+    fi
     check_omamori_ref() {
         top=$1
         sub=$2
-        if ! grep -qF "Some(\"$top\")" src/lib.rs; then
+        if ! printf '%s\n' "$lib_arms" | grep -qxF "Some(\"$top\")"; then
             echo "FAIL [invariant faq-doc-sync/#328]: FAQ uses 'omamori $top' but src/lib.rs has no such subcommand"
             faq_fail=1
             return
         fi
         [ -z "$sub" ] && return
         case "$top" in
-            config|override) subfile="src/cli/config_cmd.rs" ;;
-            audit) subfile="src/cli/audit_cmd.rs" ;;
-            *) subfile="" ;;
+            config|override) subfile="src/cli/config_cmd.rs"; subarms="$config_arms" ;;
+            audit) subfile="src/cli/audit_cmd.rs"; subarms="$audit_arms" ;;
+            *) subfile=""; subarms="" ;;
         esac
         if [ -z "$subfile" ]; then
             echo "FAIL [invariant faq-doc-sync/#328]: FAQ uses 'omamori $top $sub' but this invariant doesn't know which file dispatches '$top' sub-verbs -- add '$top' to the case statement in scripts/check-invariants.sh"
             faq_fail=1
-        elif ! grep -qF "Some(\"$sub\")" "$subfile"; then
+        elif ! printf '%s\n' "$subarms" | grep -qxF "Some(\"$sub\")"; then
             echo "FAIL [invariant faq-doc-sync/#328]: FAQ uses 'omamori $top $sub' but $subfile has no '$sub' arm"
             faq_fail=1
         fi
@@ -535,13 +575,130 @@ else
     done <<FAQ_PAIRS_EOF
 $faq_pairs
 FAQ_PAIRS_EOF
+
+    # (c) numeric defaults the FAQ states in prose must match their source
+    # constants (#396). Rendering seconds -> words uses a static lookup
+    # table, not a general converter: the table only encodes mathematical
+    # identities (3600s == "1 hour"), so the source constant stays the
+    # single source of truth and no untested pluralization logic is
+    # introduced. An unmapped value is a loud FAIL prompting a human to add
+    # a mapping and update the FAQ, not a silent pass. This is deliberately
+    # NOT the same rendering as src/break_glass.rs's own
+    # format_duration_human (CLI display, "1 hour(s)" style) -- this table
+    # only exists to match the fixed prose in docs/FAQ.md.
+    extract_uint_const() {
+        # $1 = file, $2 = const name. Anchored to the definition line only
+        # (optional visibility modifier) so a same-named `assert_eq!` or
+        # other usage elsewhere in the file (src/config.rs has both) isn't
+        # mistaken for the definition. `[0-9_]` accepts Rust numeric
+        # separators (e.g. `86_400`); stripped below along with whitespace.
+        cfile=$1
+        cname=$2
+        cline=$(grep -m1 -oE "^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?const[[:space:]]+$cname[[:space:]]*:[^=]+=[[:space:]]*[0-9_]+" "$cfile" || true)
+        printf '%s' "${cline##*=}" | tr -d '[:space:]_'
+    }
+    render_duration() {
+        case "$1" in
+            300) echo "5 minutes" ;;
+            3600) echo "1 hour" ;;
+            86400) echo "24 hours" ;;
+            *) echo "" ;;
+        esac
+    }
+    # require_const/assert_faq_contains factor out the two boilerplate
+    # shapes repeated across the 6 constants below (extract-or-FAIL,
+    # claim-matches-or-FAIL). Both are called as plain statements, never via
+    # `$(...)` -- their `echo` is a FAIL diagnostic meant to reach stdout
+    # directly, not a return value to capture (capturing would silently
+    # swallow the diagnostic into whatever variable captured it instead).
+    require_const() {
+        # $1=extracted value $2=const name $3=source file
+        if [ -z "$1" ]; then
+            echo "FAIL [invariant faq-doc-sync/#396]: could not extract $2 from $3 -- constant renamed/removed, or extraction pattern is stale"
+            faq_fail=1
+            return 1
+        fi
+    }
+    assert_faq_contains() {
+        # $1=haystack (a cached claim line/sentence, not the whole file)
+        # $2=expected substring $3=FAIL diagnostic detail
+        if ! printf '%s' "$1" | grep -qF "$2"; then
+            echo "FAIL [invariant faq-doc-sync/#396]: $3"
+            faq_fail=1
+        fi
+    }
+    bg_src=src/break_glass.rs
+    cfg_src=src/config.rs
+    if [ ! -f "$bg_src" ]; then
+        echo "FAIL [invariant faq-doc-sync/#396]: $bg_src is missing"
+        faq_fail=1
+    elif [ ! -f "$cfg_src" ]; then
+        echo "FAIL [invariant faq-doc-sync/#396]: $cfg_src is missing"
+        faq_fail=1
+    else
+        # Scope every phrase check below to the specific claim line, not the
+        # whole file (Codex R1 finding, #396): a bare `grep -qF "phrase"
+        # "$faq"` would still pass if the phrase coincidentally appeared
+        # somewhere else in the FAQ while the actual claim sentence went
+        # stale. `-m1`+`|| true` follows the same zero-match-under-set-e
+        # guard used throughout this script.
+        duration_bullet=$(grep -m1 -F '**Duration**:' "$faq" || true)
+        staging_sentence=$(grep -m1 -F 'pruned automatically' "$faq" || true)
+
+        default_secs=$(extract_uint_const "$bg_src" DEFAULT_DURATION_SECS)
+        if require_const "$default_secs" DEFAULT_DURATION_SECS "$bg_src"; then
+            default_human=$(render_duration "$default_secs")
+            if [ -z "$default_human" ]; then
+                echo "FAIL [invariant faq-doc-sync/#396]: render_duration has no mapping for DEFAULT_DURATION_SECS=$default_secs -- add a mapping in scripts/check-invariants.sh and update $faq"
+                faq_fail=1
+            else
+                assert_faq_contains "$duration_bullet" "defaults to $default_human" \
+                    "$faq's break-glass duration bullet does not say 'defaults to $default_human' (src/break_glass.rs DEFAULT_DURATION_SECS=$default_secs) -- FAQ prose may be stale"
+            fi
+        fi
+
+        min_secs=$(extract_uint_const "$bg_src" MIN_DURATION_SECS)
+        max_secs=$(extract_uint_const "$bg_src" MAX_DURATION_SECS)
+        if require_const "$min_secs" MIN_DURATION_SECS "$bg_src" && require_const "$max_secs" MAX_DURATION_SECS "$bg_src"; then
+            min_human=$(render_duration "$min_secs")
+            max_human=$(render_duration "$max_secs")
+            if [ -z "$min_human" ] || [ -z "$max_human" ]; then
+                echo "FAIL [invariant faq-doc-sync/#396]: render_duration has no mapping for MIN_DURATION_SECS=$min_secs or MAX_DURATION_SECS=$max_secs -- add a mapping in scripts/check-invariants.sh and update $faq"
+                faq_fail=1
+            else
+                assert_faq_contains "$duration_bullet" "$min_human to $max_human" \
+                    "$faq's break-glass duration bullet does not say '$min_human to $max_human' (src/break_glass.rs MIN/MAX_DURATION_SECS=$min_secs/$max_secs) -- FAQ prose may be stale"
+            fi
+        fi
+
+        max_concurrent=$(extract_uint_const "$bg_src" MAX_CONCURRENT)
+        if require_const "$max_concurrent" MAX_CONCURRENT "$bg_src"; then
+            assert_faq_contains "$duration_bullet" "most $max_concurrent bypasses" \
+                "$faq's break-glass duration bullet does not say 'most $max_concurrent bypasses' (src/break_glass.rs MAX_CONCURRENT=$max_concurrent) -- FAQ prose may be stale"
+        fi
+
+        retention_days=$(extract_uint_const "$cfg_src" DEFAULT_STAGING_RETENTION_DAYS)
+        if require_const "$retention_days" DEFAULT_STAGING_RETENTION_DAYS "$cfg_src"; then
+            assert_faq_contains "$staging_sentence" "($retention_days-day retention" \
+                "$faq's staging sentence does not say '($retention_days-day retention' (src/config.rs DEFAULT_STAGING_RETENTION_DAYS=$retention_days) -- FAQ prose may be stale"
+        fi
+
+        max_files=$(extract_uint_const "$cfg_src" DEFAULT_STAGING_MAX_FILES)
+        if require_const "$max_files" DEFAULT_STAGING_MAX_FILES "$cfg_src"; then
+            assert_faq_contains "$staging_sentence" "retention, $max_files-file cap" \
+                "$faq's staging sentence does not say 'retention, $max_files-file cap' (src/config.rs DEFAULT_STAGING_MAX_FILES=$max_files) -- FAQ prose may be stale"
+        fi
+    fi
 fi
 if [ "$faq_fail" -eq 0 ]; then
-    # Scope note: this only pins structural references (anchor targets exist,
-    # subcommand/sub-verb names exist) -- it does NOT verify semantic claims
-    # in the prose (durations, retention counts, "as of version X"). Those
+    # Scope note: this pins structural references (anchor targets exist,
+    # subcommand/sub-verb names exist) and the specific numeric defaults
+    # listed in #396 (break-glass duration bounds/concurrency cap, staging
+    # retention/cap) -- it does NOT verify other semantic claims in the
+    # prose ("as of version X", numbers outside the #396 list, cross-doc
+    # copies such as README.md's own staging-retention mention). Those
     # still need a human to re-check on future FAQ or behavior changes.
-    echo "faq-doc-sync OK: docs/FAQ.md SECURITY.md anchors and omamori subcommand references all resolve (#328)"
+    echo "faq-doc-sync OK: docs/FAQ.md SECURITY.md anchors, omamori subcommand references, and break-glass/staging numeric defaults all resolve (#328, #396)"
 else
     fail=1
 fi
@@ -617,6 +774,15 @@ else
     # (O1) omamori subcommand references, extracted from the same two sites
     # as faq-doc-sync: fenced ```bash blocks (indented fences included via
     # the `[[:space:]]*` prefix) and backtick-quoted prose.
+    #
+    # Known, deliberately deferred gap (#397 follow-up candidate): this
+    # function still re-greps src/lib.rs/config_cmd.rs/audit_cmd.rs on every
+    # call, the exact per-item-fork pattern faq-doc-sync's check_omamori_ref
+    # was refactored away from above (lib_arms/config_arms/audit_arms). Not
+    # fixed here because doing so would mean sharing state across the
+    # deliberately-non-shared boundary the comment above this invariant
+    # already explains (touching check_omamori_ref_contract to save forks
+    # is out of #397's stated scope, not an oversight).
     check_omamori_ref_contract() {
         top=$1
         sub=$2
@@ -860,6 +1026,11 @@ else
     extdocs_contract_anchors=$contract_own_anchors
     extdocs_readme_anchors=$(contract_generate_anchors README.md)
 
+    # Known, deliberately deferred gap (same #397 follow-up candidate noted
+    # above check_omamori_ref_contract): this function re-greps
+    # src/lib.rs/config_cmd.rs/audit_cmd.rs per call, and is itself called
+    # once per doc in the `$extdocs_docs` loop below -- re-forking the same
+    # three greps once per (doc, FAQ-style pair) rather than once total.
     check_omamori_ref_extdocs() {
         doc=$1
         top=$2
