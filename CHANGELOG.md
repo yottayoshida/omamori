@@ -6,8 +6,14 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+
+- **`faq-doc-sync` CI invariant now also verifies numeric claims in `docs/FAQ.md` prose** (break-glass duration default/range, concurrency cap, staging retention days/file cap) against their source constants in `src/break_glass.rs`/`src/config.rs`, closing a blind spot the invariant's own scope-note previously called out explicitly. A future constant change without a matching FAQ edit now fails CI instead of shipping silently stale. ([#396](https://github.com/yottayoshida/omamori/issues/396))
+
 ### Changed
 
+- **Internal**: the `faq-doc-sync` invariant's anchor-existence and subcommand-existence checks now cache each source file's relevant content once instead of re-reading it per FAQ reference, matching the extract-once style already used by the `TRANSPARENT_WRAPPERS`/DI-13 invariants in the same script. No behavior change for well-formed input — verified byte-identical against the pre-refactor script output — with new loud-fail guards added only for the previously-untested case of a corrupted/unparseable extraction. ([#397](https://github.com/yottayoshida/omamori/issues/397))
+- `docs/FAQ.md`'s explanation of `config disable` vs `override disable` is tightened; no change to the commands, error text, or their ordering. ([#398](https://github.com/yottayoshida/omamori/issues/398))
 - **Internal**: `full_check()` now resolves the running omamori exe once and threads the result into `check_claude_hook_hash`/`check_codex_hook_hash`/`check_claude_settings_integration`/`check_cursor_snippet`, instead of each independently re-resolving it (up to 4 redundant resolutions per `omamori doctor`/`omamori status` run). Known trade-off: on a fresh/uninstalled setup running from a Homebrew Cellar path whose stable symlink is missing, this can now print one extra `omamori warning: Cellar path detected...` line that previously wasn't reached (since no check needed resolution yet) — accepted as a narrow edge case rather than adding a lazy/memoizing resolver. ([#446](https://github.com/yottayoshida/omamori/issues/446))
 - **Internal**: extracted two shared CLI-flag-value-parsing helpers (`flag_value`/`flag_value_str` in `src/util.rs`) and migrated 13 hand-rolled "get the next arg or error" call sites across `install`/`setup`/`status`/`doctor`/`audit`/`report` to use them, removing 13 places where a copy-pasted `index += 2` could silently drift into an off-by-one. No observable behavior change — every error message, non-UTF8 value/flag-name handling, and adjacent-flag greedy value consumption is preserved and pinned by new characterization tests. `config_cmd.rs`'s 6 already-locally-deduplicated call sites are intentionally left for a follow-up issue. ([#392](https://github.com/yottayoshida/omamori/issues/392), [#377](https://github.com/yottayoshida/omamori/issues/377))
 
