@@ -8,7 +8,7 @@ use crate::audit;
 use crate::config::load_config;
 use crate::installer::resolve_base_dir;
 use crate::integrity;
-use crate::util::USAGE_HINT;
+use crate::util::{USAGE_HINT, flag_value};
 
 pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut base_dir: Option<PathBuf> = None;
@@ -18,11 +18,11 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
     while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
         match arg {
             "--base-dir" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::Usage("status requires a path after --base-dir".to_string())
+                let (value, next) = flag_value(args, index, || {
+                    "status requires a path after --base-dir".to_string()
                 })?;
                 base_dir = Some(PathBuf::from(value));
-                index += 2;
+                index = next;
             }
             "--refresh" => {
                 refresh = true;
@@ -172,4 +172,44 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
 
     println!();
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Characterization tests (#392/#377): pin current --base-dir error
+    // wording and non-UTF8 handling. Returns before any filesystem I/O, so
+    // no HOME/base-dir setup needed. `/simplify` Efficiency finding: these
+    // were originally added as subprocess tests in tests/cli.rs (before
+    // status.rs had a `mod tests`) — moved in-process here to match
+    // install.rs/doctor.rs's sibling tests, since a process spawn is far
+    // more expensive than an in-process call for logic that returns before
+    // touching the filesystem.
+
+    #[test]
+    fn status_base_dir_missing_value_error_message() {
+        let args: Vec<OsString> = vec!["omamori".into(), "status".into(), "--base-dir".into()];
+        let err = run_status_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "status requires a path after --base-dir");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_base_dir_accepts_non_utf8_path() {
+        let non_utf8 = crate::test_support::non_utf8_path_like();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "status".into(),
+            "--base-dir".into(),
+            non_utf8,
+            "--bogus-next-flag".into(),
+        ];
+        let err = run_status_command(&args).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("unknown status flag: --bogus-next-flag"),
+            "error: {err}"
+        );
+    }
 }

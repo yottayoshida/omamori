@@ -12,7 +12,7 @@ use crate::AppError;
 use crate::config;
 use crate::installer::{self, InstallOptions, SHIM_COMMANDS, SourceExe};
 use crate::integrity::{self, CheckStatus};
-use crate::util::USAGE_HINT;
+use crate::util::{USAGE_HINT, flag_value};
 
 use super::doctor::is_ai_environment;
 
@@ -66,18 +66,18 @@ pub(crate) fn run_setup_command(args: &[OsString]) -> Result<i32, AppError> {
                 index += 1;
             }
             "--base-dir" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::Usage("setup requires a path after --base-dir".to_string())
+                let (value, next) = flag_value(args, index, || {
+                    "setup requires a path after --base-dir".to_string()
                 })?;
                 base_dir = Some(PathBuf::from(value));
-                index += 2;
+                index = next;
             }
             "--source" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::Usage("setup requires a path after --source".to_string())
+                let (value, next) = flag_value(args, index, || {
+                    "setup requires a path after --source".to_string()
                 })?;
                 source_override = Some(PathBuf::from(value));
-                index += 2;
+                index = next;
             }
             _ => {
                 return Err(AppError::Usage(format!(
@@ -435,4 +435,70 @@ fn print_dry_run(
     println!("\n  [3/3] Would run doctor verification{not_reached_suffix}");
     println!("\nNo changes made.");
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Characterization tests (#392/#377): pin current --base-dir/--source
+    // error wording and non-UTF8 handling. Returns before any filesystem
+    // I/O, so no HOME/base-dir setup needed. `/simplify` Efficiency finding:
+    // these were originally added as subprocess tests in tests/cli.rs
+    // (before setup.rs had a `mod tests`) — moved in-process here to match
+    // install.rs/doctor.rs's sibling tests, since a process spawn is far
+    // more expensive than an in-process call for logic that returns before
+    // touching the filesystem.
+
+    #[test]
+    fn setup_base_dir_missing_value_error_message() {
+        let args: Vec<OsString> = vec!["omamori".into(), "setup".into(), "--base-dir".into()];
+        let err = run_setup_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "setup requires a path after --base-dir");
+    }
+
+    #[test]
+    fn setup_source_missing_value_error_message() {
+        let args: Vec<OsString> = vec!["omamori".into(), "setup".into(), "--source".into()];
+        let err = run_setup_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "setup requires a path after --source");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_base_dir_accepts_non_utf8_path() {
+        let non_utf8 = crate::test_support::non_utf8_path_like();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "setup".into(),
+            "--base-dir".into(),
+            non_utf8,
+            "--bogus-next-flag".into(),
+        ];
+        let err = run_setup_command(&args).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("unknown setup flag: --bogus-next-flag"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn setup_source_accepts_non_utf8_path() {
+        let non_utf8 = crate::test_support::non_utf8_path_like();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "setup".into(),
+            "--source".into(),
+            non_utf8,
+            "--bogus-next-flag".into(),
+        ];
+        let err = run_setup_command(&args).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("unknown setup flag: --bogus-next-flag"),
+            "error: {err}"
+        );
+    }
 }

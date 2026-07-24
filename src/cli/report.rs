@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use crate::AppError;
 use crate::audit::report::{ChainStatus, ReportAggregate, aggregate_report};
 use crate::config;
-use crate::util::USAGE_HINT;
+use crate::util::{USAGE_HINT, flag_value_str};
 
 pub(crate) fn run_report_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut days: u32 = 7;
@@ -27,14 +27,11 @@ pub(crate) fn run_report_command(args: &[OsString]) -> Result<i32, AppError> {
                 index += 1;
             }
             "--last" => {
-                let value = args
-                    .get(index + 1)
-                    .and_then(|v| v.to_str())
-                    .ok_or_else(|| {
-                        AppError::Usage("report --last requires a duration (e.g. 7d)".to_string())
-                    })?;
+                let (value, next) = flag_value_str(args, index, || {
+                    "report --last requires a duration (e.g. 7d)".to_string()
+                })?;
                 days = parse_duration(value)?;
-                index += 2;
+                index = next;
             }
             _ => {
                 return Err(AppError::Usage(format!(
@@ -305,5 +302,98 @@ mod tests {
 
         let unavail = serde_json::to_value(ChainStatus::Unavailable).unwrap();
         assert_eq!(unavail["status"], "unavailable");
+    }
+
+    // --- Characterization tests (#392/#377): pin current --last error
+    // wording before the shared-helper migration. Returns before any
+    // filesystem I/O, so no config setup needed. ---
+
+    #[test]
+    fn report_last_missing_value_error_message() {
+        let args: Vec<OsString> = vec!["omamori".into(), "report".into(), "--last".into()];
+        let err = run_report_command(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "report --last requires a duration (e.g. 7d)"
+        );
+    }
+
+    #[test]
+    fn report_last_parse_failure_error_message() {
+        // Distinct from the missing-value message above — parse_duration's
+        // own error text, unchanged by this refactor (the helper covers
+        // only the "get value or error" half).
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "report".into(),
+            "--last".into(),
+            "not-a-duration".into(),
+        ];
+        let err = run_report_command(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid duration \"not-a-duration\": use format like 7d (1d–90d)"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn report_last_rejects_non_utf8_value_same_as_missing() {
+        // Shape B fold: non-UTF8 value → same message as missing value.
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> =
+            vec!["omamori".into(), "report".into(), "--last".into(), non_utf8];
+        let err = run_report_command(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "report --last requires a duration (e.g. 7d)"
+        );
+    }
+
+    #[test]
+    fn report_last_adjacent_flag_greedy_value_consumption() {
+        // Codex Phase 6-B: strengthens V-ADJ coverage for Shape B — `--last
+        // --json` must consume the literal string "--json" as --last's
+        // value (parsed and rejected by parse_duration), not recognize
+        // --json as a flag.
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "report".into(),
+            "--last".into(),
+            "--json".into(),
+        ];
+        let err = run_report_command(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid duration \"--json\": use format like 7d (1d–90d)"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn report_non_utf8_flag_name_silently_ends_parsing() {
+        // #392/#377 V-NONUTF8-FLAG (Codex Phase 6-A finding during /plan,
+        // Codex Phase 6-B adversarial review during /develop): the outer
+        // loop `while let Some(arg) = args.get(index).and_then(|item|
+        // item.to_str())` — shared verbatim across every migrated file, not
+        // just report.rs — silently stops parsing (not an error) the moment
+        // it hits a non-UTF8 token AT THE FLAG-NAME POSITION, distinct from
+        // a non-UTF8 VALUE after a recognized flag (which the fold tests
+        // above cover). A trailing `--last not-a-duration` after the
+        // non-UTF8 token must never be reached, proving the loop actually
+        // stopped rather than skipping past the bad token.
+        let non_utf8_flag = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "report".into(),
+            non_utf8_flag,
+            "--last".into(),
+            "not-a-duration".into(),
+        ];
+        // If the loop kept going past the non-UTF8 token, this would fail
+        // on parse_duration("not-a-duration"). Success here proves parsing
+        // stopped silently at the non-UTF8 flag-name position instead.
+        let code = run_report_command(&args).unwrap();
+        assert_eq!(code, 0);
     }
 }

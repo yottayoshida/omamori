@@ -3467,6 +3467,14 @@ fn setup_unknown_flag_errors() {
     assert!(stderr.contains("unknown setup flag"), "stderr: {stderr}");
 }
 
+// Note: setup.rs/status.rs's --base-dir/--source characterization tests
+// (missing-value wording, non-UTF8 acceptance, #392/#377) live in-process in
+// each file's own `mod tests` now — moved there from this file's subprocess
+// pattern per a `/simplify` Efficiency finding (a process spawn is far more
+// expensive than an in-process call for logic that returns before touching
+// the filesystem, and install.rs/doctor.rs already had in-process
+// equivalents in the same diff).
+
 // ---------------------------------------------------------------------------
 // HOME resolver unification (#373, V-005/V-006)
 // ---------------------------------------------------------------------------

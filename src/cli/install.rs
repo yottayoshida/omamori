@@ -9,7 +9,7 @@ use crate::AppError;
 use crate::config::{self, load_config};
 use crate::engine::guard::guard_ai_config_modification;
 use crate::installer::{self, InstallOptions, SourceExe, install, uninstall};
-use crate::util::USAGE_HINT;
+use crate::util::{USAGE_HINT, flag_value};
 
 pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
     let mut base_dir: Option<PathBuf> = None;
@@ -20,18 +20,18 @@ pub(crate) fn run_install_command(args: &[OsString]) -> Result<i32, AppError> {
     while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
         match arg {
             "--base-dir" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::Usage("install requires a path after --base-dir".to_string())
+                let (value, next) = flag_value(args, index, || {
+                    "install requires a path after --base-dir".to_string()
                 })?;
                 base_dir = Some(PathBuf::from(value));
-                index += 2;
+                index = next;
             }
             "--source" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::Usage("install requires a path after --source".to_string())
+                let (value, next) = flag_value(args, index, || {
+                    "install requires a path after --source".to_string()
                 })?;
                 source = SourceExe::Explicit(PathBuf::from(value));
-                index += 2;
+                index = next;
             }
             "--hooks" => {
                 generate_hooks = true;
@@ -211,11 +211,11 @@ pub(crate) fn run_uninstall_command(args: &[OsString]) -> Result<i32, AppError> 
     while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
         match arg {
             "--base-dir" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::Usage("uninstall requires a path after --base-dir".to_string())
+                let (value, next) = flag_value(args, index, || {
+                    "uninstall requires a path after --base-dir".to_string()
                 })?;
                 base_dir = Some(PathBuf::from(value));
-                index += 2;
+                index = next;
             }
             _ => {
                 return Err(AppError::Usage(format!(
@@ -314,5 +314,140 @@ mod tests {
         let l2 = aggregate_layer2_status(&r);
         assert_eq!(l2.tools, vec!["Claude Code"]);
         assert!(l2.warnings.iter().any(|w| w.contains("Cursor")));
+    }
+
+    // --- Characterization tests (#392/#377): pin current flag-value error
+    // wording BEFORE the shared-helper migration, since none of these were
+    // previously asserted anywhere in the suite. The flag-parsing loop runs
+    // before any filesystem I/O, so these can call the command function
+    // directly with a constructed argv, no HOME/base-dir setup needed. ---
+
+    #[test]
+    fn install_base_dir_missing_value_error_message() {
+        let args = vec![
+            OsString::from("omamori"),
+            OsString::from("install"),
+            OsString::from("--base-dir"),
+        ];
+        let err = run_install_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "install requires a path after --base-dir");
+    }
+
+    #[test]
+    fn install_source_missing_value_error_message() {
+        let args = vec![
+            OsString::from("omamori"),
+            OsString::from("install"),
+            OsString::from("--source"),
+        ];
+        let err = run_install_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "install requires a path after --source");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_base_dir_accepts_non_utf8_path() {
+        // Shape A escape hatch: a non-UTF8 path must NOT be rejected by the
+        // flag-value step — it should flow through to PathBuf::from and only
+        // fail later (if at all) for reasons unrelated to arg parsing.
+        let non_utf8 = crate::test_support::non_utf8_path_like();
+        let args = vec![
+            OsString::from("omamori"),
+            OsString::from("install"),
+            OsString::from("--base-dir"),
+            non_utf8,
+            OsString::from("--source"),
+        ];
+        // The next flag after the non-UTF8 --base-dir value is --source with
+        // no value of its own — this should fail on the *--source* missing
+        // value, proving the non-UTF8 --base-dir value itself was accepted
+        // (not rejected as "requires a path after --base-dir").
+        let err = run_install_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "install requires a path after --source");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_source_accepts_non_utf8_path() {
+        // Shape A escape hatch, --source site (Codex Phase 6-B: install's
+        // --base-dir was covered but --source and uninstall's --base-dir
+        // were not — every Shape A call site independently wires the same
+        // shared flag_value helper, so each needs its own pin).
+        let non_utf8 = crate::test_support::non_utf8_path_like();
+        let args = vec![
+            OsString::from("omamori"),
+            OsString::from("install"),
+            OsString::from("--source"),
+            non_utf8,
+            OsString::from("--bogus-next-flag"),
+        ];
+        let err = run_install_command(&args).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("unknown install flag: --bogus-next-flag"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(ai_env)]
+    fn uninstall_base_dir_accepts_non_utf8_path() {
+        crate::test_support::with_clean_ai_env(|| {
+            let non_utf8 = crate::test_support::non_utf8_path_like();
+            let args = vec![
+                OsString::from("omamori"),
+                OsString::from("uninstall"),
+                OsString::from("--base-dir"),
+                non_utf8,
+                OsString::from("--bogus-next-flag"),
+            ];
+            let err = run_uninstall_command(&args).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("unknown uninstall flag: --bogus-next-flag"),
+                "error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn install_base_dir_then_source_greedy_value_consumption() {
+        // #392/#377 V-ADJ: `--base-dir --source /tmp` must consume the
+        // literal string "--source" as --base-dir's value (no lookahead
+        // rejecting flag-shaped values) — existing behavior, preserved.
+        let args = vec![
+            OsString::from("omamori"),
+            OsString::from("install"),
+            OsString::from("--base-dir"),
+            OsString::from("--source"),
+            OsString::from("/tmp"),
+        ];
+        // "/tmp" is now parsed as an unknown flag (since --source's own
+        // value slot was consumed by --base-dir), proving --source was
+        // swallowed as a value rather than being recognized as a flag.
+        let err = run_install_command(&args).unwrap_err();
+        assert!(
+            err.to_string().starts_with("unknown install flag: /tmp"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial(ai_env)]
+    fn uninstall_base_dir_missing_value_error_message() {
+        crate::test_support::with_clean_ai_env(|| {
+            let args = vec![
+                OsString::from("omamori"),
+                OsString::from("uninstall"),
+                OsString::from("--base-dir"),
+            ];
+            let err = run_uninstall_command(&args).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "uninstall requires a path after --base-dir"
+            );
+        });
     }
 }

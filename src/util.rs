@@ -106,6 +106,43 @@ pub(crate) fn parse_config_flag(args: &[OsString]) -> Result<Option<PathBuf>, Ap
     Ok(Some(PathBuf::from(&args[1])))
 }
 
+/// Reads `args[index + 1]` as this flag's value (as `&OsString`, preserving
+/// non-UTF8 paths — Shape A: `install`/`setup`/`status`/`doctor`'s
+/// `--base-dir`/`--source`), or returns `err()`'s message as a `Usage` error
+/// if absent. Returns the value and the caller's next `index` as a tuple so
+/// index advancement can't be forgotten or mis-added (#392/#377 — previously
+/// each of 7 call sites hand-wrote `index += 2` after this check). Does not
+/// validate the current arg itself; callers must only invoke this from
+/// inside a matched flag arm.
+pub(crate) fn flag_value(
+    args: &[OsString],
+    index: usize,
+    err: impl FnOnce() -> String,
+) -> Result<(&OsString, usize), AppError> {
+    let value = args.get(index + 1).ok_or_else(|| AppError::Usage(err()))?;
+    Ok((value, index + 2))
+}
+
+/// Like `flag_value`, but returns `&str` and folds "missing value" and
+/// "value is not valid UTF-8" into the SAME error (Shape B: `audit`'s
+/// `--last`/`--rule`/`--provider`/`--action`, `report`'s `--last` —
+/// deliberate existing behavior, not something this refactor changes). A
+/// single `flag_value` plus a caller-side `.to_str()` cannot preserve this
+/// fold without either duplicating `err()`'s message or double-consuming the
+/// `FnOnce` closure — this is why a dedicated variant exists rather than
+/// composing `flag_value`.
+pub(crate) fn flag_value_str(
+    args: &[OsString],
+    index: usize,
+    err: impl FnOnce() -> String,
+) -> Result<(&str, usize), AppError> {
+    let value = args
+        .get(index + 1)
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| AppError::Usage(err()))?;
+    Ok((value, index + 2))
+}
+
 // ---------------------------------------------------------------------------
 // String / OsString utilities
 // ---------------------------------------------------------------------------
@@ -371,5 +408,142 @@ mod tests {
         assert_eq!(resolved, real_path.canonicalize().unwrap());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // --- flag_value / flag_value_str (#392/#377, V-HELPER-UNIT) ---
+
+    #[test]
+    fn flag_value_consumes_adjacent_flag_shaped_token_as_literal_value() {
+        // Codex Phase 6-B: the call-site-level greedy-consumption test in
+        // install.rs proves only a downstream side effect (an "unknown
+        // flag" error further along); this pins the property directly at
+        // the helper level — args[index+1] is returned as the value
+        // unconditionally, even when it looks like another flag, with no
+        // lookahead rejecting flag-shaped tokens.
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "install".into(),
+            "--base-dir".into(),
+            "--source".into(),
+        ];
+        let (value, next) = flag_value(&args, 2, || "unreachable".to_string()).unwrap();
+        assert_eq!(value, &OsString::from("--source"));
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn flag_value_ok_returns_value_and_advances_index_by_two() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "install".into(),
+            "--base-dir".into(),
+            "/tmp".into(),
+        ];
+        let (value, next) = flag_value(&args, 2, || "unreachable".to_string()).unwrap();
+        assert_eq!(value, &OsString::from("/tmp"));
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn flag_value_missing_returns_err_message() {
+        let args: Vec<OsString> = vec!["omamori".into(), "install".into(), "--base-dir".into()];
+        let err = flag_value(&args, 2, || "custom missing message".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "custom missing message");
+    }
+
+    #[test]
+    fn flag_value_boundary_at_end_of_args_does_not_panic() {
+        // index+1 pointing exactly past the end of args must error, not panic.
+        let args: Vec<OsString> = vec!["omamori".into()];
+        let err = flag_value(&args, 0, || "boundary".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "boundary");
+    }
+
+    #[test]
+    fn flag_value_empty_string_value_is_not_missing() {
+        // A present-but-blank value is a valid take, not a missing-value error.
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "install".into(),
+            "--base-dir".into(),
+            "".into(),
+        ];
+        let (value, next) = flag_value(&args, 2, || "unreachable".to_string()).unwrap();
+        assert_eq!(value, &OsString::from(""));
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn flag_value_accepts_non_utf8_value() {
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "install".into(),
+            "--base-dir".into(),
+            non_utf8.clone(),
+        ];
+        let (value, next) = flag_value(&args, 2, || "unreachable".to_string()).unwrap();
+        assert_eq!(value, &non_utf8);
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn flag_value_str_ok_returns_str_and_advances_index_by_two() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "--rule".into(),
+            "my-rule".into(),
+        ];
+        let (value, next) = flag_value_str(&args, 2, || "unreachable".to_string()).unwrap();
+        assert_eq!(value, "my-rule");
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn flag_value_str_missing_returns_err_message() {
+        let args: Vec<OsString> = vec!["omamori".into(), "audit".into(), "--rule".into()];
+        let err = flag_value_str(&args, 2, || "custom missing message".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "custom missing message");
+    }
+
+    #[test]
+    fn flag_value_str_boundary_at_end_of_args_does_not_panic() {
+        let args: Vec<OsString> = vec!["omamori".into()];
+        let err = flag_value_str(&args, 0, || "boundary".to_string()).unwrap_err();
+        assert_eq!(err.to_string(), "boundary");
+    }
+
+    #[test]
+    fn flag_value_str_empty_string_value_is_not_missing() {
+        let args: Vec<OsString> =
+            vec!["omamori".into(), "audit".into(), "--rule".into(), "".into()];
+        let (value, next) = flag_value_str(&args, 2, || "unreachable".to_string()).unwrap();
+        assert_eq!(value, "");
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn flag_value_str_rejects_non_utf8_value_with_same_message_as_missing() {
+        // The key behavioral difference from flag_value: a non-UTF8 value
+        // must fold into the SAME error as a missing value, not a distinct
+        // "invalid UTF-8" message — this is the entire reason flag_value_str
+        // exists as a separate primitive rather than composing flag_value.
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec!["omamori".into(), "audit".into(), "--rule".into(), non_utf8];
+        let missing_args: Vec<OsString> = vec!["omamori".into(), "audit".into(), "--rule".into()];
+
+        let non_utf8_err =
+            flag_value_str(&args, 2, || "--rule requires a value".to_string()).unwrap_err();
+        let missing_err =
+            flag_value_str(&missing_args, 2, || "--rule requires a value".to_string()).unwrap_err();
+        // Codex Phase 6-B mirror-check finding: comparing the two errors to
+        // each other alone would pass even if BOTH regressed to the same
+        // wrong message — pin each to the hardcoded expected string too.
+        assert_eq!(non_utf8_err.to_string(), "--rule requires a value");
+        assert_eq!(missing_err.to_string(), "--rule requires a value");
+        assert_eq!(non_utf8_err.to_string(), missing_err.to_string());
     }
 }

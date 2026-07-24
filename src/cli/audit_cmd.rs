@@ -7,7 +7,7 @@ use crate::audit;
 use crate::config::load_config;
 use crate::engine::guard::guard_ai_config_modification;
 use crate::engine::shim::emit_config_warnings;
-use crate::util::parse_config_flag;
+use crate::util::{flag_value_str, parse_config_flag};
 
 pub(crate) fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
     match args.get(2).and_then(|item| item.to_str()) {
@@ -120,46 +120,35 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
     while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
         match arg {
             "--last" => {
-                let value = args
-                    .get(index + 1)
-                    .and_then(|v| v.to_str())
-                    .ok_or_else(|| AppError::Usage("--last requires a number".to_string()))?;
+                let (value, next) =
+                    flag_value_str(args, index, || "--last requires a number".to_string())?;
                 opts.last =
                     Some(value.parse::<usize>().map_err(|_| {
                         AppError::Usage(format!("invalid number for --last: {value}"))
                     })?);
-                index += 2;
+                index = next;
             }
             "--all" => {
                 opts.last = None;
                 index += 1;
             }
             "--rule" => {
-                opts.rule = Some(
-                    args.get(index + 1)
-                        .and_then(|v| v.to_str())
-                        .ok_or_else(|| AppError::Usage("--rule requires a value".to_string()))?
-                        .to_string(),
-                );
-                index += 2;
+                let (value, next) =
+                    flag_value_str(args, index, || "--rule requires a value".to_string())?;
+                opts.rule = Some(value.to_string());
+                index = next;
             }
             "--provider" => {
-                opts.provider = Some(
-                    args.get(index + 1)
-                        .and_then(|v| v.to_str())
-                        .ok_or_else(|| AppError::Usage("--provider requires a value".to_string()))?
-                        .to_string(),
-                );
-                index += 2;
+                let (value, next) =
+                    flag_value_str(args, index, || "--provider requires a value".to_string())?;
+                opts.provider = Some(value.to_string());
+                index = next;
             }
             "--action" => {
-                opts.action = Some(
-                    args.get(index + 1)
-                        .and_then(|v| v.to_str())
-                        .ok_or_else(|| AppError::Usage("--action requires a value".to_string()))?
-                        .to_string(),
-                );
-                index += 2;
+                let (value, next) =
+                    flag_value_str(args, index, || "--action requires a value".to_string())?;
+                opts.action = Some(value.to_string());
+                index = next;
             }
             "--json" => {
                 opts.json = true;
@@ -214,15 +203,13 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
     while let Some(arg) = args.get(index).and_then(|item| item.to_str()) {
         match arg {
             "--last" => {
-                let value = args
-                    .get(index + 1)
-                    .and_then(|v| v.to_str())
-                    .ok_or_else(|| AppError::Usage("--last requires a number".to_string()))?;
+                let (value, next) =
+                    flag_value_str(args, index, || "--last requires a number".to_string())?;
                 opts.last =
                     Some(value.parse::<usize>().map_err(|_| {
                         AppError::Usage(format!("invalid number for --last: {value}"))
                     })?);
-                index += 2;
+                index = next;
             }
             "--json" => {
                 opts.json = true;
@@ -504,5 +491,186 @@ mod tests {
         let err = run_audit_command(&args).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains(AUDIT_USAGE_HINT));
+    }
+
+    // --- Characterization tests (#392/#377): pin current flag-value error
+    // wording (Shape B: missing-value and non-UTF8-value fold into the SAME
+    // message) before the shared-helper migration. Returns before any
+    // filesystem I/O, so no HOME/config setup needed. ---
+
+    #[test]
+    fn audit_show_last_missing_value_error_message() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--last".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--last requires a number");
+    }
+
+    #[test]
+    fn audit_show_last_parse_failure_error_message() {
+        // Distinct from the missing-value message above — preserved as-is
+        // (this refactor's helper covers only the "get value or error"
+        // half; parse failures stay at the call site).
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--last".into(),
+            "not-a-number".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "invalid number for --last: not-a-number");
+    }
+
+    #[test]
+    fn audit_show_rule_missing_value_error_message() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--rule".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--rule requires a value");
+    }
+
+    #[test]
+    fn audit_show_provider_missing_value_error_message() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--provider".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--provider requires a value");
+    }
+
+    #[test]
+    fn audit_show_action_missing_value_error_message() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--action".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--action requires a value");
+    }
+
+    #[test]
+    fn audit_unknown_last_missing_value_error_message() {
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "unknown".into(),
+            "--last".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--last requires a number");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_show_last_rejects_non_utf8_value_same_as_missing() {
+        // Shape B: a non-UTF8 value must fold into the SAME message as a
+        // missing value (not a different "invalid UTF-8" message) —
+        // deliberate existing behavior, not something this refactor changes.
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--last".into(),
+            non_utf8,
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--last requires a number");
+    }
+
+    // Codex Phase 6-B adversarial review: only `audit show --last`'s fold
+    // was pinned — `--rule`/`--provider`/`--action` and `audit unknown
+    // --last` each independently wire the same shared `flag_value_str`
+    // helper, so each needs its own pin.
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_show_rule_rejects_non_utf8_value_same_as_missing() {
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--rule".into(),
+            non_utf8,
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--rule requires a value");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_show_provider_rejects_non_utf8_value_same_as_missing() {
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--provider".into(),
+            non_utf8,
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--provider requires a value");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_show_action_rejects_non_utf8_value_same_as_missing() {
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--action".into(),
+            non_utf8,
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--action requires a value");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn audit_unknown_last_rejects_non_utf8_value_same_as_missing() {
+        let non_utf8 = crate::test_support::non_utf8_osstring();
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "unknown".into(),
+            "--last".into(),
+            non_utf8,
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "--last requires a number");
+    }
+
+    #[test]
+    fn audit_show_last_adjacent_flag_greedy_value_consumption() {
+        // Codex Phase 6-B: strengthens V-ADJ coverage for Shape B — `--last
+        // --json` must consume the literal string "--json" as --last's
+        // value (parsed and rejected by usize::parse), not recognize --json
+        // as a flag.
+        let args: Vec<OsString> = vec![
+            "omamori".into(),
+            "audit".into(),
+            "show".into(),
+            "--last".into(),
+            "--json".into(),
+        ];
+        let err = run_audit_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "invalid number for --last: --json");
     }
 }

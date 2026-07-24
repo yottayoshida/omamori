@@ -16,7 +16,7 @@ use crate::audit::report::{ChainStatus, aggregate_report};
 use crate::engine::guard::guard_ai_config_modification;
 use crate::installer;
 use crate::integrity::{self, CheckItem, CheckStatus, Remediation};
-use crate::util::USAGE_HINT;
+use crate::util::{USAGE_HINT, flag_value};
 
 use time::OffsetDateTime;
 
@@ -48,11 +48,11 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
                 index += 1;
             }
             "--base-dir" => {
-                let value = args.get(index + 1).ok_or_else(|| {
-                    AppError::Usage("doctor requires a path after --base-dir".to_string())
+                let (value, next) = flag_value(args, index, || {
+                    "doctor requires a path after --base-dir".to_string()
                 })?;
                 base_dir = Some(PathBuf::from(value));
-                index += 2;
+                index = next;
             }
             _ => {
                 return Err(AppError::Usage(format!(
@@ -1897,5 +1897,41 @@ mod tests {
     fn gather_staging_info_does_not_panic() {
         // May or may not have files depending on system state, but should not panic
         let _info = gather_staging_info();
+    }
+
+    // --- Characterization tests (#392/#377): pin current --base-dir
+    // error wording before the shared-helper migration. Returns before any
+    // filesystem I/O, so no HOME/base-dir setup needed. ---
+
+    #[test]
+    fn doctor_base_dir_missing_value_error_message() {
+        let args = vec![
+            OsString::from("omamori"),
+            OsString::from("doctor"),
+            OsString::from("--base-dir"),
+        ];
+        let err = run_doctor_command(&args).unwrap_err();
+        assert_eq!(err.to_string(), "doctor requires a path after --base-dir");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn doctor_base_dir_accepts_non_utf8_path() {
+        let non_utf8 = crate::test_support::non_utf8_path_like();
+        let args = vec![
+            OsString::from("omamori"),
+            OsString::from("doctor"),
+            OsString::from("--base-dir"),
+            non_utf8,
+            OsString::from("--bogus-next-flag"),
+        ];
+        // Non-UTF8 --base-dir value accepted (not rejected); the loop moves
+        // on to the next token, which is an unrecognized flag.
+        let err = run_doctor_command(&args).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("unknown doctor flag: --bogus-next-flag"),
+            "error: {err}"
+        );
     }
 }
