@@ -90,3 +90,26 @@ pub(crate) fn with_clean_ai_env<T>(f: impl FnOnce() -> T) -> T {
     .collect();
     f()
 }
+
+/// A non-UTF8 `OsString` with no other structure — for tests pinning
+/// "invalid UTF-8 is rejected/folded the same as a missing value" (#392/#377
+/// Shape B). `/simplify` Reuse finding: this exact
+/// `OsStringExt::from_vec(vec![0xff, 0xfe])` construction was copy-pasted
+/// across util.rs/report.rs/audit_cmd.rs before being extracted here.
+#[cfg(unix)]
+pub(crate) fn non_utf8_osstring() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(vec![0xff, 0xfe])
+}
+
+/// A non-UTF8 `OsString` shaped like a filesystem path (leading invalid
+/// bytes followed by `/x`) — for tests pinning "a non-UTF8 path value is
+/// accepted, not rejected" (#392/#377 Shape A escape hatch). Distinct from
+/// `non_utf8_osstring` above since Shape A tests want something that reads
+/// as path-like in failure messages, not just an arbitrary invalid byte
+/// sequence.
+#[cfg(unix)]
+pub(crate) fn non_utf8_path_like() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    std::ffi::OsString::from_vec(vec![0xff, 0xfe, b'/', b'x'])
+}

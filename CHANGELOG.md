@@ -9,6 +9,7 @@ The format is based on Keep a Changelog.
 ### Changed
 
 - **Internal**: `full_check()` now resolves the running omamori exe once and threads the result into `check_claude_hook_hash`/`check_codex_hook_hash`/`check_claude_settings_integration`/`check_cursor_snippet`, instead of each independently re-resolving it (up to 4 redundant resolutions per `omamori doctor`/`omamori status` run). Known trade-off: on a fresh/uninstalled setup running from a Homebrew Cellar path whose stable symlink is missing, this can now print one extra `omamori warning: Cellar path detected...` line that previously wasn't reached (since no check needed resolution yet) — accepted as a narrow edge case rather than adding a lazy/memoizing resolver. ([#446](https://github.com/yottayoshida/omamori/issues/446))
+- **Internal**: extracted two shared CLI-flag-value-parsing helpers (`flag_value`/`flag_value_str` in `src/util.rs`) and migrated 13 hand-rolled "get the next arg or error" call sites across `install`/`setup`/`status`/`doctor`/`audit`/`report` to use them, removing 13 places where a copy-pasted `index += 2` could silently drift into an off-by-one. No observable behavior change — every error message, non-UTF8 value/flag-name handling, and adjacent-flag greedy value consumption is preserved and pinned by new characterization tests. `config_cmd.rs`'s 6 already-locally-deduplicated call sites are intentionally left for a follow-up issue. ([#392](https://github.com/yottayoshida/omamori/issues/392), [#377](https://github.com/yottayoshida/omamori/issues/377))
 
 ## [0.15.1] - 2026-07-23
 
