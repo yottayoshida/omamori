@@ -14,7 +14,7 @@ use crate::engine::shim::{emit_config_warnings, update_baseline_silent};
 use crate::installer::default_base_dir;
 use crate::integrity;
 use crate::rules;
-use crate::util::USAGE_HINT;
+use crate::util::{USAGE_HINT, flag_value_str};
 
 // ---------------------------------------------------------------------------
 // config subcommand
@@ -595,6 +595,7 @@ fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
 
 const CONFIG_ADD_USAGE: &str = "Usage: omamori config add <rule-name> --command <cmd> --action <block|trash|stash|log-only|move-to> [--match-any <token>]... [--match-all <token>]... [--destination <abs-path>] [--message <text>]";
 
+#[derive(Debug)]
 struct ConfigAddArgs {
     rule_name: String,
     command: String,
@@ -645,42 +646,48 @@ fn parse_config_add_args(args: &[OsString]) -> Result<ConfigAddArgs, AppError> {
     let mut index = 4usize;
     while index < args.len() {
         let arg = args[index].to_str().unwrap_or("");
-        let take_value = |flag: &str| -> Result<String, AppError> {
-            let val = args
-                .get(index + 1)
-                .and_then(|v| v.to_str())
-                .ok_or_else(|| {
-                    AppError::Usage(format!(
-                        "config add: {flag} requires a value\n\n{CONFIG_ADD_USAGE}"
-                    ))
-                })?;
-            Ok(val.to_string())
-        };
         match arg {
             "--command" => {
-                command = Some(take_value("--command")?);
-                index += 2;
+                let (value, next) = flag_value_str(args, index, || {
+                    format!("config add: --command requires a value\n\n{CONFIG_ADD_USAGE}")
+                })?;
+                command = Some(value.to_string());
+                index = next;
             }
             "--action" => {
-                let raw = take_value("--action")?;
-                action = Some(parse_config_add_action(&raw)?);
-                index += 2;
+                let (value, next) = flag_value_str(args, index, || {
+                    format!("config add: --action requires a value\n\n{CONFIG_ADD_USAGE}")
+                })?;
+                action = Some(parse_config_add_action(value)?);
+                index = next;
             }
             "--match-any" => {
-                match_any.push(take_value("--match-any")?);
-                index += 2;
+                let (value, next) = flag_value_str(args, index, || {
+                    format!("config add: --match-any requires a value\n\n{CONFIG_ADD_USAGE}")
+                })?;
+                match_any.push(value.to_string());
+                index = next;
             }
             "--match-all" => {
-                match_all.push(take_value("--match-all")?);
-                index += 2;
+                let (value, next) = flag_value_str(args, index, || {
+                    format!("config add: --match-all requires a value\n\n{CONFIG_ADD_USAGE}")
+                })?;
+                match_all.push(value.to_string());
+                index = next;
             }
             "--destination" => {
-                destination = Some(take_value("--destination")?);
-                index += 2;
+                let (value, next) = flag_value_str(args, index, || {
+                    format!("config add: --destination requires a value\n\n{CONFIG_ADD_USAGE}")
+                })?;
+                destination = Some(value.to_string());
+                index = next;
             }
             "--message" => {
-                message = Some(take_value("--message")?);
-                index += 2;
+                let (value, next) = flag_value_str(args, index, || {
+                    format!("config add: --message requires a value\n\n{CONFIG_ADD_USAGE}")
+                })?;
+                message = Some(value.to_string());
+                index = next;
             }
             other => {
                 return Err(AppError::Usage(format!(
@@ -1134,6 +1141,216 @@ fn run_config_validate(explicit_path: Option<&str>) -> Result<i32, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #451: characterization tests for the take_value -> flag_value_str
+    // migration. Written before the migration (TDD) so the pre-migration
+    // `take_value` behavior is pinned as a byte-exact baseline. Exercises
+    // `parse_config_add_args` directly (private fn, reachable via `use
+    // super::*` from this in-module `mod tests`) rather than through
+    // `tests/cli.rs`'s subprocess harness, so error messages can be
+    // compared verbatim instead of via stderr substring matching.
+
+    fn add_args(rule_name: &str, rest: &[&str]) -> Vec<OsString> {
+        let mut v: Vec<OsString> = vec![
+            "omamori".into(),
+            "config".into(),
+            "add".into(),
+            rule_name.into(),
+        ];
+        v.extend(rest.iter().map(OsString::from));
+        v
+    }
+
+    // V-001: each of the 6 flags reports the same "requires a value"
+    // message, verbatim, when its value is missing (flag is the last arg).
+    #[test]
+    fn config_add_missing_value_error_messages_are_verbatim() {
+        for flag in [
+            "--command",
+            "--action",
+            "--match-any",
+            "--match-all",
+            "--destination",
+            "--message",
+        ] {
+            let args = add_args("r1", &[flag]);
+            let err = parse_config_add_args(&args).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("config add: {flag} requires a value\n\n{CONFIG_ADD_USAGE}"),
+                "flag: {flag}"
+            );
+        }
+    }
+
+    // V-002: a non-UTF8 value at any of the 6 flags folds into the exact
+    // same "requires a value" message as a missing value (Shape B fold,
+    // inherited from `flag_value_str`).
+    #[cfg(unix)]
+    #[test]
+    fn config_add_non_utf8_value_folds_to_same_missing_message() {
+        for flag in [
+            "--command",
+            "--action",
+            "--match-any",
+            "--match-all",
+            "--destination",
+            "--message",
+        ] {
+            let mut args = add_args("r1", &[flag]);
+            args.push(crate::test_support::non_utf8_osstring());
+            let err = parse_config_add_args(&args).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("config add: {flag} requires a value\n\n{CONFIG_ADD_USAGE}"),
+                "flag: {flag}"
+            );
+        }
+    }
+
+    // V-003: adjacent flags are consumed greedily -- a flag with no value
+    // takes the next token (even if it looks like a flag) as its literal
+    // value, with no lookahead. `--command` here swallows `--action` as its
+    // value, so the loop then sees `block` in flag-dispatch position, which
+    // is an unknown flag.
+    #[test]
+    fn config_add_adjacent_flag_greedy_value_consumption() {
+        let args = add_args("r1", &["--command", "--action", "block"]);
+        let err = parse_config_add_args(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("config add: unknown flag `block`\n\n{CONFIG_ADD_USAGE}")
+        );
+    }
+
+    // V-004: --action's error branches beyond missing-value/non-UTF8 (both
+    // already covered for all 6 flags, --action included, by the two loops
+    // above) -- an unrecognized-but-present value, and an empty-string
+    // value (which is NOT a missing value -- flag_value_str treats "" as
+    // present-but-blank -- so it hits parse_config_add_action's
+    // unknown-action path, not the requires-a-value path).
+    #[test]
+    fn config_add_action_unknown_value() {
+        let args = add_args("r1", &["--action", "bogus"]);
+        let err = parse_config_add_args(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "config add: unknown --action `bogus`\n  Valid values: block, trash, stash, log-only, move-to\n\n{CONFIG_ADD_USAGE}"
+            )
+        );
+    }
+
+    #[test]
+    fn config_add_action_empty_string_is_unknown_not_missing() {
+        let args = add_args("r1", &["--action", ""]);
+        let err = parse_config_add_args(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "config add: unknown --action ``\n  Valid values: block, trash, stash, log-only, move-to\n\n{CONFIG_ADD_USAGE}"
+            )
+        );
+    }
+
+    // V-005: repeated --match-any/--match-all flags each advance the index
+    // correctly and all tokens are collected (not just the last one).
+    #[test]
+    fn config_add_repeated_match_flags_collect_all_tokens_with_correct_index_advance() {
+        let args = add_args(
+            "r1",
+            &[
+                "--command",
+                "ls",
+                "--action",
+                "block",
+                "--match-any",
+                "a",
+                "--match-any",
+                "b",
+                "--match-all",
+                "c",
+            ],
+        );
+        let parsed = parse_config_add_args(&args).unwrap();
+        assert_eq!(parsed.match_any, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(parsed.match_all, vec!["c".to_string()]);
+    }
+
+    // Codex 6-B finding: none of the existing tests assert that all 6
+    // migrated values survive parsing intact together -- only match_any/
+    // match_all were checked in combination. A dropped/swapped field
+    // (e.g. `--action`'s value accidentally stored into `destination`)
+    // would slip past every other test here.
+    #[test]
+    fn config_add_full_happy_path_populates_all_six_fields() {
+        let args = add_args(
+            "r1",
+            &[
+                "--command",
+                "ls",
+                "--action",
+                "move-to",
+                "--match-any",
+                "-l",
+                "--match-all",
+                "/tmp",
+                "--destination",
+                "/abs/path",
+                "--message",
+                "hello",
+            ],
+        );
+        let parsed = parse_config_add_args(&args).unwrap();
+        assert_eq!(parsed.rule_name, "r1");
+        assert_eq!(parsed.command, "ls");
+        assert_eq!(parsed.action, rules::ActionKind::MoveTo);
+        assert_eq!(parsed.match_any, vec!["-l".to_string()]);
+        assert_eq!(parsed.match_all, vec!["/tmp".to_string()]);
+        assert_eq!(parsed.destination, Some("/abs/path".to_string()));
+        assert_eq!(parsed.message, Some("hello".to_string()));
+    }
+
+    // Codex 6-B finding: verify the loop correctly continues past multiple
+    // already-consumed valid flag/value pairs before hitting an unknown
+    // flag, rather than only testing unknown-flag-detection in isolation.
+    #[test]
+    fn config_add_unknown_flag_after_valid_prefix_is_detected() {
+        let args = add_args(
+            "r1",
+            &[
+                "--command",
+                "ls",
+                "--action",
+                "block",
+                "--match-any",
+                "-l",
+                "--bogus",
+            ],
+        );
+        let err = parse_config_add_args(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("config add: unknown flag `--bogus`\n\n{CONFIG_ADD_USAGE}")
+        );
+    }
+
+    // V-007: a non-UTF8 *flag name* (not value) is out of this migration's
+    // scope -- `args[index].to_str().unwrap_or("")` maps it to an empty
+    // string, which falls through to the `other` match arm as an unknown
+    // flag. Pinned here so the migration doesn't accidentally touch this
+    // dispatch line.
+    #[cfg(unix)]
+    #[test]
+    fn config_add_non_utf8_flag_name_is_unknown_flag() {
+        let mut args = add_args("r1", &[]);
+        args.push(crate::test_support::non_utf8_osstring());
+        let err = parse_config_add_args(&args).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("config add: unknown flag ``\n\n{CONFIG_ADD_USAGE}")
+        );
+    }
 
     // --- GR-005: mutate_config pipeline (T6 guardrail) ---
 
