@@ -41,6 +41,15 @@ note the explicit contrast drawn there with the v0.13.x config-mutation-events f
 note (that note holds because it reuses *existing*, already-hashed fields for a new purpose;
 provenance is the opposite case — genuinely new fields outside the hashed struct entirely).
 
+**Update (#177 B2, 2026-07-25)**: `wrapper_kind` — the field this ADR's own Consequences section
+anticipated as issue #177's "fold-in" target — landed as a second `Option<T>` +
+`skip_serializing_if` field outside `HashableEvent`, by the same Design A pattern, ahead of
+`CHAIN_VERSION`'s actual 1→2 flip (staged separately as #177 B3). Provenance is therefore no
+longer the *only* unprotected payload, just the first; see SECURITY.md's "Channel separation"
+section for `wrapper_kind`'s specific unhashed-carrier note. Both fields close the same way, in
+the same bump — B3 is a hard precondition for #459's `detection_layer` `:{wrapper}` suffix
+sunset, exactly as issue #177 already is for this ADR's own deferred provenance fold-in.
+
 ## Alternatives Considered
 
 | Option | Rejected because |

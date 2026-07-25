@@ -841,9 +841,14 @@ fn run_hook_check_command(
         } => {
             // The wrapper name inside `reason` flows into the audit
             // `detection_layer` field as `"layer2:pipe-to-shell:{wrapper}"`
-            // for forensic attribution but is intentionally NOT printed to
-            // stderr — block-reason text stays wrapper-agnostic per v0.9.5
-            // invariant (`block_reason_text_stability_across_wrappers`).
+            // for forensic attribution. It is NOT printed in the text-mode
+            // `eprintln!("{message}")` below (block-reason text stays
+            // wrapper-agnostic per the v0.9.5 channel-separation
+            // invariant, see `hook_deny_blockstructural_pipe_to_shell_
+            // carries_wrapper_kind` in tests/hook_integration.rs) — it
+            // IS surfaced in the `--json-error` branch's `layer` field
+            // just below, per the documented schema (SECURITY.md
+            // "Layer 2 Deny Coverage").
             // Computed once and threaded into both the detection_layer
             // derivation and the AuditEvent field below, rather than each
             // independently re-matching `reason` (#177 B2 /simplify pass).
@@ -1409,6 +1414,18 @@ fn audit_log_hook_block(
     debug_assert!(
         is_valid_detection_layer(&detection_layer_value),
         "detection_layer value must come from VALID_DETECTION_LAYERS taxonomy: got {detection_layer_value:?}"
+    );
+    // `detection_layer`'s "layer2:pipe-to-shell:{wrapper}" suffix and
+    // `AuditEvent.wrapper_kind` are two independently-passed carriers of
+    // the same fact (#177 B2 /simplify pass fused their *derivation* at
+    // the one call site that had both, but a future second call site
+    // could still pass mismatched values). Pin them here so the two
+    // never silently diverge.
+    debug_assert_eq!(
+        wrapper_kind,
+        detection_layer_value.strip_prefix("layer2:pipe-to-shell:"),
+        "wrapper_kind must agree with detection_layer's suffix: \
+         layer={detection_layer_value:?}, wrapper_kind={wrapper_kind:?}"
     );
 
     let load_result = match load_config(None) {

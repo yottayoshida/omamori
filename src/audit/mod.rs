@@ -774,6 +774,47 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #177 B2: mirrors `provenance_value_tampering_is_silent_under_design_a`
+    /// above — `wrapper_kind` is a second field outside `HashableEvent`
+    /// (SECURITY.md "Channel separation", Design A). Without this test the
+    /// SECURITY.md claim that `wrapper_kind` tampering is chain-silent is
+    /// documentation-only, unverified against the actual implementation.
+    #[test]
+    fn wrapper_kind_tampering_is_silent_under_design_a() {
+        let dir = test_dir("tamper-wrapper-kind-177b2");
+        let logger = test_logger(&dir);
+        let mut first_event = make_event("first-cmd");
+        first_event.wrapper_kind = Some("env".to_string());
+        logger.append(first_event).unwrap();
+        logger.append(make_event("second-cmd")).unwrap();
+
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        assert_eq!(lines.len(), 2);
+
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            first.get("wrapper_kind").and_then(|v| v.as_str()),
+            Some("env"),
+            "precondition: first line must actually carry a wrapper_kind value to tamper with"
+        );
+        // Same JSON shape, different value — exactly what a same-user
+        // attacker with direct audit.jsonl write access could do.
+        first["wrapper_kind"] = serde_json::json!("sudo");
+        lines[0] = serde_json::to_string(&first).unwrap();
+        fs::write(&logger.path, lines.join("\n") + "\n").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "Design A: a value-only edit to wrapper_kind must not be detectable via the hash \
+             chain — this is the accepted cost (SECURITY.md 'Channel separation'), not a bug"
+        );
+        assert_eq!(result.torn_lines, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn provenance_type_corruption_causes_downstream_chain_break() {
         let dir = test_dir("tamper-syntactic-420");
