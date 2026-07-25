@@ -168,20 +168,36 @@ pub(super) fn hmac_bytes(secret: Option<&[u8; 32]>, data: &[u8]) -> String {
 // Chain state reading
 // ---------------------------------------------------------------------------
 
-pub(super) fn read_chain_state(
-    file: &mut fs::File,
-    secret: Option<&[u8; 32]>,
-) -> (Option<u64>, String) {
+/// Where an append should resume from, based on the file's current tail
+/// entry. `#177 B1 step 3`: distinguishes "safe to append" (`Fresh` /
+/// `Ready`) from "this tail entry declares a `chain_version` this binary
+/// doesn't recognize" (`UnsupportedVersion`) — the caller must refuse to
+/// append after the latter rather than silently resuming seq numbering
+/// past, or chaining `prev_hash` onto, an entry it never verified.
+#[derive(Debug, PartialEq)]
+pub(super) enum ChainTailState {
+    /// No prior chain entries (empty file, or the tail is legacy/malformed)
+    /// — safe to start a new chain from `genesis`.
+    Fresh { genesis: String },
+    /// Tail entry is a real, version-supported chain entry — safe to
+    /// append with `seq = last_seq + 1`, `prev_hash = last_hash`.
+    Ready { last_seq: u64, last_hash: String },
+    /// Tail entry declares an unsupported `chain_version` — not safe to
+    /// append after it.
+    UnsupportedVersion { chain_version: u32 },
+}
+
+pub(super) fn read_chain_state(file: &mut fs::File, secret: Option<&[u8; 32]>) -> ChainTailState {
     let genesis = genesis_hash(secret);
 
     let last_line = match read_last_valid_line(file) {
         Some(line) => line,
-        None => return (None, genesis),
+        None => return ChainTailState::Fresh { genesis },
     };
 
     let parsed: serde_json::Value = match serde_json::from_str(&last_line) {
         Ok(v) => v,
-        Err(_) => return (None, genesis),
+        Err(_) => return ChainTailState::Fresh { genesis },
     };
 
     // Chain entry has chain_version + seq + entry_hash
@@ -190,15 +206,27 @@ pub(super) fn read_chain_state(
         parsed.get("seq"),
         parsed.get("entry_hash"),
     ) {
-        (Some(_cv), Some(seq_val), Some(hash_val)) => {
+        (Some(cv), Some(seq_val), Some(hash_val)) => {
+            let Some(chain_version) = cv.as_u64().and_then(|v| u32::try_from(v).ok()) else {
+                // chain_version present but not a plausible u32 → treat as
+                // corruption, restart from genesis (matches the existing
+                // malformed-entry fallback below).
+                return ChainTailState::Fresh { genesis };
+            };
+            if chain_version != CHAIN_VERSION {
+                return ChainTailState::UnsupportedVersion { chain_version };
+            }
             match (seq_val.as_u64(), hash_val.as_str()) {
-                (Some(seq), Some(hash)) if !hash.is_empty() => (Some(seq), hash.to_string()),
+                (Some(seq), Some(hash)) if !hash.is_empty() => ChainTailState::Ready {
+                    last_seq: seq,
+                    last_hash: hash.to_string(),
+                },
                 // Malformed chain entry → treat as corruption, restart from genesis
-                _ => (None, genesis),
+                _ => ChainTailState::Fresh { genesis },
             }
         }
         // Legacy entry (no chain fields) → new chain from genesis
-        _ => (None, genesis),
+        _ => ChainTailState::Fresh { genesis },
     }
 }
 

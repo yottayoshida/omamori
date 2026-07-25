@@ -24,7 +24,7 @@ pub use verify::{
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
-use chain::{CHAIN_VERSION, compute_entry_hash_for_write, read_chain_state};
+use chain::{CHAIN_VERSION, ChainTailState, compute_entry_hash_for_write, read_chain_state};
 use provenance::ProcessProvenance;
 use retention::{PRUNE_CHECK_INTERVAL, try_prune};
 use secret::{
@@ -259,14 +259,33 @@ impl AuditLogger {
 
         flock_exclusive(&file)?;
 
-        // Read chain state under lock (another process may have appended since our open)
-        let (last_seq, last_hash) = read_chain_state(&mut file, self.secret.as_ref());
-        let seq = last_seq.map_or(0, |s| s + 1);
+        // Read chain state under lock (another process may have appended since our open).
+        // #177 B1 step 3: a tail entry declaring an unsupported chain_version means we
+        // can't safely resume seq numbering or chain prev_hash onto it — refuse to
+        // append (best-effort: G-2, this must not affect the caller's already-decided
+        // block/allow verdict, so we warn and return Ok, not Err).
+        let (seq, prev_hash) = match read_chain_state(&mut file, self.secret.as_ref()) {
+            ChainTailState::UnsupportedVersion { chain_version } => {
+                eprintln!(
+                    "omamori warning: audit log tail declares chain_version {chain_version}, \
+                     which this omamori build does not recognize \u{2014} refusing to append \
+                     (this event was not recorded). This does not affect the command's own \
+                     block/allow decision. Upgrade omamori, or run `omamori audit verify` to \
+                     investigate."
+                );
+                return Ok(());
+            }
+            ChainTailState::Fresh { genesis } => (0, genesis),
+            ChainTailState::Ready {
+                last_seq,
+                last_hash,
+            } => (last_seq + 1, last_hash),
+        };
 
         // Set chain fields
         event.chain_version = Some(CHAIN_VERSION);
         event.seq = Some(seq);
-        event.prev_hash = Some(last_hash);
+        event.prev_hash = Some(prev_hash);
         event.key_id = Some(self.key_id.clone());
         event.entry_hash = Some(compute_entry_hash_for_write(self.secret.as_ref(), &event));
 
@@ -839,6 +858,40 @@ mod tests {
         assert!(events[0]["chain_version"].is_null(), "legacy has no chain");
         assert_eq!(events[1]["seq"], 0, "new chain starts at seq 0");
         assert_eq!(events[1]["prev_hash"], genesis_hash(Some(&TEST_SECRET)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- #177 B1 step 3: append refuses an unsupported-version tail ---
+
+    #[test]
+    fn append_refuses_after_unknown_chain_version_tail() {
+        let dir = test_dir("append-unknown-version-refuse");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_unknown_version_line(&logger.path, 1);
+
+        let before = fs::read_to_string(&logger.path).unwrap();
+        let before_line_count = before.lines().filter(|l| !l.trim().is_empty()).count();
+
+        let result = logger.append(make_event("cmd1-should-not-be-recorded"));
+        assert!(
+            result.is_ok(),
+            "append must not error out — G-2: best-effort, must not affect the \
+             caller's already-decided block/allow verdict"
+        );
+
+        let after = fs::read_to_string(&logger.path).unwrap();
+        let after_line_count = after.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            before_line_count, after_line_count,
+            "append must refuse to write after an unsupported-chain_version tail — \
+             the file's entry count must be unchanged"
+        );
+        assert!(
+            !after.contains("cmd1-should-not-be-recorded"),
+            "the refused event must not appear anywhere in the file"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

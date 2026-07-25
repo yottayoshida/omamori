@@ -2317,6 +2317,69 @@ fn audit_verify_exits_4_on_unknown_chain_version() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// #177 B1 step 3 / G-2: `append()` refusing to write after an unsupported
+/// `chain_version` tail must NOT affect the command's own block decision —
+/// audit logging is best-effort. Seeds a real chain entry via the live hook
+/// script, hand-appends a future-version tail entry, then triggers a
+/// second deny and confirms it still Blocks, warns on stderr, and does not
+/// add a new line to audit.jsonl.
+#[test]
+fn hook_deny_still_blocks_when_audit_tail_has_unknown_chain_version() {
+    let (base, hook_path, shim_dir) = setup_hook_env("v177-append-refuse-block-unaffected");
+
+    let json1 = pretooluse_bash_json("rm -rf /");
+    let (_, _, exit1) = run_hook_script(&hook_path, &shim_dir, &json1);
+    assert_eq!(
+        decision_from_exit(exit1),
+        Decision::Block,
+        "setup deny must Block to seed the chain"
+    );
+
+    let audit_path = audit_path_for(&base);
+    let future_entry = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:01Z",
+        "provider": "test",
+        "command": "future-cmd",
+        "action": "block",
+        "result": "blocked",
+        "target_count": 0,
+        "target_hash": "",
+        "chain_version": 999,
+        "seq": 1,
+        "prev_hash": "irrelevant",
+        "key_id": "default",
+        "entry_hash": "irrelevant",
+    });
+    let mut content = std::fs::read_to_string(&audit_path).unwrap();
+    content.push_str(&serde_json::to_string(&future_entry).unwrap());
+    content.push('\n');
+    std::fs::write(&audit_path, &content).unwrap();
+    let line_count_before = content.lines().filter(|l| !l.trim().is_empty()).count();
+
+    let json2 = pretooluse_bash_json("rm -rf /etc");
+    let (_, stderr2, exit2) = run_hook_script(&hook_path, &shim_dir, &json2);
+
+    assert_eq!(
+        decision_from_exit(exit2),
+        Decision::Block,
+        "G-2: the command's block decision must be unaffected by the audit \
+         append refusal (stderr={stderr2})"
+    );
+    assert!(
+        stderr2.contains("chain_version 999") && stderr2.contains("refusing to append"),
+        "hook stderr must surface the append-refusal warning — got: {stderr2}"
+    );
+
+    let after = std::fs::read_to_string(&audit_path).unwrap();
+    let line_count_after = after.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        line_count_before, line_count_after,
+        "the second deny's event must not have been recorded"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// V-023 / ADV-181-1: serial Layer 2 deny events produce a contiguous chain
 /// (seq 0, 1, 2, ...) and `audit verify` accepts them. Concurrent Layer 1 +
 /// Layer 2 flock contention is harder to drive deterministically from an
