@@ -1753,6 +1753,132 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Codex Round 1 test-adversarial review: a *parsed* (AuditEvent-shape-
+    /// compatible) unknown-version entry with no `seq` field previously
+    /// reported `unknown_version_at = Some(0)` (the generic `seq` default),
+    /// misleadingly pointing at entry #0 regardless of how deep in the
+    /// chain it actually appeared. Must report `expected_seq` instead,
+    /// matching the raw-JSON fallback path's behavior.
+    #[test]
+    fn verify_unknown_chain_version_missing_seq_reports_expected_seq() {
+        let dir = test_dir("verify-unknown-version-missing-seq");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        // Fully AuditEvent-parseable (all required fields present) but no
+        // `seq` — chain_version alone must still trigger the dispatch.
+        let future_no_seq = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:02Z",
+            "provider": "test",
+            "command": "future-cmd",
+            "action": "block",
+            "result": "blocked",
+            "target_count": 0,
+            "target_hash": "",
+            "chain_version": 999,
+            "prev_hash": "irrelevant",
+            "key_id": "default",
+            "entry_hash": "irrelevant",
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&future_no_seq).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.unknown_version_at,
+            Some(2),
+            "must report expected_seq (2 real entries verified so far), not 0"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 test-adversarial review: `chain_version: 0` must not
+    /// be silently accepted as "current" (a `>` vs `!=` mutation on the
+    /// version comparison would let this slip through, since 0 < 1 rather
+    /// than > 1) nor confused with a legacy entry (chain_version present,
+    /// just not a value this binary hashes).
+    #[test]
+    fn verify_chain_version_zero_is_unverifiable_not_current() {
+        let dir = test_dir("verify-chain-version-zero");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+
+        let zero_version_entry = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "provider": "test",
+            "command": "future-cmd",
+            "action": "block",
+            "result": "blocked",
+            "target_count": 0,
+            "target_hash": "irrelevant",
+            "chain_version": 0,
+            "seq": 1,
+            "prev_hash": "irrelevant",
+            "key_id": "default",
+            "entry_hash": "irrelevant",
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&zero_version_entry).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.unknown_chain_version,
+            Some(0),
+            "chain_version: 0 must be treated as an unsupported version, not silently \
+             accepted as current or folded into legacy handling"
+        );
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 test-adversarial review: an entry that looks like a
+    /// prune point (`command`/`action`/`result` match `is_prune_point`)
+    /// but declares an unsupported `chain_version` must be treated as
+    /// unverifiable, not specially recognized as a real prune point —
+    /// version dispatch must win regardless of what the entry's other
+    /// fields claim to be.
+    #[test]
+    fn verify_unknown_version_prune_shaped_entry_is_unverifiable_not_pruned() {
+        let dir = test_dir("verify-unknown-version-prune-shaped");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        let fake_future_prune = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:02Z",
+            "provider": "omamori",
+            "command": "_prune",
+            "action": "retention",
+            "result": "pruned",
+            "target_count": 2,
+            "target_hash": "irrelevant",
+            "chain_version": 999,
+            "seq": 2,
+            "prev_hash": "irrelevant",
+            "key_id": "default",
+            "entry_hash": "irrelevant",
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&fake_future_prune).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.unknown_version_at, Some(2));
+        assert!(
+            !result.pruned,
+            "a prune-shaped entry with an unsupported chain_version must not be \
+             recognized as a real prune point"
+        );
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn verify_unknown_chain_version_distrusts_everything_after_it() {
         let dir = test_dir("verify-unknown-version-tail");

@@ -246,8 +246,15 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // Not evidence of tampering — evidence this binary
                 // predates the chain format (or a downgrade happened).
                 // Stop verifying; everything from here on is tallied,
-                // not trusted.
-                mark_unverifiable_tail(&mut result, seq, v);
+                // not trusted. Codex Round 1 test-adversarial review:
+                // report expected_seq (not the generic `seq` default of
+                // 0 above) when this entry's own `seq` field is missing —
+                // matches the raw-JSON fallback path below and avoids a
+                // misleading "at entry #0" report for an unrecognized-
+                // version entry appearing deep in an otherwise-verified
+                // chain.
+                let reported_seq = event.seq.unwrap_or(expected_seq);
+                mark_unverifiable_tail(&mut result, reported_seq, v);
                 unverifiable_tail = true;
                 continue;
             }

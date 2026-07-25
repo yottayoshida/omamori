@@ -2313,6 +2313,17 @@ fn audit_verify_exits_4_on_unknown_chain_version() {
         "must not use the broken_at (exit 1) tamper-claim phrasing for an unrecognized \
          chain_version — got: {stderr}"
     );
+    // Codex Round 1 test-adversarial review: pin the exact accounting
+    // numbers, not just that the exit code/some text is present — one real
+    // entry (seq 0) was seeded, one future entry (seq 1) was appended.
+    assert!(
+        stderr.contains("1 entries verified before this point"),
+        "stderr must report verified_prefix_entries=1 — got: {stderr}"
+    );
+    assert!(
+        stderr.contains("unable to verify 1 entries at or after it"),
+        "stderr must report unverified_entries_after=1 — got: {stderr}"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
