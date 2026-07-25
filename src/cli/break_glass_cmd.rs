@@ -225,6 +225,7 @@ fn build_break_glass_event(
         ppid: None,
         parent_process: None,
         cwd_hash: None,
+        wrapper_kind: None,
     }
 }
 
@@ -381,6 +382,7 @@ pub(crate) fn create_bypass_event(
         ppid,
         parent_process,
         cwd_hash,
+        wrapper_kind: None,
     }
 }
 

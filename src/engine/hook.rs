@@ -66,18 +66,23 @@ pub(crate) enum HookCheckResult {
     },
     /// Command is blocked by the unwrap stack (structural block: pipe-to-shell, etc.).
     ///
-    /// `wrapper_kind` carries the transparent-wrapper basename
-    /// (e.g. `Some("env")`, `Some("sudo")`) for `BlockReason::PipeToShell`
-    /// origins, or `None` for bare-shell / process-substitution / parse-error
-    /// / depth-exceeded etc. The wrapper name flows from
-    /// `unwrap::BlockReason::PipeToShell { wrapper }` and is forensic-only —
-    /// it is recorded in the audit log `detection_layer` field as
-    /// `"layer2:pipe-to-shell:{wrapper}"` but MUST NOT leak to stderr (see
-    /// `message` field, which carries the v0.9.5 fixed string regardless of
-    /// wrapper). v0.9.7 #181 C-1.
+    /// `reason` carries the full `unwrap::BlockReason` that triggered this
+    /// block — the actual classification (pipe-to-shell with its wrapper
+    /// name, obfuscated-expansion, parse-error, etc.), not a value lowered
+    /// into a single `Option<&'static str>` at construction time. #177 B2:
+    /// the previous shape stored only `wrapper_kind: Option<&'static str>`,
+    /// which forced `ObfuscatedExpansion` to smuggle its identity through
+    /// that same slot as a fake wrapper name (`Some("__obfuscated_expansion__")`)
+    /// since it has no real wrapper — a type-abuse sentinel now unnecessary.
+    /// `block_structural_detection_layer` derives the audit log
+    /// `detection_layer` field (e.g. `"layer2:pipe-to-shell:{wrapper}"`,
+    /// `"layer2:obfuscated-expansion"`) from `reason` at the point of use.
+    /// The wrapper name inside `PipeToShell` remains forensic-only — it
+    /// MUST NOT leak to stderr (see `message`, which carries the v0.9.5
+    /// fixed string regardless of wrapper). v0.9.7 #181 C-1.
     BlockStructural {
         message: String,
-        wrapper_kind: Option<&'static str>,
+        reason: unwrap::BlockReason,
         matched_pattern: Option<&'static str>,
         matched_position: Option<Range<usize>>,
     },
@@ -271,12 +276,40 @@ fn check_phase_1b(command: &str) -> Result<(), HookCheckResult> {
     Ok(())
 }
 
-/// Extract `wrapper_kind` from a `BlockReason` for audit `detection_layer`.
+/// Extract `wrapper_kind` from a `BlockReason` — the single source of
+/// truth for "what real wrapper name, if any, triggered this." Used by
+/// the materialize path (`AllowMaterialize`/`audit_log_materialize`) and
+/// by `block_structural_detection_layer` below, which takes the result as
+/// a parameter rather than re-deriving it, so a caller that needs the
+/// wrapper name for more than one purpose (audit `detection_layer` AND
+/// `AuditEvent.wrapper_kind`, see `run_hook_check_command`'s
+/// `BlockStructural` arm) computes it once. `ObfuscatedExpansion` is
+/// never materializable (see `is_materializable`), so it can never reach
+/// the materialize path, and correctly falls into the `_ => None` arm here.
 fn block_reason_wrapper_kind(reason: &unwrap::BlockReason) -> Option<&'static str> {
     match reason {
         unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
-        unwrap::BlockReason::ObfuscatedExpansion => Some("__obfuscated_expansion__"),
         _ => None,
+    }
+}
+
+/// Derive the audit log `detection_layer` value for a `BlockStructural`
+/// verdict from its `BlockReason` and the already-extracted `wrapper_kind`
+/// (#177 B2, replacing the old `wrapper_kind ==
+/// Some("__obfuscated_expansion__")` sentinel match). `wrapper_kind` is
+/// `Some(_)` only for `PipeToShell` with an identified wrapper — see
+/// `block_reason_wrapper_kind` — so checking it first is equivalent to,
+/// and replaces, matching `PipeToShell { wrapper: Some(w) }` directly.
+fn block_structural_detection_layer(
+    reason: &unwrap::BlockReason,
+    wrapper_kind: Option<&str>,
+) -> String {
+    if let Some(w) = wrapper_kind {
+        return format!("layer2:pipe-to-shell:{w}");
+    }
+    match reason {
+        unwrap::BlockReason::ObfuscatedExpansion => "layer2:obfuscated-expansion".to_string(),
+        _ => "layer2:structural".to_string(),
     }
 }
 
@@ -298,7 +331,7 @@ pub(crate) fn resolve_structural_block(
 
     let block = || HookCheckResult::BlockStructural {
         message: format!("omamori hook: blocked — {}", reason.message()),
-        wrapper_kind,
+        reason: *reason,
         matched_pattern: None,
         matched_position: None,
     };
@@ -484,10 +517,9 @@ pub(crate) fn check_command_for_hook_with_rules(
     match unwrap::parse_command_string(command) {
         unwrap::ParseResult::Block(reason) => {
             // Test path: always block (no config to consult).
-            let wrapper_kind = block_reason_wrapper_kind(&reason);
             HookCheckResult::BlockStructural {
                 message: format!("omamori hook: blocked — {}", reason.message()),
-                wrapper_kind,
+                reason,
                 matched_pattern: None,
                 matched_position: None,
             }
@@ -742,6 +774,7 @@ fn run_hook_check_command(
                     None,
                     None,
                     "layer2:meta-pattern".to_string(),
+                    None,
                 );
                 eprintln!("omamori hook: blocked — {reason}");
                 if verbose {
@@ -781,6 +814,7 @@ fn run_hook_check_command(
                     Some(&rule_name),
                     unwrap_chain.clone(),
                     "layer2:rule".to_string(),
+                    None,
                 );
                 let chain_str = unwrap_chain
                     .as_deref()
@@ -801,20 +835,25 @@ fn run_hook_check_command(
         }
         HookCheckResult::BlockStructural {
             message,
-            wrapper_kind,
+            reason,
             matched_pattern,
             matched_position,
         } => {
-            // `wrapper_kind` flows into the audit `detection_layer` field as
-            // `"layer2:pipe-to-shell:{wrapper}"` for forensic attribution but
-            // is intentionally NOT printed to stderr — block-reason text
-            // stays wrapper-agnostic per v0.9.5 invariant
-            // (`block_reason_text_stability_across_wrappers`).
-            let detection_layer = match wrapper_kind {
-                Some("__obfuscated_expansion__") => "layer2:obfuscated-expansion".to_string(),
-                Some(w) => format!("layer2:pipe-to-shell:{w}"),
-                None => "layer2:structural".to_string(),
-            };
+            // The wrapper name inside `reason` flows into the audit
+            // `detection_layer` field as `"layer2:pipe-to-shell:{wrapper}"`
+            // for forensic attribution. It is NOT printed in the text-mode
+            // `eprintln!("{message}")` below (block-reason text stays
+            // wrapper-agnostic per the v0.9.5 channel-separation
+            // invariant, see `hook_deny_blockstructural_pipe_to_shell_
+            // carries_wrapper_kind` in tests/hook_integration.rs) — it
+            // IS surfaced in the `--json-error` branch's `layer` field
+            // just below, per the documented schema (SECURITY.md
+            // "Layer 2 Deny Coverage").
+            // Computed once and threaded into both the detection_layer
+            // derivation and the AuditEvent field below, rather than each
+            // independently re-matching `reason` (#177 B2 /simplify pass).
+            let wrapper_kind = block_reason_wrapper_kind(&reason);
+            let detection_layer = block_structural_detection_layer(&reason, wrapper_kind);
             if json_error {
                 emit_json_error(
                     &detection_layer,
@@ -825,7 +864,7 @@ fn run_hook_check_command(
                     &format!("run `omamori explain -- {command}` for details"),
                 );
             } else {
-                audit_log_hook_block(command, provider, None, None, detection_layer);
+                audit_log_hook_block(command, provider, None, None, detection_layer, wrapper_kind);
                 eprintln!("{message}");
                 if verbose {
                     eprintln!("  provider: {provider}");
@@ -1303,6 +1342,7 @@ fn audit_log_materialize(
     event.action = "materialize".to_string();
     event.result = "allow".to_string();
     event.detection_layer = Some(detection_layer);
+    event.wrapper_kind = wrapper_kind.map(str::to_string);
     if let Some(p) = staging_path {
         event.unwrap_chain = Some(vec![format!("staging:{p}")]);
     }
@@ -1369,10 +1409,23 @@ fn audit_log_hook_block(
     rule_name: Option<&str>,
     unwrap_chain: Option<String>,
     detection_layer_value: String,
+    wrapper_kind: Option<&'static str>,
 ) {
     debug_assert!(
         is_valid_detection_layer(&detection_layer_value),
         "detection_layer value must come from VALID_DETECTION_LAYERS taxonomy: got {detection_layer_value:?}"
+    );
+    // `detection_layer`'s "layer2:pipe-to-shell:{wrapper}" suffix and
+    // `AuditEvent.wrapper_kind` are two independently-passed carriers of
+    // the same fact (#177 B2 /simplify pass fused their *derivation* at
+    // the one call site that had both, but a future second call site
+    // could still pass mismatched values). Pin them here so the two
+    // never silently diverge.
+    debug_assert_eq!(
+        wrapper_kind,
+        detection_layer_value.strip_prefix("layer2:pipe-to-shell:"),
+        "wrapper_kind must agree with detection_layer's suffix: \
+         layer={detection_layer_value:?}, wrapper_kind={wrapper_kind:?}"
     );
 
     let load_result = match load_config(None) {
@@ -1413,6 +1466,10 @@ fn audit_log_hook_block(
     // multi-step rewrite chains; today we only carry the single-line summary
     // produced by `format_unwrap_chain`, wrapped in a 1-element vec.
     event.unwrap_chain = unwrap_chain.map(|c| vec![c]);
+    // #177 B2: wrapper_kind promoted to its own field, alongside (not instead
+    // of) the existing detection_layer ":{wrapper}" suffix — see #459 for the
+    // separate, later sunset of that suffix.
+    event.wrapper_kind = wrapper_kind.map(str::to_string);
 
     if let Err(e) = logger.append(event) {
         warn_audit_append_error(
@@ -3641,6 +3698,90 @@ mod tests {
             materialize_detection_layer(&unwrap::BlockReason::TooManySegments, None),
             "layer2:materialize:too-many-segments"
         );
+    }
+
+    /// `BlockReason` variants that carry no wrapper name and aren't
+    /// `ObfuscatedExpansion` (which gets its own distinct
+    /// `detection_layer` value). Shared between
+    /// `block_structural_detection_layer_variants` and
+    /// `block_reason_wrapper_kind_all_variants` (/simplify pass, #177 B2)
+    /// so the two tests' variant coverage can't silently drift apart.
+    const NON_WRAPPER_BLOCK_REASONS: [unwrap::BlockReason; 6] = [
+        unwrap::BlockReason::InputTooLarge,
+        unwrap::BlockReason::TooManyTokens,
+        unwrap::BlockReason::TooManySegments,
+        unwrap::BlockReason::DepthExceeded,
+        unwrap::BlockReason::ParseError,
+        unwrap::BlockReason::DynamicGeneration,
+    ];
+
+    /// #177 B2: `block_structural_detection_layer` replaces the old
+    /// `wrapper_kind == Some("__obfuscated_expansion__")` sentinel match —
+    /// pin every `BlockReason` variant's mapping directly against the
+    /// enum, not against a magic string.
+    #[test]
+    fn block_structural_detection_layer_variants() {
+        assert_eq!(
+            block_structural_detection_layer(
+                &unwrap::BlockReason::PipeToShell {
+                    wrapper: Some("env")
+                },
+                Some("env"),
+            ),
+            "layer2:pipe-to-shell:env"
+        );
+        assert_eq!(
+            block_structural_detection_layer(
+                &unwrap::BlockReason::PipeToShell { wrapper: None },
+                None,
+            ),
+            "layer2:structural",
+            "a PipeToShell block with no identified wrapper falls back to the generic structural layer"
+        );
+        assert_eq!(
+            block_structural_detection_layer(&unwrap::BlockReason::ObfuscatedExpansion, None),
+            "layer2:obfuscated-expansion"
+        );
+        for reason in NON_WRAPPER_BLOCK_REASONS {
+            assert_eq!(
+                block_structural_detection_layer(&reason, None),
+                "layer2:structural",
+                "{reason:?} must map to the generic structural layer"
+            );
+        }
+    }
+
+    /// Codex test-adversarial review (#177 B2): table-driven over every
+    /// `BlockReason` variant this function can receive, plus both
+    /// `PipeToShell` shapes — `_ => None` is trivially correct for all
+    /// non-wrapper variants today, but a future edit that adds an
+    /// explicit arm for just one variant (accidentally reintroducing a
+    /// sentinel-shaped leak, or any other wrong value) would only be
+    /// caught by a test that names that specific variant.
+    #[test]
+    fn block_reason_wrapper_kind_all_variants() {
+        assert_eq!(
+            block_reason_wrapper_kind(&unwrap::BlockReason::PipeToShell {
+                wrapper: Some("env")
+            }),
+            Some("env")
+        );
+        assert_eq!(
+            block_reason_wrapper_kind(&unwrap::BlockReason::PipeToShell { wrapper: None }),
+            None
+        );
+        assert_eq!(
+            block_reason_wrapper_kind(&unwrap::BlockReason::ObfuscatedExpansion),
+            None,
+            "must be None, not the removed Some(\"__obfuscated_expansion__\") sentinel"
+        );
+        for reason in NON_WRAPPER_BLOCK_REASONS {
+            assert_eq!(
+                block_reason_wrapper_kind(&reason),
+                None,
+                "{reason:?} has no wrapper and must map to None, not a sentinel or leaked value"
+            );
+        }
     }
 
     /// Staging file respects 1 MB limit.

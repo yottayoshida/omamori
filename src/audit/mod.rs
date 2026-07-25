@@ -241,6 +241,7 @@ impl AuditLogger {
             ppid,
             parent_process,
             cwd_hash,
+            wrapper_kind: None,
         }
     }
 
@@ -365,6 +366,7 @@ impl AuditLogger {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AuditEvent {
     pub timestamp: String,
     pub provider: String,
@@ -402,6 +404,22 @@ pub struct AuditEvent {
     pub parent_process: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd_hash: Option<String>,
+    // --- Structural block classification (#177 B2) ---
+    // Promotes the wrapper name (e.g. "env", "sudo") that was previously
+    // only embedded inside the detection_layer string
+    // ("layer2:pipe-to-shell:{wrapper}") to its own field, alongside — not
+    // instead of — that suffix (see #459 for its later, separate sunset).
+    // `None` for every block/allow path except BlockStructural's
+    // PipeToShell origin and the materialize path derived from it.
+    // `String`, not `&'static str`: AuditEvent round-trips through
+    // `Deserialize` when reading audit.jsonl back (verify/report/show),
+    // which requires owned data — a borrowed field can't satisfy the
+    // `'static` bound serde's derive needs against a non-'static input.
+    // Deliberately NOT added to `HashableEvent` (chain.rs) yet — like the
+    // process-provenance fields above, this is a `CHAIN_VERSION` 2 (#177
+    // B3) concern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrapper_kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +584,7 @@ mod tests {
             ppid: None,
             parent_process: None,
             cwd_hash: None,
+            wrapper_kind: None,
         }
     }
 
@@ -749,6 +768,47 @@ mod tests {
             result.broken_at, None,
             "Design A: a value-only edit to a provenance field must not be \
              detectable via the hash chain — this is the accepted cost, not a bug"
+        );
+        assert_eq!(result.torn_lines, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #177 B2: mirrors `provenance_value_tampering_is_silent_under_design_a`
+    /// above — `wrapper_kind` is a second field outside `HashableEvent`
+    /// (SECURITY.md "Channel separation", Design A). Without this test the
+    /// SECURITY.md claim that `wrapper_kind` tampering is chain-silent is
+    /// documentation-only, unverified against the actual implementation.
+    #[test]
+    fn wrapper_kind_tampering_is_silent_under_design_a() {
+        let dir = test_dir("tamper-wrapper-kind-177b2");
+        let logger = test_logger(&dir);
+        let mut first_event = make_event("first-cmd");
+        first_event.wrapper_kind = Some("env".to_string());
+        logger.append(first_event).unwrap();
+        logger.append(make_event("second-cmd")).unwrap();
+
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        assert_eq!(lines.len(), 2);
+
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(
+            first.get("wrapper_kind").and_then(|v| v.as_str()),
+            Some("env"),
+            "precondition: first line must actually carry a wrapper_kind value to tamper with"
+        );
+        // Same JSON shape, different value — exactly what a same-user
+        // attacker with direct audit.jsonl write access could do.
+        first["wrapper_kind"] = serde_json::json!("sudo");
+        lines[0] = serde_json::to_string(&first).unwrap();
+        fs::write(&logger.path, lines.join("\n") + "\n").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "Design A: a value-only edit to wrapper_kind must not be detectable via the hash \
+             chain — this is the accepted cost (SECURITY.md 'Channel separation'), not a bug"
         );
         assert_eq!(result.torn_lines, 0);
 
@@ -3341,6 +3401,7 @@ mod tests {
             ppid: None,
             parent_process: None,
             cwd_hash: None,
+            wrapper_kind: None,
         };
         let json = serde_json::to_string(&HashableEvent::from_event(&event)).unwrap();
 
@@ -3357,6 +3418,47 @@ mod tests {
             This WILL break verify_chain on all existing audit.jsonl files. \
             If this is intentional (new chain_version), update this test and bump CHAIN_VERSION."
         );
+    }
+
+    /// Codex test-adversarial review (#177 B2): `AuditEvent.wrapper_kind`
+    /// was deliberately typed `Option<String>` rather than
+    /// `Option<&'static str>` specifically so it can survive a real
+    /// Serialize→Deserialize round trip (reading `audit.jsonl` back) —
+    /// that specific claim had no test.
+    #[test]
+    fn wrapper_kind_survives_json_round_trip() {
+        let mut event = make_event("cmd0");
+        event.wrapper_kind = Some("env".to_string());
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(r#""wrapper_kind":"env""#),
+            "wrapper_kind must serialize as a plain string field — got: {json}"
+        );
+
+        let round_tripped: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.wrapper_kind,
+            Some("env".to_string()),
+            "wrapper_kind must survive a full Serialize -> Deserialize round trip"
+        );
+    }
+
+    /// Codex test-adversarial review (#177 B2): `wrapper_kind: None` must
+    /// be omitted from JSON entirely (`skip_serializing_if`), matching
+    /// every other `Option` field on `AuditEvent`, and must round-trip
+    /// back to `None` rather than an empty string or explicit null.
+    #[test]
+    fn wrapper_kind_none_is_omitted_and_round_trips_to_none() {
+        let event = make_event("cmd0"); // wrapper_kind: None by default
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("wrapper_kind"),
+            "wrapper_kind: None must be omitted from JSON, not serialized as null — got: {json}"
+        );
+
+        let round_tripped: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.wrapper_kind, None);
     }
 
     #[test]
