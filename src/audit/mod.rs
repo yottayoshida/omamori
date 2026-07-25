@@ -24,7 +24,7 @@ pub use verify::{
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
-use chain::{CHAIN_VERSION, compute_entry_hash, read_chain_state};
+use chain::{CHAIN_VERSION, compute_entry_hash_for_write, read_chain_state};
 use provenance::ProcessProvenance;
 use retention::{PRUNE_CHECK_INTERVAL, try_prune};
 use secret::{
@@ -268,7 +268,7 @@ impl AuditLogger {
         event.seq = Some(seq);
         event.prev_hash = Some(last_hash);
         event.key_id = Some(self.key_id.clone());
-        event.entry_hash = Some(compute_entry_hash(self.secret.as_ref(), &event));
+        event.entry_hash = Some(compute_entry_hash_for_write(self.secret.as_ref(), &event));
 
         // Ensure new entry starts on its own line (torn lines may lack trailing newline)
         let len = file.seek(SeekFrom::End(0))?;
@@ -473,6 +473,7 @@ fn write_hwm(hwm_path: &std::path::Path, seq: u64) -> Result<(), std::io::Error>
 
 #[cfg(test)]
 mod tests {
+    use super::chain::compute_entry_hash;
     use super::*;
     use crate::rules::{ActionKind, RuleConfig};
     use std::fs::OpenOptions;
@@ -780,8 +781,8 @@ mod tests {
         event.prev_hash = Some("genesis".to_string());
         event.key_id = Some("default".to_string());
 
-        let h1 = compute_entry_hash(Some(&TEST_SECRET), &event);
-        let h2 = compute_entry_hash(Some(&TEST_SECRET), &event);
+        let h1 = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
+        let h2 = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
         assert_eq!(h1, h2);
     }
 
@@ -793,9 +794,9 @@ mod tests {
         event.prev_hash = Some("genesis".to_string());
         event.key_id = Some("default".to_string());
 
-        let h_orig = compute_entry_hash(Some(&TEST_SECRET), &event);
+        let h_orig = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
         event.result = "tampered".to_string();
-        let h_tampered = compute_entry_hash(Some(&TEST_SECRET), &event);
+        let h_tampered = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
         assert_ne!(h_orig, h_tampered);
     }
 
@@ -807,7 +808,7 @@ mod tests {
         event.prev_hash = Some("genesis".to_string());
         event.key_id = Some("default".to_string());
 
-        let hash = compute_entry_hash(None, &event);
+        let hash = compute_entry_hash_for_write(None, &event);
         assert_eq!(hash, "NO_HMAC_SECRET");
     }
 
@@ -1009,7 +1010,8 @@ mod tests {
         // Pinning both sides against goldens (not against each other) ensures
         // a future algorithm change can't paper over a real tamper.
         let parsed_seq1: AuditEvent = serde_json::from_value(events[1].clone()).unwrap();
-        let recomputed_seq1 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq1);
+        let recomputed_seq1 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq1)
+            .expect_hash("chain_tamper_detected: seq=1 is a real v1 entry");
 
         assert_eq!(
             events[1]["entry_hash"].as_str().unwrap(),
@@ -1246,7 +1248,8 @@ mod tests {
             "attacker only flipped prev_hash bytes; entry_hash byte sequence unchanged"
         );
         let parsed_seq0: AuditEvent = serde_json::from_value(events[0].clone()).unwrap();
-        let recomputed_seq0 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq0);
+        let recomputed_seq0 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq0)
+            .expect_hash("chain_tamper_genesis_rewrite_detected: seq=0 is a real v1 entry");
         assert_ne!(
             recomputed_seq0, GOLDEN_ENTRY_HASHES[0],
             "recomputed entry_hash over tampered (prev_hash-rewritten) genesis payload \
@@ -1948,7 +1951,7 @@ mod tests {
             event.seq = Some(seq as u64);
             event.prev_hash = Some(prev_hash.clone());
             event.key_id = Some("default".to_string());
-            event.entry_hash = Some(compute_entry_hash(Some(secret), &event));
+            event.entry_hash = Some(compute_entry_hash_for_write(Some(secret), &event));
             prev_hash = event.entry_hash.clone().unwrap();
             content.push_str(&serde_json::to_string(&event).unwrap());
             content.push('\n');
@@ -2365,7 +2368,7 @@ mod tests {
             event.seq = Some(seq as u64);
             event.prev_hash = Some(prev_hash.clone());
             event.key_id = Some("default".to_string());
-            event.entry_hash = Some(compute_entry_hash(Some(&TEST_SECRET), &event));
+            event.entry_hash = Some(compute_entry_hash_for_write(Some(&TEST_SECRET), &event));
             prev_hash = event.entry_hash.clone().unwrap();
             content.push_str(&serde_json::to_string(&event).unwrap());
             content.push('\n');

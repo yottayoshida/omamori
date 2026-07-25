@@ -2,7 +2,9 @@
 
 use std::io::{BufRead, Write};
 
-use super::chain::{compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash};
+use super::chain::{
+    RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash,
+};
 use super::retention::is_prune_point;
 use super::secret::{flock_shared, load_keyring, open_read_nofollow, read_secret, secret_path_for};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
@@ -187,7 +189,20 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         // --- entry_hash HMAC verification (multi-key: lookup by key_id) ---
         let entry_key_id = event.key_id.as_deref().unwrap_or("default");
         let entry_secret = keyring.get(entry_key_id).unwrap_or(&secret);
-        let recomputed = compute_entry_hash(Some(entry_secret), &event);
+        let recomputed = match compute_entry_hash(Some(entry_secret), &event) {
+            RecomputedHash::Hash(h) => h,
+            // #177 B1 step 1 (type-safety only): give `UnsupportedVersion`
+            // its own signal in step 2. For now, preserve the exact prior
+            // behavior (an entry this binary can't hash-verify reads as
+            // `broken_at`) so this step changes zero observable behavior.
+            RecomputedHash::UnsupportedVersion(_) => {
+                result.broken_at = Some(seq);
+                break;
+            }
+            RecomputedHash::Legacy => {
+                unreachable!("event.chain_version.is_none() already filtered above")
+            }
+        };
         if recomputed != recorded_hash {
             result.broken_at = Some(seq);
             break;

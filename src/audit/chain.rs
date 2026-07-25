@@ -79,7 +79,76 @@ pub(super) fn prune_genesis_hash(secret: Option<&[u8; 32]>) -> String {
     hmac_bytes(secret, PRUNE_GENESIS_SEED)
 }
 
-pub(super) fn compute_entry_hash(secret: Option<&[u8; 32]>, event: &AuditEvent) -> String {
+/// Result of recomputing an entry's `entry_hash` for verification. Distinct
+/// from a bare `String` (#177 B1) so a verifier can tell "this entry isn't
+/// part of a chain at all" (`Legacy`) apart from "this entry claims a
+/// `chain_version` this binary doesn't know how to hash" (`UnsupportedVersion`)
+/// apart from "successfully recomputed, compare it" (`Hash`) — collapsing the
+/// first two into "just doesn't match" is exactly the forward-compatibility
+/// gap #177 exists to close (a future `chain_version` a v1-era binary can't
+/// verify must not silently read as tampered, nor silently read as fine).
+#[derive(Debug, PartialEq)]
+pub(super) enum RecomputedHash {
+    Hash(String),
+    Legacy,
+    UnsupportedVersion(u32),
+}
+
+impl RecomputedHash {
+    /// Test/writer convenience: unwrap the `Hash` variant, panicking with a
+    /// descriptive message otherwise. Only valid where the caller has
+    /// already guaranteed `event.chain_version == Some(CHAIN_VERSION)` (a
+    /// freshly-constructed event about to be written, or a test fixture
+    /// that set it explicitly) — production *verification* code must not
+    /// use this and must instead match on all three variants, since an
+    /// entry read back from disk can claim any `chain_version`.
+    #[cfg(test)]
+    pub(super) fn expect_hash(self, context: &str) -> String {
+        match self {
+            Self::Hash(h) => h,
+            other => panic!("{context}: expected RecomputedHash::Hash, got {other:?}"),
+        }
+    }
+}
+
+/// Recompute `entry_hash` for verification. Dispatches on the event's own
+/// `chain_version` rather than trusting the caller's expectation — an event
+/// read back from disk can claim any version, including one this binary
+/// predates.
+pub(super) fn compute_entry_hash(secret: Option<&[u8; 32]>, event: &AuditEvent) -> RecomputedHash {
+    match event.chain_version {
+        None => RecomputedHash::Legacy,
+        Some(CHAIN_VERSION) => RecomputedHash::Hash(hash_v1(secret, event)),
+        Some(other) => RecomputedHash::UnsupportedVersion(other),
+    }
+}
+
+/// Writer-side: compute `entry_hash` for an event this process is about to
+/// append or write as a prune point. Callers set `event.chain_version =
+/// Some(CHAIN_VERSION)` immediately before calling this (see `append` /
+/// `build_prune_point`), so `compute_entry_hash` always resolves to `Hash`
+/// here — this wrapper exists so write call sites get a plain `String`
+/// instead of matching a case that cannot occur for a freshly-constructed
+/// event.
+pub(super) fn compute_entry_hash_for_write(
+    secret: Option<&[u8; 32]>,
+    event: &AuditEvent,
+) -> String {
+    debug_assert_eq!(
+        event.chain_version,
+        Some(CHAIN_VERSION),
+        "compute_entry_hash_for_write is for writer call sites only — \
+         event.chain_version must already be set to the current CHAIN_VERSION"
+    );
+    match compute_entry_hash(secret, event) {
+        RecomputedHash::Hash(h) => h,
+        RecomputedHash::Legacy | RecomputedHash::UnsupportedVersion(_) => unreachable!(
+            "writer call sites always set chain_version = Some(CHAIN_VERSION) before hashing"
+        ),
+    }
+}
+
+fn hash_v1(secret: Option<&[u8; 32]>, event: &AuditEvent) -> String {
     let canonical = serde_json::to_string(&HashableEvent::from_event(event))
         .expect("AuditEvent serialization cannot fail");
     hmac_bytes(secret, canonical.as_bytes())
