@@ -1807,6 +1807,46 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #177 B1 step 4: a legacy-shaped (no chain_version) entry appearing
+    /// AFTER real chain entries have started must fail-close (broken_at),
+    /// not silently count as benign pre-#164 history. Legacy entries never
+    /// participate in prev_hash/seq continuity tracking, so without this
+    /// check an attacker could splice unaudited content into the middle of
+    /// an otherwise-verified chain and have it counted as "legacy skipped"
+    /// rather than flagged.
+    #[test]
+    fn verify_mid_chain_legacy_fails_closed() {
+        let dir = test_dir("verify-mid-chain-legacy");
+        let logger = test_logger(&dir);
+
+        logger.append(make_event("cmd0")).unwrap();
+
+        let injected_legacy = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "provider": "test",
+            "command": "injected",
+            "action": "passthrough",
+            "result": "passthrough",
+            "target_count": 0,
+            "target_hash": "legacy"
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&injected_legacy).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_some(),
+            "a legacy entry after a real chain entry must fail-close"
+        );
+        assert_eq!(
+            result.chain_entries, 1,
+            "the one real entry before the injected legacy line is still counted"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn verify_legacy_only() {
         let dir = test_dir("verify-legacy-only");

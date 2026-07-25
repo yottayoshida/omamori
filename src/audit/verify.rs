@@ -174,6 +174,19 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         };
 
         if event.chain_version.is_none() {
+            // #177 B1 step 4: legacy (no chain_version) entries are only
+            // legitimate at the head of the file — genuine pre-#164
+            // history that predates chain tracking. A legacy-shaped entry
+            // appearing AFTER real chain entries have started is fail-
+            // closed, not silently skipped: it's either corruption, or an
+            // attacker exploiting the fact that legacy entries never
+            // participate in prev_hash/seq continuity tracking to splice
+            // unaudited content into the middle of an otherwise-verified
+            // chain without breaking the links around it.
+            if result.chain_entries > 0 {
+                result.broken_at = Some(expected_seq);
+                break;
+            }
             result.legacy_entries += 1;
             continue;
         }
