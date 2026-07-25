@@ -2221,6 +2221,32 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    // #177 B1 step 5 / V-B31: `prune_genesis_hash_is_deterministic` and
+    // `_is_distinct` above compare the function against itself or against
+    // an unrelated hash — neither pins the *value*. `PRUNE_GENESIS_SEED`
+    // (chain.rs) could be edited and both tests would stay green, silently
+    // invalidating the prev_hash anchor every already-pruned audit.jsonl on
+    // disk links against. This pins the literal value, same pattern as
+    // GOLDEN_GENESIS above.
+    //
+    // Regenerating: this value must NEVER be edited to make a change pass.
+    // If PRUNE_GENESIS_SEED changes intentionally, every existing pruned
+    // chain becomes unverifiable — that's a breaking, `CHAIN_VERSION`-class
+    // decision, not a test update.
+    const GOLDEN_PRUNE_GENESIS: &str =
+        "c1af069504c38b0fd648e34f5577a0107b3f3bd8e704f179ebc73928e0d59b50";
+
+    #[test]
+    fn prune_genesis_hash_matches_golden() {
+        assert_eq!(
+            prune_genesis_hash(Some(&TEST_SECRET)),
+            GOLDEN_PRUNE_GENESIS,
+            "PRUNE_GENESIS_SEED (or the HMAC domain separator) changed — every already-pruned \
+             audit.jsonl's prune_point anchor is now unverifiable. This is not a test to fix by \
+             updating the golden; see the comment above GOLDEN_PRUNE_GENESIS."
+        );
+    }
+
     #[test]
     fn try_prune_removes_old_entries() {
         let dir = test_dir("prune-old");
