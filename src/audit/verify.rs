@@ -113,6 +113,22 @@ fn mark_unverifiable_tail(result: &mut VerifyResult, seq: u64, chain_version: u3
     result.unverified_entries_after = 1;
 }
 
+/// Minimal typed peek for the raw-JSON fallback (an entry whose full
+/// `AuditEvent` parse already failed). Any JSON key not named here —
+/// including an attacker-controlled arbitrarily large one — is skipped by
+/// serde during deserialization rather than allocated, unlike a
+/// `serde_json::Value` peek of the same line (see the fallback's comment
+/// for the measured cost of that). Both fields are `Option` so a missing
+/// or wrong-shaped `seq` degrades to the `expected_seq` fallback rather
+/// than failing the whole peek — a type-mismatched `chain_version`
+/// (rather than missing) still fails the peek, same as a
+/// `serde_json::Value` peek would have failed to extract a `u32` from it.
+#[derive(serde::Deserialize)]
+struct ChainVersionSeqPeek {
+    chain_version: Option<u32>,
+    seq: Option<u64>,
+}
+
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
     let secret_path = secret_path_for(&path);
@@ -188,14 +204,19 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // expected_seq for whatever comes next, which would
                 // misreport a real subsequent entry (chaining from this
                 // one's unverified hash) as broken_at.
-                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed)
-                    && let Some(chain_version) = super::chain::parse_chain_version(&raw)
+                // Security review (#177 B1): peeking via serde_json::Value here
+                // (unlike chain.rs's read_chain_state, whose tail-window read is
+                // already capped at 64 KB) materializes a full DOM for whatever
+                // this *unbounded* per-line scan reads — measured ~5.7x memory
+                // and ~25x CPU amplification on a single hostile ~50MB line vs.
+                // the typed AuditEvent parse path it substitutes for. A typed
+                // peek struct lets serde skip any field it doesn't name
+                // (including large ones) without allocating it.
+                if let Ok(peek) = serde_json::from_str::<ChainVersionSeqPeek>(trimmed)
+                    && let Some(chain_version) = peek.chain_version
                     && chain_version != CHAIN_VERSION
                 {
-                    let seq = raw
-                        .get("seq")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(expected_seq);
+                    let seq = peek.seq.unwrap_or(expected_seq);
                     mark_unverifiable_tail(&mut result, seq, chain_version);
                     continue;
                 }

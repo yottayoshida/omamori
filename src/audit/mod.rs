@@ -260,20 +260,27 @@ impl AuditLogger {
         flock_exclusive(&file)?;
 
         // Read chain state under lock (another process may have appended since our open).
-        // #177 B1 step 3: a tail entry declaring an unsupported chain_version means we
-        // can't safely resume seq numbering or chain prev_hash onto it — refuse to
-        // append (best-effort: G-2, this must not affect the caller's already-decided
-        // block/allow verdict, so we warn and return Ok, not Err).
+        // #177 B1 step 3: when the last valid JSON line within read_chain_state's tail
+        // window declares an unsupported chain_version, we can't safely resume seq
+        // numbering or chain prev_hash onto it — refuse to append. This returns Err,
+        // like every other append failure (disk full,
+        // permissions, secret unavailable) — QA Phase 8 finding F-001: the two call
+        // sites that already implement strict-mode enforcement (shim.rs's
+        // try_audit_append, hook.rs's break-glass bypass path) only escalate to
+        // blocking on Err, and strict mode's documented contract ("no receipt is a
+        // reason not to allow") applies here exactly as it does to any other
+        // recording failure. G-2's best-effort *default* is unaffected: every call
+        // site's existing Err handling already treats a non-strict Err as a warning,
+        // not a block — Err doesn't change that, it only makes strict mode able to
+        // see this case at all.
         let (seq, prev_hash) = match read_chain_state(&mut file, self.secret.as_ref()) {
             ChainTailState::UnsupportedVersion { chain_version } => {
-                eprintln!(
-                    "omamori warning: audit log tail declares chain_version {chain_version}, \
-                     which this omamori build does not recognize \u{2014} refusing to append \
-                     (this event was not recorded). This does not affect the command's own \
-                     block/allow decision. Upgrade omamori, or run `omamori audit verify` to \
-                     investigate."
-                );
-                return Ok(());
+                return Err(std::io::Error::other(format!(
+                    "audit log tail declares chain_version {chain_version}, which this \
+                     omamori build does not recognize \u{2014} refusing to append (this \
+                     event was not recorded; not necessarily tampering \u{2014} may mean \
+                     this binary predates a newer chain format)"
+                )));
             }
             ChainTailState::Fresh { genesis } => (0, genesis),
             ChainTailState::Ready {
@@ -876,9 +883,11 @@ mod tests {
 
         let result = logger.append(make_event("cmd1-should-not-be-recorded"));
         assert!(
-            result.is_ok(),
-            "append must not error out — G-2: best-effort, must not affect the \
-             caller's already-decided block/allow verdict"
+            result.is_err(),
+            "append must return Err — QA Phase 8 F-001: strict mode's 'no receipt = don't \
+             allow' contract only escalates on Err. G-2's best-effort default is preserved \
+             by the caller's own Err handling (a warning, not a block in non-strict mode), \
+             not by append() itself claiming success."
         );
 
         let after = fs::read_to_string(&logger.path).unwrap();
@@ -891,6 +900,46 @@ mod tests {
         assert!(
             !after.contains("cmd1-should-not-be-recorded"),
             "the refused event must not appear anywhere in the file"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// QA Phase 8 F-001 (#177 B1): `try_audit_append` is the seam every
+    /// non-hook call site (`exec`, sudo-block, non-protected passthrough)
+    /// routes audit logging through, and it's `strict`-aware. Before the
+    /// append() Err fix, an unsupported-version tail returned `Ok(())`,
+    /// so `try_audit_append`'s `if let Err(e) = logger.append(event)`
+    /// never fired — strict mode's documented "no receipt = don't allow"
+    /// contract silently didn't apply to this one failure mode, creating
+    /// a permanent, silent audit blackout that `[audit] strict = true`
+    /// exists specifically to prevent.
+    #[test]
+    fn try_audit_append_strict_blocks_on_unknown_chain_version_tail() {
+        let dir = test_dir("try-audit-append-strict-unknown-version");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_unknown_version_line(&logger.path, 1);
+
+        let strict_logger = AuditLogger {
+            path: logger.path.clone(),
+            secret: logger.secret,
+            retention_days: logger.retention_days,
+            key_id: logger.key_id.clone(),
+        };
+        let event = strict_logger.create_event(
+            &CommandInvocation::new("cmd1".to_string(), vec![]),
+            None,
+            &[],
+            &ActionOutcome::PassedThrough { exit_code: 0 },
+            None,
+        );
+        let result = crate::engine::shim::try_audit_append(&strict_logger, event, true);
+        assert_eq!(
+            result,
+            Some(1),
+            "strict mode must block when the audit tail has an unrecognized chain_version, \
+             the same as it blocks on any other append failure"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -918,7 +967,10 @@ mod tests {
         let before_line_count = content.lines().filter(|l| !l.trim().is_empty()).count();
 
         let result = logger.append(make_event("cmd1-should-not-be-recorded"));
-        assert!(result.is_ok());
+        assert!(
+            result.is_err(),
+            "must return Err (QA Phase 8 F-001: strict mode)"
+        );
 
         let after = fs::read_to_string(&logger.path).unwrap();
         let after_line_count = after.lines().filter(|l| !l.trim().is_empty()).count();

@@ -56,6 +56,11 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     "  This is not necessarily tampering — it may mean this omamori \
                      binary predates a newer chain format. Upgrade omamori and re-run."
                 );
+                eprintln!(
+                    "  If you are already running the latest omamori, an unrecognized \
+                     chain_version is unexpected — treat this as possible tampering. \
+                     Tail-truncation detection is suspended while this entry is present."
+                );
                 Ok(4)
             } else if result.chain_entries == 0 && result.legacy_entries > 0 {
                 eprintln!(
