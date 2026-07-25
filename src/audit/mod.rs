@@ -241,6 +241,7 @@ impl AuditLogger {
             ppid,
             parent_process,
             cwd_hash,
+            wrapper_kind: None,
         }
     }
 
@@ -365,6 +366,7 @@ impl AuditLogger {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AuditEvent {
     pub timestamp: String,
     pub provider: String,
@@ -402,6 +404,22 @@ pub struct AuditEvent {
     pub parent_process: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd_hash: Option<String>,
+    // --- Structural block classification (#177 B2) ---
+    // Promotes the wrapper name (e.g. "env", "sudo") that was previously
+    // only embedded inside the detection_layer string
+    // ("layer2:pipe-to-shell:{wrapper}") to its own field, alongside — not
+    // instead of — that suffix (see #459 for its later, separate sunset).
+    // `None` for every block/allow path except BlockStructural's
+    // PipeToShell origin and the materialize path derived from it.
+    // `String`, not `&'static str`: AuditEvent round-trips through
+    // `Deserialize` when reading audit.jsonl back (verify/report/show),
+    // which requires owned data — a borrowed field can't satisfy the
+    // `'static` bound serde's derive needs against a non-'static input.
+    // Deliberately NOT added to `HashableEvent` (chain.rs) yet — like the
+    // process-provenance fields above, this is a `CHAIN_VERSION` 2 (#177
+    // B3) concern.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrapper_kind: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +584,7 @@ mod tests {
             ppid: None,
             parent_process: None,
             cwd_hash: None,
+            wrapper_kind: None,
         }
     }
 
@@ -3341,6 +3360,7 @@ mod tests {
             ppid: None,
             parent_process: None,
             cwd_hash: None,
+            wrapper_kind: None,
         };
         let json = serde_json::to_string(&HashableEvent::from_event(&event)).unwrap();
 

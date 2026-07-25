@@ -185,6 +185,7 @@ pub(super) fn build_prune_point(
         ppid: None,
         parent_process: None,
         cwd_hash: None,
+        wrapper_kind: None,
     };
     event.entry_hash = Some(compute_entry_hash_for_write(secret, &event));
     event

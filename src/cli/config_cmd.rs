@@ -380,6 +380,7 @@ fn build_config_mutation_event(rule_name: &str, action: &str, command: String) -
         ppid: None,
         parent_process: None,
         cwd_hash: None,
+        wrapper_kind: None,
     }
 }
 

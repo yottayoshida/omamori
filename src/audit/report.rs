@@ -502,6 +502,7 @@ mod tests {
                 ppid: None,
                 parent_process: None,
                 cwd_hash: None,
+                wrapper_kind: None,
             })
             .unwrap();
 
@@ -610,6 +611,7 @@ mod tests {
                 ppid: None,
                 parent_process: None,
                 cwd_hash: None,
+                wrapper_kind: None,
             })
             .unwrap();
         let hwm_file = hwm_path_for(&audit_path);

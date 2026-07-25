@@ -2116,6 +2116,14 @@ fn hook_deny_blockstructural_creates_audit_entry() {
         event["rule_id"].is_null(),
         "V-017: rule_id must be null for obfuscated-expansion (unwrap-stack detection, not a named rule) (got event={event})"
     );
+    // #177 B2: the old wrapper_kind == Some("__obfuscated_expansion__")
+    // sentinel is gone. wrapper_kind is a real, first-class AuditEvent
+    // field now, and ObfuscatedExpansion has no wrapper — it must be
+    // null, not the sentinel string leaking into the audit trail.
+    assert!(
+        event["wrapper_kind"].is_null(),
+        "#177 B2: wrapper_kind must be null for ObfuscatedExpansion, not a sentinel string (got event={event})"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -2142,6 +2150,12 @@ fn hook_materialize_per_wrapper_format() {
         assert_eq!(
             event["detection_layer"], expected,
             "V-018: detection_layer must be '{expected}' for wrapper '{wrapper}' (got event={event})"
+        );
+        // #177 B2: wrapper_kind is now also a first-class AuditEvent field,
+        // alongside (not instead of) the detection_layer suffix above.
+        assert_eq!(
+            event["wrapper_kind"], wrapper,
+            "#177 B2: wrapper_kind must carry '{wrapper}' as its own field (got event={event})"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -46,7 +46,7 @@ pub enum ParseResult {
     Block(BlockReason),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum BlockReason {
     InputTooLarge,
