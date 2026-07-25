@@ -19,7 +19,12 @@ use super::secret::open_read_nofollow;
 use super::verify::verify_chain;
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 
-/// Chain integrity status (3-state per SEC-R8).
+/// Chain integrity status. Originally 3-state per SEC-R8; #177 B1 step 2
+/// adds `Unverifiable` as a 4th, distinct from `Broken` — an entry
+/// declaring a `chain_version` this binary doesn't recognize is not
+/// evidence of tampering, it's evidence the binary predates the chain
+/// format. Collapsing it into `Broken` would misreport "you've been
+/// tampered with" for what may just be "upgrade omamori."
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ChainStatus {
@@ -29,6 +34,11 @@ pub enum ChainStatus {
         at_seq: u64,
     },
     Truncated,
+    Unverifiable {
+        #[serde(skip_serializing)]
+        at_seq: u64,
+        chain_version: u32,
+    },
     Unavailable,
 }
 
@@ -38,6 +48,7 @@ impl ChainStatus {
             Self::Intact => "intact",
             Self::Broken { .. } => "broken",
             Self::Truncated => "truncated",
+            Self::Unverifiable { .. } => "unverifiable",
             Self::Unavailable => "unavailable",
         }
     }
@@ -115,6 +126,14 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
             result.hwm_tampered = verify_result.hwm_tampered;
             if let Some(at_seq) = verify_result.broken_at {
                 ChainStatus::Broken { at_seq }
+            } else if let (Some(at_seq), Some(chain_version)) = (
+                verify_result.unknown_version_at,
+                verify_result.unknown_chain_version,
+            ) {
+                ChainStatus::Unverifiable {
+                    at_seq,
+                    chain_version,
+                }
             } else if verify_result.tail_truncated {
                 ChainStatus::Truncated
             } else {
@@ -435,6 +454,94 @@ mod tests {
 
         assert_eq!(*stats.by_rule.get("unknown").unwrap_or(&0), 1);
         assert!(!stats.by_rule.contains_key(""));
+    }
+
+    /// #177 B1 step 2: an entry declaring a `chain_version` this binary
+    /// doesn't recognize must surface as `ChainStatus::Unverifiable`, not
+    /// silently fold into `Broken` (tamper) or `Intact` (fine) — both are
+    /// wrong, and `Broken` in particular would misreport "you've been
+    /// tampered with" for what may just be "upgrade omamori."
+    #[test]
+    fn test_aggregate_report_surfaces_unverifiable_chain_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-report-unverifiable-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("audit enabled");
+        logger
+            .append(AuditEvent {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                provider: "test".to_string(),
+                command: "cmd0".to_string(),
+                rule_id: None,
+                action: "block".to_string(),
+                result: "blocked".to_string(),
+                target_count: 1,
+                target_hash: String::new(),
+                detection_layer: None,
+                unwrap_chain: None,
+                raw_input_hash: None,
+                chain_version: None,
+                seq: None,
+                prev_hash: None,
+                key_id: None,
+                entry_hash: None,
+                pid: None,
+                ppid: None,
+                parent_process: None,
+                cwd_hash: None,
+            })
+            .unwrap();
+
+        // Hand-append an entry from an imagined future omamori version.
+        // entry_hash/prev_hash content is inert: the verifier's version
+        // dispatch fires before it ever reads those fields for a
+        // chain_version it doesn't recognize.
+        let future_entry = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "provider": "test",
+            "command": "cmd1",
+            "action": "block",
+            "result": "blocked",
+            "target_count": 1,
+            "target_hash": "",
+            "chain_version": 999,
+            "seq": 1,
+            "prev_hash": "irrelevant",
+            "key_id": "default",
+            "entry_hash": "irrelevant",
+        });
+        let mut content = std::fs::read_to_string(&audit_path).unwrap();
+        content.push_str(&serde_json::to_string(&future_entry).unwrap());
+        content.push('\n');
+        std::fs::write(&audit_path, content).unwrap();
+
+        let report = aggregate_report(&config, 7);
+        match report.chain_status {
+            ChainStatus::Unverifiable {
+                at_seq,
+                chain_version,
+            } => {
+                assert_eq!(at_seq, 1);
+                assert_eq!(chain_version, 999);
+            }
+            other => panic!("expected ChainStatus::Unverifiable, got {other:?}"),
+        }
+        assert_eq!(report.chain_status.as_str(), "unverifiable");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

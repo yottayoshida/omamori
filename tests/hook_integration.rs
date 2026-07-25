@@ -2249,6 +2249,74 @@ fn cross_version_audit_verify_pin() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// #177 B1 step 2: an entry declaring a `chain_version` this binary doesn't
+/// recognize must make `omamori audit verify` exit 4 (a distinct, non-tamper
+/// signal), not exit 1 (which reads as "you've been tampered with").
+///
+/// Seeds one real chain entry via the live hook script (genuine secret/HMAC
+/// plumbing), then hand-appends a second entry from an imagined future
+/// omamori version directly onto the same audit.jsonl the CLI will read.
+#[test]
+fn audit_verify_exits_4_on_unknown_chain_version() {
+    let (base, hook_path, shim_dir) = setup_hook_env("v177-unknown-version-exit4");
+    let json = pretooluse_bash_json("rm -rf /");
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "setup deny must Block to seed the chain"
+    );
+
+    let audit_path = audit_path_for(&base);
+    let future_entry = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:01Z",
+        "provider": "test",
+        "command": "future-cmd",
+        "action": "block",
+        "result": "blocked",
+        "target_count": 0,
+        "target_hash": "",
+        "chain_version": 999,
+        "seq": 1,
+        "prev_hash": "irrelevant",
+        "key_id": "default",
+        "entry_hash": "irrelevant",
+    });
+    let mut content = std::fs::read_to_string(&audit_path).unwrap();
+    content.push_str(&serde_json::to_string(&future_entry).unwrap());
+    content.push('\n');
+    std::fs::write(&audit_path, content).unwrap();
+
+    let verify = Command::new(binary())
+        .arg("audit")
+        .arg("verify")
+        .env("HOME", &base)
+        .env("XDG_DATA_HOME", base.join(".local/share"))
+        .output()
+        .expect("failed to run omamori audit verify");
+
+    assert_eq!(
+        verify.status.code(),
+        Some(4),
+        "unknown chain_version must exit 4, not exit 1 (tampered) or exit 0 (intact) \
+         (stdout={}, stderr={})",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        stderr.contains("chain_version 999"),
+        "stderr must name the unrecognized version — got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("may have been tampered with"),
+        "must not use the broken_at (exit 1) tamper-claim phrasing for an unrecognized \
+         chain_version — got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// V-023 / ADV-181-1: serial Layer 2 deny events produce a contiguous chain
 /// (seq 0, 1, 2, ...) and `audit verify` accepts them. Concurrent Layer 1 +
 /// Layer 2 flock contention is harder to drive deterministically from an

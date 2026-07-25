@@ -1522,6 +1522,34 @@ mod tests {
         }
     }
 
+    /// Hand-crafts and appends a single JSON line whose `chain_version`
+    /// (999) this binary's hashing logic doesn't recognize — simulating an
+    /// entry written by a future omamori version. `entry_hash`/`prev_hash`/
+    /// `target_hash` content is deliberately arbitrary: the verifier's
+    /// version dispatch (`RecomputedHash::UnsupportedVersion`) fires
+    /// *before* it ever reads those fields for an unrecognized version, so
+    /// their exact values are inert for these tests.
+    fn append_unknown_version_line(path: &Path, seq: u64) {
+        let event = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "provider": "test",
+            "command": "future-cmd",
+            "action": "passthrough",
+            "result": "passthrough",
+            "target_count": 0,
+            "target_hash": "irrelevant",
+            "chain_version": 999,
+            "seq": seq,
+            "prev_hash": "irrelevant",
+            "key_id": "default",
+            "entry_hash": "irrelevant",
+        });
+        let mut content = fs::read_to_string(path).unwrap_or_default();
+        content.push_str(&serde_json::to_string(&event).unwrap());
+        content.push('\n');
+        fs::write(path, content).unwrap();
+    }
+
     #[test]
     fn verify_clean_chain() {
         let dir = test_dir("verify-clean");
@@ -1550,6 +1578,132 @@ mod tests {
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert!(result.broken_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- #177 B1 step 2: forward-unknown chain_version handling ---
+
+    #[test]
+    fn verify_unknown_chain_version_reports_unverifiable_not_broken() {
+        let dir = test_dir("verify-unknown-version");
+        let logger = test_logger(&dir);
+        for i in 0..3 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        append_unknown_version_line(&logger.path, 3);
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "an unrecognized chain_version is not tamper evidence"
+        );
+        assert_eq!(result.unknown_version_at, Some(3));
+        assert_eq!(result.unknown_chain_version, Some(999));
+        assert_eq!(result.verified_prefix_entries, 3);
+        assert_eq!(result.chain_entries, 3);
+        assert_eq!(result.unverified_entries_after, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_unknown_chain_version_distrusts_everything_after_it() {
+        let dir = test_dir("verify-unknown-version-tail");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        append_unknown_version_line(&logger.path, 2);
+        // Two more lines after the unknown-version entry, shaped like
+        // ordinary v1 chain entries. Even though they claim chain_version
+        // 1, nothing after an unauthenticated entry is trustworthy — the
+        // prev_hash chain running through it can't be validated — so these
+        // must be tallied as unverified, not silently re-admitted as
+        // verified chain_entries.
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        for seq in 3..5u64 {
+            let fake_v1 = serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "provider": "test",
+                "command": "later-cmd",
+                "action": "passthrough",
+                "result": "passthrough",
+                "target_count": 0,
+                "target_hash": "irrelevant",
+                "chain_version": 1,
+                "seq": seq,
+                "prev_hash": "irrelevant",
+                "key_id": "default",
+                "entry_hash": "irrelevant",
+            });
+            content.push_str(&serde_json::to_string(&fake_v1).unwrap());
+            content.push('\n');
+        }
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.verified_prefix_entries, 2);
+        assert_eq!(
+            result.chain_entries, 2,
+            "entries after the unknown version must not be counted as verified"
+        );
+        assert_eq!(
+            result.unverified_entries_after, 3,
+            "the unknown-version entry itself plus the 2 fake-v1 lines after it"
+        );
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_unknown_chain_version_does_not_bootstrap_hwm() {
+        // #177 B1 step 2 / plan risk V-B50-equivalent: bootstrapping the
+        // HWM off an early stop at unknown_version_at would permanently
+        // cap future truncation detection below the chain's true length —
+        // a poison-pill unknown-version entry could mask deletion of
+        // everything after it. The HWM must only ever be touched when
+        // verification actually reached EOF.
+        //
+        // Entries are written via `write_chain_entries` (direct disk
+        // write), not `logger.append()` — `append()` bootstraps its own
+        // HWM as a side effect of every call, which would make this the
+        // *second* time the HWM is set and mask the bug this test exists
+        // to catch. This models a freshly-arrived audit.jsonl being
+        // verified for the very first time (`HwmState::Missing`).
+        let dir = test_dir("verify-unknown-version-hwm-guard");
+        let _ = test_logger(&dir); // secret file only
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+                ("cmd2", "2026-01-01T00:00:02Z"),
+            ],
+        );
+        append_unknown_version_line(&path, 3);
+
+        assert!(
+            matches!(read_hwm(&hwm_path_for(&path)), HwmState::Missing),
+            "sanity: HWM must be Missing before the first-ever verify"
+        );
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.unknown_version_at, Some(3));
+        assert!(
+            !result.tail_truncated,
+            "must not compare against an HWM bootstrap that never happened"
+        );
+        assert!(
+            !result.hwm_missing,
+            "the guard skips the bootstrap entirely — it must not run it and then discard the result"
+        );
+
+        assert!(
+            matches!(read_hwm(&hwm_path_for(&path)), HwmState::Missing),
+            "HWM must remain Missing — bootstrapping it off an early stop would permanently \
+             cap future truncation detection below the chain's true (unknown) length"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

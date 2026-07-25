@@ -40,6 +40,23 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 eprintln!("  The audit log may have been tampered with.");
                 eprintln!("  Inspect: omamori audit show --last 10");
                 Ok(1)
+            } else if let (Some(seq), Some(chain_version)) =
+                (result.unknown_version_at, result.unknown_chain_version)
+            {
+                eprintln!(
+                    "omamori audit verify: chain entry #{seq} declares chain_version \
+                     {chain_version}, which this omamori build does not recognize."
+                );
+                eprintln!(
+                    "  {} entries verified before this point; unable to verify {} \
+                     entries at or after it.",
+                    result.verified_prefix_entries, result.unverified_entries_after
+                );
+                eprintln!(
+                    "  This is not necessarily tampering — it may mean this omamori \
+                     binary predates a newer chain format. Upgrade omamori and re-run."
+                );
+                Ok(4)
             } else if result.chain_entries == 0 && result.legacy_entries > 0 {
                 eprintln!(
                     "omamori audit verify: no chain entries found ({} legacy entries skipped)",

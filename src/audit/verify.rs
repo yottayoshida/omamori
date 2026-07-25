@@ -51,6 +51,25 @@ pub struct VerifyResult {
     pub tail_truncated: bool,
     pub hwm_missing: bool,
     pub hwm_tampered: bool,
+    /// #177 B1 step 2: seq of the first entry whose `chain_version` this
+    /// binary doesn't recognize. `None` means every entry encountered was
+    /// either verifiable or legacy. Distinct from `broken_at` — this is not
+    /// evidence of tampering, it's evidence the binary predates the chain
+    /// format (or, less likely, that a downgrade happened after a newer
+    /// entry was written).
+    pub unknown_version_at: Option<u64>,
+    /// The unsupported `chain_version` value found at `unknown_version_at`.
+    pub unknown_chain_version: Option<u32>,
+    /// Count of chain entries successfully verified *before*
+    /// `unknown_version_at` was hit. Equal to `chain_entries` when
+    /// `unknown_version_at` is `None`.
+    pub verified_prefix_entries: u64,
+    /// Count of lines from `unknown_version_at` onward (inclusive) that
+    /// could not be verified — once one entry's authenticity can't be
+    /// confirmed, the `prev_hash` chain running through it means nothing
+    /// after it can be trusted either, regardless of what those later
+    /// lines individually claim.
+    pub unverified_entries_after: u64,
 }
 
 pub struct ShowOptions {
@@ -119,17 +138,30 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         tail_truncated: false,
         hwm_missing: false,
         hwm_tampered: false,
+        unknown_version_at: None,
+        unknown_chain_version: None,
+        verified_prefix_entries: 0,
+        unverified_entries_after: 0,
     };
     let mut expected_prev = genesis;
     let mut expected_seq: u64 = 0;
     let mut last_was_prune = false;
     let mut prune_target_hash: Option<String> = None;
     let mut prune_target_count: Option<u64> = None;
+    // #177 B1 step 2: once an entry's chain_version can't be authenticated,
+    // the prev_hash chain running through it means nothing after it can be
+    // trusted either — every remaining line just gets tallied, not verified.
+    let mut unverifiable_tail = false;
 
     for line in reader.lines() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+
+        if unverifiable_tail {
+            result.unverified_entries_after += 1;
             continue;
         }
 
@@ -150,6 +182,33 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         let prev_hash = event.prev_hash.as_deref().unwrap_or("");
         let recorded_hash = event.entry_hash.as_deref().unwrap_or("");
         let is_prune = is_prune_point(&event);
+
+        // --- entry_hash HMAC verification (multi-key: lookup by key_id).
+        // Also the version dispatch point: an entry whose chain_version
+        // this binary doesn't recognize can't be authenticated at all, so
+        // nothing about it — including its own seq/prev_hash — is
+        // trustworthy structural signal. Check this before the prev_hash
+        // check below, not after. ---
+        let entry_key_id = event.key_id.as_deref().unwrap_or("default");
+        let entry_secret = keyring.get(entry_key_id).unwrap_or(&secret);
+        let recomputed = match compute_entry_hash(Some(entry_secret), &event) {
+            RecomputedHash::Hash(h) => h,
+            RecomputedHash::UnsupportedVersion(v) => {
+                // Not evidence of tampering — evidence this binary
+                // predates the chain format (or a downgrade happened).
+                // Stop verifying; everything from here on is tallied,
+                // not trusted.
+                result.unknown_version_at = Some(seq);
+                result.unknown_chain_version = Some(v);
+                result.verified_prefix_entries = result.chain_entries;
+                result.unverified_entries_after = 1;
+                unverifiable_tail = true;
+                continue;
+            }
+            RecomputedHash::Legacy => {
+                unreachable!("event.chain_version.is_none() already filtered above")
+            }
+        };
 
         // --- prev_hash verification ---
         if result.chain_entries == 0 {
@@ -186,23 +245,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             }
         }
 
-        // --- entry_hash HMAC verification (multi-key: lookup by key_id) ---
-        let entry_key_id = event.key_id.as_deref().unwrap_or("default");
-        let entry_secret = keyring.get(entry_key_id).unwrap_or(&secret);
-        let recomputed = match compute_entry_hash(Some(entry_secret), &event) {
-            RecomputedHash::Hash(h) => h,
-            // #177 B1 step 1 (type-safety only): give `UnsupportedVersion`
-            // its own signal in step 2. For now, preserve the exact prior
-            // behavior (an entry this binary can't hash-verify reads as
-            // `broken_at`) so this step changes zero observable behavior.
-            RecomputedHash::UnsupportedVersion(_) => {
-                result.broken_at = Some(seq);
-                break;
-            }
-            RecomputedHash::Legacy => {
-                unreachable!("event.chain_version.is_none() already filtered above")
-            }
-        };
         if recomputed != recorded_hash {
             result.broken_at = Some(seq);
             break;
@@ -237,8 +279,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         result.chain_entries += 1;
     }
 
-    // HWM check: detect tail truncation
-    if result.broken_at.is_none() && result.chain_entries > 0 {
+    // HWM check: detect tail truncation. Requires having actually reached
+    // EOF (#177 B1 step 2) — an early stop on unknown_version_at means
+    // expected_seq stopped advancing before the real end of file, so
+    // writing/comparing the HWM here would compare against a false "end"
+    // and could silently lower the high-water-mark on a later re-verify.
+    if result.broken_at.is_none() && result.unknown_version_at.is_none() && result.chain_entries > 0
+    {
         let hwm_file = hwm_path_for(&path);
         let max_verified_seq = expected_seq.saturating_sub(1);
         match read_hwm(&hwm_file) {

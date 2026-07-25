@@ -126,6 +126,17 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
         ChainStatus::Truncated => {
             println!("  Audit log: truncated (entries may have been removed)")
         }
+        ChainStatus::Unverifiable { chain_version, .. } => {
+            if verbose {
+                println!(
+                    "  Audit log: unverifiable — entry declares chain_version {chain_version}, \
+                     which this omamori build does not recognize (not necessarily tampering — \
+                     may mean this binary predates a newer chain format)"
+                );
+            } else {
+                println!("  Audit log: unverifiable (unrecognized chain_version)");
+            }
+        }
         ChainStatus::Unavailable => println!("  Audit log: unavailable"),
     }
 
@@ -136,7 +147,7 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
     }
     if matches!(
         report.chain_status,
-        ChainStatus::Broken { .. } | ChainStatus::Truncated
+        ChainStatus::Broken { .. } | ChainStatus::Truncated | ChainStatus::Unverifiable { .. }
     ) {
         follow_ups.push("verify chain: omamori audit verify");
     }
@@ -299,6 +310,23 @@ mod tests {
 
         let truncated = serde_json::to_value(ChainStatus::Truncated).unwrap();
         assert_eq!(truncated["status"], "truncated");
+
+        // #177 B1 step 2
+        let unverifiable = serde_json::to_value(ChainStatus::Unverifiable {
+            at_seq: 7,
+            chain_version: 999,
+        })
+        .unwrap();
+        assert_eq!(unverifiable["status"], "unverifiable");
+        assert!(
+            unverifiable.get("at_seq").is_none(),
+            "SEC-R8: at_seq not in JSON (matches Broken's precedent)"
+        );
+        assert_eq!(
+            unverifiable["chain_version"], 999,
+            "chain_version IS meant to be JSON-visible (unlike at_seq) — it's the \
+             actionable part of this status, not forensic detail"
+        );
 
         let unavail = serde_json::to_value(ChainStatus::Unavailable).unwrap();
         assert_eq!(unavail["status"], "unavailable");
