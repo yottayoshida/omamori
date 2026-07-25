@@ -3,7 +3,7 @@
 use std::io::{BufRead, Write};
 
 use super::chain::{
-    RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash,
+    CHAIN_VERSION, RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash,
 };
 use super::retention::is_prune_point;
 use super::secret::{flock_shared, load_keyring, open_read_nofollow, read_secret, secret_path_for};
@@ -102,6 +102,19 @@ pub struct AuditSummary {
 // verify_chain
 // ---------------------------------------------------------------------------
 
+/// Records the point where an entry's `chain_version` became unverifiable
+/// and switches `result` into its terminal "unverifiable tail" state.
+/// Shared by both places `verify_chain` can discover this — the fast path
+/// (a successfully-parsed `AuditEvent` whose `chain_version` field is
+/// unsupported) and the raw-JSON fallback (an entry whose *shape* a future
+/// `chain_version` changed enough that `AuditEvent` can't even parse it).
+fn mark_unverifiable_tail(result: &mut VerifyResult, seq: u64, chain_version: u32) {
+    result.unknown_version_at = Some(seq);
+    result.unknown_chain_version = Some(chain_version);
+    result.verified_prefix_entries = result.chain_entries;
+    result.unverified_entries_after = 1;
+}
+
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
     let secret_path = secret_path_for(&path);
@@ -168,6 +181,29 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         let event: AuditEvent = match serde_json::from_str(trimmed) {
             Ok(e) => e,
             Err(_) => {
+                // Codex Round 1 (#177 B1): a future chain_version might pair
+                // with a JSON shape this binary's AuditEvent can't
+                // deserialize at all. Before assuming genuine corruption
+                // (torn line), peek the raw JSON for chain_version — if
+                // it's present and unrecognized, this must read as
+                // "unverifiable", not "torn". Torn-line handling resumes
+                // verification against the pre-entry expected_prev/
+                // expected_seq for whatever comes next, which would
+                // misreport a real subsequent entry (chaining from this
+                // one's unverified hash) as broken_at.
+                if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed)
+                    && let Some(cv) = raw.get("chain_version").and_then(|v| v.as_u64())
+                    && let Ok(chain_version) = u32::try_from(cv)
+                    && chain_version != CHAIN_VERSION
+                {
+                    let seq = raw
+                        .get("seq")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(expected_seq);
+                    mark_unverifiable_tail(&mut result, seq, chain_version);
+                    unverifiable_tail = true;
+                    continue;
+                }
                 result.torn_lines += 1;
                 continue;
             }
@@ -211,10 +247,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // predates the chain format (or a downgrade happened).
                 // Stop verifying; everything from here on is tallied,
                 // not trusted.
-                result.unknown_version_at = Some(seq);
-                result.unknown_chain_version = Some(v);
-                result.verified_prefix_entries = result.chain_entries;
-                result.unverified_entries_after = 1;
+                mark_unverifiable_tail(&mut result, seq, v);
                 unverifiable_tail = true;
                 continue;
             }
@@ -290,6 +323,15 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         expected_prev = recorded_hash.to_string();
         expected_seq = seq + 1;
         result.chain_entries += 1;
+    }
+
+    // Codex Round 1 (#177 B1): verified_prefix_entries is set mid-loop only
+    // when an unknown-version entry is hit. Without this, it stays at its
+    // zero-initialized default for every chain that verifies cleanly (or
+    // breaks on broken_at) — silently violating the field's documented
+    // contract ("equal to chain_entries when unknown_version_at is None").
+    if result.unknown_version_at.is_none() {
+        result.verified_prefix_entries = result.chain_entries;
     }
 
     // HWM check: detect tail truncation. Requires having actually reached

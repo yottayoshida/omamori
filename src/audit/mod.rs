@@ -896,6 +896,40 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Codex Round 1 (#177 B1): a future-version tail entry that doesn't
+    /// carry `seq`/`entry_hash` in a form the old code recognized fell
+    /// through to `Fresh` (silently restart the chain from genesis)
+    /// instead of refusing to append — forking a second, disconnected
+    /// chain in the same file with no record that the original continued.
+    #[test]
+    fn append_refuses_after_unknown_chain_version_tail_missing_seq_and_hash() {
+        let dir = test_dir("append-unknown-version-refuse-bad-shape");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+
+        let future_tail = serde_json::json!({
+            "chain_version": 999,
+            "some_future_field": "whatever a v999 tail entry looks like"
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&future_tail).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, &content).unwrap();
+        let before_line_count = content.lines().filter(|l| !l.trim().is_empty()).count();
+
+        let result = logger.append(make_event("cmd1-should-not-be-recorded"));
+        assert!(result.is_ok());
+
+        let after = fs::read_to_string(&logger.path).unwrap();
+        let after_line_count = after.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            before_line_count, after_line_count,
+            "must refuse to append, not silently fork a new chain from genesis"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // --- Torn line handling ---
 
     #[test]
@@ -1655,6 +1689,67 @@ mod tests {
         assert_eq!(result.verified_prefix_entries, 3);
         assert_eq!(result.chain_entries, 3);
         assert_eq!(result.unverified_entries_after, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 (#177 B1): a future chain_version might pair with a
+    /// JSON shape this binary's AuditEvent can't deserialize at all — the
+    /// original implementation fell through to "torn line" handling for
+    /// this case, which resumes verification against the pre-entry
+    /// expected_prev/expected_seq for whatever comes next (risking a false
+    /// broken_at on a real subsequent entry chaining from this one's
+    /// unverified hash).
+    #[test]
+    fn verify_unknown_chain_version_with_incompatible_shape_still_reports_unverifiable() {
+        let dir = test_dir("verify-unknown-version-bad-shape");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        // Missing every field AuditEvent requires (timestamp/provider/
+        // command/action/result/target_count/target_hash) except
+        // chain_version/seq — simulating a future entry shape this binary
+        // genuinely cannot parse.
+        let malformed_future = serde_json::json!({
+            "chain_version": 999,
+            "seq": 2,
+            "some_future_field": "whatever a v999 entry looks like"
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&malformed_future).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.torn_lines, 0,
+            "an unrecognized-version entry must not be miscounted as a torn line, \
+             even when its shape can't be deserialized as AuditEvent"
+        );
+        assert_eq!(result.unknown_version_at, Some(2));
+        assert_eq!(result.unknown_chain_version, Some(999));
+        assert_eq!(result.verified_prefix_entries, 2);
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 (#177 B1): `verified_prefix_entries` is documented to
+    /// equal `chain_entries` when `unknown_version_at` is `None` — pin that
+    /// for the common case (a chain that verifies cleanly with no
+    /// unrecognized version anywhere).
+    #[test]
+    fn verify_clean_chain_sets_verified_prefix_entries() {
+        let dir = test_dir("verify-clean-prefix");
+        let logger = test_logger(&dir);
+        for i in 0..4 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.chain_entries, 4);
+        assert_eq!(
+            result.verified_prefix_entries, 4,
+            "must equal chain_entries per its documented contract when unknown_version_at is None"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

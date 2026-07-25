@@ -200,13 +200,16 @@ pub(super) fn read_chain_state(file: &mut fs::File, secret: Option<&[u8; 32]>) -
         Err(_) => return ChainTailState::Fresh { genesis },
     };
 
-    // Chain entry has chain_version + seq + entry_hash
-    match (
-        parsed.get("chain_version"),
-        parsed.get("seq"),
-        parsed.get("entry_hash"),
-    ) {
-        (Some(cv), Some(seq_val), Some(hash_val)) => {
+    // Codex Round 1 (#177 B1): check chain_version FIRST, independent of
+    // whether seq/entry_hash are also present. A future chain_version's
+    // entry shape might structure those fields differently (or omit them
+    // entirely) — that must still refuse to append (UnsupportedVersion),
+    // not silently restart the chain from genesis. Restarting would fork a
+    // second, disconnected chain in the same file with no record that the
+    // original one continued past this point.
+    match parsed.get("chain_version") {
+        None => ChainTailState::Fresh { genesis }, // legacy entry
+        Some(cv) => {
             let Some(chain_version) = cv.as_u64().and_then(|v| u32::try_from(v).ok()) else {
                 // chain_version present but not a plausible u32 → treat as
                 // corruption, restart from genesis (matches the existing
@@ -216,17 +219,18 @@ pub(super) fn read_chain_state(file: &mut fs::File, secret: Option<&[u8; 32]>) -
             if chain_version != CHAIN_VERSION {
                 return ChainTailState::UnsupportedVersion { chain_version };
             }
-            match (seq_val.as_u64(), hash_val.as_str()) {
-                (Some(seq), Some(hash)) if !hash.is_empty() => ChainTailState::Ready {
-                    last_seq: seq,
-                    last_hash: hash.to_string(),
+            match (parsed.get("seq"), parsed.get("entry_hash")) {
+                (Some(seq_val), Some(hash_val)) => match (seq_val.as_u64(), hash_val.as_str()) {
+                    (Some(seq), Some(hash)) if !hash.is_empty() => ChainTailState::Ready {
+                        last_seq: seq,
+                        last_hash: hash.to_string(),
+                    },
+                    // Malformed chain entry → treat as corruption, restart from genesis
+                    _ => ChainTailState::Fresh { genesis },
                 },
-                // Malformed chain entry → treat as corruption, restart from genesis
                 _ => ChainTailState::Fresh { genesis },
             }
         }
-        // Legacy entry (no chain fields) → new chain from genesis
-        _ => ChainTailState::Fresh { genesis },
     }
 }
 

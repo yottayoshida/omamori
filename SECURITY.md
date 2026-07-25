@@ -830,7 +830,11 @@ retention_days = 90  # 0 = unlimited (default)
 
 ### Legacy Compatibility
 
-Entries written before v0.7.0 lack chain fields. When `append()` encounters a legacy last entry (no `chain_version`), it starts a new chain from genesis (`seq=0`). `omamori audit verify` skips legacy entries with a warning. A log containing only legacy entries returns exit code 2 (no chain entries to verify).
+Entries written before v0.7.0 lack chain fields. When `append()` encounters a legacy last entry (no `chain_version`), it starts a new chain from genesis (`seq=0`). `omamori audit verify` skips legacy entries with a warning. A log containing only legacy entries returns exit code 2 (no chain entries to verify). A legacy entry appearing *after* real chain entries have started (not at the head) is not legitimate history — it fails closed as `broken_at` (#177), since legacy entries never participate in `prev_hash`/`seq` continuity tracking and could otherwise let unaudited content be spliced into the middle of an otherwise-verified chain.
+
+### Forward-Unknown Chain Versions (#177+)
+
+An entry declaring a `chain_version` this binary doesn't recognize (a future format, or a downgrade after a newer entry was written) is *not* treated as tampering. `omamori audit verify` reports it distinctly and exits with code **4**, stopping verification at that entry — everything from it onward is counted but not trusted (the `prev_hash` chain running through an unauthenticated entry can't be relied on for anything after it either). `omamori report`/`doctor` surface this the same way, with wording that does not claim tampering. `append()` similarly refuses to write after a tail entry with an unrecognized `chain_version`: it warns on stderr and records nothing, but never affects the triggering command's own block/allow decision (G-2, best-effort).
 
 ### Verify Information Disclosure Policy (v0.7.1+)
 
