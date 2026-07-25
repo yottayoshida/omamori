@@ -276,13 +276,16 @@ fn check_phase_1b(command: &str) -> Result<(), HookCheckResult> {
     Ok(())
 }
 
-/// Extract `wrapper_kind` from a `BlockReason` for the materialize path
-/// (`AllowMaterialize`/`audit_log_materialize`) — `ObfuscatedExpansion` is
+/// Extract `wrapper_kind` from a `BlockReason` — the single source of
+/// truth for "what real wrapper name, if any, triggered this." Used by
+/// the materialize path (`AllowMaterialize`/`audit_log_materialize`) and
+/// by `block_structural_detection_layer` below, which takes the result as
+/// a parameter rather than re-deriving it, so a caller that needs the
+/// wrapper name for more than one purpose (audit `detection_layer` AND
+/// `AuditEvent.wrapper_kind`, see `run_hook_check_command`'s
+/// `BlockStructural` arm) computes it once. `ObfuscatedExpansion` is
 /// never materializable (see `is_materializable`), so it can never reach
-/// either of those, and correctly falls into the `_ => None` arm here.
-/// `BlockStructural` no longer uses this — it carries the full `reason`
-/// and derives its own classification via
-/// `block_structural_detection_layer`.
+/// the materialize path, and correctly falls into the `_ => None` arm here.
 fn block_reason_wrapper_kind(reason: &unwrap::BlockReason) -> Option<&'static str> {
     match reason {
         unwrap::BlockReason::PipeToShell { wrapper } => *wrapper,
@@ -291,13 +294,20 @@ fn block_reason_wrapper_kind(reason: &unwrap::BlockReason) -> Option<&'static st
 }
 
 /// Derive the audit log `detection_layer` value for a `BlockStructural`
-/// verdict directly from its `BlockReason` — #177 B2, replacing the old
-/// `wrapper_kind == Some("__obfuscated_expansion__")` sentinel match.
-fn block_structural_detection_layer(reason: &unwrap::BlockReason) -> String {
+/// verdict from its `BlockReason` and the already-extracted `wrapper_kind`
+/// (#177 B2, replacing the old `wrapper_kind ==
+/// Some("__obfuscated_expansion__")` sentinel match). `wrapper_kind` is
+/// `Some(_)` only for `PipeToShell` with an identified wrapper — see
+/// `block_reason_wrapper_kind` — so checking it first is equivalent to,
+/// and replaces, matching `PipeToShell { wrapper: Some(w) }` directly.
+fn block_structural_detection_layer(
+    reason: &unwrap::BlockReason,
+    wrapper_kind: Option<&str>,
+) -> String {
+    if let Some(w) = wrapper_kind {
+        return format!("layer2:pipe-to-shell:{w}");
+    }
     match reason {
-        unwrap::BlockReason::PipeToShell { wrapper: Some(w) } => {
-            format!("layer2:pipe-to-shell:{w}")
-        }
         unwrap::BlockReason::ObfuscatedExpansion => "layer2:obfuscated-expansion".to_string(),
         _ => "layer2:structural".to_string(),
     }
@@ -834,7 +844,11 @@ fn run_hook_check_command(
             // for forensic attribution but is intentionally NOT printed to
             // stderr — block-reason text stays wrapper-agnostic per v0.9.5
             // invariant (`block_reason_text_stability_across_wrappers`).
-            let detection_layer = block_structural_detection_layer(&reason);
+            // Computed once and threaded into both the detection_layer
+            // derivation and the AuditEvent field below, rather than each
+            // independently re-matching `reason` (#177 B2 /simplify pass).
+            let wrapper_kind = block_reason_wrapper_kind(&reason);
+            let detection_layer = block_structural_detection_layer(&reason, wrapper_kind);
             if json_error {
                 emit_json_error(
                     &detection_layer,
@@ -845,14 +859,7 @@ fn run_hook_check_command(
                     &format!("run `omamori explain -- {command}` for details"),
                 );
             } else {
-                audit_log_hook_block(
-                    command,
-                    provider,
-                    None,
-                    None,
-                    detection_layer,
-                    block_reason_wrapper_kind(&reason),
-                );
+                audit_log_hook_block(command, provider, None, None, detection_layer, wrapper_kind);
                 eprintln!("{message}");
                 if verbose {
                     eprintln!("  provider: {provider}");
@@ -3676,6 +3683,21 @@ mod tests {
         );
     }
 
+    /// `BlockReason` variants that carry no wrapper name and aren't
+    /// `ObfuscatedExpansion` (which gets its own distinct
+    /// `detection_layer` value). Shared between
+    /// `block_structural_detection_layer_variants` and
+    /// `block_reason_wrapper_kind_all_variants` (/simplify pass, #177 B2)
+    /// so the two tests' variant coverage can't silently drift apart.
+    const NON_WRAPPER_BLOCK_REASONS: [unwrap::BlockReason; 6] = [
+        unwrap::BlockReason::InputTooLarge,
+        unwrap::BlockReason::TooManyTokens,
+        unwrap::BlockReason::TooManySegments,
+        unwrap::BlockReason::DepthExceeded,
+        unwrap::BlockReason::ParseError,
+        unwrap::BlockReason::DynamicGeneration,
+    ];
+
     /// #177 B2: `block_structural_detection_layer` replaces the old
     /// `wrapper_kind == Some("__obfuscated_expansion__")` sentinel match —
     /// pin every `BlockReason` variant's mapping directly against the
@@ -3683,57 +3705,42 @@ mod tests {
     #[test]
     fn block_structural_detection_layer_variants() {
         assert_eq!(
-            block_structural_detection_layer(&unwrap::BlockReason::PipeToShell {
-                wrapper: Some("env")
-            }),
+            block_structural_detection_layer(
+                &unwrap::BlockReason::PipeToShell {
+                    wrapper: Some("env")
+                },
+                Some("env"),
+            ),
             "layer2:pipe-to-shell:env"
         );
         assert_eq!(
-            block_structural_detection_layer(&unwrap::BlockReason::PipeToShell { wrapper: None }),
+            block_structural_detection_layer(
+                &unwrap::BlockReason::PipeToShell { wrapper: None },
+                None,
+            ),
             "layer2:structural",
             "a PipeToShell block with no identified wrapper falls back to the generic structural layer"
         );
         assert_eq!(
-            block_structural_detection_layer(&unwrap::BlockReason::ObfuscatedExpansion),
+            block_structural_detection_layer(&unwrap::BlockReason::ObfuscatedExpansion, None),
             "layer2:obfuscated-expansion"
         );
-        for reason in [
-            unwrap::BlockReason::InputTooLarge,
-            unwrap::BlockReason::TooManyTokens,
-            unwrap::BlockReason::TooManySegments,
-            unwrap::BlockReason::DepthExceeded,
-            unwrap::BlockReason::ParseError,
-            unwrap::BlockReason::DynamicGeneration,
-        ] {
+        for reason in NON_WRAPPER_BLOCK_REASONS {
             assert_eq!(
-                block_structural_detection_layer(&reason),
+                block_structural_detection_layer(&reason, None),
                 "layer2:structural",
                 "{reason:?} must map to the generic structural layer"
             );
         }
     }
 
-    /// #177 B2: the sentinel is gone — `block_reason_wrapper_kind` must
-    /// never again produce `Some("__obfuscated_expansion__")`, since
-    /// `ObfuscatedExpansion` is never materializable and this function's
-    /// only remaining consumer is the materialize path
-    /// (`AllowMaterialize`/`audit_log_materialize`).
-    #[test]
-    fn block_reason_wrapper_kind_no_sentinel_for_obfuscated_expansion() {
-        assert_eq!(
-            block_reason_wrapper_kind(&unwrap::BlockReason::ObfuscatedExpansion),
-            None
-        );
-    }
-
-    /// Codex test-adversarial review (#177 B2): the previous test only
-    /// exercised `ObfuscatedExpansion` out of `BlockReason`'s 7
-    /// non-`PipeToShell` variants — `_ => None` is trivially correct for
-    /// all of them today, but a future edit that adds an explicit arm for
-    /// just one variant (accidentally reintroducing a sentinel-shaped
-    /// leak, or any other wrong value) would only be caught by a test
-    /// that names that specific variant. Table-driven over every variant
-    /// this function can receive, plus both `PipeToShell` shapes.
+    /// Codex test-adversarial review (#177 B2): table-driven over every
+    /// `BlockReason` variant this function can receive, plus both
+    /// `PipeToShell` shapes — `_ => None` is trivially correct for all
+    /// non-wrapper variants today, but a future edit that adds an
+    /// explicit arm for just one variant (accidentally reintroducing a
+    /// sentinel-shaped leak, or any other wrong value) would only be
+    /// caught by a test that names that specific variant.
     #[test]
     fn block_reason_wrapper_kind_all_variants() {
         assert_eq!(
@@ -3746,15 +3753,12 @@ mod tests {
             block_reason_wrapper_kind(&unwrap::BlockReason::PipeToShell { wrapper: None }),
             None
         );
-        for reason in [
-            unwrap::BlockReason::InputTooLarge,
-            unwrap::BlockReason::TooManyTokens,
-            unwrap::BlockReason::TooManySegments,
-            unwrap::BlockReason::DepthExceeded,
-            unwrap::BlockReason::ParseError,
-            unwrap::BlockReason::DynamicGeneration,
-            unwrap::BlockReason::ObfuscatedExpansion,
-        ] {
+        assert_eq!(
+            block_reason_wrapper_kind(&unwrap::BlockReason::ObfuscatedExpansion),
+            None,
+            "must be None, not the removed Some(\"__obfuscated_expansion__\") sentinel"
+        );
+        for reason in NON_WRAPPER_BLOCK_REASONS {
             assert_eq!(
                 block_reason_wrapper_kind(&reason),
                 None,
