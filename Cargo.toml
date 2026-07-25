@@ -41,6 +41,14 @@ include = [
     "docs/FAQ.md",
 ]
 
+[lints.clippy]
+# #175: enforced together with clippy.toml's `disallowed-methods` entries
+# (which name the specific banned items and reasons). Declaring the lint
+# level here means it's on even for `cargo clippy` invocations that don't
+# pass `-D warnings` explicitly — CI's `-D warnings` (ci.yml) is
+# defense-in-depth, not the only enforcement.
+disallowed_methods = "deny"
+
 [dependencies]
 libc = "0.2.186"
 serde = { version = "1.0", features = ["derive"] }

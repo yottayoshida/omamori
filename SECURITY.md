@@ -193,10 +193,10 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
 
 - `blocked`: always `true` (allow path uses Claude Code hook response, not this schema)
 - `layer`: forensic layer identifier prefixed with `layer2:` to match the audit log `detection_layer` field exactly. Stderr JSON `layer` and audit row `detection_layer` are interchangeable for correlation
-- `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`; for input validation it is `"invalid-input"`; for file protection it is `"protected-file"`
-- `matched_pattern`: the protected pattern token when known. `null` for structural blocks, Phase 1B token-level detections, and input validation errors
+- `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`; for input validation it is `"invalid-input"`; for file protection it is `"protected-file"` when a `PROTECTED_FILE_PATTERNS` entry actually matched, or `"unresolvable-base"` (#175) when a *relative* `file_path` couldn't be evaluated at all because the process's working directory was unresolvable — see the `layer2:file-protection` row below
+- `matched_pattern`: the protected pattern token when known. `null` for structural blocks, Phase 1B token-level detections, input validation errors, and the `"unresolvable-base"` fail-close case above (no pattern was ever evaluated, so none is reported)
 - `matched_position`: byte range `[start, end)` of the match in the original command string when known; `null` when position tracking is not available for the layer
-- `hint`: action guidance for the AI agent consumer. Shell-command blocks reference `omamori explain`; input validation and file protection blocks use a "Tell the user:" pattern directing the AI to inform the user and offer alternatives
+- `hint`: action guidance for the AI agent consumer. Shell-command blocks reference `omamori explain`; input validation and file protection blocks use a "Tell the user:" pattern directing the AI to inform the user and offer alternatives — the `"unresolvable-base"` case's hint explicitly says the file's protection status was never determined, not that it matched a protected pattern
 
 **Layer values**:
 
@@ -208,7 +208,7 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
 | `layer2:pipe-to-shell:<wrapper>` | Phase 2 pipe-to-shell with wrapper (e.g. `env`, `bash`) |
 | `layer2:obfuscated-expansion` | Phase 2 obfuscated expansion detection |
 | `layer2:input-validation` | Malformed or incomplete hook input (JSON parse failure or missing fields) |
-| `layer2:file-protection` | Protected file modification attempt |
+| `layer2:file-protection` | Protected file modification attempt (`rule_id: "protected-file"`), or a relative path that couldn't be evaluated because the working directory was unresolvable (`rule_id: "unresolvable-base"`, #175 — fail-closed, not necessarily a real match) |
 
 **Security note — input validation errors**: `MalformedJson` and `MalformedMissingField` emit identical JSON (same layer, rule_id, reason) to minimize oracle exposure. Attackers cannot distinguish JSON parse failures from missing-field errors, preventing incremental input refinement. The reason string is static and never includes raw stdin content to prevent reflection attacks.
 

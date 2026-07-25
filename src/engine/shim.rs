@@ -607,8 +607,18 @@ pub(crate) fn run_command(
     let context_override: Option<RuleConfig> = if let (Some(rule), Some(ctx_config)) =
         (matched_rule, &load_result.config.context)
     {
+        // Captured here rather than at function entry (#175 /simplify
+        // Efficiency review): the sudo-block and non-protected-fast-path
+        // early returns above never consult `base`, so deferring this
+        // syscall to its actual point of use skips it on those paths.
+        // Distinct from the provenance capture near the top of this
+        // function: that one feeds `cwd_hash` (hashed under CHAIN_VERSION
+        // 2, #177) and must keep reading `env::current_dir()` directly
+        // rather than routing through this helper — see `audit::provenance`
+        // module docs.
+        let base = context::process_base_or_root();
         // Tier 1: path-based evaluation
-        let ctx = context::evaluate_context(&invocation, rule, ctx_config);
+        let ctx = context::evaluate_context(&invocation, rule, ctx_config, &base);
         let tier1_override = if let Some(override_action) = ctx.action_override {
             eprintln!(
                 "omamori: {} {} → {} ({}, original: {})",
@@ -830,7 +840,10 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env, ai_env)]
+    // `cwd` joins the group here because this test reads the real process
+    // CWD (below) — shares the group with every other real-CWD-reading
+    // test in the crate (Security Phase 8 review).
+    #[serial_test::serial(home_env, ai_env, cwd)]
     fn run_shim_skips_housekeeping_without_cwd_writes_when_home_unset() {
         // #373 T2: the flip side of the test above — Steps 1-3 (housekeeping)
         // must be skipped cleanly (no CWD-relative `./.omamori` writes) when
@@ -838,6 +851,10 @@ mod tests {
         // CLAUDECODE is pinned for the same determinism reason as the sibling
         // test above (routes run_shim through the protected evaluation path
         // instead of leaving it to whatever the ambient shell happens to have).
+        // reason: reads the *real* process CWD deliberately — this is a
+        // #373-class regression witness (did housekeeping pollute it?),
+        // not a `context::process_base` path-resolution concern.
+        #[allow(clippy::disallowed_methods)]
         let cwd_omamori = std::env::current_dir().unwrap().join(".omamori");
         let cwd_omamori_existed_before = cwd_omamori.exists();
 

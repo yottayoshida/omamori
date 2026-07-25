@@ -1,0 +1,20 @@
+# #175: process-CWD reads are banned outside the small set of entry points
+# that are allowed to construct a `base: &Path` for `context::normalize_path`
+# / `context::resolve_path` / `context::evaluate_context`. Everywhere else,
+# CWD-dependence is exactly the class of bug #164/#175 exist to structurally
+# remove.
+#
+# `context::process_base`/`context::process_base_or_root` are themselves
+# exempt (they're the one sanctioned place `env::current_dir` is read from);
+# clippy's `disallowed-methods` lint does not fire inside the disallowed
+# item's own defining crate module unless the call is textually present, so
+# no path-based exemption is needed there — see that module for the actual
+# single call site.
+#
+# `#[allow(clippy::disallowed_methods)]` at a call site requires a `// reason:`
+# comment immediately above it (enforced by review, not machine-checked) —
+# see CONTRIBUTING.md.
+disallowed-methods = [
+    { path = "std::env::current_dir", reason = "CWD reads are banned outside context::process_base (#175) — pass an explicit base: &Path instead" },
+    { path = "std::env::set_current_dir", reason = "mutating process CWD is banned outside test harnesses that pin it under #[serial_test::serial(cwd)] (#175/#344-class flake)" },
+]

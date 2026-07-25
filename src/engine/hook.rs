@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::ops::Range;
+use std::path::Path;
 
 use crate::AppError;
 use crate::audit::AuditLogger;
@@ -536,6 +537,10 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     let provider = parse_provider_flag(args);
     let verbose = std::env::var("OMAMORI_VERBOSE").is_ok();
     let json_error = parse_json_error_flag(args);
+    // Captured once per invocation (#175) — threaded through to
+    // `is_protected_file_path` for both `HookInput` shapes below, rather
+    // than re-reading the CWD per file-op check.
+    let base = crate::context::process_base();
 
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
@@ -594,26 +599,34 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
         HookInput::UnknownTool {
             tool_name,
             tool_input,
-        } => run_hook_check_unknown_tool(&tool_name, &tool_input, &provider, verbose, json_error),
+        } => run_hook_check_unknown_tool(
+            &tool_name,
+            &tool_input,
+            &provider,
+            verbose,
+            json_error,
+            base.as_deref(),
+        ),
         HookInput::FileOp { tool, path } => {
-            if let Some((pattern, kind, description)) = is_protected_file_path(&path) {
+            if let Some(verdict) = is_protected_file_path(&path, base.as_deref()) {
                 if json_error {
                     emit_json_error(
                         "layer2:file-protection",
-                        "protected-file",
-                        &format!("blocked {tool} to protected file — {description}"),
-                        Some(pattern),
+                        verdict.rule_id(),
+                        &verdict.blocked_reason(&tool),
+                        verdict.matched_pattern(),
                         None,
-                        HINT_FILE_PROTECTION,
+                        verdict.hint(),
                     );
                     return Ok(2);
                 }
-                eprintln!("omamori hook: blocked {tool} to protected file — {description}");
-                eprintln!("  matched: {} '{pattern}'", kind.label());
-                eprintln!("  AI agents cannot modify omamori configuration or security files.");
-                eprintln!(
-                    "  To edit config: use `omamori config` CLI or edit the file directly in your terminal."
-                );
+                eprintln!("omamori hook: {}", verdict.blocked_reason(&tool));
+                if let Some(line) = verdict.matched_line() {
+                    eprintln!("{line}");
+                }
+                for line in verdict.remediation_lines() {
+                    eprintln!("{line}");
+                }
                 if verbose {
                     eprintln!("  provider: {provider}");
                     eprintln!("  tool: {tool}");
@@ -858,6 +871,7 @@ fn run_hook_check_unknown_tool(
     provider: &str,
     verbose: bool,
     json_error: bool,
+    base: Option<&Path>,
 ) -> Result<i32, AppError> {
     match classify_input_shape(tool_input) {
         // Shell-shape and file-op-shape *should* have been resolved at
@@ -872,24 +886,25 @@ fn run_hook_check_unknown_tool(
             run_hook_check_command(cmd, provider, verbose, json_error)
         }
         InputShape::FileOp(path) => {
-            if let Some((pattern, kind, description)) = is_protected_file_path(path) {
+            if let Some(verdict) = is_protected_file_path(path, base) {
                 if json_error {
                     emit_json_error(
                         "layer2:file-protection",
-                        "protected-file",
-                        &format!("blocked {tool_name} to protected file — {description}"),
-                        Some(pattern),
+                        verdict.rule_id(),
+                        &verdict.blocked_reason(tool_name),
+                        verdict.matched_pattern(),
                         None,
-                        HINT_FILE_PROTECTION,
+                        verdict.hint(),
                     );
                     return Ok(2);
                 }
-                eprintln!("omamori hook: blocked {tool_name} to protected file — {description}");
-                eprintln!("  matched: {} '{pattern}'", kind.label());
-                eprintln!("  AI agents cannot modify omamori configuration or security files.");
-                eprintln!(
-                    "  To edit config: use `omamori config` CLI or edit the file directly in your terminal."
-                );
+                eprintln!("omamori hook: {}", verdict.blocked_reason(tool_name));
+                if let Some(line) = verdict.matched_line() {
+                    eprintln!("{line}");
+                }
+                for line in verdict.remediation_lines() {
+                    eprintln!("{line}");
+                }
                 if verbose {
                     eprintln!("  provider: {provider}");
                     eprintln!("  tool: {tool_name}");
@@ -1620,6 +1635,110 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
     ),
 ];
 
+/// Verdict from `is_protected_file_path`: either it identified which
+/// `PROTECTED_FILE_PATTERNS` entry matched, or the path could not be
+/// evaluated at all (fail-closed) because `base` was unresolvable for a
+/// relative `path` (#175). Kept distinct from a fabricated `(pattern,
+/// kind, description)` tuple — /simplify Altitude review: jamming the
+/// fail-closed case into the "real match" shape produced a nonsense
+/// `matched: path contains '(cwd unresolvable)'` message and leaked a
+/// fake pseudo-pattern into `--json-error`'s `matched_pattern` field.
+#[derive(Debug, PartialEq)]
+enum FileProtectionVerdict {
+    Matched {
+        pattern: &'static str,
+        kind: MatchKind,
+        description: &'static str,
+    },
+    BaseUnresolvable,
+}
+
+impl FileProtectionVerdict {
+    fn description(&self) -> &'static str {
+        match self {
+            Self::Matched { description, .. } => description,
+            Self::BaseUnresolvable => {
+                "protected-file check requires a resolvable working directory to judge a relative path; failing closed"
+            }
+        }
+    }
+
+    /// The pattern string surfaced in `--json-error`'s `matched_pattern`
+    /// field. `None` for `BaseUnresolvable` — there is no real pattern to
+    /// report, and inventing one would give downstream tooling a value
+    /// that doesn't correspond to any `PROTECTED_FILE_PATTERNS` entry.
+    fn matched_pattern(&self) -> Option<&'static str> {
+        match self {
+            Self::Matched { pattern, .. } => Some(pattern),
+            Self::BaseUnresolvable => None,
+        }
+    }
+
+    /// The human-readable `  matched: <kind> '<pattern>'` stderr line.
+    /// `None` for `BaseUnresolvable`, which has no pattern to report.
+    fn matched_line(&self) -> Option<String> {
+        match self {
+            Self::Matched { pattern, kind, .. } => {
+                Some(format!("  matched: {} '{pattern}'", kind.label()))
+            }
+            Self::BaseUnresolvable => None,
+        }
+    }
+
+    /// `rule_id` surfaced in `--json-error` output. QA+Security Phase 8
+    /// review: distinct from `Matched`'s so downstream tooling (and a
+    /// human triaging logs) can tell a real protected-file hit apart from
+    /// an infrastructure fail-close.
+    fn rule_id(&self) -> &'static str {
+        match self {
+            Self::Matched { .. } => "protected-file",
+            Self::BaseUnresolvable => "unresolvable-base",
+        }
+    }
+
+    /// The `hint` field consumed by the AI agent (`--json-error` mode) or
+    /// the equivalent human-readable remediation lines (plain stderr
+    /// mode) — see `remediation_lines`.
+    fn hint(&self) -> &'static str {
+        match self {
+            Self::Matched { .. } => HINT_FILE_PROTECTION,
+            Self::BaseUnresolvable => HINT_BASE_UNRESOLVABLE,
+        }
+    }
+
+    /// The `blocked <tool> ...` message shared by stderr (prefixed with
+    /// `"omamori hook: "` by the caller) and `--json-error`'s `reason`
+    /// field (unprefixed). `Matched` says "to protected file" — a claim
+    /// that's actually true in that case; `BaseUnresolvable` does not,
+    /// since whether the file is protected was never determined.
+    fn blocked_reason(&self, tool: &str) -> String {
+        match self {
+            Self::Matched { .. } => {
+                format!("blocked {tool} to protected file — {}", self.description())
+            }
+            Self::BaseUnresolvable => format!("blocked {tool} — {}", self.description()),
+        }
+    }
+
+    /// Human-readable remediation lines (plain stderr mode only — printed
+    /// after `matched_line`). Distinct per case so a `BaseUnresolvable`
+    /// block doesn't tell the user/AI agent to use `omamori config`, which
+    /// does nothing to fix an unresolvable working directory.
+    fn remediation_lines(&self) -> &'static [&'static str] {
+        match self {
+            Self::Matched { .. } => &[
+                "  AI agents cannot modify omamori configuration or security files.",
+                "  To edit config: use `omamori config` CLI or edit the file directly in your terminal.",
+            ],
+            Self::BaseUnresolvable => &[
+                "  omamori could not determine the working directory, so it cannot verify",
+                "  whether this file is protected — failing closed as a precaution.",
+                "  Re-run from a directory that still exists.",
+            ],
+        }
+    }
+}
+
 /// Check whether a file path targets a protected omamori file.
 ///
 /// Applies each pattern to both the lexically-normalized path and every
@@ -1629,8 +1748,27 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
 /// any pattern but which resolves to a protected file is still caught via
 /// the canonical candidate, while a distinct, non-symlinked file that
 /// merely shares a substring (`audit.jsonl.md`) is not.
-fn is_protected_file_path(path: &str) -> Option<(&'static str, MatchKind, &'static str)> {
-    let lexical = crate::context::normalize_path(path);
+///
+/// `base` anchors relative `path`s (see `context::normalize_path` doc —
+/// security-load-bearing, must come only from the process's own CWD via
+/// `context::process_base`). Absolute `path`s need no base at all.
+///
+/// `base: None` (the process CWD is unresolvable) fail-closes for a
+/// relative `path`: rather than silently falling through to `None`
+/// (allowed, the effect of matching zero patterns), this returns
+/// [`FileProtectionVerdict::BaseUnresolvable`] so the caller blocks it
+/// (#175). Unlike `evaluate_context`, a synthetic `/`-rooted base is NOT
+/// an acceptable substitute here — several `PROTECTED_FILE_PATTERNS`
+/// Subpath entries (e.g. `omamori/config.toml`) require components that
+/// only appear once `base` is joined in, so falling back to `/` would
+/// silently reopen exactly the gap this function exists to close.
+fn is_protected_file_path(path: &str, base: Option<&Path>) -> Option<FileProtectionVerdict> {
+    if base.is_none() && Path::new(path).is_relative() {
+        return Some(FileProtectionVerdict::BaseUnresolvable);
+    }
+    // Absolute `path`s never consult `base` (normalize_path only joins a
+    // relative path); the `/` here is an unused placeholder for that case.
+    let lexical = crate::context::normalize_path(path, base.unwrap_or(Path::new("/")));
 
     let candidates: Vec<std::path::PathBuf> = match std::fs::canonicalize(&lexical) {
         Ok(canonical) => vec![canonical],
@@ -1644,11 +1782,19 @@ fn is_protected_file_path(path: &str) -> Option<(&'static str, MatchKind, &'stat
 
     for &(pattern, kind, reason) in PROTECTED_FILE_PATTERNS {
         if kind.matches(&lexical, pattern) {
-            return Some((pattern, kind, reason));
+            return Some(FileProtectionVerdict::Matched {
+                pattern,
+                kind,
+                description: reason,
+            });
         }
         for candidate in &candidates {
             if kind.matches(candidate, pattern) {
-                return Some((pattern, kind, reason));
+                return Some(FileProtectionVerdict::Matched {
+                    pattern,
+                    kind,
+                    description: reason,
+                });
             }
         }
     }
@@ -1907,6 +2053,14 @@ const HINT_INPUT_VALIDATION: &str = "Tell the user: this action was blocked by o
 
 const HINT_FILE_PROTECTION: &str = "Tell the user: this file is protected by omamori and AI modifications are blocked. Describe the intended change and ask if you should try a different approach or if the user prefers to make the change directly.";
 
+/// #175 / QA+Security Phase 8 review: distinct from `HINT_FILE_PROTECTION`
+/// because `FileProtectionVerdict::BaseUnresolvable` is an infrastructure
+/// fail-close, not a policy decision — the file may not be protected at
+/// all. Reusing the file-protection hint would tell the AI agent (and
+/// through it, the user) something false and point at a pointless
+/// remediation (`omamori config`) that doesn't address the real cause.
+const HINT_BASE_UNRESOLVABLE: &str = "Tell the user: omamori could not resolve the current working directory, so it could not verify whether this file is protected and blocked the action as a precaution — this is not necessarily a real policy match. Ask the user to re-run from a directory that still exists.";
+
 /// Emit a structured JSON error to stderr for `--json-error` mode.
 /// Schema is documented in SECURITY.md "hook-check --json-error schema".
 fn emit_json_error(
@@ -1994,7 +2148,124 @@ pub fn fuzz_check_command_for_hook(command: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// `#175`: `is_protected_file_path` now takes `base: Option<&Path>` for
+    /// resolving relative `path`s (see the production function's doc for
+    /// the fail-closed contract). Every pre-#175 test in this module below
+    /// exercises absolute-path pattern matching (GR-004 / #320 shape
+    /// enumeration) — orthogonal to base handling — so this shadowing
+    /// wrapper supplies an unused dummy base, keeping those test bodies
+    /// byte-identical rather than mechanically threading a base through
+    /// call sites that don't test it. Base-sensitivity itself is covered
+    /// separately by the `V-A03`/`V-A04`/`V-A05`/`V-A15` tests below.
+    fn is_protected_file_path(path: &str) -> Option<(&'static str, MatchKind, &'static str)> {
+        match super::is_protected_file_path(path, Some(Path::new("/unused-test-base"))) {
+            Some(FileProtectionVerdict::Matched {
+                pattern,
+                kind,
+                description,
+            }) => Some((pattern, kind, description)),
+            Some(FileProtectionVerdict::BaseUnresolvable) => {
+                unreachable!(
+                    "shadow wrapper always supplies Some(base), so this arm is unreachable"
+                )
+            }
+            None => None,
+        }
+    }
+
+    // Codex Round 1 P1: the security-load-bearing fail-closed branch itself
+    // (`base: None` + relative `path`) had no direct test — only exercised
+    // indirectly via the hook-script integration tests. These two pin it at
+    // the unit level, calling `super::is_protected_file_path` directly
+    // (bypassing the module's own `is_protected_file_path` shadow above,
+    // which always supplies a `Some` base).
+
+    #[test]
+    fn is_protected_file_path_fails_closed_when_base_is_none_and_path_is_relative() {
+        assert_eq!(
+            super::is_protected_file_path("config.toml", None),
+            Some(FileProtectionVerdict::BaseUnresolvable),
+            "a relative path with no resolvable base must fail closed (blocked), not silently allow"
+        );
+    }
+
+    #[test]
+    fn is_protected_file_path_absolute_path_unaffected_by_none_base() {
+        // An absolute path never needs `base` at all — `base: None` must
+        // not spuriously block it. Uses the same witness path as
+        // `protected_file_path_rejects_unrelated` above (known non-match)
+        // to isolate "None doesn't cause a false block" from "None doesn't
+        // suppress a real match" (covered by the config.toml case above,
+        // which IS a real Subpath match once resolved against any base).
+        assert_eq!(
+            super::is_protected_file_path("/tmp/myfile.txt", None),
+            None,
+            "an absolute, non-matching path must stay allowed regardless of base"
+        );
+    }
+
+    // QA V-012 / Security (converging Minor): `BaseUnresolvable` must not
+    // claim "to protected file" (never determined) and must carry its own
+    // rule_id/hint/remediation rather than the `Matched` case's — otherwise
+    // the message misleads whoever reads it about what actually happened.
+    // These pin the distinction so a future edit can't collapse the two
+    // cases back together silently.
+    #[test]
+    fn base_unresolvable_verdict_has_distinct_rule_id_and_hint_from_matched() {
+        let unresolvable = FileProtectionVerdict::BaseUnresolvable;
+        let matched = FileProtectionVerdict::Matched {
+            pattern: "config.toml",
+            kind: MatchKind::Subpath,
+            description: "omamori config",
+        };
+
+        assert_eq!(unresolvable.rule_id(), "unresolvable-base");
+        assert_eq!(matched.rule_id(), "protected-file");
+        assert_ne!(unresolvable.rule_id(), matched.rule_id());
+
+        assert_eq!(unresolvable.hint(), HINT_BASE_UNRESOLVABLE);
+        assert_eq!(matched.hint(), HINT_FILE_PROTECTION);
+        assert_ne!(unresolvable.hint(), matched.hint());
+    }
+
+    #[test]
+    fn base_unresolvable_blocked_reason_does_not_claim_protected_file() {
+        let reason = FileProtectionVerdict::BaseUnresolvable.blocked_reason("Edit");
+        assert!(
+            !reason.contains("to protected file"),
+            "BaseUnresolvable never determined protection status — got: {reason}"
+        );
+        assert!(
+            reason.contains("Edit"),
+            "the tool name must still appear in the message — got: {reason}"
+        );
+    }
+
+    #[test]
+    fn matched_blocked_reason_still_claims_protected_file() {
+        let matched = FileProtectionVerdict::Matched {
+            pattern: "config.toml",
+            kind: MatchKind::Subpath,
+            description: "omamori config",
+        };
+        let reason = matched.blocked_reason("Write");
+        assert!(
+            reason.contains("to protected file"),
+            "a real Matched verdict did determine protection status — got: {reason}"
+        );
+    }
+
+    #[test]
+    fn base_unresolvable_remediation_does_not_suggest_omamori_config() {
+        let lines = FileProtectionVerdict::BaseUnresolvable.remediation_lines();
+        let joined = lines.join(" ");
+        assert!(
+            !joined.contains("omamori config"),
+            "`omamori config` does nothing to fix an unresolvable working directory — got: {joined}"
+        );
+    }
 
     // --- GR-001: fail-close config fallback (T8 guardrail, DREAD 9.0) ---
 

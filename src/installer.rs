@@ -4070,7 +4070,10 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    // `cwd` joins the `home_env` group here because this test reads the
+    // real process CWD (below) — shares the group with every other
+    // real-CWD-reading test in the crate (Security Phase 8 review).
+    #[serial_test::serial(home_env, cwd)]
     fn install_with_home_unset_succeeds_without_cwd_fallback() {
         let root =
             std::env::temp_dir().join(format!("omamori-install-nohome-{}", std::process::id()));
@@ -4078,6 +4081,11 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(&source, "binary").unwrap();
 
+        // reason: this reads the *real* process CWD deliberately — the test
+        // verifies install() did NOT pollute it when HOME is unset (a
+        // #373-class regression witness), not a `context::process_base`
+        // path-resolution concern.
+        #[allow(clippy::disallowed_methods)]
         let cwd_claude = std::env::current_dir().unwrap().join(".claude");
         let cwd_claude_existed_before = cwd_claude.exists();
 
@@ -4192,14 +4200,23 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    // `cwd` joins the `home_env` group here because this test reads the
+    // real process CWD (below) — same reasoning as the sibling install
+    // test above (Security Phase 8 review).
+    #[serial_test::serial(home_env, cwd)]
     fn uninstall_succeeds_when_home_unset() {
         let root =
             std::env::temp_dir().join(format!("omamori-uninstall-nohome-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
 
-        let cwd_claude = std::env::current_dir().unwrap().join(".claude");
-        let cwd_codex = std::env::current_dir().unwrap().join(".codex");
+        // reason: same real-CWD pollution witness as
+        // install_with_home_unset_succeeds_without_cwd_fallback above.
+        // Captured once (not once per derived path) — /simplify Efficiency
+        // review.
+        #[allow(clippy::disallowed_methods)]
+        let cwd = std::env::current_dir().unwrap();
+        let cwd_claude = cwd.join(".claude");
+        let cwd_codex = cwd.join(".codex");
         let cwd_claude_existed_before = cwd_claude.exists();
         let cwd_codex_existed_before = cwd_codex.exists();
 

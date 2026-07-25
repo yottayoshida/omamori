@@ -71,8 +71,14 @@ pub(crate) fn run_explain_command(args: &[OsString]) -> Result<i32, AppError> {
     // Preserve shell quoting for Layer 2 (hook evaluation operates on shell strings)
     let command_str = shell_words::join(&command_parts);
 
+    // Captured once per invocation (#175): `evaluate_context`'s verdict for
+    // any relative target path is relative to *this* — surfaced below so a
+    // user re-running `explain` from a different directory isn't surprised
+    // by a different answer without knowing why.
+    let base = context::process_base_or_root();
+
     // --- Layer 1 evaluation (shim / PATH-level) ---
-    let layer1 = evaluate_layer1(&command_parts, config_path.as_deref());
+    let layer1 = evaluate_layer1(&command_parts, config_path.as_deref(), &base);
 
     // --- Layer 2 evaluation (hook / token-level) ---
     let layer2 = evaluate_layer2(&command_str);
@@ -82,9 +88,9 @@ pub(crate) fn run_explain_command(args: &[OsString]) -> Result<i32, AppError> {
     let exit_code = if blocked { 2 } else { 0 };
 
     if json {
-        print_json(&command_str, &layer1, &layer2, blocked);
+        print_json(&command_str, &layer1, &layer2, blocked, &base);
     } else {
-        print_report(&command_str, &layer1, &layer2, blocked);
+        print_report(&command_str, &layer1, &layer2, blocked, &base);
     }
 
     Ok(exit_code)
@@ -115,6 +121,7 @@ struct Layer2Result {
 fn evaluate_layer1(
     command_parts: &[String],
     config_path: Option<&std::path::Path>,
+    base: &std::path::Path,
 ) -> Layer1Result {
     let load_result = match load_config(config_path) {
         Ok(r) => r,
@@ -165,7 +172,7 @@ fn evaluate_layer1(
 
     // Context evaluation
     let context_override = if let Some(ctx_config) = &load_result.config.context {
-        let ctx = context::evaluate_context(&invocation, rule, ctx_config);
+        let ctx = context::evaluate_context(&invocation, rule, ctx_config, base);
         ctx.action_override
             .map(|action| format!("{} ({})", action.as_str(), ctx.reason))
     } else {
@@ -257,10 +264,20 @@ fn evaluate_layer2(command_str: &str) -> Layer2Result {
 // Display
 // ---------------------------------------------------------------------------
 
-fn print_report(command_str: &str, layer1: &Layer1Result, layer2: &Layer2Result, blocked: bool) {
+fn print_report(
+    command_str: &str,
+    layer1: &Layer1Result,
+    layer2: &Layer2Result,
+    blocked: bool,
+    base: &std::path::Path,
+) {
     let verdict = if blocked { "BLOCK" } else { "ALLOW" };
     println!("omamori explain: {command_str}\n");
     println!("  Verdict: {verdict}\n");
+    // #175: relative target paths in the command are evaluated against
+    // this directory (Layer 1 context evaluation) — surfaced so re-running
+    // from elsewhere doesn't produce a silently different answer.
+    println!("  evaluated relative to: {}\n", base.display());
 
     // Layer 1
     println!("  Layer 1 (PATH shim):");
@@ -295,10 +312,17 @@ fn print_report(command_str: &str, layer1: &Layer1Result, layer2: &Layer2Result,
     }
 }
 
-fn print_json(command_str: &str, layer1: &Layer1Result, layer2: &Layer2Result, blocked: bool) {
+fn print_json(
+    command_str: &str,
+    layer1: &Layer1Result,
+    layer2: &Layer2Result,
+    blocked: bool,
+    base: &std::path::Path,
+) {
     let output = serde_json::json!({
         "command": command_str,
         "verdict": if blocked { "block" } else { "allow" },
+        "evaluated_relative_to": base.display().to_string(),
         "layer1": {
             "blocked": layer1.blocked,
             "matched_rule": layer1.matched_rule,
@@ -326,7 +350,7 @@ mod tests {
     #[test]
     fn layer1_no_rule_match_is_allow() {
         let parts = vec!["ls".to_string(), "/tmp".to_string()];
-        let result = evaluate_layer1(&parts, None);
+        let result = evaluate_layer1(&parts, None, std::path::Path::new("/test-base"));
         assert!(!result.blocked);
         assert!(result.matched_rule.is_none());
         assert_eq!(result.action, "allow");
@@ -335,7 +359,7 @@ mod tests {
     #[test]
     fn layer1_rm_recursive_matches_rule() {
         let parts = vec!["rm".to_string(), "-rf".to_string(), "/tmp/test".to_string()];
-        let result = evaluate_layer1(&parts, None);
+        let result = evaluate_layer1(&parts, None, std::path::Path::new("/test-base"));
         assert!(result.matched_rule.is_some());
         // Whether blocked depends on context config — the rule exists
         assert!(result.matched_rule.unwrap().contains("rm"));
@@ -425,6 +449,12 @@ mod tests {
             detail: "ok".to_string(),
         };
         // Just ensure it doesn't panic
-        print_json("ls /tmp", &l1, &l2, false);
+        print_json(
+            "ls /tmp",
+            &l1,
+            &l2,
+            false,
+            std::path::Path::new("/test-base"),
+        );
     }
 }

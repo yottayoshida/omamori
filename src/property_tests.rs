@@ -47,8 +47,9 @@
 //!
 //! Path arguments are drawn from a fixed list of literal absolute paths so
 //! the generator is independent of the test process's working directory
-//! (see PR1 / `normalize_path_with_base` and the v0.9.6 PR5 design note in
-//! `moonlit-sparking-meadow.md`).
+//! (see PR1 / `context::normalize_path` and the v0.9.6 PR5 design note in
+//! `moonlit-sparking-meadow.md`; #175 later promoted `normalize_path` to
+//! require this same explicit-base discipline everywhere).
 //!
 //! ## Properties (256 cases each)
 //!

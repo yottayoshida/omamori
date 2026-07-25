@@ -26,6 +26,26 @@ else
     echo "#1 OK: Cargo.lock is tracked"
 fi
 
+# ---------- Invariant #2: clippy.toml is tracked and bans both CWD methods (#175) ----------
+# QA/Security Phase 8 (#175): clippy.toml enforces the process-CWD-read ban
+# (Cargo.toml's `[lints.clippy] disallowed_methods = "deny"`) but is itself
+# just a file on disk -- if it's untracked or a bad merge drops one of its
+# two entries, `cargo clippy` silently has nothing to check against and
+# passes even with banned calls present elsewhere. This only guards
+# clippy.toml's own presence/content, not whether CI actually runs clippy.
+if [ -z "$(git ls-files clippy.toml)" ]; then
+    echo "FAIL [invariant #2]: clippy.toml is not tracked"
+    fail=1
+elif ! grep -q '"std::env::current_dir"' clippy.toml; then
+    echo "FAIL [invariant #2]: clippy.toml is missing the std::env::current_dir ban"
+    fail=1
+elif ! grep -q '"std::env::set_current_dir"' clippy.toml; then
+    echo "FAIL [invariant #2]: clippy.toml is missing the std::env::set_current_dir ban"
+    fail=1
+else
+    echo "#2 OK: clippy.toml is tracked and bans both std::env::current_dir and std::env::set_current_dir"
+fi
+
 # ---------- Invariant #3: required paths are effectively ignored ----------
 # `git check-ignore -q` respects the full .gitignore hierarchy *including*
 # any `!pattern` negations, so a negation rule that silently disabled an
