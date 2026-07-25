@@ -3539,6 +3539,10 @@ fn setup_non_interactive_without_base_dir_errors_actionably_when_home_unset() {
         "error must name the cause and the recovery flag: {stderr}"
     );
 
+    // reason: reads the *real* process CWD deliberately — a #373-class
+    // pollution witness (this binary must not fall back to it), not a
+    // `context::process_base` path-resolution concern.
+    #[allow(clippy::disallowed_methods)]
     let cwd_omamori = std::env::current_dir().unwrap().join(".omamori");
     assert!(
         !cwd_omamori.exists(),
@@ -3704,6 +3708,9 @@ fn config_add_succeeds_when_home_unset_but_xdg_config_home_set() {
     // fail the config mutation that already landed on disk. Also covers the
     // adversarial-review blind spot that `init`'s equivalent skip (line 135)
     // had no CWD non-pollution assertion, unlike install/run_shim's.
+    // reason: same real-CWD pollution witness pattern as
+    // install_without_base_dir_errors_actionably_when_home_unset above.
+    #[allow(clippy::disallowed_methods)]
     let cwd_omamori = std::env::current_dir().unwrap().join(".omamori");
     let cwd_omamori_existed_before = cwd_omamori.exists();
     let dir = unique_dir("config-add-nohome");
@@ -4473,6 +4480,71 @@ fn config_add_creates_rule_that_fires_in_explain() {
     assert!(stdout.contains("Verdict: BLOCK"), "stdout: {stdout}");
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// #175 V-A11: `omamori explain`'s Layer 1 context evaluation is genuinely
+/// CWD-sensitive at the CLI/process level (not just unit-tested inside
+/// `context.rs`). The default `rm-recursive-to-trash` rule + default
+/// `regenerable_paths` (`target/`) only downgrades `rm -rf target/` to
+/// `LogOnly` when `fs::canonicalize` succeeds — which depends on whether a
+/// real `target/` directory exists relative to wherever `explain` was
+/// actually invoked from. Two isolated dirs, same command, different verdict.
+#[test]
+fn explain_relative_path_is_cwd_sensitive() {
+    let config_home = unique_dir("explain-cwd-sensitive-config");
+    let cwd_with_target = unique_dir("explain-cwd-sensitive-with-target");
+    let cwd_without_target = unique_dir("explain-cwd-sensitive-without-target");
+    fs::create_dir_all(cwd_with_target.join("target")).unwrap();
+
+    let run = |cwd: &std::path::Path| -> String {
+        let mut cmd = Command::new(binary());
+        clean_ai_env(&mut cmd);
+        let output = cmd
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("HOME")
+            .current_dir(cwd)
+            .args(["explain", "--", "rm", "-rf", "target/"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+
+    let stdout_with_target = run(&cwd_with_target);
+    let stdout_without_target = run(&cwd_without_target);
+
+    // macOS resolves `env::temp_dir()`'s `/var/...` through the
+    // `/private/var` symlink by the time a child process's
+    // `env::current_dir()` reads it back — canonicalize here so the
+    // expected-value comparison isn't sensitive to that OS quirk.
+    let cwd_with_target_canonical = fs::canonicalize(&cwd_with_target).unwrap();
+    let cwd_without_target_canonical = fs::canonicalize(&cwd_without_target).unwrap();
+
+    let _ = fs::remove_dir_all(&config_home);
+    let _ = fs::remove_dir_all(&cwd_with_target);
+    let _ = fs::remove_dir_all(&cwd_without_target);
+
+    assert!(
+        stdout_with_target.contains("context override:") && stdout_with_target.contains("log-only"),
+        "target/ existing under the invocation dir must downgrade to log-only: {stdout_with_target}"
+    );
+    assert!(
+        !stdout_without_target.contains("log-only"),
+        "target/ NOT existing under the invocation dir must not downgrade (same rule, same relative arg, different cwd): {stdout_without_target}"
+    );
+    assert!(
+        stdout_with_target.contains(&format!(
+            "evaluated relative to: {}",
+            cwd_with_target_canonical.display()
+        )),
+        "the #175 base line must name the actual invocation dir: {stdout_with_target}"
+    );
+    assert!(
+        stdout_without_target.contains(&format!(
+            "evaluated relative to: {}",
+            cwd_without_target_canonical.display()
+        )),
+        "the #175 base line must name the actual invocation dir: {stdout_without_target}"
+    );
 }
 
 /// /code-review R1 finding: a successful `add` must still surface an

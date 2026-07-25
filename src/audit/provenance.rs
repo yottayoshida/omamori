@@ -71,6 +71,15 @@ impl ProcessProvenance {
         let pid = std::process::id();
         let ppid = get_ppid();
         let parent_process = ppid.and_then(proc_pidpath).map(|p| sanitize(&p));
+        // reason: this cwd is a forensic value (feeds `cwd_hash`, which
+        // CHAIN_VERSION 2 / #177 folds into the HMAC-protected entry_hash),
+        // not a protection-judgment `base`. It must NOT be replaced with
+        // `context::process_base()` — that would silently change what
+        // "unresolvable CWD" looks like on disk (a present, hashed
+        // `hmac("/")` value instead of an absent key), which would make
+        // the same real-world condition hash differently depending on
+        // which helper happened to write the entry. #175/#177 interaction.
+        #[allow(clippy::disallowed_methods)]
         let cwd = env::current_dir().ok();
         Self {
             pid,

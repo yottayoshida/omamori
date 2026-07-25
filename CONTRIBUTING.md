@@ -47,6 +47,33 @@ may be promoted from PR-template checklist to a repository ruleset.
 
 ---
 
+## Process CWD discipline (#175)
+
+`std::env::current_dir`/`std::env::set_current_dir` are banned crate-wide by
+`clippy.toml`'s `disallowed-methods` (enforced via `[lints.clippy]` in
+`Cargo.toml`, independent of CI's `-D warnings`). The one sanctioned read is
+`context::process_base` — everywhere else that needs a base for relative-path
+resolution should receive `base: &Path` explicitly (see
+`context::normalize_path`/`resolve_path`/`evaluate_context` doc comments) or
+call `context::process_base`/`process_base_or_root` itself.
+
+If you hit this lint:
+
+- **You're resolving a relative path (protection judgment, CLI inquiry
+  command, etc.)** — thread `base: &Path` through instead, sourced from
+  `context::process_base` at the entry point, not re-read deeper in the call
+  stack.
+- **You're writing a test that must observe the *real* process CWD** (e.g.
+  asserting a code path did NOT pollute it — a #373-class regression
+  witness) — this is a legitimate exception. Add
+  `#[allow(clippy::disallowed_methods)]` with a `// reason:` comment
+  immediately above the call explaining why the real CWD specifically (not
+  an arbitrary absolute path) is needed. Grep `disallowed_methods` in this
+  repo for existing examples before writing a new one — most cases are
+  already covered by the same pattern.
+
+---
+
 ## GitHub Actions SHA pinning
 
 Every `uses:` in `.github/workflows/*.yml` MUST be pinned to a 40-character

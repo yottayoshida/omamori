@@ -14,6 +14,8 @@ pub(crate) fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError
     let config_path = parse_config_flag(&args[2..])?;
     let load_result = load_config(config_path.as_deref())?;
     emit_config_warnings(&load_result);
+    // Captured once per invocation (#175) for the Context section below.
+    let base = context::process_base_or_root();
 
     // Rules section
     let config = &load_result.config;
@@ -92,7 +94,7 @@ pub(crate) fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError
             let inv = CommandInvocation::new(cmd.to_string(), args.clone());
             let test_rule = config.rules.iter().find(|r| r.command == *cmd && r.enabled);
             if let Some(rule) = test_rule {
-                let result = context::evaluate_context(&inv, rule, ctx_config);
+                let result = context::evaluate_context(&inv, rule, ctx_config, &base);
                 let (status, detail) = match &result.action_override {
                     Some(action) => (
                         "PASS",

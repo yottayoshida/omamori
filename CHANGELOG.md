@@ -6,6 +6,19 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: `context::normalize_path` and `context::evaluate_context` now require an explicit `base: &Path` argument instead of implicitly resolving relative paths against the process's current working directory. `context::resolve_path` is removed from the public API entirely (it had zero known callers, including on crates.io — reverse-dependency check via the crates.io API returned zero results). This closes the CWD-implicit path in Tier 1 (path-based) context evaluation and protected-file matching; Tier 2 (git-aware evaluation, `evaluate_git_context`) still spawns `git` without pinning its working directory and continues to depend on the child process inheriting the parent's CWD — out of scope for this change. A new `clippy.toml` (`disallowed-methods`) now bans `env::current_dir`/`env::set_current_dir` everywhere in the crate outside `context::process_base`, with one further named exception: `audit::provenance::ProcessProvenance::collect()` intentionally keeps its own direct `env::current_dir()` read (`#[allow(clippy::disallowed_methods)]`) because that value feeds the forensic `cwd_hash` field, which is scheduled to come under the audit chain's HMAC protection in a future `CHAIN_VERSION` bump (#177) and must not be rerouted through `process_base`'s different failure semantics. Every other call site was updated to pass the process's own CWD as `base`, verified byte-identical via characterization tests before and after, with one narrow behavioral exception (see Security below). The signature change itself affects only code depending on `omamori` as a library (`cargo install`/Homebrew binary users are unaffected) — see Added below for the one CLI-visible side effect. ([#175](https://github.com/yottayoshida/omamori/issues/175))
+
+### Added
+
+- **`omamori explain` now prints the directory the command was evaluated against**: a new `evaluated relative to: <path>` line in human-readable output, and an `evaluated_relative_to` field in `--json` output. This is a direct, minor user-visible consequence of #175's `base: &Path` plumbing — previously this directory was resolved implicitly and never surfaced. No change to any block/allow verdict. ([#175](https://github.com/yottayoshida/omamori/issues/175))
+- **New `invariants-check` CI invariant #2**: verifies `clippy.toml` is tracked by git and still bans both `std::env::current_dir` and `std::env::set_current_dir`, so an accidental `git rm`/omission or a bad merge that drops one of the two bans is caught in CI instead of `cargo clippy` silently having nothing left to check against. ([#175](https://github.com/yottayoshida/omamori/issues/175))
+
+### Security
+
+- **Hardened**: when the process's current working directory is unresolvable (e.g. deleted out from under a running command — an extremely rare condition), a *relative* `file_path` in an AI tool's hook payload is now blocked outright instead of being evaluated against the previous `/`-rooted fallback, which could under-match some `PROTECTED_FILE_PATTERNS` Subpath entries (e.g. `omamori/config.toml`) and allow through what should have been protected. This is the one behavior change carved out of the "no observable change" note above — it only affects the CWD-unresolvable edge case, never normal operation. ([#175](https://github.com/yottayoshida/omamori/issues/175))
+
 ## [0.15.2] - 2026-07-24
 
 **Summary**: Internal cleanup release — closes out the CLI-flag-value-parsing helper migration (#392/#377/#451) across all 19 call sites, extends the `faq-doc-sync` CI invariant to catch numeric prose drift (#396/#397), and reduces redundant exe resolution in `doctor`/`status` (#446). No user-facing behavior change.

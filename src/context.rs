@@ -96,20 +96,81 @@ pub const NEVER_REGENERABLE: &[&str] = &["src", "lib", "app", ".git", ".env", ".
 // Path normalization
 // ---------------------------------------------------------------------------
 
+/// Captures the process's current working directory once, for callers that
+/// need a `base: &Path` and have no more specific origin than "wherever the
+/// AI tool/user shell currently is". Returns `None` rather than silently
+/// substituting something else when the CWD is unresolvable (e.g. deleted
+/// out from under the running process) — mirroring [`home_dir`]'s fail-close
+/// discipline (#373): an unusable value must not silently change which path
+/// a downstream `protected_paths`/`regenerable_paths` match, or a protected-
+/// file check, evaluates.
+///
+/// `base` is security-load-bearing: `is_protected_file_path`
+/// (`engine::hook`) resolves relative `file_path`s against it to decide
+/// whether an AI tool may write to omamori's own config/hooks/audit files.
+/// Callers must construct `base` only from the process's own CWD (this
+/// function) or an equivalently trusted origin — never from external input
+/// (hook payload fields, arguments meant for the target command, etc.).
+// reason: this is the one sanctioned CWD-read entry point (#175); every
+// other caller in the crate must go through this function instead.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn process_base() -> Option<PathBuf> {
+    env::current_dir().ok()
+}
+
+/// [`process_base`] with the historical `/` fallback, consolidated to this
+/// one call site so no caller re-invents its own default.
+///
+/// Safe for [`evaluate_context`] callers under the *default* `protected_paths`
+/// (single-component entries like `src/`, `.git/`): `path_matches_pattern`
+/// does a contiguous-component-window match, and a single-component pattern
+/// needs no components from `base` to complete its window, so the synthetic
+/// `/`-rooted path still matches it correctly. **This does not generalize**:
+/// a user-configured multi-component `protected_paths` entry (e.g.
+/// `"some/nested/dir"`) can rely on `base` supplying a leading portion of the
+/// window (the same boundary-spanning shape `is_protected_file_path`'s
+/// Subpath matching has, see its V-A15 test) — under the real CWD it
+/// matches, under the synthetic `/` fallback it silently does not, and
+/// Priority 1 escalation is skipped (fail-*open* for that one rule, not
+/// fail-closed). Exploitability is low (requires both an unresolvable CWD
+/// *and* a non-default multi-component `protected_paths` entry) but this
+/// fallback does not close it — tracked as a follow-up issue rather than
+/// fixed here. `regenerable_paths` downgrade is unaffected either way: it
+/// requires `fs::canonicalize` to succeed, which a synthetic `/`-rooted path
+/// generally will not, so an unresolvable CWD can only ever suppress a
+/// downgrade, never one that shouldn't happen. **Not** safe for exact-
+/// location checks like `is_protected_file_path`, which must fail-closed on
+/// [`process_base`]'s `None` directly instead of routing through this
+/// fallback.
+pub(crate) fn process_base_or_root() -> PathBuf {
+    process_base().unwrap_or_else(|| PathBuf::from("/"))
+}
+
 /// Lexical path normalization with an explicit base directory for relative-path
 /// resolution: expand `~`, resolve relative paths against `base`, remove `.` and
 /// `..`. Does NOT access the filesystem (no symlink resolution).
 ///
-/// `~` expansion uses [`home_dir`] (fail-close, #373): if `HOME` is unset,
+/// `~` expansion uses `home_dir` (fail-close, #373): if `HOME` is unset,
 /// empty, or relative, `~/foo` is left untouched rather than falling back to
 /// a CWD-relative resolution of `foo` — an unusable `HOME` must not silently
 /// change which path a `protected_paths`/`regenerable_paths` match evaluates.
 ///
-/// Internal callers that need to pin a specific base (to avoid races with
-/// concurrent `env::set_current_dir` elsewhere in the process) use this
-/// directly. Public callers that want process CWD semantics use
-/// [`normalize_path`].
-pub(crate) fn normalize_path_with_base(path: &str, base: &Path) -> PathBuf {
+/// `base` must be absolute — callers resolve it via `process_base` (or an
+/// equivalently trusted origin) before calling. Enforced with a real
+/// `assert!` (not `debug_assert!`, so this holds in release builds too):
+/// `Path::join` alone never touches the filesystem, so a relative `base`
+/// would not make *this* function CWD-dependent — but `resolve_path` (and
+/// [`evaluate_context`], which calls it) feed this function's result into
+/// `fs::canonicalize`, which silently resolves a still-relative path
+/// against the real process CWD. A caller-supplied relative `base` must be
+/// caught here, at the one place both call paths share, not left to
+/// silently reintroduce the exact CWD dependence this PR (#175) exists to
+/// remove (Codex Round 1 review finding).
+pub fn normalize_path(path: &str, base: &Path) -> PathBuf {
+    assert!(
+        base.is_absolute(),
+        "normalize_path: base must be absolute, got {base:?} — see module docs"
+    );
     // Step 1: ~ expansion
     let path = if let Some(rest) = path.strip_prefix("~/") {
         match home_dir() {
@@ -145,16 +206,6 @@ pub(crate) fn normalize_path_with_base(path: &str, base: &Path) -> PathBuf {
     components.iter().collect()
 }
 
-/// Lexical path normalization relative to the process CWD.
-///
-/// Thin wrapper over [`normalize_path_with_base`] that captures the current
-/// working directory once at entry. Public API preserved for backwards
-/// compatibility (semver).
-pub fn normalize_path(path: &str) -> PathBuf {
-    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    normalize_path_with_base(path, &base)
-}
-
 /// Try to resolve the real path (symlinks included) via `fs::canonicalize`
 /// after lexically absolutizing against `base`.
 ///
@@ -163,24 +214,15 @@ pub fn normalize_path(path: &str) -> PathBuf {
 /// `multi_target_*` quarantine root cause (#164).
 ///
 /// Returns `(canonical, true)` on success, `(lexical, false)` if the path
-/// does not exist.
-pub(crate) fn resolve_path_with_base(raw: &str, base: &Path) -> (PathBuf, bool) {
-    let lexical = normalize_path_with_base(raw, base);
+/// does not exist. `base` must be absolute (see [`normalize_path`] doc).
+pub(crate) fn resolve_path(raw: &str, base: &Path) -> (PathBuf, bool) {
+    let lexical = normalize_path(raw, base);
     // canonicalize on the absolute lexical path, not on `raw`, so the result
     // does not depend on the current process CWD.
     match fs::canonicalize(&lexical) {
         Ok(canonical) => (canonical, true),
         Err(_) => (lexical, false),
     }
-}
-
-/// Try to resolve the real path (symlinks included) via canonicalize().
-/// Returns Ok(canonical) if the path exists, Err(lexical) if it doesn't.
-///
-/// Thin wrapper over [`resolve_path_with_base`] that captures process CWD.
-pub fn resolve_path(raw: &str) -> (PathBuf, bool) {
-    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    resolve_path_with_base(raw, &base)
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +320,7 @@ fn effective_regenerable_paths(paths: &[String]) -> Vec<String> {
 // Context evaluation (Tier 1: path-based)
 // ---------------------------------------------------------------------------
 
-/// Evaluate context for a matched rule with an explicit base directory.
+/// Evaluate context for a matched rule.
 ///
 /// Evaluation priority (highest first):
 /// 1. protected_paths match → escalate to Block
@@ -288,15 +330,26 @@ fn effective_regenerable_paths(paths: &[String]) -> Vec<String> {
 /// 5. No match → keep original
 ///
 /// Relative target paths in `invocation` are resolved against `base` via
-/// [`resolve_path_with_base`], so the verdict does not depend on the process
-/// CWD. Internal callers that need deterministic resolution (tests with
-/// concurrent `env::set_current_dir` neighbors) use this directly.
-pub(crate) fn evaluate_context_with_base(
+/// `resolve_path`, so the verdict does not depend on the process CWD.
+/// `base` must be absolute (see [`normalize_path`] doc) — callers resolve it
+/// via `process_base`/`process_base_or_root` before calling. Priority 1
+/// (protected_paths) matches on path components, so it still functions
+/// against `process_base_or_root`'s synthetic `/` fallback for the default,
+/// single-component `protected_paths` entries; see that function's doc for
+/// the narrower multi-component-entry caveat this does *not* cover.
+pub fn evaluate_context(
     invocation: &CommandInvocation,
     _rule: &RuleConfig,
     config: &ContextConfig,
     base: &Path,
 ) -> ContextEvaluation {
+    // Real `assert!`, not `debug_assert!` — see `normalize_path`'s doc for
+    // why (this also protects the empty-`targets` early return below, which
+    // never reaches `resolve_path`'s own transitive check).
+    assert!(
+        base.is_absolute(),
+        "evaluate_context: base must be absolute, got {base:?} — see module docs"
+    );
     let targets = invocation.target_args();
     if targets.is_empty() {
         return ContextEvaluation {
@@ -316,7 +369,7 @@ pub(crate) fn evaluate_context_with_base(
     };
 
     for target in &targets {
-        let (resolved, canonicalized) = resolve_path_with_base(target, base);
+        let (resolved, canonicalized) = resolve_path(target, base);
 
         // Priority 1: protected_paths → escalate to Block (most severe, short-circuit)
         if let Some(pattern) = matches_any_pattern(&resolved, &config.protected_paths) {
@@ -348,19 +401,6 @@ pub(crate) fn evaluate_context_with_base(
     }
 
     result
-}
-
-/// Evaluate context for a matched rule.
-///
-/// Thin wrapper over [`evaluate_context_with_base`] that captures the process
-/// CWD at entry. Public API preserved for backwards compatibility (semver).
-pub fn evaluate_context(
-    invocation: &CommandInvocation,
-    rule: &RuleConfig,
-    config: &ContextConfig,
-) -> ContextEvaluation {
-    let base = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    evaluate_context_with_base(invocation, rule, config, &base)
 }
 
 // ---------------------------------------------------------------------------
@@ -555,30 +595,107 @@ pub fn evaluate_git_context(
 mod tests {
     use super::*;
 
-    // NOTE (v0.9.6 structural fix for #164):
-    // The v0.9.5 `multi_target_*` quarantine has been resolved by introducing
-    // `evaluate_context_with_base` / `resolve_path_with_base` /
-    // `normalize_path_with_base`. Tests that previously relied on the process
-    // CWD to resolve relative paths now pass an explicit base (via
-    // `test_base()`), so `fs::canonicalize` receives an absolute path and its
-    // result no longer depends on concurrent `env::set_current_dir` calls in
-    // the `git_context_*` family.
+    // NOTE (v0.9.6 structural fix for #164; #175 completed the promotion):
+    // The v0.9.5 `multi_target_*` quarantine was resolved by introducing
+    // base-taking internal helpers, later promoted to be the public
+    // `normalize_path`/`resolve_path`/`evaluate_context` signatures
+    // themselves (#175). Tests that previously relied on the process CWD to
+    // resolve relative paths now pass an explicit base (via `test_base()`
+    // or `normalize_test_base()`), so `fs::canonicalize` receives an
+    // absolute path and its result no longer depends on concurrent
+    // `env::set_current_dir` calls in the `git_context_*` family.
     //
     // As a result:
     //   - `multi_target_*` tests no longer need `#[serial_test::serial]`.
     //   - `git_context_*` tests pass an explicit cwd into the internal
     //     subprocess helpers, so they do not mutate process CWD.
     //
-    // Since v0.10.0, #175 tracks the full public-API promotion of
-    // `normalize_path`/`resolve_path`/`evaluate_context` to require an
-    // explicit `base: &Path`, at which point the process CWD can be banned
-    // outside the shim/hook entry points via `.clippy.toml` disallowed_methods.
+    // The process CWD is now read in exactly one place in this module
+    // (`process_base`), and is banned everywhere else in the crate outside
+    // shim/hook entry points via `clippy.toml`'s `disallowed-methods`.
+
+    /// Absolute base for `normalize_path` tests. Unlike `evaluate_context`/
+    /// `resolve_path` tests (`test_base()`), `normalize_path` never touches
+    /// the filesystem, so this needs no `/tmp` fixture directory — any
+    /// absolute path literal is sufficient.
+    fn normalize_test_base() -> PathBuf {
+        PathBuf::from("/omamori-normalize-test-base")
+    }
+
+    // --- process_base / process_base_or_root (V-A09) ---
+
+    #[test]
+    // Reads the real process CWD (via `process_base`) — shares the `cwd`
+    // serial group with `process_base_fails_closed_when_cwd_is_unlinked`
+    // and every other real-CWD-reading test in the crate, so none of them
+    // can observe a CWD another one is mutating (Security Phase 8 review:
+    // `serial(cwd)` was previously held by only one test, making the lock
+    // inert).
+    #[serial_test::serial(cwd)]
+    fn process_base_returns_some_for_a_normal_cwd() {
+        assert!(process_base().is_some());
+        assert_eq!(process_base_or_root(), process_base().unwrap());
+    }
+
+    // #175/#373: `process_base` must fail-close (return `None`) rather than
+    // silently substituting something else when the CWD is unresolvable —
+    // e.g. deleted out from under the running process. `process_base_or_root`
+    // then applies the one sanctioned `/` fallback on top of that `None`.
+    //
+    // Verified (not assumed) on both CI legs: `getcwd(3)` after the CWD
+    // directory has been unlinked returns `ENOENT` on both Linux and macOS
+    // (confirmed empirically on Darwin 24.3.0 — this comment previously
+    // claimed macOS could silently return a dangling path instead, which
+    // was wrong; QA + Security Phase 8 review both independently caught
+    // it). No `#[cfg(target_os = ...)]` gate — this runs unconditionally on
+    // every platform CI builds for (`ci.yml`'s matrix), so the fail-close
+    // guarantee is verified on the actual macOS runtime omamori ships on
+    // (`docs/CONTRACT.md`), not only on a CI-only Linux leg.
+    #[test]
+    #[serial_test::serial(cwd)]
+    fn process_base_fails_closed_when_cwd_is_unlinked() {
+        let dir = env::temp_dir().join(format!("omamori-cwd-unlink-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // reason: this reads the *real* process CWD deliberately — the
+        // whole point of this test is to observe process_base()'s behavior
+        // against a genuinely unlinked real CWD, which cannot be simulated
+        // any other way.
+        #[allow(clippy::disallowed_methods)]
+        let original_cwd = env::current_dir().unwrap();
+        // reason: same real-CWD test as above — moves the process into the
+        // fixture dir that gets unlinked out from under it.
+        #[allow(clippy::disallowed_methods)]
+        {
+            env::set_current_dir(&dir).unwrap();
+        }
+        fs::remove_dir(&dir).unwrap();
+
+        let result = process_base();
+        let fallback = process_base_or_root();
+
+        // reason: same real-CWD test as above — restores the process's
+        // original CWD so this test doesn't leak state into siblings.
+        #[allow(clippy::disallowed_methods)]
+        {
+            env::set_current_dir(&original_cwd).unwrap();
+        }
+
+        assert_eq!(
+            result, None,
+            "process_base must return None (fail-close), not a stale/dangling path"
+        );
+        assert_eq!(
+            fallback,
+            PathBuf::from("/"),
+            "process_base_or_root must apply the one sanctioned `/` fallback on top of None"
+        );
+    }
 
     // --- normalize_path ---
 
     #[test]
     fn normalize_resolves_dot_dot() {
-        let result = normalize_path("target/../src/main.rs");
+        let result = normalize_path("target/../src/main.rs", &normalize_test_base());
         assert!(
             result.ends_with("src/main.rs"),
             "expected ends_with src/main.rs, got: {}",
@@ -595,7 +712,7 @@ mod tests {
 
     #[test]
     fn normalize_resolves_dot() {
-        let result = normalize_path("./target/");
+        let result = normalize_path("./target/", &normalize_test_base());
         assert!(result.ends_with("target"));
     }
 
@@ -606,49 +723,129 @@ mod tests {
         // torn/transient value from a concurrent HOME-mutating test
         // elsewhere in this file (#344-class flake; this exact test name
         // was previously observed flaking for the same reason).
-        let result = normalize_path("~/Documents");
+        let result = normalize_path("~/Documents", &normalize_test_base());
         if let Some(home) = env::var_os("HOME") {
             assert!(result.starts_with(PathBuf::from(home)));
         }
     }
 
     #[test]
-    fn normalize_makes_absolute() {
-        let result = normalize_path("target");
+    fn normalize_joins_relative_path_against_absolute_base() {
+        // Successor to the pre-#175 `normalize_makes_absolute`: verifies the
+        // explicit-base contract directly (relative path + absolute base →
+        // absolute result equal to their join), rather than relying on
+        // process CWD to make this true implicitly.
+        let result = normalize_path("target", &normalize_test_base());
         assert!(result.is_absolute());
+        assert_eq!(result, normalize_test_base().join("target"));
+    }
+
+    // V-A12: degenerate inputs must not panic and must resolve to a
+    // documented, deterministic value (pinning current behavior explicitly
+    // rather than leaving it implicit).
+    #[test]
+    fn normalize_degenerate_inputs_do_not_panic() {
+        let base = normalize_test_base();
+        assert_eq!(
+            normalize_path("", &base),
+            base,
+            "empty path resolves to base itself"
+        );
+        assert_eq!(
+            normalize_path(".", &base),
+            base,
+            "\".\" resolves to base itself"
+        );
+        // "~" alone (no trailing slash) does not match the `~/` prefix
+        // `strip_prefix` checks for, so it is treated as a literal relative
+        // component rather than triggering HOME expansion.
+        assert_eq!(
+            normalize_path("~", &base),
+            base.join("~"),
+            "bare ~ (no trailing slash) is NOT tilde-expanded, joined as a literal component"
+        );
+        assert_eq!(
+            normalize_path("~x", &base),
+            base.join("~x"),
+            "~x (not ~/) is not tilde-expanded, joined as a literal component"
+        );
+        // A long run of leading ".." components has nothing to pop past
+        // the base's own RootDir component — must not panic or underflow.
+        assert_eq!(
+            normalize_path("../../../../../../etc/passwd", &base),
+            PathBuf::from("/etc/passwd"),
+            "excess .. components stop popping at the root, not before"
+        );
+    }
+
+    // V-A01/V-A02 (redesigned per Codex Round 1 P0): a caller-supplied
+    // *relative* base is now a hard `assert!` failure in every build
+    // profile, not just debug. The original design of this test verified
+    // that `normalize_path` computed a CWD-independent (if wrong) result
+    // even with a relative base in release builds, on the theory that
+    // `Path::join` never touches the filesystem. That theory is correct for
+    // `normalize_path` in isolation, but Codex Round 1 found the real gap
+    // it was papering over: `resolve_path`/`evaluate_context` feed
+    // `normalize_path`'s result into `fs::canonicalize`, which — if the
+    // result is still relative because `base` was relative — silently
+    // resolves against the real process CWD, reintroducing exactly the
+    // dependence #175 exists to remove. A "graceful" relative-base result
+    // is therefore not actually safe to allow anywhere in this call chain;
+    // panicking loudly is the correct behavior, and this test now verifies
+    // that instead of verifying the old (insufficient) graceful fallback.
+    #[test]
+    #[should_panic(expected = "must be absolute")]
+    fn normalize_path_panics_on_relative_base_in_every_profile() {
+        let _ = normalize_path("x", Path::new("rel"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be absolute")]
+    fn evaluate_context_panics_on_relative_base_in_every_profile() {
+        let inv = CommandInvocation::new(
+            "rm".to_string(),
+            vec!["-rf".to_string(), "target/".to_string()],
+        );
+        let _ = evaluate_context(&inv, &test_rule(), &test_config(), Path::new("rel"));
     }
 
     // --- path_matches_pattern ---
 
+    // #175: these tests exercise `path_matches_pattern`'s pure component
+    // matching directly — the specific absolute path used is irrelevant to
+    // what's under test, so `normalize_test_base()` replaces what was
+    // previously an unnecessary `env::current_dir()` read (banned outside
+    // `context::process_base` by `clippy.toml`'s `disallowed-methods`).
+
     #[test]
     fn pattern_matches_exact_component() {
-        let cwd = env::current_dir().unwrap();
-        assert!(path_matches_pattern(&cwd.join("target"), "target"));
-        assert!(path_matches_pattern(&cwd.join("target/debug"), "target"));
+        let base = normalize_test_base();
+        assert!(path_matches_pattern(&base.join("target"), "target"));
+        assert!(path_matches_pattern(&base.join("target/debug"), "target"));
     }
 
     #[test]
     fn pattern_does_not_match_partial_name() {
-        let cwd = env::current_dir().unwrap();
-        assert!(!path_matches_pattern(&cwd.join("target_dir"), "target"));
-        assert!(!path_matches_pattern(&cwd.join("my-target"), "target"));
-        assert!(!path_matches_pattern(&cwd.join("src_backup"), "src"));
+        let base = normalize_test_base();
+        assert!(!path_matches_pattern(&base.join("target_dir"), "target"));
+        assert!(!path_matches_pattern(&base.join("my-target"), "target"));
+        assert!(!path_matches_pattern(&base.join("src_backup"), "src"));
     }
 
     #[test]
     fn pattern_matches_intermediate_component() {
-        let cwd = env::current_dir().unwrap();
-        assert!(path_matches_pattern(&cwd.join("lib/src/foo"), "src"));
+        let base = normalize_test_base();
+        assert!(path_matches_pattern(&base.join("lib/src/foo"), "src"));
     }
 
     #[test]
     fn trailing_slash_does_not_affect_match() {
-        let cwd = env::current_dir().unwrap();
-        let path = cwd.join("target");
+        let base = normalize_test_base();
+        let path = base.join("target");
         assert!(path_matches_pattern(&path, "target"));
         assert!(path_matches_pattern(&path, "target/"));
 
-        let path_slash = cwd.join("target/");
+        let path_slash = base.join("target/");
         assert!(path_matches_pattern(&path_slash, "target"));
     }
 
@@ -706,14 +903,14 @@ mod tests {
     /// cannot collide either.
     ///
     /// Also idempotently creates fixture children (`target/`, `node_modules/`)
-    /// so that `fs::canonicalize` through `resolve_path_with_base` succeeds
-    /// and regenerable-path canonicalization tests can reach the `LogOnly`
+    /// so that `fs::canonicalize` through `resolve_path` succeeds and
+    /// regenerable-path canonicalization tests can reach the `LogOnly`
     /// branch. Cleanup is deliberately skipped: parallel tests in the same
     /// PID would race on a cleanup, and the tree is tiny under `/tmp`.
     ///
     /// Example: `/tmp/omamori-ctx-test-12345/target/` is what a relative
     /// `target/` arg resolves to when evaluating via
-    /// `evaluate_context_with_base(&inv, &rule, &config, &test_base())`.
+    /// `evaluate_context(&inv, &rule, &config, &test_base())`.
     fn test_base() -> PathBuf {
         let base = PathBuf::from(format!("/tmp/omamori-ctx-test-{}", std::process::id()));
         std::fs::create_dir_all(base.join("target")).unwrap();
@@ -728,7 +925,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
         assert_eq!(result.action_override, Some(ActionKind::Block));
         assert!(result.reason.contains("protected path"));
     }
@@ -737,7 +934,7 @@ mod tests {
     fn context_no_targets_returns_none() {
         let config = test_config();
         let inv = CommandInvocation::new("rm".to_string(), vec!["-rf".to_string()]);
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
         assert!(result.action_override.is_none());
     }
 
@@ -748,7 +945,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "data/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
         assert!(result.action_override.is_none());
     }
 
@@ -764,7 +961,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
         // src/ is in NEVER_REGENERABLE, so it should NOT be downgraded
         assert!(
             result.action_override.is_none(),
@@ -784,19 +981,22 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "shared/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
         assert_eq!(result.action_override, Some(ActionKind::Block));
     }
 
     #[test]
     fn traversal_attack_is_caught() {
         let config = test_config();
-        // target/../src/ should normalize to CWD/src/ and match protected_paths
+        // target/../src/ normalizes to <test_base()>/src/ and matches
+        // protected_paths via component matching — re-verified against the
+        // explicit base (not assumed to carry over mechanically from the
+        // pre-#175 CWD-implicit version, per QA review of this test).
         let inv = CommandInvocation::new(
             "rm".to_string(),
             vec!["-rf".to_string(), "target/../src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
         assert_eq!(
             result.action_override,
             Some(ActionKind::Block),
@@ -812,7 +1012,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "target_dir/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config);
+        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
         assert!(
             result.action_override.is_none(),
             "target_dir should not match target pattern"
@@ -823,16 +1023,16 @@ mod tests {
     fn multi_target_protected_wins_over_regenerable() {
         // P1-1: rm -rf target/ src/ — src/ must be caught even though target/ matches first.
         //
-        // Uses `evaluate_context_with_base` + `test_base()` so concurrent
-        // process CWD changes cannot flip the verdict. This closes the
-        // v0.9.5 #164 quarantine (structural fix, v0.9.6 scope 10).
+        // Uses `test_base()` so concurrent process CWD changes cannot flip
+        // the verdict. This closes the v0.9.5 #164 quarantine (structural
+        // fix, v0.9.6 scope 10).
         let base = test_base();
         let config = test_config();
         let inv = CommandInvocation::new(
             "rm".to_string(),
             vec!["-rf".to_string(), "target/".to_string(), "src/".to_string()],
         );
-        let result = evaluate_context_with_base(&inv, &test_rule(), &config, &base);
+        let result = evaluate_context(&inv, &test_rule(), &config, &base);
         assert_eq!(
             result.action_override,
             Some(ActionKind::Block),
@@ -842,8 +1042,8 @@ mod tests {
 
     #[test]
     fn multi_target_all_regenerable_downgrades() {
-        // #164 structural fix: explicit base via `evaluate_context_with_base`
-        // instead of relying on process CWD. See module note.
+        // #164 structural fix: explicit base instead of relying on process
+        // CWD. See module note.
         let base = test_base();
         let config = test_config();
         let inv = CommandInvocation::new(
@@ -854,7 +1054,7 @@ mod tests {
                 "node_modules/".to_string(),
             ],
         );
-        let result = evaluate_context_with_base(&inv, &test_rule(), &config, &base);
+        let result = evaluate_context(&inv, &test_rule(), &config, &base);
         assert_eq!(result.action_override, Some(ActionKind::LogOnly));
     }
 
@@ -1310,17 +1510,17 @@ mod tests {
 
     #[test]
     #[serial_test::serial(home_env)]
-    fn normalize_path_with_base_leaves_tilde_untouched_when_home_unusable() {
+    fn normalize_path_leaves_tilde_untouched_when_home_unusable() {
         // #373: an unusable HOME (unset/empty/relative) must not silently
         // fall back to a CWD-relative resolution of the tilde-stripped
         // remainder — that would let `~/protected-dir` resolve to a
         // completely different path than intended, potentially missing a
-        // protected_paths/regenerable_paths match (evaluate_context_with_base
-        // consumes this via resolve_path_with_base). Instead `~/foo` is left
-        // as a literal (non-existent) path relative to `base`.
+        // protected_paths/regenerable_paths match (evaluate_context consumes
+        // this via resolve_path). Instead `~/foo` is left as a literal
+        // (non-existent) path relative to `base`.
         let base = Path::new("/base");
         for home in [None, Some(""), Some("relative")] {
-            let result = with_home(home, || normalize_path_with_base("~/protected-dir", base));
+            let result = with_home(home, || normalize_path("~/protected-dir", base));
             assert_eq!(
                 result,
                 PathBuf::from("/base/~/protected-dir"),
@@ -1331,10 +1531,10 @@ mod tests {
 
     #[test]
     #[serial_test::serial(home_env)]
-    fn normalize_path_with_base_expands_tilde_when_home_absolute() {
+    fn normalize_path_expands_tilde_when_home_absolute() {
         let base = Path::new("/base");
         let result = with_home(Some("/tmp/omamori-tilde-test"), || {
-            normalize_path_with_base("~/protected-dir", base)
+            normalize_path("~/protected-dir", base)
         });
         assert_eq!(
             result,

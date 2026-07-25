@@ -74,7 +74,23 @@ fn setup_hook_env(case: &str) -> (PathBuf, PathBuf, PathBuf) {
 ///      behavior (CI fresh runners have no global install, so the shell would
 ///      otherwise fail with "command not found" and exit non-zero, making
 ///      every Allow-case look like Block).
-fn run_hook_script(hook_path: &Path, shim_dir: &Path, input: &str) -> (String, String, i32) {
+///
+/// `cwd: None` lets the child inherit this test process's own CWD — the
+/// shape every pre-#175 call site (25+) relies on. `cwd: Some(dir)` pins
+/// the child's CWD explicitly instead; `run_hook_script_in` (#175) uses
+/// this to test that a *relative* `file_path` in a hook payload resolves
+/// against the hook process's own working directory (via
+/// `context::process_base` → `is_protected_file_path`), not against
+/// wherever `cargo test` happened to start from. Before #175 no test in
+/// this module exercised a relative `file_path` at all — every existing
+/// case (e.g. `unknown_tool_file_path_protected_blocks`) uses an absolute
+/// path, so the base-resolution step was never on the tested path.
+fn run_hook_script_impl(
+    cwd: Option<&Path>,
+    hook_path: &Path,
+    shim_dir: &Path,
+    input: &str,
+) -> (String, String, i32) {
     let current_path = std::env::var("PATH").unwrap_or_default();
     let binary_dir = binary()
         .parent()
@@ -103,8 +119,12 @@ fn run_hook_script(hook_path: &Path, shim_dir: &Path, input: &str) -> (String, S
         .expect("hook_path must be at <base>/hooks/<file>")
         .to_path_buf();
 
-    let mut child = Command::new("/bin/sh")
-        .arg(hook_path)
+    let mut command = Command::new("/bin/sh");
+    command.arg(hook_path);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
         .env("PATH", injected_path)
         .env("HOME", &test_home)
         .env("XDG_CONFIG_HOME", test_home.join(".config"))
@@ -129,6 +149,19 @@ fn run_hook_script(hook_path: &Path, shim_dir: &Path, input: &str) -> (String, S
         String::from_utf8_lossy(&output.stderr).to_string(),
         output.status.code().unwrap_or(-1),
     )
+}
+
+fn run_hook_script(hook_path: &Path, shim_dir: &Path, input: &str) -> (String, String, i32) {
+    run_hook_script_impl(None, hook_path, shim_dir, input)
+}
+
+fn run_hook_script_in(
+    cwd: &Path,
+    hook_path: &Path,
+    shim_dir: &Path,
+    input: &str,
+) -> (String, String, i32) {
+    run_hook_script_impl(Some(cwd), hook_path, shim_dir, input)
 }
 
 fn pretooluse_bash_json(command: &str) -> String {
@@ -1527,6 +1560,169 @@ fn unknown_tool_file_path_protected_blocks() {
         decision_from_exit(exit),
         Decision::Block,
         "PR6: unknown tool with file_path on a protected path must Block (FileOp routing)"
+    );
+}
+
+// --- #175: relative `file_path` base-sensitivity (V-A04/V-A05/V-A15) ---
+//
+// `unknown_tool_file_path_protected_blocks` above only ever exercises an
+// ABSOLUTE `file_path` — it provides zero coverage of whether a *relative*
+// `file_path` resolves against the hook process's own CWD correctly. These
+// three tests close that gap via `run_hook_script_in`, each pairing a
+// positive (Block) and negative (Allow) CWD so the assertion can only pass
+// if `context::process_base` is genuinely threaded through
+// `is_protected_file_path` — a version that ignored `base` entirely, or
+// substituted a fixed `/`, would make either the positive or the negative
+// branch (or both) come out wrong. This doubles as the harness sanity
+// check for `run_hook_script_in` itself: if `.current_dir(cwd)` silently
+// failed to apply, the two branches below would produce identical
+// decisions rather than the required Block/Allow split.
+
+/// `..` lexical resolution: a relative `file_path` reaching into the
+/// omamori data directory only resolves correctly against the hook
+/// process's actual CWD.
+#[test]
+fn relative_path_dotdot_resolves_against_hook_cwd() {
+    let (base, hook_path, shim_dir) = setup_hook_env("relpath-dotdot");
+    let json = pretooluse_unknown_with_input(
+        "FutureEditor",
+        serde_json::json!({ "file_path": "../omamori/marker.txt" }),
+    );
+
+    // Positive: cwd = <base>/.local/share/x. "../omamori/marker.txt"
+    // resolves lexically to <base>/.local/share/omamori/marker.txt, which
+    // contains the `.local/share/omamori` Subpath sequence.
+    let cwd_inside = base.join(".local/share/x");
+    std::fs::create_dir_all(&cwd_inside).unwrap();
+    let (_, _, exit_inside) = run_hook_script_in(&cwd_inside, &hook_path, &shim_dir, &json);
+
+    // Negative: cwd = <base>/tmp. The same relative `file_path` resolves
+    // to <base>/omamori/marker.txt — no protected pattern matches. A
+    // version that ignored `base` (or substituted a fixed value) would
+    // make this come out the same as the positive case above.
+    let cwd_outside = base.join("tmp");
+    std::fs::create_dir_all(&cwd_outside).unwrap();
+    let (_, _, exit_outside) = run_hook_script_in(&cwd_outside, &hook_path, &shim_dir, &json);
+
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit_inside),
+        Decision::Block,
+        "../omamori/marker.txt from <base>/.local/share/x must resolve into the protected data dir"
+    );
+    assert_eq!(
+        decision_from_exit(exit_outside),
+        Decision::Allow,
+        "../omamori/marker.txt from <base>/tmp must NOT resolve into the protected data dir"
+    );
+}
+
+/// `fs::canonicalize` resolution: a relative `file_path` through a symlink
+/// only resolves to its real (protected) target against the hook
+/// process's actual CWD.
+#[cfg(unix)]
+#[test]
+fn relative_path_symlink_canonicalizes_against_hook_cwd() {
+    let (base, hook_path, shim_dir) = setup_hook_env("relpath-symlink");
+    let real_data_dir = base.join(".local/share/omamori");
+    std::fs::create_dir_all(&real_data_dir).unwrap();
+    std::fs::write(real_data_dir.join("marker.txt"), b"").unwrap();
+
+    let proj_dir = base.join("proj");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    std::os::unix::fs::symlink(&real_data_dir, proj_dir.join("data")).unwrap();
+
+    let json = pretooluse_unknown_with_input(
+        "FutureEditor",
+        serde_json::json!({ "file_path": "data/marker.txt" }),
+    );
+
+    // Positive: cwd = <base>/proj, where `data` is a symlink to the real
+    // protected data dir. "data/marker.txt" canonicalizes through it.
+    let (_, _, exit_inside) = run_hook_script_in(&proj_dir, &hook_path, &shim_dir, &json);
+
+    // Negative: cwd = <base>/tmp, which has no `data` symlink at all — the
+    // same relative `file_path` cannot canonicalize to anything protected.
+    let cwd_outside = base.join("tmp");
+    std::fs::create_dir_all(&cwd_outside).unwrap();
+    let (_, _, exit_outside) = run_hook_script_in(&cwd_outside, &hook_path, &shim_dir, &json);
+
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(
+        decision_from_exit(exit_inside),
+        Decision::Block,
+        "data/marker.txt from <base>/proj must canonicalize through the symlink to the protected dir"
+    );
+    assert_eq!(
+        decision_from_exit(exit_outside),
+        Decision::Allow,
+        "data/marker.txt from <base>/tmp (no such symlink) must not canonicalize to anything protected"
+    );
+}
+
+/// Subpath pattern spanning the base↔relative-path boundary: `base`
+/// contributes some of a Subpath pattern's components and the relative
+/// `file_path` contributes the rest — neither half matches the pattern
+/// alone. `path_matches_pattern`'s component-window matching means this is
+/// a *different* failure mode from `..`/symlink resolution: no lexical
+/// dots or filesystem canonicalization is involved, just component
+/// concatenation. Two independent pattern/boundary shapes are covered so a
+/// fix that only handles a 1-component overhang (A) doesn't leave a
+/// 2-component overhang (B) undetected.
+#[test]
+fn relative_path_subpath_pattern_spans_base_boundary() {
+    let (base, hook_path, shim_dir) = setup_hook_env("relpath-subpath-boundary");
+
+    // A: pattern `omamori/config.toml` (2 components). base contributes
+    // the "omamori" half, the relative `file_path` contributes
+    // "config.toml" — 1-component overhang.
+    let a_json = pretooluse_unknown_with_input(
+        "FutureEditor",
+        serde_json::json!({ "file_path": "config.toml" }),
+    );
+    let a_cwd_inside = base.join(".config/omamori");
+    std::fs::create_dir_all(&a_cwd_inside).unwrap();
+    let (_, _, a_exit_inside) = run_hook_script_in(&a_cwd_inside, &hook_path, &shim_dir, &a_json);
+    let a_cwd_outside = base.join("tmp-a");
+    std::fs::create_dir_all(&a_cwd_outside).unwrap();
+    let (_, _, a_exit_outside) = run_hook_script_in(&a_cwd_outside, &hook_path, &shim_dir, &a_json);
+
+    // B: pattern `.local/share/omamori` (3 components). base contributes
+    // ".local/share", the relative `file_path` contributes "omamori/sub/…"
+    // — a 2-component overhang, proving the fix isn't special-cased to
+    // exactly a 1-component gap.
+    let b_json = pretooluse_unknown_with_input(
+        "FutureEditor",
+        serde_json::json!({ "file_path": "omamori/sub/marker.txt" }),
+    );
+    let b_cwd_inside = base.join(".local/share");
+    std::fs::create_dir_all(&b_cwd_inside).unwrap();
+    let (_, _, b_exit_inside) = run_hook_script_in(&b_cwd_inside, &hook_path, &shim_dir, &b_json);
+    let b_cwd_outside = base.join("tmp-b");
+    std::fs::create_dir_all(&b_cwd_outside).unwrap();
+    let (_, _, b_exit_outside) = run_hook_script_in(&b_cwd_outside, &hook_path, &shim_dir, &b_json);
+
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert_eq!(
+        decision_from_exit(a_exit_inside),
+        Decision::Block,
+        "config.toml from <base>/.config/omamori must complete the omamori/config.toml Subpath match"
+    );
+    assert_eq!(
+        decision_from_exit(a_exit_outside),
+        Decision::Allow,
+        "config.toml from <base>/tmp-a must NOT match omamori/config.toml"
+    );
+    assert_eq!(
+        decision_from_exit(b_exit_inside),
+        Decision::Block,
+        "omamori/sub/marker.txt from <base>/.local/share must complete the .local/share/omamori Subpath match"
+    );
+    assert_eq!(
+        decision_from_exit(b_exit_outside),
+        Decision::Allow,
+        "omamori/sub/marker.txt from <base>/tmp-b must NOT match .local/share/omamori"
     );
 }
 
