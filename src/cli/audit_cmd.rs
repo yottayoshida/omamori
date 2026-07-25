@@ -50,7 +50,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 eprintln!(
                     "  {} entries verified before this point; unable to verify {} \
                      entries at or after it.",
-                    result.verified_prefix_entries, result.unverified_entries_after
+                    result.chain_entries, result.unverified_entries_after
                 );
                 eprintln!(
                     "  This is not necessarily tampering — it may mean this omamori \

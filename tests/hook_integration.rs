@@ -1938,6 +1938,33 @@ fn audit_path_for(base: &Path) -> PathBuf {
     base.join(".local/share/omamori/audit.jsonl")
 }
 
+/// Hand-crafts and appends a single JSON line simulating an entry written
+/// by a future omamori version (`chain_version: 999`, this binary's
+/// hashing logic doesn't recognize it). `entry_hash`/`prev_hash`/
+/// `target_hash` content is deliberately arbitrary — the verifier's
+/// version dispatch fires before it ever reads those fields for an
+/// unrecognized version.
+fn append_future_chain_entry(audit_path: &Path, seq: u64) {
+    let future_entry = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:01Z",
+        "provider": "test",
+        "command": "future-cmd",
+        "action": "block",
+        "result": "blocked",
+        "target_count": 0,
+        "target_hash": "",
+        "chain_version": 999,
+        "seq": seq,
+        "prev_hash": "irrelevant",
+        "key_id": "default",
+        "entry_hash": "irrelevant",
+    });
+    let mut content = std::fs::read_to_string(audit_path).unwrap();
+    content.push_str(&serde_json::to_string(&future_entry).unwrap());
+    content.push('\n');
+    std::fs::write(audit_path, content).unwrap();
+}
+
 /// V-014: BlockMeta path (Phase 1B env-var tampering) appends an audit event
 /// with `detection_layer="layer2:meta-pattern"`. Trigger: `unset CLAUDECODE`
 /// is caught by `detect_env_var_tampering` (Phase 1B).
@@ -2268,24 +2295,7 @@ fn audit_verify_exits_4_on_unknown_chain_version() {
     );
 
     let audit_path = audit_path_for(&base);
-    let future_entry = serde_json::json!({
-        "timestamp": "2026-01-01T00:00:01Z",
-        "provider": "test",
-        "command": "future-cmd",
-        "action": "block",
-        "result": "blocked",
-        "target_count": 0,
-        "target_hash": "",
-        "chain_version": 999,
-        "seq": 1,
-        "prev_hash": "irrelevant",
-        "key_id": "default",
-        "entry_hash": "irrelevant",
-    });
-    let mut content = std::fs::read_to_string(&audit_path).unwrap();
-    content.push_str(&serde_json::to_string(&future_entry).unwrap());
-    content.push('\n');
-    std::fs::write(&audit_path, content).unwrap();
+    append_future_chain_entry(&audit_path, 1);
 
     let verify = Command::new(binary())
         .arg("audit")
@@ -2318,7 +2328,7 @@ fn audit_verify_exits_4_on_unknown_chain_version() {
     // entry (seq 0) was seeded, one future entry (seq 1) was appended.
     assert!(
         stderr.contains("1 entries verified before this point"),
-        "stderr must report verified_prefix_entries=1 — got: {stderr}"
+        "stderr must report chain_entries=1 as the verified-before count — got: {stderr}"
     );
     assert!(
         stderr.contains("unable to verify 1 entries at or after it"),
@@ -2347,24 +2357,8 @@ fn hook_deny_still_blocks_when_audit_tail_has_unknown_chain_version() {
     );
 
     let audit_path = audit_path_for(&base);
-    let future_entry = serde_json::json!({
-        "timestamp": "2026-01-01T00:00:01Z",
-        "provider": "test",
-        "command": "future-cmd",
-        "action": "block",
-        "result": "blocked",
-        "target_count": 0,
-        "target_hash": "",
-        "chain_version": 999,
-        "seq": 1,
-        "prev_hash": "irrelevant",
-        "key_id": "default",
-        "entry_hash": "irrelevant",
-    });
-    let mut content = std::fs::read_to_string(&audit_path).unwrap();
-    content.push_str(&serde_json::to_string(&future_entry).unwrap());
-    content.push('\n');
-    std::fs::write(&audit_path, &content).unwrap();
+    append_future_chain_entry(&audit_path, 1);
+    let content = std::fs::read_to_string(&audit_path).unwrap();
     let line_count_before = content.lines().filter(|l| !l.trim().is_empty()).count();
 
     let json2 = pretooluse_bash_json("rm -rf /etc");

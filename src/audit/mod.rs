@@ -1609,32 +1609,57 @@ mod tests {
         }
     }
 
-    /// Hand-crafts and appends a single JSON line whose `chain_version`
-    /// (999) this binary's hashing logic doesn't recognize — simulating an
-    /// entry written by a future omamori version. `entry_hash`/`prev_hash`/
-    /// `target_hash` content is deliberately arbitrary: the verifier's
-    /// version dispatch (`RecomputedHash::UnsupportedVersion`) fires
-    /// *before* it ever reads those fields for an unrecognized version, so
-    /// their exact values are inert for these tests.
-    fn append_unknown_version_line(path: &Path, seq: u64) {
-        let event = serde_json::json!({
+    /// Hand-crafts and appends a single JSON line with the given
+    /// `chain_version`/`command`/`action`/`result`, simulating an entry
+    /// written by a possibly-future, possibly-corrupt omamori version.
+    /// `entry_hash`/`prev_hash`/`target_hash` content is deliberately
+    /// arbitrary: for any `chain_version` != `CHAIN_VERSION`, the
+    /// verifier's version dispatch (`RecomputedHash::UnsupportedVersion`)
+    /// fires *before* it ever reads those fields, so their exact values
+    /// are inert. `seq: None` omits the `seq` key entirely, simulating a
+    /// shape the current binary can't extract a seq from.
+    fn append_chain_version_line(
+        path: &Path,
+        chain_version: u32,
+        seq: Option<u64>,
+        command: &str,
+        action: &str,
+        result: &str,
+    ) {
+        let mut event = serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z",
             "provider": "test",
-            "command": "future-cmd",
-            "action": "passthrough",
-            "result": "passthrough",
+            "command": command,
+            "action": action,
+            "result": result,
             "target_count": 0,
             "target_hash": "irrelevant",
-            "chain_version": 999,
-            "seq": seq,
+            "chain_version": chain_version,
             "prev_hash": "irrelevant",
             "key_id": "default",
             "entry_hash": "irrelevant",
         });
+        if let Some(seq) = seq {
+            event["seq"] = serde_json::json!(seq);
+        }
         let mut content = fs::read_to_string(path).unwrap_or_default();
         content.push_str(&serde_json::to_string(&event).unwrap());
         content.push('\n');
         fs::write(path, content).unwrap();
+    }
+
+    /// Convenience wrapper for the common case: a future entry
+    /// (`chain_version: 999`) with an ordinary (non-prune) command shape
+    /// and `seq` present.
+    fn append_unknown_version_line(path: &Path, seq: u64) {
+        append_chain_version_line(
+            path,
+            999,
+            Some(seq),
+            "future-cmd",
+            "passthrough",
+            "passthrough",
+        );
     }
 
     #[test]
@@ -1686,7 +1711,6 @@ mod tests {
         );
         assert_eq!(result.unknown_version_at, Some(3));
         assert_eq!(result.unknown_chain_version, Some(999));
-        assert_eq!(result.verified_prefix_entries, 3);
         assert_eq!(result.chain_entries, 3);
         assert_eq!(result.unverified_entries_after, 1);
         let _ = fs::remove_dir_all(&dir);
@@ -1728,28 +1752,8 @@ mod tests {
         );
         assert_eq!(result.unknown_version_at, Some(2));
         assert_eq!(result.unknown_chain_version, Some(999));
-        assert_eq!(result.verified_prefix_entries, 2);
+        assert_eq!(result.chain_entries, 2);
         assert!(result.broken_at.is_none());
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// Codex Round 1 (#177 B1): `verified_prefix_entries` is documented to
-    /// equal `chain_entries` when `unknown_version_at` is `None` — pin that
-    /// for the common case (a chain that verifies cleanly with no
-    /// unrecognized version anywhere).
-    #[test]
-    fn verify_clean_chain_sets_verified_prefix_entries() {
-        let dir = test_dir("verify-clean-prefix");
-        let logger = test_logger(&dir);
-        for i in 0..4 {
-            logger.append(make_event(&format!("cmd{i}"))).unwrap();
-        }
-        let result = verify_chain(&verify_config(&dir)).unwrap();
-        assert_eq!(result.chain_entries, 4);
-        assert_eq!(
-            result.verified_prefix_entries, 4,
-            "must equal chain_entries per its documented contract when unknown_version_at is None"
-        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1768,23 +1772,7 @@ mod tests {
         }
         // Fully AuditEvent-parseable (all required fields present) but no
         // `seq` — chain_version alone must still trigger the dispatch.
-        let future_no_seq = serde_json::json!({
-            "timestamp": "2026-01-01T00:00:02Z",
-            "provider": "test",
-            "command": "future-cmd",
-            "action": "block",
-            "result": "blocked",
-            "target_count": 0,
-            "target_hash": "",
-            "chain_version": 999,
-            "prev_hash": "irrelevant",
-            "key_id": "default",
-            "entry_hash": "irrelevant",
-        });
-        let mut content = fs::read_to_string(&logger.path).unwrap();
-        content.push_str(&serde_json::to_string(&future_no_seq).unwrap());
-        content.push('\n');
-        fs::write(&logger.path, content).unwrap();
+        append_chain_version_line(&logger.path, 999, None, "future-cmd", "block", "blocked");
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert_eq!(
@@ -1806,24 +1794,7 @@ mod tests {
         let logger = test_logger(&dir);
         logger.append(make_event("cmd0")).unwrap();
 
-        let zero_version_entry = serde_json::json!({
-            "timestamp": "2026-01-01T00:00:01Z",
-            "provider": "test",
-            "command": "future-cmd",
-            "action": "block",
-            "result": "blocked",
-            "target_count": 0,
-            "target_hash": "irrelevant",
-            "chain_version": 0,
-            "seq": 1,
-            "prev_hash": "irrelevant",
-            "key_id": "default",
-            "entry_hash": "irrelevant",
-        });
-        let mut content = fs::read_to_string(&logger.path).unwrap();
-        content.push_str(&serde_json::to_string(&zero_version_entry).unwrap());
-        content.push('\n');
-        fs::write(&logger.path, content).unwrap();
+        append_chain_version_line(&logger.path, 0, Some(1), "future-cmd", "block", "blocked");
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert_eq!(
@@ -1849,24 +1820,7 @@ mod tests {
         for i in 0..2 {
             logger.append(make_event(&format!("cmd{i}"))).unwrap();
         }
-        let fake_future_prune = serde_json::json!({
-            "timestamp": "2026-01-01T00:00:02Z",
-            "provider": "omamori",
-            "command": "_prune",
-            "action": "retention",
-            "result": "pruned",
-            "target_count": 2,
-            "target_hash": "irrelevant",
-            "chain_version": 999,
-            "seq": 2,
-            "prev_hash": "irrelevant",
-            "key_id": "default",
-            "entry_hash": "irrelevant",
-        });
-        let mut content = fs::read_to_string(&logger.path).unwrap();
-        content.push_str(&serde_json::to_string(&fake_future_prune).unwrap());
-        content.push('\n');
-        fs::write(&logger.path, content).unwrap();
+        append_chain_version_line(&logger.path, 999, Some(2), "_prune", "retention", "pruned");
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert_eq!(result.unknown_version_at, Some(2));
@@ -1915,7 +1869,6 @@ mod tests {
         fs::write(&logger.path, content).unwrap();
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
-        assert_eq!(result.verified_prefix_entries, 2);
         assert_eq!(
             result.chain_entries, 2,
             "entries after the unknown version must not be counted as verified"

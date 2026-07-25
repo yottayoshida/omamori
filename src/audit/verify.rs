@@ -60,10 +60,6 @@ pub struct VerifyResult {
     pub unknown_version_at: Option<u64>,
     /// The unsupported `chain_version` value found at `unknown_version_at`.
     pub unknown_chain_version: Option<u32>,
-    /// Count of chain entries successfully verified *before*
-    /// `unknown_version_at` was hit. Equal to `chain_entries` when
-    /// `unknown_version_at` is `None`.
-    pub verified_prefix_entries: u64,
     /// Count of lines from `unknown_version_at` onward (inclusive) that
     /// could not be verified — once one entry's authenticity can't be
     /// confirmed, the `prev_hash` chain running through it means nothing
@@ -103,15 +99,17 @@ pub struct AuditSummary {
 // ---------------------------------------------------------------------------
 
 /// Records the point where an entry's `chain_version` became unverifiable
-/// and switches `result` into its terminal "unverifiable tail" state.
-/// Shared by both places `verify_chain` can discover this — the fast path
-/// (a successfully-parsed `AuditEvent` whose `chain_version` field is
-/// unsupported) and the raw-JSON fallback (an entry whose *shape* a future
-/// `chain_version` changed enough that `AuditEvent` can't even parse it).
+/// and switches `result` into its terminal "unverifiable tail" state —
+/// `result.unknown_version_at.is_some()` *is* that state; the main loop
+/// checks it directly rather than tracking a separate local flag that
+/// could drift out of sync with it. Shared by both places `verify_chain`
+/// can discover this — the fast path (a successfully-parsed `AuditEvent`
+/// whose `chain_version` field is unsupported) and the raw-JSON fallback
+/// (an entry whose *shape* a future `chain_version` changed enough that
+/// `AuditEvent` can't even parse it).
 fn mark_unverifiable_tail(result: &mut VerifyResult, seq: u64, chain_version: u32) {
     result.unknown_version_at = Some(seq);
     result.unknown_chain_version = Some(chain_version);
-    result.verified_prefix_entries = result.chain_entries;
     result.unverified_entries_after = 1;
 }
 
@@ -153,7 +151,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         hwm_tampered: false,
         unknown_version_at: None,
         unknown_chain_version: None,
-        verified_prefix_entries: 0,
         unverified_entries_after: 0,
     };
     let mut expected_prev = genesis;
@@ -161,10 +158,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let mut last_was_prune = false;
     let mut prune_target_hash: Option<String> = None;
     let mut prune_target_count: Option<u64> = None;
-    // #177 B1 step 2: once an entry's chain_version can't be authenticated,
-    // the prev_hash chain running through it means nothing after it can be
-    // trusted either — every remaining line just gets tallied, not verified.
-    let mut unverifiable_tail = false;
 
     for line in reader.lines() {
         let line = line?;
@@ -173,7 +166,11 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             continue;
         }
 
-        if unverifiable_tail {
+        // #177 B1 step 2: once an entry's chain_version can't be
+        // authenticated, the prev_hash chain running through it means
+        // nothing after it can be trusted either — every remaining line
+        // just gets tallied, not verified.
+        if result.unknown_version_at.is_some() {
             result.unverified_entries_after += 1;
             continue;
         }
@@ -192,8 +189,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // misreport a real subsequent entry (chaining from this
                 // one's unverified hash) as broken_at.
                 if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed)
-                    && let Some(cv) = raw.get("chain_version").and_then(|v| v.as_u64())
-                    && let Ok(chain_version) = u32::try_from(cv)
+                    && let Some(chain_version) = super::chain::parse_chain_version(&raw)
                     && chain_version != CHAIN_VERSION
                 {
                     let seq = raw
@@ -201,7 +197,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(expected_seq);
                     mark_unverifiable_tail(&mut result, seq, chain_version);
-                    unverifiable_tail = true;
                     continue;
                 }
                 result.torn_lines += 1;
@@ -255,7 +250,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // chain.
                 let reported_seq = event.seq.unwrap_or(expected_seq);
                 mark_unverifiable_tail(&mut result, reported_seq, v);
-                unverifiable_tail = true;
                 continue;
             }
             RecomputedHash::Legacy => {
@@ -330,15 +324,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         expected_prev = recorded_hash.to_string();
         expected_seq = seq + 1;
         result.chain_entries += 1;
-    }
-
-    // Codex Round 1 (#177 B1): verified_prefix_entries is set mid-loop only
-    // when an unknown-version entry is hit. Without this, it stays at its
-    // zero-initialized default for every chain that verifies cleanly (or
-    // breaks on broken_at) — silently violating the field's documented
-    // contract ("equal to chain_entries when unknown_version_at is None").
-    if result.unknown_version_at.is_none() {
-        result.verified_prefix_entries = result.chain_entries;
     }
 
     // HWM check: detect tail truncation. Requires having actually reached

@@ -187,6 +187,21 @@ pub(super) enum ChainTailState {
     UnsupportedVersion { chain_version: u32 },
 }
 
+/// Extract `chain_version` from a raw JSON value as a plausible `u32`.
+/// `None` covers both "no `chain_version` key at all" (legacy entry) and
+/// "present but not a valid `u32`" (corruption) — callers that need to
+/// distinguish those two treat `None` as legacy/corrupt either way, so one
+/// shared coercion is enough. `#177 B1`: `read_chain_state` (append-side
+/// tail check) and `verify_chain`'s raw-JSON fallback (an entry whose
+/// *shape* a future `chain_version` might break `AuditEvent`'s Deserialize
+/// for) both need this same peek before trusting a typed parse — factored
+/// out (Codex simplify pass) after both independently reimplemented it.
+pub(super) fn parse_chain_version(raw: &serde_json::Value) -> Option<u32> {
+    raw.get("chain_version")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+}
+
 pub(super) fn read_chain_state(file: &mut fs::File, secret: Option<&[u8; 32]>) -> ChainTailState {
     let genesis = genesis_hash(secret);
 
@@ -207,30 +222,24 @@ pub(super) fn read_chain_state(file: &mut fs::File, secret: Option<&[u8; 32]>) -
     // not silently restart the chain from genesis. Restarting would fork a
     // second, disconnected chain in the same file with no record that the
     // original one continued past this point.
-    match parsed.get("chain_version") {
-        None => ChainTailState::Fresh { genesis }, // legacy entry
-        Some(cv) => {
-            let Some(chain_version) = cv.as_u64().and_then(|v| u32::try_from(v).ok()) else {
-                // chain_version present but not a plausible u32 → treat as
-                // corruption, restart from genesis (matches the existing
-                // malformed-entry fallback below).
-                return ChainTailState::Fresh { genesis };
-            };
-            if chain_version != CHAIN_VERSION {
-                return ChainTailState::UnsupportedVersion { chain_version };
-            }
-            match (parsed.get("seq"), parsed.get("entry_hash")) {
-                (Some(seq_val), Some(hash_val)) => match (seq_val.as_u64(), hash_val.as_str()) {
-                    (Some(seq), Some(hash)) if !hash.is_empty() => ChainTailState::Ready {
-                        last_seq: seq,
-                        last_hash: hash.to_string(),
-                    },
-                    // Malformed chain entry → treat as corruption, restart from genesis
-                    _ => ChainTailState::Fresh { genesis },
-                },
-                _ => ChainTailState::Fresh { genesis },
-            }
+    match parse_chain_version(&parsed) {
+        // Absent or malformed chain_version → legacy entry or corruption,
+        // either way safe to restart from genesis.
+        None => ChainTailState::Fresh { genesis },
+        Some(chain_version) if chain_version != CHAIN_VERSION => {
+            ChainTailState::UnsupportedVersion { chain_version }
         }
+        Some(_) => match (parsed.get("seq"), parsed.get("entry_hash")) {
+            (Some(seq_val), Some(hash_val)) => match (seq_val.as_u64(), hash_val.as_str()) {
+                (Some(seq), Some(hash)) if !hash.is_empty() => ChainTailState::Ready {
+                    last_seq: seq,
+                    last_hash: hash.to_string(),
+                },
+                // Malformed chain entry → treat as corruption, restart from genesis
+                _ => ChainTailState::Fresh { genesis },
+            },
+            _ => ChainTailState::Fresh { genesis },
+        },
     }
 }
 

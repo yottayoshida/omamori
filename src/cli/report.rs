@@ -126,12 +126,15 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
         ChainStatus::Truncated => {
             println!("  Audit log: truncated (entries may have been removed)")
         }
-        ChainStatus::Unverifiable { chain_version, .. } => {
+        ChainStatus::Unverifiable {
+            at_seq,
+            chain_version,
+        } => {
             if verbose {
                 println!(
-                    "  Audit log: unverifiable — entry declares chain_version {chain_version}, \
-                     which this omamori build does not recognize (not necessarily tampering — \
-                     may mean this binary predates a newer chain format)"
+                    "  Audit log: unverifiable at seq {at_seq} — entry declares chain_version \
+                     {chain_version}, which this omamori build does not recognize (not \
+                     necessarily tampering — may mean this binary predates a newer chain format)"
                 );
             } else {
                 println!("  Audit log: unverifiable (unrecognized chain_version)");
