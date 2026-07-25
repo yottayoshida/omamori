@@ -3726,6 +3726,43 @@ mod tests {
         );
     }
 
+    /// Codex test-adversarial review (#177 B2): the previous test only
+    /// exercised `ObfuscatedExpansion` out of `BlockReason`'s 7
+    /// non-`PipeToShell` variants — `_ => None` is trivially correct for
+    /// all of them today, but a future edit that adds an explicit arm for
+    /// just one variant (accidentally reintroducing a sentinel-shaped
+    /// leak, or any other wrong value) would only be caught by a test
+    /// that names that specific variant. Table-driven over every variant
+    /// this function can receive, plus both `PipeToShell` shapes.
+    #[test]
+    fn block_reason_wrapper_kind_all_variants() {
+        assert_eq!(
+            block_reason_wrapper_kind(&unwrap::BlockReason::PipeToShell {
+                wrapper: Some("env")
+            }),
+            Some("env")
+        );
+        assert_eq!(
+            block_reason_wrapper_kind(&unwrap::BlockReason::PipeToShell { wrapper: None }),
+            None
+        );
+        for reason in [
+            unwrap::BlockReason::InputTooLarge,
+            unwrap::BlockReason::TooManyTokens,
+            unwrap::BlockReason::TooManySegments,
+            unwrap::BlockReason::DepthExceeded,
+            unwrap::BlockReason::ParseError,
+            unwrap::BlockReason::DynamicGeneration,
+            unwrap::BlockReason::ObfuscatedExpansion,
+        ] {
+            assert_eq!(
+                block_reason_wrapper_kind(&reason),
+                None,
+                "{reason:?} has no wrapper and must map to None, not a sentinel or leaked value"
+            );
+        }
+    }
+
     /// Staging file respects 1 MB limit.
     #[test]
     fn staging_file_rejects_oversized_content() {

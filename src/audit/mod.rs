@@ -3379,6 +3379,47 @@ mod tests {
         );
     }
 
+    /// Codex test-adversarial review (#177 B2): `AuditEvent.wrapper_kind`
+    /// was deliberately typed `Option<String>` rather than
+    /// `Option<&'static str>` specifically so it can survive a real
+    /// Serialize→Deserialize round trip (reading `audit.jsonl` back) —
+    /// that specific claim had no test.
+    #[test]
+    fn wrapper_kind_survives_json_round_trip() {
+        let mut event = make_event("cmd0");
+        event.wrapper_kind = Some("env".to_string());
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            json.contains(r#""wrapper_kind":"env""#),
+            "wrapper_kind must serialize as a plain string field — got: {json}"
+        );
+
+        let round_tripped: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.wrapper_kind,
+            Some("env".to_string()),
+            "wrapper_kind must survive a full Serialize -> Deserialize round trip"
+        );
+    }
+
+    /// Codex test-adversarial review (#177 B2): `wrapper_kind: None` must
+    /// be omitted from JSON entirely (`skip_serializing_if`), matching
+    /// every other `Option` field on `AuditEvent`, and must round-trip
+    /// back to `None` rather than an empty string or explicit null.
+    #[test]
+    fn wrapper_kind_none_is_omitted_and_round_trips_to_none() {
+        let event = make_event("cmd0"); // wrapper_kind: None by default
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("wrapper_kind"),
+            "wrapper_kind: None must be omitted from JSON, not serialized as null — got: {json}"
+        );
+
+        let round_tripped: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.wrapper_kind, None);
+    }
+
     #[test]
     fn hwm_bootstrap_on_pre_hwm_chain() {
         let dir = test_dir("hwm-bootstrap");
