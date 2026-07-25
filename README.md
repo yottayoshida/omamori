@@ -316,7 +316,7 @@ omamori exec [--config PATH] -- CMD      # Run command through policy engine
 
 omamori report [--last 7d] [--json] [--verbose]  # Aggregate audit summary (1d–90d)
 
-omamori audit verify                     # Verify hash chain integrity (exit 0/1/2/3)
+omamori audit verify                     # Verify hash chain integrity (exit 0/1/2/3/4)
 omamori audit show [--last N] [--json]   # View recent audit entries (default: last 20)
 omamori audit show --all                 # View all entries
 omamori audit show --rule <name>         # Filter by rule (substring match)

@@ -284,7 +284,7 @@ fn print_risk_signals_section(ai_env: bool) {
     let has_unknown = report.unknown_tool_fail_opens > 0;
     let chain_broken = matches!(
         report.chain_status,
-        ChainStatus::Broken { .. } | ChainStatus::Truncated
+        ChainStatus::Broken { .. } | ChainStatus::Truncated | ChainStatus::Unverifiable { .. }
     );
     let audit_unwritable = load_result.config.audit.enabled
         && matches!(
@@ -327,6 +327,19 @@ fn print_risk_signals_section(ai_env: bool) {
                 println!("    chain: truncated (entries may have been removed)");
             } else {
                 println!("    chain: truncated — run omamori audit verify");
+            }
+        }
+        ChainStatus::Unverifiable { chain_version, .. } => {
+            if ai_env {
+                println!(
+                    "    chain: unverifiable (entry declares chain_version {chain_version}, \
+                     unrecognized by this build)"
+                );
+            } else {
+                println!(
+                    "    chain: unverifiable — entry declares chain_version {chain_version}, \
+                     unrecognized by this build — run omamori audit verify"
+                );
             }
         }
         _ => {}

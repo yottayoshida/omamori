@@ -24,7 +24,7 @@ pub use verify::{
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
-use chain::{CHAIN_VERSION, compute_entry_hash, read_chain_state};
+use chain::{CHAIN_VERSION, ChainTailState, compute_entry_hash_for_write, read_chain_state};
 use provenance::ProcessProvenance;
 use retention::{PRUNE_CHECK_INTERVAL, try_prune};
 use secret::{
@@ -259,16 +259,42 @@ impl AuditLogger {
 
         flock_exclusive(&file)?;
 
-        // Read chain state under lock (another process may have appended since our open)
-        let (last_seq, last_hash) = read_chain_state(&mut file, self.secret.as_ref());
-        let seq = last_seq.map_or(0, |s| s + 1);
+        // Read chain state under lock (another process may have appended since our open).
+        // #177 B1 step 3: when the last valid JSON line within read_chain_state's tail
+        // window declares an unsupported chain_version, we can't safely resume seq
+        // numbering or chain prev_hash onto it — refuse to append. This returns Err,
+        // like every other append failure (disk full,
+        // permissions, secret unavailable) — QA Phase 8 finding F-001: the two call
+        // sites that already implement strict-mode enforcement (shim.rs's
+        // try_audit_append, hook.rs's break-glass bypass path) only escalate to
+        // blocking on Err, and strict mode's documented contract ("no receipt is a
+        // reason not to allow") applies here exactly as it does to any other
+        // recording failure. G-2's best-effort *default* is unaffected: every call
+        // site's existing Err handling already treats a non-strict Err as a warning,
+        // not a block — Err doesn't change that, it only makes strict mode able to
+        // see this case at all.
+        let (seq, prev_hash) = match read_chain_state(&mut file, self.secret.as_ref()) {
+            ChainTailState::UnsupportedVersion { chain_version } => {
+                return Err(std::io::Error::other(format!(
+                    "audit log tail declares chain_version {chain_version}, which this \
+                     omamori build does not recognize \u{2014} refusing to append (this \
+                     event was not recorded; not necessarily tampering \u{2014} may mean \
+                     this binary predates a newer chain format)"
+                )));
+            }
+            ChainTailState::Fresh { genesis } => (0, genesis),
+            ChainTailState::Ready {
+                last_seq,
+                last_hash,
+            } => (last_seq + 1, last_hash),
+        };
 
         // Set chain fields
         event.chain_version = Some(CHAIN_VERSION);
         event.seq = Some(seq);
-        event.prev_hash = Some(last_hash);
+        event.prev_hash = Some(prev_hash);
         event.key_id = Some(self.key_id.clone());
-        event.entry_hash = Some(compute_entry_hash(self.secret.as_ref(), &event));
+        event.entry_hash = Some(compute_entry_hash_for_write(self.secret.as_ref(), &event));
 
         // Ensure new entry starts on its own line (torn lines may lack trailing newline)
         let len = file.seek(SeekFrom::End(0))?;
@@ -473,6 +499,7 @@ fn write_hwm(hwm_path: &std::path::Path, seq: u64) -> Result<(), std::io::Error>
 
 #[cfg(test)]
 mod tests {
+    use super::chain::compute_entry_hash;
     use super::*;
     use crate::rules::{ActionKind, RuleConfig};
     use std::fs::OpenOptions;
@@ -780,8 +807,8 @@ mod tests {
         event.prev_hash = Some("genesis".to_string());
         event.key_id = Some("default".to_string());
 
-        let h1 = compute_entry_hash(Some(&TEST_SECRET), &event);
-        let h2 = compute_entry_hash(Some(&TEST_SECRET), &event);
+        let h1 = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
+        let h2 = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
         assert_eq!(h1, h2);
     }
 
@@ -793,9 +820,9 @@ mod tests {
         event.prev_hash = Some("genesis".to_string());
         event.key_id = Some("default".to_string());
 
-        let h_orig = compute_entry_hash(Some(&TEST_SECRET), &event);
+        let h_orig = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
         event.result = "tampered".to_string();
-        let h_tampered = compute_entry_hash(Some(&TEST_SECRET), &event);
+        let h_tampered = compute_entry_hash_for_write(Some(&TEST_SECRET), &event);
         assert_ne!(h_orig, h_tampered);
     }
 
@@ -807,7 +834,7 @@ mod tests {
         event.prev_hash = Some("genesis".to_string());
         event.key_id = Some("default".to_string());
 
-        let hash = compute_entry_hash(None, &event);
+        let hash = compute_entry_hash_for_write(None, &event);
         assert_eq!(hash, "NO_HMAC_SECRET");
     }
 
@@ -838,6 +865,119 @@ mod tests {
         assert!(events[0]["chain_version"].is_null(), "legacy has no chain");
         assert_eq!(events[1]["seq"], 0, "new chain starts at seq 0");
         assert_eq!(events[1]["prev_hash"], genesis_hash(Some(&TEST_SECRET)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- #177 B1 step 3: append refuses an unsupported-version tail ---
+
+    #[test]
+    fn append_refuses_after_unknown_chain_version_tail() {
+        let dir = test_dir("append-unknown-version-refuse");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_unknown_version_line(&logger.path, 1);
+
+        let before = fs::read_to_string(&logger.path).unwrap();
+        let before_line_count = before.lines().filter(|l| !l.trim().is_empty()).count();
+
+        let result = logger.append(make_event("cmd1-should-not-be-recorded"));
+        assert!(
+            result.is_err(),
+            "append must return Err — QA Phase 8 F-001: strict mode's 'no receipt = don't \
+             allow' contract only escalates on Err. G-2's best-effort default is preserved \
+             by the caller's own Err handling (a warning, not a block in non-strict mode), \
+             not by append() itself claiming success."
+        );
+
+        let after = fs::read_to_string(&logger.path).unwrap();
+        let after_line_count = after.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            before_line_count, after_line_count,
+            "append must refuse to write after an unsupported-chain_version tail — \
+             the file's entry count must be unchanged"
+        );
+        assert!(
+            !after.contains("cmd1-should-not-be-recorded"),
+            "the refused event must not appear anywhere in the file"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// QA Phase 8 F-001 (#177 B1): `try_audit_append` is the seam every
+    /// non-hook call site (`exec`, sudo-block, non-protected passthrough)
+    /// routes audit logging through, and it's `strict`-aware. Before the
+    /// append() Err fix, an unsupported-version tail returned `Ok(())`,
+    /// so `try_audit_append`'s `if let Err(e) = logger.append(event)`
+    /// never fired — strict mode's documented "no receipt = don't allow"
+    /// contract silently didn't apply to this one failure mode, creating
+    /// a permanent, silent audit blackout that `[audit] strict = true`
+    /// exists specifically to prevent.
+    #[test]
+    fn try_audit_append_strict_blocks_on_unknown_chain_version_tail() {
+        let dir = test_dir("try-audit-append-strict-unknown-version");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_unknown_version_line(&logger.path, 1);
+
+        let strict_logger = AuditLogger {
+            path: logger.path.clone(),
+            secret: logger.secret,
+            retention_days: logger.retention_days,
+            key_id: logger.key_id.clone(),
+        };
+        let event = strict_logger.create_event(
+            &CommandInvocation::new("cmd1".to_string(), vec![]),
+            None,
+            &[],
+            &ActionOutcome::PassedThrough { exit_code: 0 },
+            None,
+        );
+        let result = crate::engine::shim::try_audit_append(&strict_logger, event, true);
+        assert_eq!(
+            result,
+            Some(1),
+            "strict mode must block when the audit tail has an unrecognized chain_version, \
+             the same as it blocks on any other append failure"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 (#177 B1): a future-version tail entry that doesn't
+    /// carry `seq`/`entry_hash` in a form the old code recognized fell
+    /// through to `Fresh` (silently restart the chain from genesis)
+    /// instead of refusing to append — forking a second, disconnected
+    /// chain in the same file with no record that the original continued.
+    #[test]
+    fn append_refuses_after_unknown_chain_version_tail_missing_seq_and_hash() {
+        let dir = test_dir("append-unknown-version-refuse-bad-shape");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+
+        let future_tail = serde_json::json!({
+            "chain_version": 999,
+            "some_future_field": "whatever a v999 tail entry looks like"
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&future_tail).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, &content).unwrap();
+        let before_line_count = content.lines().filter(|l| !l.trim().is_empty()).count();
+
+        let result = logger.append(make_event("cmd1-should-not-be-recorded"));
+        assert!(
+            result.is_err(),
+            "must return Err (QA Phase 8 F-001: strict mode)"
+        );
+
+        let after = fs::read_to_string(&logger.path).unwrap();
+        let after_line_count = after.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            before_line_count, after_line_count,
+            "must refuse to append, not silently fork a new chain from genesis"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1009,7 +1149,8 @@ mod tests {
         // Pinning both sides against goldens (not against each other) ensures
         // a future algorithm change can't paper over a real tamper.
         let parsed_seq1: AuditEvent = serde_json::from_value(events[1].clone()).unwrap();
-        let recomputed_seq1 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq1);
+        let recomputed_seq1 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq1)
+            .expect_hash("chain_tamper_detected: seq=1 is a real v1 entry");
 
         assert_eq!(
             events[1]["entry_hash"].as_str().unwrap(),
@@ -1246,7 +1387,8 @@ mod tests {
             "attacker only flipped prev_hash bytes; entry_hash byte sequence unchanged"
         );
         let parsed_seq0: AuditEvent = serde_json::from_value(events[0].clone()).unwrap();
-        let recomputed_seq0 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq0);
+        let recomputed_seq0 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq0)
+            .expect_hash("chain_tamper_genesis_rewrite_detected: seq=0 is a real v1 entry");
         assert_ne!(
             recomputed_seq0, GOLDEN_ENTRY_HASHES[0],
             "recomputed entry_hash over tampered (prev_hash-rewritten) genesis payload \
@@ -1519,6 +1661,59 @@ mod tests {
         }
     }
 
+    /// Hand-crafts and appends a single JSON line with the given
+    /// `chain_version`/`command`/`action`/`result`, simulating an entry
+    /// written by a possibly-future, possibly-corrupt omamori version.
+    /// `entry_hash`/`prev_hash`/`target_hash` content is deliberately
+    /// arbitrary: for any `chain_version` != `CHAIN_VERSION`, the
+    /// verifier's version dispatch (`RecomputedHash::UnsupportedVersion`)
+    /// fires *before* it ever reads those fields, so their exact values
+    /// are inert. `seq: None` omits the `seq` key entirely, simulating a
+    /// shape the current binary can't extract a seq from.
+    fn append_chain_version_line(
+        path: &Path,
+        chain_version: u32,
+        seq: Option<u64>,
+        command: &str,
+        action: &str,
+        result: &str,
+    ) {
+        let mut event = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "provider": "test",
+            "command": command,
+            "action": action,
+            "result": result,
+            "target_count": 0,
+            "target_hash": "irrelevant",
+            "chain_version": chain_version,
+            "prev_hash": "irrelevant",
+            "key_id": "default",
+            "entry_hash": "irrelevant",
+        });
+        if let Some(seq) = seq {
+            event["seq"] = serde_json::json!(seq);
+        }
+        let mut content = fs::read_to_string(path).unwrap_or_default();
+        content.push_str(&serde_json::to_string(&event).unwrap());
+        content.push('\n');
+        fs::write(path, content).unwrap();
+    }
+
+    /// Convenience wrapper for the common case: a future entry
+    /// (`chain_version: 999`) with an ordinary (non-prune) command shape
+    /// and `seq` present.
+    fn append_unknown_version_line(path: &Path, seq: u64) {
+        append_chain_version_line(
+            path,
+            999,
+            Some(seq),
+            "future-cmd",
+            "passthrough",
+            "passthrough",
+        );
+    }
+
     #[test]
     fn verify_clean_chain() {
         let dir = test_dir("verify-clean");
@@ -1547,6 +1742,247 @@ mod tests {
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert!(result.broken_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- #177 B1 step 2: forward-unknown chain_version handling ---
+
+    #[test]
+    fn verify_unknown_chain_version_reports_unverifiable_not_broken() {
+        let dir = test_dir("verify-unknown-version");
+        let logger = test_logger(&dir);
+        for i in 0..3 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        append_unknown_version_line(&logger.path, 3);
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "an unrecognized chain_version is not tamper evidence"
+        );
+        assert_eq!(result.unknown_version_at, Some(3));
+        assert_eq!(result.unknown_chain_version, Some(999));
+        assert_eq!(result.chain_entries, 3);
+        assert_eq!(result.unverified_entries_after, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 (#177 B1): a future chain_version might pair with a
+    /// JSON shape this binary's AuditEvent can't deserialize at all — the
+    /// original implementation fell through to "torn line" handling for
+    /// this case, which resumes verification against the pre-entry
+    /// expected_prev/expected_seq for whatever comes next (risking a false
+    /// broken_at on a real subsequent entry chaining from this one's
+    /// unverified hash).
+    #[test]
+    fn verify_unknown_chain_version_with_incompatible_shape_still_reports_unverifiable() {
+        let dir = test_dir("verify-unknown-version-bad-shape");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        // Missing every field AuditEvent requires (timestamp/provider/
+        // command/action/result/target_count/target_hash) except
+        // chain_version/seq — simulating a future entry shape this binary
+        // genuinely cannot parse.
+        let malformed_future = serde_json::json!({
+            "chain_version": 999,
+            "seq": 2,
+            "some_future_field": "whatever a v999 entry looks like"
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&malformed_future).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.torn_lines, 0,
+            "an unrecognized-version entry must not be miscounted as a torn line, \
+             even when its shape can't be deserialized as AuditEvent"
+        );
+        assert_eq!(result.unknown_version_at, Some(2));
+        assert_eq!(result.unknown_chain_version, Some(999));
+        assert_eq!(result.chain_entries, 2);
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 test-adversarial review: a *parsed* (AuditEvent-shape-
+    /// compatible) unknown-version entry with no `seq` field previously
+    /// reported `unknown_version_at = Some(0)` (the generic `seq` default),
+    /// misleadingly pointing at entry #0 regardless of how deep in the
+    /// chain it actually appeared. Must report `expected_seq` instead,
+    /// matching the raw-JSON fallback path's behavior.
+    #[test]
+    fn verify_unknown_chain_version_missing_seq_reports_expected_seq() {
+        let dir = test_dir("verify-unknown-version-missing-seq");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        // Fully AuditEvent-parseable (all required fields present) but no
+        // `seq` — chain_version alone must still trigger the dispatch.
+        append_chain_version_line(&logger.path, 999, None, "future-cmd", "block", "blocked");
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.unknown_version_at,
+            Some(2),
+            "must report expected_seq (2 real entries verified so far), not 0"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 test-adversarial review: `chain_version: 0` must not
+    /// be silently accepted as "current" (a `>` vs `!=` mutation on the
+    /// version comparison would let this slip through, since 0 < 1 rather
+    /// than > 1) nor confused with a legacy entry (chain_version present,
+    /// just not a value this binary hashes).
+    #[test]
+    fn verify_chain_version_zero_is_unverifiable_not_current() {
+        let dir = test_dir("verify-chain-version-zero");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+
+        append_chain_version_line(&logger.path, 0, Some(1), "future-cmd", "block", "blocked");
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.unknown_chain_version,
+            Some(0),
+            "chain_version: 0 must be treated as an unsupported version, not silently \
+             accepted as current or folded into legacy handling"
+        );
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex Round 1 test-adversarial review: an entry that looks like a
+    /// prune point (`command`/`action`/`result` match `is_prune_point`)
+    /// but declares an unsupported `chain_version` must be treated as
+    /// unverifiable, not specially recognized as a real prune point —
+    /// version dispatch must win regardless of what the entry's other
+    /// fields claim to be.
+    #[test]
+    fn verify_unknown_version_prune_shaped_entry_is_unverifiable_not_pruned() {
+        let dir = test_dir("verify-unknown-version-prune-shaped");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        append_chain_version_line(&logger.path, 999, Some(2), "_prune", "retention", "pruned");
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.unknown_version_at, Some(2));
+        assert!(
+            !result.pruned,
+            "a prune-shaped entry with an unsupported chain_version must not be \
+             recognized as a real prune point"
+        );
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_unknown_chain_version_distrusts_everything_after_it() {
+        let dir = test_dir("verify-unknown-version-tail");
+        let logger = test_logger(&dir);
+        for i in 0..2 {
+            logger.append(make_event(&format!("cmd{i}"))).unwrap();
+        }
+        append_unknown_version_line(&logger.path, 2);
+        // Two more lines after the unknown-version entry, shaped like
+        // ordinary v1 chain entries. Even though they claim chain_version
+        // 1, nothing after an unauthenticated entry is trustworthy — the
+        // prev_hash chain running through it can't be validated — so these
+        // must be tallied as unverified, not silently re-admitted as
+        // verified chain_entries.
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        for seq in 3..5u64 {
+            let fake_v1 = serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "provider": "test",
+                "command": "later-cmd",
+                "action": "passthrough",
+                "result": "passthrough",
+                "target_count": 0,
+                "target_hash": "irrelevant",
+                "chain_version": 1,
+                "seq": seq,
+                "prev_hash": "irrelevant",
+                "key_id": "default",
+                "entry_hash": "irrelevant",
+            });
+            content.push_str(&serde_json::to_string(&fake_v1).unwrap());
+            content.push('\n');
+        }
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.chain_entries, 2,
+            "entries after the unknown version must not be counted as verified"
+        );
+        assert_eq!(
+            result.unverified_entries_after, 3,
+            "the unknown-version entry itself plus the 2 fake-v1 lines after it"
+        );
+        assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_unknown_chain_version_does_not_bootstrap_hwm() {
+        // #177 B1 step 2 / plan risk V-B50-equivalent: bootstrapping the
+        // HWM off an early stop at unknown_version_at would permanently
+        // cap future truncation detection below the chain's true length —
+        // a poison-pill unknown-version entry could mask deletion of
+        // everything after it. The HWM must only ever be touched when
+        // verification actually reached EOF.
+        //
+        // Entries are written via `write_chain_entries` (direct disk
+        // write), not `logger.append()` — `append()` bootstraps its own
+        // HWM as a side effect of every call, which would make this the
+        // *second* time the HWM is set and mask the bug this test exists
+        // to catch. This models a freshly-arrived audit.jsonl being
+        // verified for the very first time (`HwmState::Missing`).
+        let dir = test_dir("verify-unknown-version-hwm-guard");
+        let _ = test_logger(&dir); // secret file only
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+                ("cmd2", "2026-01-01T00:00:02Z"),
+            ],
+        );
+        append_unknown_version_line(&path, 3);
+
+        assert!(
+            matches!(read_hwm(&hwm_path_for(&path)), HwmState::Missing),
+            "sanity: HWM must be Missing before the first-ever verify"
+        );
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(result.unknown_version_at, Some(3));
+        assert!(
+            !result.tail_truncated,
+            "must not compare against an HWM bootstrap that never happened"
+        );
+        assert!(
+            !result.hwm_missing,
+            "the guard skips the bootstrap entirely — it must not run it and then discard the result"
+        );
+
+        assert!(
+            matches!(read_hwm(&hwm_path_for(&path)), HwmState::Missing),
+            "HWM must remain Missing — bootstrapping it off an early stop would permanently \
+             cap future truncation detection below the chain's true (unknown) length"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1594,6 +2030,46 @@ mod tests {
         assert_eq!(result.legacy_entries, 1);
         assert_eq!(result.chain_entries, 1);
         assert!(result.broken_at.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #177 B1 step 4: a legacy-shaped (no chain_version) entry appearing
+    /// AFTER real chain entries have started must fail-close (broken_at),
+    /// not silently count as benign pre-#164 history. Legacy entries never
+    /// participate in prev_hash/seq continuity tracking, so without this
+    /// check an attacker could splice unaudited content into the middle of
+    /// an otherwise-verified chain and have it counted as "legacy skipped"
+    /// rather than flagged.
+    #[test]
+    fn verify_mid_chain_legacy_fails_closed() {
+        let dir = test_dir("verify-mid-chain-legacy");
+        let logger = test_logger(&dir);
+
+        logger.append(make_event("cmd0")).unwrap();
+
+        let injected_legacy = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "provider": "test",
+            "command": "injected",
+            "action": "passthrough",
+            "result": "passthrough",
+            "target_count": 0,
+            "target_hash": "legacy"
+        });
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(&serde_json::to_string(&injected_legacy).unwrap());
+        content.push('\n');
+        fs::write(&logger.path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_some(),
+            "a legacy entry after a real chain entry must fail-close"
+        );
+        assert_eq!(
+            result.chain_entries, 1,
+            "the one real entry before the injected legacy line is still counted"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1948,7 +2424,7 @@ mod tests {
             event.seq = Some(seq as u64);
             event.prev_hash = Some(prev_hash.clone());
             event.key_id = Some("default".to_string());
-            event.entry_hash = Some(compute_entry_hash(Some(secret), &event));
+            event.entry_hash = Some(compute_entry_hash_for_write(Some(secret), &event));
             prev_hash = event.entry_hash.clone().unwrap();
             content.push_str(&serde_json::to_string(&event).unwrap());
             content.push('\n');
@@ -1969,6 +2445,32 @@ mod tests {
         let a = prune_genesis_hash(Some(&TEST_SECRET));
         let b = prune_genesis_hash(Some(&TEST_SECRET));
         assert_eq!(a, b);
+    }
+
+    // #177 B1 step 5 / V-B31: `prune_genesis_hash_is_deterministic` and
+    // `_is_distinct` above compare the function against itself or against
+    // an unrelated hash — neither pins the *value*. `PRUNE_GENESIS_SEED`
+    // (chain.rs) could be edited and both tests would stay green, silently
+    // invalidating the prev_hash anchor every already-pruned audit.jsonl on
+    // disk links against. This pins the literal value, same pattern as
+    // GOLDEN_GENESIS above.
+    //
+    // Regenerating: this value must NEVER be edited to make a change pass.
+    // If PRUNE_GENESIS_SEED changes intentionally, every existing pruned
+    // chain becomes unverifiable — that's a breaking, `CHAIN_VERSION`-class
+    // decision, not a test update.
+    const GOLDEN_PRUNE_GENESIS: &str =
+        "c1af069504c38b0fd648e34f5577a0107b3f3bd8e704f179ebc73928e0d59b50";
+
+    #[test]
+    fn prune_genesis_hash_matches_golden() {
+        assert_eq!(
+            prune_genesis_hash(Some(&TEST_SECRET)),
+            GOLDEN_PRUNE_GENESIS,
+            "PRUNE_GENESIS_SEED (or the HMAC domain separator) changed — every already-pruned \
+             audit.jsonl's prune_point anchor is now unverifiable. This is not a test to fix by \
+             updating the golden; see the comment above GOLDEN_PRUNE_GENESIS."
+        );
     }
 
     #[test]
@@ -2365,7 +2867,7 @@ mod tests {
             event.seq = Some(seq as u64);
             event.prev_hash = Some(prev_hash.clone());
             event.key_id = Some("default".to_string());
-            event.entry_hash = Some(compute_entry_hash(Some(&TEST_SECRET), &event));
+            event.entry_hash = Some(compute_entry_hash_for_write(Some(&TEST_SECRET), &event));
             prev_hash = event.entry_hash.clone().unwrap();
             content.push_str(&serde_json::to_string(&event).unwrap());
             content.push('\n');

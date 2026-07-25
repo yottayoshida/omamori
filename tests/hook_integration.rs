@@ -1938,6 +1938,33 @@ fn audit_path_for(base: &Path) -> PathBuf {
     base.join(".local/share/omamori/audit.jsonl")
 }
 
+/// Hand-crafts and appends a single JSON line simulating an entry written
+/// by a future omamori version (`chain_version: 999`, this binary's
+/// hashing logic doesn't recognize it). `entry_hash`/`prev_hash`/
+/// `target_hash` content is deliberately arbitrary — the verifier's
+/// version dispatch fires before it ever reads those fields for an
+/// unrecognized version.
+fn append_future_chain_entry(audit_path: &Path, seq: u64) {
+    let future_entry = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:01Z",
+        "provider": "test",
+        "command": "future-cmd",
+        "action": "block",
+        "result": "blocked",
+        "target_count": 0,
+        "target_hash": "",
+        "chain_version": 999,
+        "seq": seq,
+        "prev_hash": "irrelevant",
+        "key_id": "default",
+        "entry_hash": "irrelevant",
+    });
+    let mut content = std::fs::read_to_string(audit_path).unwrap();
+    content.push_str(&serde_json::to_string(&future_entry).unwrap());
+    content.push('\n');
+    std::fs::write(audit_path, content).unwrap();
+}
+
 /// V-014: BlockMeta path (Phase 1B env-var tampering) appends an audit event
 /// with `detection_layer="layer2:meta-pattern"`. Trigger: `unset CLAUDECODE`
 /// is caught by `detect_env_var_tampering` (Phase 1B).
@@ -2246,6 +2273,115 @@ fn cross_version_audit_verify_pin() {
         String::from_utf8_lossy(&verify.stdout),
         String::from_utf8_lossy(&verify.stderr)
     );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #177 B1 step 2: an entry declaring a `chain_version` this binary doesn't
+/// recognize must make `omamori audit verify` exit 4 (a distinct, non-tamper
+/// signal), not exit 1 (which reads as "you've been tampered with").
+///
+/// Seeds one real chain entry via the live hook script (genuine secret/HMAC
+/// plumbing), then hand-appends a second entry from an imagined future
+/// omamori version directly onto the same audit.jsonl the CLI will read.
+#[test]
+fn audit_verify_exits_4_on_unknown_chain_version() {
+    let (base, hook_path, shim_dir) = setup_hook_env("v177-unknown-version-exit4");
+    let json = pretooluse_bash_json("rm -rf /");
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "setup deny must Block to seed the chain"
+    );
+
+    let audit_path = audit_path_for(&base);
+    append_future_chain_entry(&audit_path, 1);
+
+    let verify = Command::new(binary())
+        .arg("audit")
+        .arg("verify")
+        .env("HOME", &base)
+        .env("XDG_DATA_HOME", base.join(".local/share"))
+        .output()
+        .expect("failed to run omamori audit verify");
+
+    assert_eq!(
+        verify.status.code(),
+        Some(4),
+        "unknown chain_version must exit 4, not exit 1 (tampered) or exit 0 (intact) \
+         (stdout={}, stderr={})",
+        String::from_utf8_lossy(&verify.stdout),
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        stderr.contains("chain_version 999"),
+        "stderr must name the unrecognized version — got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("may have been tampered with"),
+        "must not use the broken_at (exit 1) tamper-claim phrasing for an unrecognized \
+         chain_version — got: {stderr}"
+    );
+    // Codex Round 1 test-adversarial review: pin the exact accounting
+    // numbers, not just that the exit code/some text is present — one real
+    // entry (seq 0) was seeded, one future entry (seq 1) was appended.
+    assert!(
+        stderr.contains("1 entries verified before this point"),
+        "stderr must report chain_entries=1 as the verified-before count — got: {stderr}"
+    );
+    assert!(
+        stderr.contains("unable to verify 1 entries at or after it"),
+        "stderr must report unverified_entries_after=1 — got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #177 B1 step 3 / G-2: `append()` refusing to write after an unsupported
+/// `chain_version` tail must NOT affect the command's own block decision —
+/// audit logging is best-effort. Seeds a real chain entry via the live hook
+/// script, hand-appends a future-version tail entry, then triggers a
+/// second deny and confirms it still Blocks, warns on stderr, and does not
+/// add a new line to audit.jsonl.
+#[test]
+fn hook_deny_still_blocks_when_audit_tail_has_unknown_chain_version() {
+    let (base, hook_path, shim_dir) = setup_hook_env("v177-append-refuse-block-unaffected");
+
+    let json1 = pretooluse_bash_json("rm -rf /");
+    let (_, _, exit1) = run_hook_script(&hook_path, &shim_dir, &json1);
+    assert_eq!(
+        decision_from_exit(exit1),
+        Decision::Block,
+        "setup deny must Block to seed the chain"
+    );
+
+    let audit_path = audit_path_for(&base);
+    append_future_chain_entry(&audit_path, 1);
+    let content = std::fs::read_to_string(&audit_path).unwrap();
+    let line_count_before = content.lines().filter(|l| !l.trim().is_empty()).count();
+
+    let json2 = pretooluse_bash_json("rm -rf /etc");
+    let (_, stderr2, exit2) = run_hook_script(&hook_path, &shim_dir, &json2);
+
+    assert_eq!(
+        decision_from_exit(exit2),
+        Decision::Block,
+        "G-2: the command's block decision must be unaffected by the audit \
+         append refusal (stderr={stderr2})"
+    );
+    assert!(
+        stderr2.contains("chain_version 999") && stderr2.contains("refusing to append"),
+        "hook stderr must surface the append-refusal warning — got: {stderr2}"
+    );
+
+    let after = std::fs::read_to_string(&audit_path).unwrap();
+    let line_count_after = after.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        line_count_before, line_count_after,
+        "the second deny's event must not have been recorded"
+    );
+
     let _ = std::fs::remove_dir_all(&base);
 }
 

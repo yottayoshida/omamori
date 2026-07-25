@@ -2,7 +2,9 @@
 
 use std::io::{BufRead, Write};
 
-use super::chain::{compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash};
+use super::chain::{
+    CHAIN_VERSION, RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash,
+};
 use super::retention::is_prune_point;
 use super::secret::{flock_shared, load_keyring, open_read_nofollow, read_secret, secret_path_for};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
@@ -49,6 +51,21 @@ pub struct VerifyResult {
     pub tail_truncated: bool,
     pub hwm_missing: bool,
     pub hwm_tampered: bool,
+    /// #177 B1 step 2: seq of the first entry whose `chain_version` this
+    /// binary doesn't recognize. `None` means every entry encountered was
+    /// either verifiable or legacy. Distinct from `broken_at` — this is not
+    /// evidence of tampering, it's evidence the binary predates the chain
+    /// format (or, less likely, that a downgrade happened after a newer
+    /// entry was written).
+    pub unknown_version_at: Option<u64>,
+    /// The unsupported `chain_version` value found at `unknown_version_at`.
+    pub unknown_chain_version: Option<u32>,
+    /// Count of lines from `unknown_version_at` onward (inclusive) that
+    /// could not be verified — once one entry's authenticity can't be
+    /// confirmed, the `prev_hash` chain running through it means nothing
+    /// after it can be trusted either, regardless of what those later
+    /// lines individually claim.
+    pub unverified_entries_after: u64,
 }
 
 pub struct ShowOptions {
@@ -80,6 +97,37 @@ pub struct AuditSummary {
 // ---------------------------------------------------------------------------
 // verify_chain
 // ---------------------------------------------------------------------------
+
+/// Records the point where an entry's `chain_version` became unverifiable
+/// and switches `result` into its terminal "unverifiable tail" state —
+/// `result.unknown_version_at.is_some()` *is* that state; the main loop
+/// checks it directly rather than tracking a separate local flag that
+/// could drift out of sync with it. Shared by both places `verify_chain`
+/// can discover this — the fast path (a successfully-parsed `AuditEvent`
+/// whose `chain_version` field is unsupported) and the raw-JSON fallback
+/// (an entry whose *shape* a future `chain_version` changed enough that
+/// `AuditEvent` can't even parse it).
+fn mark_unverifiable_tail(result: &mut VerifyResult, seq: u64, chain_version: u32) {
+    result.unknown_version_at = Some(seq);
+    result.unknown_chain_version = Some(chain_version);
+    result.unverified_entries_after = 1;
+}
+
+/// Minimal typed peek for the raw-JSON fallback (an entry whose full
+/// `AuditEvent` parse already failed). Any JSON key not named here —
+/// including an attacker-controlled arbitrarily large one — is skipped by
+/// serde during deserialization rather than allocated, unlike a
+/// `serde_json::Value` peek of the same line (see the fallback's comment
+/// for the measured cost of that). Both fields are `Option` so a missing
+/// or wrong-shaped `seq` degrades to the `expected_seq` fallback rather
+/// than failing the whole peek — a type-mismatched `chain_version`
+/// (rather than missing) still fails the peek, same as a
+/// `serde_json::Value` peek would have failed to extract a `u32` from it.
+#[derive(serde::Deserialize)]
+struct ChainVersionSeqPeek {
+    chain_version: Option<u32>,
+    seq: Option<u64>,
+}
 
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
@@ -117,6 +165,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         tail_truncated: false,
         hwm_missing: false,
         hwm_tampered: false,
+        unknown_version_at: None,
+        unknown_chain_version: None,
+        unverified_entries_after: 0,
     };
     let mut expected_prev = genesis;
     let mut expected_seq: u64 = 0;
@@ -131,15 +182,63 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             continue;
         }
 
+        // #177 B1 step 2: once an entry's chain_version can't be
+        // authenticated, the prev_hash chain running through it means
+        // nothing after it can be trusted either — every remaining line
+        // just gets tallied, not verified.
+        if result.unknown_version_at.is_some() {
+            result.unverified_entries_after += 1;
+            continue;
+        }
+
         let event: AuditEvent = match serde_json::from_str(trimmed) {
             Ok(e) => e,
             Err(_) => {
+                // Codex Round 1 (#177 B1): a future chain_version might pair
+                // with a JSON shape this binary's AuditEvent can't
+                // deserialize at all. Before assuming genuine corruption
+                // (torn line), peek the raw JSON for chain_version — if
+                // it's present and unrecognized, this must read as
+                // "unverifiable", not "torn". Torn-line handling resumes
+                // verification against the pre-entry expected_prev/
+                // expected_seq for whatever comes next, which would
+                // misreport a real subsequent entry (chaining from this
+                // one's unverified hash) as broken_at.
+                // Security review (#177 B1): peeking via serde_json::Value here
+                // (unlike chain.rs's read_chain_state, whose tail-window read is
+                // already capped at 64 KB) materializes a full DOM for whatever
+                // this *unbounded* per-line scan reads — measured ~5.7x memory
+                // and ~25x CPU amplification on a single hostile ~50MB line vs.
+                // the typed AuditEvent parse path it substitutes for. A typed
+                // peek struct lets serde skip any field it doesn't name
+                // (including large ones) without allocating it.
+                if let Ok(peek) = serde_json::from_str::<ChainVersionSeqPeek>(trimmed)
+                    && let Some(chain_version) = peek.chain_version
+                    && chain_version != CHAIN_VERSION
+                {
+                    let seq = peek.seq.unwrap_or(expected_seq);
+                    mark_unverifiable_tail(&mut result, seq, chain_version);
+                    continue;
+                }
                 result.torn_lines += 1;
                 continue;
             }
         };
 
         if event.chain_version.is_none() {
+            // #177 B1 step 4: legacy (no chain_version) entries are only
+            // legitimate at the head of the file — genuine pre-#164
+            // history that predates chain tracking. A legacy-shaped entry
+            // appearing AFTER real chain entries have started is fail-
+            // closed, not silently skipped: it's either corruption, or an
+            // attacker exploiting the fact that legacy entries never
+            // participate in prev_hash/seq continuity tracking to splice
+            // unaudited content into the middle of an otherwise-verified
+            // chain without breaking the links around it.
+            if result.chain_entries > 0 {
+                result.broken_at = Some(expected_seq);
+                break;
+            }
             result.legacy_entries += 1;
             continue;
         }
@@ -148,6 +247,36 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         let prev_hash = event.prev_hash.as_deref().unwrap_or("");
         let recorded_hash = event.entry_hash.as_deref().unwrap_or("");
         let is_prune = is_prune_point(&event);
+
+        // --- entry_hash HMAC verification (multi-key: lookup by key_id).
+        // Also the version dispatch point: an entry whose chain_version
+        // this binary doesn't recognize can't be authenticated at all, so
+        // nothing about it — including its own seq/prev_hash — is
+        // trustworthy structural signal. Check this before the prev_hash
+        // check below, not after. ---
+        let entry_key_id = event.key_id.as_deref().unwrap_or("default");
+        let entry_secret = keyring.get(entry_key_id).unwrap_or(&secret);
+        let recomputed = match compute_entry_hash(Some(entry_secret), &event) {
+            RecomputedHash::Hash(h) => h,
+            RecomputedHash::UnsupportedVersion(v) => {
+                // Not evidence of tampering — evidence this binary
+                // predates the chain format (or a downgrade happened).
+                // Stop verifying; everything from here on is tallied,
+                // not trusted. Codex Round 1 test-adversarial review:
+                // report expected_seq (not the generic `seq` default of
+                // 0 above) when this entry's own `seq` field is missing —
+                // matches the raw-JSON fallback path below and avoids a
+                // misleading "at entry #0" report for an unrecognized-
+                // version entry appearing deep in an otherwise-verified
+                // chain.
+                let reported_seq = event.seq.unwrap_or(expected_seq);
+                mark_unverifiable_tail(&mut result, reported_seq, v);
+                continue;
+            }
+            RecomputedHash::Legacy => {
+                unreachable!("event.chain_version.is_none() already filtered above")
+            }
+        };
 
         // --- prev_hash verification ---
         if result.chain_entries == 0 {
@@ -184,10 +313,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             }
         }
 
-        // --- entry_hash HMAC verification (multi-key: lookup by key_id) ---
-        let entry_key_id = event.key_id.as_deref().unwrap_or("default");
-        let entry_secret = keyring.get(entry_key_id).unwrap_or(&secret);
-        let recomputed = compute_entry_hash(Some(entry_secret), &event);
         if recomputed != recorded_hash {
             result.broken_at = Some(seq);
             break;
@@ -222,8 +347,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         result.chain_entries += 1;
     }
 
-    // HWM check: detect tail truncation
-    if result.broken_at.is_none() && result.chain_entries > 0 {
+    // HWM check: detect tail truncation. Requires having actually reached
+    // EOF (#177 B1 step 2) — an early stop on unknown_version_at means
+    // expected_seq stopped advancing before the real end of file, so
+    // writing/comparing the HWM here would compare against a false "end"
+    // and could silently lower the high-water-mark on a later re-verify.
+    if result.broken_at.is_none() && result.unknown_version_at.is_none() && result.chain_entries > 0
+    {
         let hwm_file = hwm_path_for(&path);
         let max_verified_seq = expected_seq.saturating_sub(1);
         match read_hwm(&hwm_file) {

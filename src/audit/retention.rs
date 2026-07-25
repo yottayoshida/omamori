@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use time::OffsetDateTime;
 
 use super::AuditEvent;
-use super::chain::{CHAIN_VERSION, compute_entry_hash, hmac_bytes, prune_genesis_hash};
+use super::chain::{CHAIN_VERSION, compute_entry_hash_for_write, hmac_bytes, prune_genesis_hash};
 use super::{hwm_path_for, write_hwm};
 
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
@@ -186,7 +186,7 @@ pub(super) fn build_prune_point(
         parent_process: None,
         cwd_hash: None,
     };
-    event.entry_hash = Some(compute_entry_hash(secret, &event));
+    event.entry_hash = Some(compute_entry_hash_for_write(secret, &event));
     event
 }
 
