@@ -15,9 +15,44 @@ use super::AuditEvent;
 
 pub(super) type HmacSha256 = Hmac<Sha256>;
 
-pub(super) const CHAIN_VERSION: u32 = 1;
+pub(super) const CHAIN_VERSION: u32 = 2;
 pub(super) const GENESIS_SEED: &[u8] = b"omamori-genesis-v1";
 pub(super) const PRUNE_GENESIS_SEED: &[u8] = b"omamori-prune-v1";
+
+/// Every `chain_version` this binary can recompute a hash for. Shared by
+/// `read_chain_state` (append-side tail check) and `verify_chain`'s
+/// raw-JSON fallback peek (`verify.rs`) — before #177 B3 these two each
+/// independently compared against the single `CHAIN_VERSION` constant, so
+/// bumping it to `2` without this shared set would have required editing
+/// both in lockstep with no compiler check that neither was missed.
+///
+/// `compute_entry_hash`'s `match` below is a THIRD place that must agree
+/// with this array — its arms are literal (`Some(1) => hash_v1`, not
+/// `Some(v) if is_supported_chain_version(v) => ...`) because each
+/// supported version dispatches to a different hasher, which an array
+/// membership check can't express. Adding a version to this array without
+/// adding a matching arm there would let `read_chain_state`/`verify_chain`
+/// treat the version as safe to append-after / worth authenticating, while
+/// `compute_entry_hash` still reports `UnsupportedVersion` for it —
+/// `all_supported_chain_versions_produce_a_hash` (mod.rs test) exists
+/// specifically to catch that split at test time instead of in production.
+///
+/// `verify_chain`'s own `v1_entries`/`v2_entries` tally (`verify.rs`) is a
+/// FOURTH place with the same literal-match shape, for the same reason
+/// (each version increments a different counter). Security review (#177
+/// B3): the two safety nets are asymmetric by construction —
+/// `all_supported_chain_versions_produce_a_hash` catches a version added to
+/// this array without a `compute_entry_hash` arm, but NOT the reverse (a
+/// `compute_entry_hash` arm added without updating this array first) —
+/// that entry would hash and verify successfully, then simply fall through
+/// the tally `match`'s `_ => {}` arm uncounted rather than crash
+/// verification (deliberately not `unreachable!()`, see that match's own
+/// comment).
+pub(super) const SUPPORTED_CHAIN_VERSIONS: [u32; 2] = [1, 2];
+
+pub(super) fn is_supported_chain_version(v: u32) -> bool {
+    SUPPORTED_CHAIN_VERSIONS.contains(&v)
+}
 
 // ---------------------------------------------------------------------------
 // HashableEvent — canonical representation for entry_hash computation
@@ -46,9 +81,20 @@ pub(super) struct HashableEvent {
 }
 
 impl HashableEvent {
+    /// `chain_version` is hardcoded to `1`, not read from `event` (contrast
+    /// `HashableEventV2::from_event` below, hardcoded to `2`) — #177 B3:
+    /// `event.chain_version.unwrap_or(CHAIN_VERSION)` meant "trust the
+    /// caller, default to whatever the current binary considers current."
+    /// That default silently pointed at V2 the moment `CHAIN_VERSION`
+    /// flipped, so a `None`-chain_version event handed to this V1 hasher
+    /// (which cannot occur in production — `compute_entry_hash` routes
+    /// `None` to `Legacy` first — but can occur from fixture/mutation-test
+    /// code that constructs a `HashableEvent` directly) would silently hash
+    /// as V2 dressed in V1's field set instead of failing loudly. Hardcoding
+    /// removes the ambiguity structurally: this function only ever means V1.
     pub(super) fn from_event(event: &AuditEvent) -> Self {
         Self {
-            chain_version: event.chain_version.unwrap_or(CHAIN_VERSION),
+            chain_version: 1,
             seq: event.seq.unwrap_or(0),
             prev_hash: event.prev_hash.clone().unwrap_or_default(),
             key_id: event.key_id.clone().unwrap_or_default(),
@@ -63,6 +109,69 @@ impl HashableEvent {
             detection_layer: event.detection_layer.clone(),
             unwrap_chain: event.unwrap_chain.clone(),
             raw_input_hash: event.raw_input_hash.clone(),
+        }
+    }
+}
+
+/// Canonical representation of a `chain_version: 2` event for `entry_hash`
+/// computation (#177 B3). Extends `HashableEvent` (V1)'s 15 fields with the
+/// 5 fields that were previously excluded from chain integrity by design
+/// (ADR-0006's Design A for `pid`/`ppid`/`parent_process`/`cwd_hash`, and
+/// `wrapper_kind`'s equivalent B2-era exclusion) — appended in the same
+/// relative order they already appear in `AuditEvent`. Field order is fixed
+/// by struct definition order (serde guarantee) and locked by golden test
+/// GR-002-V2; unlike V1 fields, these 5 are pairwise same-typed
+/// (`Option<u32>` × 2, `Option<String>` × 3), so a field-swap bug (e.g.
+/// `ppid: event.pid`) would silently pass a golden fixture where all 5 are
+/// `None` — the GR-002-V2 fixture therefore uses 5 distinct non-`None`
+/// values, never all-`None`.
+#[derive(Serialize)]
+pub(super) struct HashableEventV2 {
+    chain_version: u32,
+    seq: u64,
+    prev_hash: String,
+    key_id: String,
+    timestamp: String,
+    provider: String,
+    command: String,
+    rule_id: Option<String>,
+    action: String,
+    result: String,
+    target_count: usize,
+    target_hash: String,
+    detection_layer: Option<String>,
+    unwrap_chain: Option<Vec<String>>,
+    raw_input_hash: Option<String>,
+    pid: Option<u32>,
+    ppid: Option<u32>,
+    parent_process: Option<String>,
+    cwd_hash: Option<String>,
+    wrapper_kind: Option<String>,
+}
+
+impl HashableEventV2 {
+    pub(super) fn from_event(event: &AuditEvent) -> Self {
+        Self {
+            chain_version: 2,
+            seq: event.seq.unwrap_or(0),
+            prev_hash: event.prev_hash.clone().unwrap_or_default(),
+            key_id: event.key_id.clone().unwrap_or_default(),
+            timestamp: event.timestamp.clone(),
+            provider: event.provider.clone(),
+            command: event.command.clone(),
+            rule_id: event.rule_id.clone(),
+            action: event.action.clone(),
+            result: event.result.clone(),
+            target_count: event.target_count,
+            target_hash: event.target_hash.clone(),
+            detection_layer: event.detection_layer.clone(),
+            unwrap_chain: event.unwrap_chain.clone(),
+            raw_input_hash: event.raw_input_hash.clone(),
+            pid: event.pid,
+            ppid: event.ppid,
+            parent_process: event.parent_process.clone(),
+            cwd_hash: event.cwd_hash.clone(),
+            wrapper_kind: event.wrapper_kind.clone(),
         }
     }
 }
@@ -118,7 +227,8 @@ impl RecomputedHash {
 pub(super) fn compute_entry_hash(secret: Option<&[u8; 32]>, event: &AuditEvent) -> RecomputedHash {
     match event.chain_version {
         None => RecomputedHash::Legacy,
-        Some(CHAIN_VERSION) => RecomputedHash::Hash(hash_v1(secret, event)),
+        Some(1) => RecomputedHash::Hash(hash_v1(secret, event)),
+        Some(2) => RecomputedHash::Hash(hash_v2(secret, event)),
         Some(other) => RecomputedHash::UnsupportedVersion(other),
     }
 }
@@ -150,6 +260,12 @@ pub(super) fn compute_entry_hash_for_write(
 
 fn hash_v1(secret: Option<&[u8; 32]>, event: &AuditEvent) -> String {
     let canonical = serde_json::to_string(&HashableEvent::from_event(event))
+        .expect("AuditEvent serialization cannot fail");
+    hmac_bytes(secret, canonical.as_bytes())
+}
+
+fn hash_v2(secret: Option<&[u8; 32]>, event: &AuditEvent) -> String {
+    let canonical = serde_json::to_string(&HashableEventV2::from_event(event))
         .expect("AuditEvent serialization cannot fail");
     hmac_bytes(secret, canonical.as_bytes())
 }
@@ -226,7 +342,11 @@ pub(super) fn read_chain_state(file: &mut fs::File, secret: Option<&[u8; 32]>) -
         // Absent or malformed chain_version → legacy entry or corruption,
         // either way safe to restart from genesis.
         None => ChainTailState::Fresh { genesis },
-        Some(chain_version) if chain_version != CHAIN_VERSION => {
+        // #177 B3: any *supported* version's tail is safe to append after
+        // — not just the current CHAIN_VERSION. A v1 tail must accept a v2
+        // append (shape enumeration F-D, the single most common post-
+        // upgrade shape) without being misclassified as unsupported.
+        Some(chain_version) if !is_supported_chain_version(chain_version) => {
             ChainTailState::UnsupportedVersion { chain_version }
         }
         Some(_) => match (parsed.get("seq"), parsed.get("entry_hash")) {

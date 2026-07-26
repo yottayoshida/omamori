@@ -3,7 +3,8 @@
 use std::io::{BufRead, Write};
 
 use super::chain::{
-    CHAIN_VERSION, RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes, prune_genesis_hash,
+    RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes, is_supported_chain_version,
+    prune_genesis_hash,
 };
 use super::retention::is_prune_point;
 use super::secret::{flock_shared, load_keyring, open_read_nofollow, read_secret, secret_path_for};
@@ -41,6 +42,13 @@ impl From<std::io::Error> for AuditError {
 // Result types
 // ---------------------------------------------------------------------------
 
+// #177 B3 (QA review): matches the precedent B2 set for `AuditEvent` when
+// it added `wrapper_kind` — a public struct gaining new public fields
+// gets `#[non_exhaustive]` in the same change, closing the exhaustive
+// struct-literal/destructure two-way door before 1.0 rather than after
+// (crates.io reverse dependencies verified at 0, same as B2's check).
+#[derive(Default)]
+#[non_exhaustive]
 pub struct VerifyResult {
     pub chain_entries: u64,
     pub legacy_entries: u64,
@@ -66,6 +74,14 @@ pub struct VerifyResult {
     /// after it can be trusted either, regardless of what those later
     /// lines individually claim.
     pub unverified_entries_after: u64,
+    /// #177 B3: counts of *verified* chain entries by `chain_version`, for
+    /// the mixed-chain counter `omamori audit verify` prints when a log
+    /// spans the v1→v2 upgrade boundary. Legacy entries (no `chain_version`)
+    /// are counted in `legacy_entries` above, not here. Entries at or after
+    /// `unknown_version_at` are excluded — they were never verified, so
+    /// asserting a version for them would be a claim about unverified data.
+    pub v1_entries: u64,
+    pub v2_entries: u64,
 }
 
 pub struct ShowOptions {
@@ -155,20 +171,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let genesis = genesis_hash(Some(&secret));
     let prune_genesis = prune_genesis_hash(Some(&secret));
 
-    let mut result = VerifyResult {
-        chain_entries: 0,
-        legacy_entries: 0,
-        torn_lines: 0,
-        broken_at: None,
-        pruned: false,
-        pruned_count: None,
-        tail_truncated: false,
-        hwm_missing: false,
-        hwm_tampered: false,
-        unknown_version_at: None,
-        unknown_chain_version: None,
-        unverified_entries_after: 0,
-    };
+    let mut result = VerifyResult::default();
     let mut expected_prev = genesis;
     let mut expected_seq: u64 = 0;
     let mut last_was_prune = false;
@@ -212,9 +215,15 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // the typed AuditEvent parse path it substitutes for. A typed
                 // peek struct lets serde skip any field it doesn't name
                 // (including large ones) without allocating it.
+                // #177 B3: a genuinely corrupted *supported*-version entry
+                // (fails AuditEvent::deserialize but chain_version peeks as
+                // 1 or 2) must fall through to torn_lines below, not be
+                // misreported as "unrecognized version" — that would tell
+                // an operator to upgrade omamori when the real problem is
+                // file corruption on an already-current binary.
                 if let Ok(peek) = serde_json::from_str::<ChainVersionSeqPeek>(trimmed)
                     && let Some(chain_version) = peek.chain_version
-                    && chain_version != CHAIN_VERSION
+                    && !is_supported_chain_version(chain_version)
                 {
                     let seq = peek.seq.unwrap_or(expected_seq);
                     mark_unverifiable_tail(&mut result, seq, chain_version);
@@ -345,6 +354,29 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         expected_prev = recorded_hash.to_string();
         expected_seq = seq + 1;
         result.chain_entries += 1;
+        // #177 B3: `event.chain_version` is `Some` here — the `None`
+        // (legacy) case already `continue`d above, and `compute_entry_hash`
+        // (via `recomputed` above) already rejected any value outside
+        // `SUPPORTED_CHAIN_VERSIONS`. A prune point is counted under its
+        // own declared version, same as any other entry.
+        //
+        // Security review (#177 B3): this `match` is a FOURTH place that
+        // must stay in sync with `SUPPORTED_CHAIN_VERSIONS` and
+        // `compute_entry_hash`'s dispatch (chain.rs's doc comment on
+        // `SUPPORTED_CHAIN_VERSIONS` names the other three) — and, unlike
+        // those, a future version added to `compute_entry_hash` without a
+        // matching arm added *here* would reach this point having already
+        // verified successfully (`Hash(_)`, `recomputed == recorded_hash`
+        // above), so panicking now would crash `omamori audit verify` on
+        // an entry that just proved itself authentic. Deliberately no
+        // panic: an unrecognized-but-successfully-hashed version is simply
+        // left out of the v1/v2 breakdown (a display nicety) rather than
+        // taking down verification of a chain that's otherwise intact.
+        match event.chain_version {
+            Some(1) => result.v1_entries += 1,
+            Some(2) => result.v2_entries += 1,
+            _ => {}
+        }
     }
 
     // HWM check: detect tail truncation. Requires having actually reached

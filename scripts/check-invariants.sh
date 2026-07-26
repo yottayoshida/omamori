@@ -457,6 +457,25 @@ echo "DI-15 RETIRED (v0.10.4): subst_depth removed with strip_quoted_data"
 # audit_log_hook_allow_relaxed and layer2:relaxed: removed with relaxed_by infrastructure.
 echo "DI-16 RETIRED (v0.10.4): relaxed_by audit path removed with meta-pattern infrastructure"
 
+# extract_uint_const: reads a Rust `const NAME: <uint type> = <value>;`
+# declaration's value out of a source file. Hoisted above every invariant
+# that uses it (faq-doc-sync below, chain-version-doc-sync further down,
+# #177 B3 /simplify: previously duplicated verbatim inside the
+# chain-version-doc-sync block) -- unlike `require_const`/`assert_faq_contains`
+# just below, this helper touches no shared mutable state (`faq_fail` etc.),
+# so sharing it across invariants doesn't couple their pass/fail tracking.
+extract_uint_const() {
+    # $1 = file, $2 = const name. Anchored to the definition line only
+    # (optional visibility modifier) so a same-named `assert_eq!` or
+    # other usage elsewhere in the file (src/config.rs has both) isn't
+    # mistaken for the definition. `[0-9_]` accepts Rust numeric
+    # separators (e.g. `86_400`); stripped below along with whitespace.
+    cfile=$1
+    cname=$2
+    cline=$(grep -m1 -oE "^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?const[[:space:]]+$cname[[:space:]]*:[^=]+=[[:space:]]*[0-9_]+" "$cfile" || true)
+    printf '%s' "${cline##*=}" | tr -d '[:space:]_'
+}
+
 # ---------- Invariant: faq-doc-sync (#328, PR-C3) ----------
 # docs/FAQ.md must not rot against the code and SECURITY.md it points into:
 #   (a) every `SECURITY.md#anchor` the FAQ references must resolve to a real
@@ -606,17 +625,7 @@ FAQ_PAIRS_EOF
     # NOT the same rendering as src/break_glass.rs's own
     # format_duration_human (CLI display, "1 hour(s)" style) -- this table
     # only exists to match the fixed prose in docs/FAQ.md.
-    extract_uint_const() {
-        # $1 = file, $2 = const name. Anchored to the definition line only
-        # (optional visibility modifier) so a same-named `assert_eq!` or
-        # other usage elsewhere in the file (src/config.rs has both) isn't
-        # mistaken for the definition. `[0-9_]` accepts Rust numeric
-        # separators (e.g. `86_400`); stripped below along with whitespace.
-        cfile=$1
-        cname=$2
-        cline=$(grep -m1 -oE "^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?const[[:space:]]+$cname[[:space:]]*:[^=]+=[[:space:]]*[0-9_]+" "$cfile" || true)
-        printf '%s' "${cline##*=}" | tr -d '[:space:]_'
-    }
+    # (extract_uint_const is defined once, above the faq-doc-sync section.)
     render_duration() {
         case "$1" in
             300) echo "5 minutes" ;;
@@ -1177,6 +1186,45 @@ fi
 
 if [ "$extdocs_fail" -eq 0 ]; then
     echo "extdocs-doc-sync OK: docs/reference-architecture.md and docs/evaluation-kit.md SECURITY/CONTRACT/README anchors, own anchors, omamori subcommand references, README links, and forbidden-word scan all pass (#407, #408)"
+else
+    fail=1
+fi
+
+# ---------- Invariant: chain-version-doc-sync (#177 B3) ----------
+# SECURITY.md's schema table row for `chain_version` must state the actual
+# current CHAIN_VERSION value, not a
+# stale one left behind by a future bump. #177 B1/B2 landed with
+# CHAIN_VERSION still 1 and SECURITY.md correctly said "currently 1"
+# throughout; B3 flipped the constant to 2 and updated the doc by hand.
+# Nothing else re-checks that pairing, so a future bump that updates the
+# constant but forgets this one prose line would ship silently stale.
+chainver_fail=0
+chain_src=src/audit/chain.rs
+sec_doc=SECURITY.md
+if [ ! -f "$chain_src" ]; then
+    echo "FAIL [invariant chain-version-doc-sync/#177]: $chain_src is missing"
+    chainver_fail=1
+elif [ ! -f "$sec_doc" ]; then
+    echo "FAIL [invariant chain-version-doc-sync/#177]: $sec_doc is missing"
+    chainver_fail=1
+else
+    chain_version=$(extract_uint_const "$chain_src" CHAIN_VERSION)
+    if [ -z "$chain_version" ]; then
+        echo "FAIL [invariant chain-version-doc-sync/#177]: could not extract CHAIN_VERSION from $chain_src -- constant renamed/removed, or extraction pattern is stale"
+        chainver_fail=1
+    else
+        chain_version_row=$(grep -m1 -F '| `chain_version` |' "$sec_doc" || true)
+        if [ -z "$chain_version_row" ]; then
+            echo "FAIL [invariant chain-version-doc-sync/#177]: $sec_doc has no \`chain_version\` schema table row -- table restructured?"
+            chainver_fail=1
+        elif ! printf '%s' "$chain_version_row" | grep -qF "Currently \`$chain_version\`"; then
+            echo "FAIL [invariant chain-version-doc-sync/#177]: $sec_doc's chain_version row does not say 'Currently \`$chain_version\`' (src/audit/chain.rs CHAIN_VERSION=$chain_version) -- doc prose is stale"
+            chainver_fail=1
+        fi
+    fi
+fi
+if [ "$chainver_fail" -eq 0 ]; then
+    echo "chain-version-doc-sync OK: SECURITY.md's chain_version schema row matches src/audit/chain.rs's CHAIN_VERSION constant (#177)"
 else
     fail=1
 fi

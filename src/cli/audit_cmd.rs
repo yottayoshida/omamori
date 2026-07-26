@@ -28,6 +28,40 @@ pub(crate) fn run_audit_command(args: &[OsString]) -> Result<i32, AppError> {
     }
 }
 
+/// Builds `omamori audit verify`'s success-path stdout message. Extracted
+/// from `run_audit_verify` (#177 B3, Codex Phase 6-B) so the `(N v1 + M v2)`
+/// mixed-version parenthetical — and the rest of this message's shape —
+/// gets direct unit-test coverage without needing a full CLI subprocess and
+/// a signed `audit.jsonl` fixture built from outside the crate.
+fn format_verify_success_message(result: &audit::VerifyResult) -> String {
+    let mut msg = format!(
+        "omamori audit verify: {} entries verified, chain intact.",
+        result.chain_entries
+    );
+    // #177 B3: only surface the version split once a log actually spans
+    // the v1→v2 upgrade boundary — a single-version log (the common case,
+    // both before and long after upgrading) gets no redundant
+    // parenthetical.
+    if result.v1_entries > 0 && result.v2_entries > 0 {
+        msg.push_str(&format!(
+            " ({} v1 + {} v2)",
+            result.v1_entries, result.v2_entries
+        ));
+    }
+    if result.pruned
+        && let Some(count) = result.pruned_count
+    {
+        msg.push_str(&format!(" ({count} entries pruned; prune_point anchored)"));
+    }
+    if result.legacy_entries > 0 {
+        msg.push_str(&format!(" ({} legacy skipped)", result.legacy_entries));
+    }
+    if result.torn_lines > 0 {
+        msg.push_str(&format!(" ({} torn lines skipped)", result.torn_lines));
+    }
+    msg
+}
+
 fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
     let config_path = parse_config_flag(&args[3..])?;
     let load_result = load_config(config_path.as_deref())?;
@@ -72,22 +106,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 println!("omamori audit verify: no entries to verify.");
                 Ok(0)
             } else {
-                let mut msg = format!(
-                    "omamori audit verify: {} entries verified, chain intact.",
-                    result.chain_entries
-                );
-                if result.pruned
-                    && let Some(count) = result.pruned_count
-                {
-                    msg.push_str(&format!(" ({count} entries pruned; prune_point anchored)"));
-                }
-                if result.legacy_entries > 0 {
-                    msg.push_str(&format!(" ({} legacy skipped)", result.legacy_entries));
-                }
-                if result.torn_lines > 0 {
-                    msg.push_str(&format!(" ({} torn lines skipped)", result.torn_lines));
-                }
-                println!("{msg}");
+                println!("{}", format_verify_success_message(&result));
                 if result.tail_truncated {
                     eprintln!(
                         "  WARNING: audit log tail may have been truncated \
@@ -369,6 +388,70 @@ fn run_audit_hash_cwd(args: &[OsString]) -> Result<i32, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #177 B3 (Codex Phase 6-B): the mixed-version parenthetical had zero
+    /// test coverage of its own — the underlying `VerifyResult.v1_entries`/
+    /// `v2_entries` fields were pinned elsewhere, but not this exact string
+    /// format, and the one internal test that exercised both fields
+    /// together used a symmetric 2+2 count that a swapped format argument
+    /// (`v1`/`v2` labels transposed) would not have caught. Deliberately
+    /// asymmetric here for that reason.
+    #[test]
+    fn format_verify_success_message_shows_mixed_version_breakdown() {
+        let result = audit::VerifyResult {
+            chain_entries: 3,
+            v1_entries: 2,
+            v2_entries: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_verify_success_message(&result),
+            "omamori audit verify: 3 entries verified, chain intact. (2 v1 + 1 v2)"
+        );
+    }
+
+    #[test]
+    fn format_verify_success_message_omits_breakdown_for_single_version_log() {
+        let result = audit::VerifyResult {
+            chain_entries: 3,
+            v1_entries: 3,
+            v2_entries: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_verify_success_message(&result),
+            "omamori audit verify: 3 entries verified, chain intact.",
+            "an all-v1 (or all-v2) log must not show a redundant (N v1 + M v2) parenthetical"
+        );
+
+        let result = audit::VerifyResult {
+            chain_entries: 3,
+            v1_entries: 0,
+            v2_entries: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_verify_success_message(&result),
+            "omamori audit verify: 3 entries verified, chain intact."
+        );
+    }
+
+    #[test]
+    fn format_verify_success_message_combines_breakdown_with_other_suffixes() {
+        let result = audit::VerifyResult {
+            chain_entries: 5,
+            v1_entries: 4,
+            v2_entries: 1,
+            legacy_entries: 2,
+            torn_lines: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_verify_success_message(&result),
+            "omamori audit verify: 5 entries verified, chain intact. (4 v1 + 1 v2) \
+             (2 legacy skipped) (1 torn lines skipped)"
+        );
+    }
 
     // V-012: audit error paths use short hint, not full audit_usage() dump
 
