@@ -50,6 +50,17 @@ section for `wrapper_kind`'s specific unhashed-carrier note. Both fields close t
 the same bump — B3 is a hard precondition for #459's `detection_layer` `:{wrapper}` suffix
 sunset, exactly as issue #177 already is for this ADR's own deferred provenance fold-in.
 
+**Update (#177 B3, 2026-07-26, Design A superseded for `chain_version: 2` — permanent for `chain_version: 1`)**:
+`CHAIN_VERSION` is now `2`. `HashableEventV2` includes `pid`/`ppid`/`parent_process`/`cwd_hash`
+and `wrapper_kind` — the fold-in this ADR deferred has landed, and Design A no longer describes
+new writes. What Design A still describes, permanently, is every `chain_version: 1` entry already
+on disk: existing `audit.jsonl` bytes are never rewritten (ADR-0007), so a same-user attacker can
+still alter provenance/`wrapper_kind` on a v1 entry undetected — that specific residual risk this
+ADR accepted does not retroactively close. See SECURITY.md's "Process Provenance" section (updated
+by B3) for the current v1/v2 split, and ADR-0007 for why in-place rewriting was never on the
+table as a way to close it for existing entries. This ADR's Status stays `Accepted` rather than
+`Superseded`, because the v1 half of its Decision is not superseded — it is now permanent.
+
 ## Alternatives Considered
 
 | Option | Rejected because |

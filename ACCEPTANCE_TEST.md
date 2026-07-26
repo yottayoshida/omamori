@@ -196,8 +196,8 @@ echo "exit=$?"
 omamori report --last 30d
 echo "exit=$?"
 
-# Rep-3: JSON schema (SEC-R2: 7 fields, no by_rule)
-omamori report --json | jq '(keys | length == 7) and (has("by_rule") | not)'
+# Rep-3: JSON schema (SEC-R2: 8 fields, by_rule present)
+omamori report --json | jq '(keys | length == 8) and has("by_rule")'
 echo "exit=$?"
 
 # Rep-4: out-of-range duration
@@ -213,12 +213,12 @@ echo "exit=$?"
 |---|---|---|---|---|
 | Rep-1 | `omamori report` | `exit = 0 ∧ stdout ~~ /omamori report/` | default 7d report | [ ] |
 | Rep-2 | `omamori report --last 30d` | `exit = 0 ∧ stdout ~~ /last 30 days/` | explicit duration | [ ] |
-| Rep-3 | `omamori report --json \| jq '(keys \| length == 7) and (has("by_rule") \| not)'` | `exit = 0 ∧ output = true` | SEC-R2 JSON schema: exactly 7 fields, no by_rule | [ ] |
+| Rep-3 | `omamori report --json \| jq '(keys \| length == 8) and has("by_rule")'` | `exit = 0 ∧ output = true` | SEC-R2 JSON schema: exactly 8 fields, by_rule present | [ ] |
 | Rep-4 | `omamori report --last 91d` | `exit ≠ 0 ∧ stderr ~~ /out of range/` | SEC-R4 upper bound | [ ] |
 | Rep-5 | `omamori report --last 7` | `exit ≠ 0 ∧ stderr ~~ /invalid duration/` | no-unit rejection | [ ] |
 | Rep-6 | `omamori report --last 1d` | `exit = 0` | SEC-R4 lower bound | [ ] |
 | Rep-7 | `omamori report --json --last 7d \| jq .chain_status.status` | `"intact" or "broken" or "unavailable"` | chain_status 3-state (SEC-R8) | [ ] |
-| Rep-8 | `omamori report --json \| jq 'has("by_rule")'` | `false` | by_rule absent from JSON (SEC-R2) | [ ] |
+| Rep-8 | `omamori report --json \| jq 'has("by_rule")'` | `true` | by_rule present in JSON (SEC-R2) | [ ] |
 
 ## Audit Trail (A-*)
 

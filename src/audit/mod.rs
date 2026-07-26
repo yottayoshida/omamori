@@ -394,8 +394,11 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_hash: Option<String>,
     // --- Process provenance fields (#420) ---
-    // Deliberately NOT added to `HashableEvent` (chain.rs) — Design A,
-    // see ADR-0006 and SECURITY.md's "Process Provenance" section.
+    // Absent from `HashableEvent` (V1 preimage, chain.rs) — Design A, see
+    // ADR-0006 and SECURITY.md's "Process Provenance" section. Included in
+    // `HashableEventV2` (#177 B3) — hash-protected on `chain_version: 2`
+    // entries, permanently unprotected on `chain_version: 1` entries
+    // (existing bytes are never rewritten, ADR-0007).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,9 +418,9 @@ pub struct AuditEvent {
     // `Deserialize` when reading audit.jsonl back (verify/report/show),
     // which requires owned data — a borrowed field can't satisfy the
     // `'static` bound serde's derive needs against a non-'static input.
-    // Deliberately NOT added to `HashableEvent` (chain.rs) yet — like the
-    // process-provenance fields above, this is a `CHAIN_VERSION` 2 (#177
-    // B3) concern.
+    // Absent from `HashableEvent` (V1 preimage) — like the process-provenance
+    // fields above. Included in `HashableEventV2` (#177 B3), with the same
+    // v1/v2 hash-protection split.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wrapper_kind: Option<String>,
 }
@@ -524,7 +527,10 @@ mod tests {
     use std::path::Path;
 
     // Also import submodule internals needed by tests
-    use chain::{HashableEvent, genesis_hash, prune_genesis_hash};
+    use chain::{
+        HashableEvent, HashableEventV2, RecomputedHash, SUPPORTED_CHAIN_VERSIONS, genesis_hash,
+        prune_genesis_hash,
+    };
     use retention::{MIN_RETENTION_DAYS, build_prune_point, try_prune_at};
     use secret::{create_secret, decode_hex_secret, flock_exclusive, read_secret};
     use verify::{AuditError, display_timestamp};
@@ -743,9 +749,13 @@ mod tests {
         logger
     }
 
+    /// #177 B3: `logger.append()` now writes `chain_version: 2`, so a
+    /// tamper against its output exercises the *detected* side of the
+    /// v1/v2 asymmetry (shape enumeration §5). `_remains_silent_on_v1_entries`
+    /// below covers the still-undetectable v1 side.
     #[test]
-    fn provenance_value_tampering_is_silent_under_design_a() {
-        let dir = test_dir("tamper-semantic-420");
+    fn provenance_value_tampering_is_detected_on_v2_entries() {
+        let dir = test_dir("tamper-semantic-420-v2");
         let logger = provenance_tamper_fixture(&dir);
 
         let content = fs::read_to_string(&logger.path).unwrap();
@@ -757,31 +767,33 @@ mod tests {
             first.get("pid").is_some(),
             "precondition: first line must actually carry a pid value to tamper with"
         );
-        // Same JSON shape, different value — exactly what a same-user
-        // attacker with direct audit.jsonl write access could do.
+        assert_eq!(
+            first.get("chain_version").and_then(|v| v.as_u64()),
+            Some(2),
+            "precondition: logger.append() must write the current (v2) chain_version"
+        );
         first["pid"] = serde_json::json!(999_999);
         lines[0] = serde_json::to_string(&first).unwrap();
         fs::write(&logger.path, lines.join("\n") + "\n").unwrap();
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert_eq!(
-            result.broken_at, None,
-            "Design A: a value-only edit to a provenance field must not be \
-             detectable via the hash chain — this is the accepted cost, not a bug"
+            result.broken_at,
+            Some(0),
+            "#177 B3: pid is now part of HashableEventV2 — a value-only edit to a v2 entry's \
+             provenance field MUST be detected via the hash chain"
         );
         assert_eq!(result.torn_lines, 0);
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// #177 B2: mirrors `provenance_value_tampering_is_silent_under_design_a`
-    /// above — `wrapper_kind` is a second field outside `HashableEvent`
-    /// (SECURITY.md "Channel separation", Design A). Without this test the
-    /// SECURITY.md claim that `wrapper_kind` tampering is chain-silent is
-    /// documentation-only, unverified against the actual implementation.
+    /// #177 B2/B3: mirrors `provenance_value_tampering_is_detected_on_v2_entries`
+    /// above for `wrapper_kind`, the second field HashableEventV2 newly
+    /// protects.
     #[test]
-    fn wrapper_kind_tampering_is_silent_under_design_a() {
-        let dir = test_dir("tamper-wrapper-kind-177b2");
+    fn wrapper_kind_tampering_is_detected_on_v2_entries() {
+        let dir = test_dir("tamper-wrapper-kind-177b3-v2");
         let logger = test_logger(&dir);
         let mut first_event = make_event("first-cmd");
         first_event.wrapper_kind = Some("env".to_string());
@@ -798,19 +810,384 @@ mod tests {
             Some("env"),
             "precondition: first line must actually carry a wrapper_kind value to tamper with"
         );
-        // Same JSON shape, different value — exactly what a same-user
-        // attacker with direct audit.jsonl write access could do.
+        assert_eq!(
+            first.get("chain_version").and_then(|v| v.as_u64()),
+            Some(2),
+            "precondition: logger.append() must write the current (v2) chain_version"
+        );
         first["wrapper_kind"] = serde_json::json!("sudo");
         lines[0] = serde_json::to_string(&first).unwrap();
         fs::write(&logger.path, lines.join("\n") + "\n").unwrap();
 
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert_eq!(
-            result.broken_at, None,
-            "Design A: a value-only edit to wrapper_kind must not be detectable via the hash \
-             chain — this is the accepted cost (SECURITY.md 'Channel separation'), not a bug"
+            result.broken_at,
+            Some(0),
+            "#177 B3: wrapper_kind is now part of HashableEventV2 — a value-only edit to a v2 \
+             entry's wrapper_kind MUST be detected via the hash chain"
         );
         assert_eq!(result.torn_lines, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #177 B3: writes a 2-entry V1-tagged chain directly (not via
+    /// `logger.append()`, which now writes v2) — the first entry carries
+    /// fixed `pid`/`wrapper_kind` values to tamper with. Fixed, not
+    /// `ProcessProvenance::collect()`'s real environment values (unlike
+    /// `provenance_tamper_fixture` above): this fixture isn't golden-hex
+    /// pinned, but determinism still matters for readable failure output.
+    fn v1_provenance_and_wrapper_tamper_fixture(dir: &Path) -> PathBuf {
+        test_logger(dir); // secret file only; audit.jsonl written below
+        let path = dir.join("audit.jsonl");
+        let genesis = genesis_hash(Some(&TEST_SECRET));
+
+        let mut first = make_event("first-cmd");
+        first.chain_version = Some(1);
+        first.seq = Some(0);
+        first.prev_hash = Some(genesis);
+        first.key_id = Some("default".to_string());
+        first.pid = Some(4242);
+        first.wrapper_kind = Some("env".to_string());
+        first.entry_hash = Some(
+            compute_entry_hash(Some(&TEST_SECRET), &first)
+                .expect_hash("v1_provenance_and_wrapper_tamper_fixture: first"),
+        );
+
+        let mut second = make_event("second-cmd");
+        second.chain_version = Some(1);
+        second.seq = Some(1);
+        second.prev_hash = first.entry_hash.clone();
+        second.key_id = Some("default".to_string());
+        second.entry_hash = Some(
+            compute_entry_hash(Some(&TEST_SECRET), &second)
+                .expect_hash("v1_provenance_and_wrapper_tamper_fixture: second"),
+        );
+
+        let content = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap(),
+        );
+        fs::write(&path, content).unwrap();
+        path
+    }
+
+    /// #177 B3: the permanent, non-negotiable half of the v1/v2 asymmetry
+    /// (shape enumeration §5, A-4) — a v1 entry's provenance was never
+    /// hash-protected and B3 does not retroactively protect it (existing
+    /// audit.jsonl bytes are never rewritten). If this test ever starts
+    /// failing (`broken_at` becoming `Some`), that means V1 hashing
+    /// changed, which would break every existing user's audit.jsonl.
+    #[test]
+    fn provenance_value_tampering_remains_silent_on_v1_entries() {
+        let dir = test_dir("tamper-semantic-420-v1");
+        let path = v1_provenance_and_wrapper_tamper_fixture(&dir);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(first["pid"], serde_json::json!(4242));
+        first["pid"] = serde_json::json!(999_999);
+        lines[0] = serde_json::to_string(&first).unwrap();
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "Design A, permanent for v1: a value-only edit to a v1 entry's provenance field \
+             must never be detectable via the hash chain — existing audit.jsonl bytes are \
+             never rewritten, so this is not a bug to fix"
+        );
+        assert_eq!(result.torn_lines, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #177 B3: mirrors `provenance_value_tampering_remains_silent_on_v1_entries`
+    /// for `wrapper_kind`.
+    #[test]
+    fn wrapper_kind_tampering_remains_silent_on_v1_entries() {
+        let dir = test_dir("tamper-wrapper-kind-177b3-v1");
+        let path = v1_provenance_and_wrapper_tamper_fixture(&dir);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        let mut first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(first["wrapper_kind"], serde_json::json!("env"));
+        first["wrapper_kind"] = serde_json::json!("sudo");
+        lines[0] = serde_json::to_string(&first).unwrap();
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "Design A, permanent for v1: a value-only edit to a v1 entry's wrapper_kind must \
+             never be detectable via the hash chain — existing audit.jsonl bytes are never \
+             rewritten, so this is not a bug to fix"
+        );
+        assert_eq!(result.torn_lines, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #177 B3: the single most important tampering test in this module
+    /// (shape enumeration §5.2). A chain with v1 entries followed by v2
+    /// entries — the exact shape every existing user's log takes on
+    /// upgrade — proves per-entry, stateless dispatch rather than a
+    /// degenerate file-level version check: tampering the v1 portion stays
+    /// silent (all 4 entries still verify), but the SAME dispatch applied
+    /// to the v2 portion of the SAME chain detects tampering. Splitting
+    /// this into two single-version files (as the 4 tests above do) could
+    /// only ever show "v1 files behave differently from v2 files" — never
+    /// that a single chain switches behavior mid-stream at the version
+    /// boundary, which is what #177 B3 actually implements.
+    /// The v1 portion (seq 0-1) is built directly, the same structural
+    /// necessity as `hash_v1_algorithm_is_frozen` above (`logger.append()`
+    /// can only ever write the current `CHAIN_VERSION`, now 2). The v2
+    /// portion (seq 2-3) is appended through the REAL `AuditLogger::append`
+    /// (Codex Phase 6-B): the original version of this fixture built both
+    /// halves through the same direct `compute_entry_hash` call, which
+    /// couldn't distinguish a bug in `compute_entry_hash` itself from a bug
+    /// in `append()`'s own wiring onto an existing tail — routing the v2
+    /// half through the production writer closes that gap for exactly the
+    /// entries this test's Part 2 assertion (tampering the v2 side) relies
+    /// on.
+    fn write_mixed_v1_v2_provenance_fixture(dir: &Path) -> PathBuf {
+        // `test_logger`'s own return value is the logger this fixture needs
+        // for its v2 (real-append) half below — keep it instead of
+        // discarding it and rebuilding an identical one later (/simplify).
+        let logger = test_logger(dir);
+        let path = logger.path.clone();
+        let genesis = genesis_hash(Some(&TEST_SECRET));
+        let mut prev_hash = genesis;
+        let mut lines = Vec::new();
+
+        for i in 0..2u64 {
+            let mut event = make_event(&format!("cmd{i}"));
+            event.chain_version = Some(1);
+            event.seq = Some(i);
+            event.prev_hash = Some(prev_hash.clone());
+            event.key_id = Some("default".to_string());
+            event.pid = Some(4242);
+            event.entry_hash = Some(
+                compute_entry_hash(Some(&TEST_SECRET), &event)
+                    .expect_hash("write_mixed_v1_v2_provenance_fixture: v1"),
+            );
+            prev_hash = event.entry_hash.clone().unwrap();
+            lines.push(serde_json::to_string(&event).unwrap());
+        }
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        for i in 2..4u64 {
+            let mut event = make_event(&format!("cmd{i}"));
+            event.pid = Some(4242);
+            logger.append(event).unwrap();
+        }
+
+        path
+    }
+
+    #[test]
+    fn v1_and_v2_tamper_asymmetry_within_one_chain() {
+        // Part 1: tamper the v1 portion (seq=0) of a v1→v2 chain — must
+        // stay silent, and verification must still reach and confirm all
+        // 4 entries (the v2 tail included), not just stop quietly.
+        let dir_v1 = test_dir("tamper-asymmetry-v1-side");
+        let path_v1 = write_mixed_v1_v2_provenance_fixture(&dir_v1);
+        let content = fs::read_to_string(&path_v1).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        let mut seq0: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(seq0["chain_version"], serde_json::json!(1));
+        seq0["pid"] = serde_json::json!(999_999);
+        lines[0] = serde_json::to_string(&seq0).unwrap();
+        fs::write(&path_v1, lines.join("\n") + "\n").unwrap();
+
+        let result_v1_tamper = verify_chain(&verify_config(&dir_v1)).unwrap();
+        assert_eq!(
+            result_v1_tamper.broken_at, None,
+            "tampering the v1 (seq=0) portion of a mixed v1→v2 chain must stay silent"
+        );
+        assert_eq!(
+            result_v1_tamper.chain_entries, 4,
+            "all 4 entries (v1 and v2) must still verify — the v1 tamper doesn't just get \
+             silently skipped, the rest of the chain genuinely checks out"
+        );
+        assert_eq!(result_v1_tamper.v1_entries, 2);
+        assert_eq!(result_v1_tamper.v2_entries, 2);
+        let _ = fs::remove_dir_all(&dir_v1);
+
+        // Part 2: fresh copy of the same mixed chain, tamper the v2 portion
+        // (seq=2) instead — same per-entry dispatch, opposite outcome.
+        let dir_v2 = test_dir("tamper-asymmetry-v2-side");
+        let path_v2 = write_mixed_v1_v2_provenance_fixture(&dir_v2);
+        let content = fs::read_to_string(&path_v2).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        let mut seq2: serde_json::Value = serde_json::from_str(&lines[2]).unwrap();
+        assert_eq!(seq2["chain_version"], serde_json::json!(2));
+        seq2["pid"] = serde_json::json!(999_999);
+        lines[2] = serde_json::to_string(&seq2).unwrap();
+        fs::write(&path_v2, lines.join("\n") + "\n").unwrap();
+
+        let result_v2_tamper = verify_chain(&verify_config(&dir_v2)).unwrap();
+        assert_eq!(
+            result_v2_tamper.broken_at,
+            Some(2),
+            "tampering the v2 (seq=2) portion of the SAME mixed chain shape must be detected \
+             — proving per-entry dispatch, not a degenerate file-level version check"
+        );
+        let _ = fs::remove_dir_all(&dir_v2);
+    }
+
+    /// #177 B3 (Codex Round 1 P1): shape-enumeration release blocker T-09
+    /// (`read_chain_state` accepting a v1 tail as safe-to-append-after) was
+    /// otherwise only exercised indirectly, through hand-built fixtures
+    /// that never touch `AuditLogger::append()` itself. This test drives
+    /// the real production writer path starting from a genuine v1 tail,
+    /// proving `append()` — not just `verify_chain`'s dispatch — correctly
+    /// continues a v1 chain with a new v2 entry.
+    #[test]
+    fn append_continues_a_v1_tail_with_a_v2_entry() {
+        let dir = test_dir("append-v1-tail-v2-continue");
+        let logger = test_logger(&dir); // audit.jsonl written below
+        let path = logger.path.clone();
+        let ts = "2026-01-01T00:00:00Z";
+        let entries: [(&str, &str); 2] = [("cmd0", ts), ("cmd1", ts)];
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
+
+        let before = read_events(&path);
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[1]["chain_version"], serde_json::json!(1));
+        let last_v1_seq = before[1]["seq"].as_u64().unwrap();
+        let last_v1_hash = before[1]["entry_hash"].as_str().unwrap().to_string();
+
+        logger.append(make_event("cmd2")).unwrap();
+
+        let after = read_events(&path);
+        assert_eq!(after.len(), 3);
+        assert_eq!(
+            after[2]["chain_version"],
+            serde_json::json!(2),
+            "append() must write the current CHAIN_VERSION (2) onto a v1 tail"
+        );
+        assert_eq!(
+            after[2]["seq"].as_u64().unwrap(),
+            last_v1_seq + 1,
+            "seq must continue from the v1 tail's last seq, not restart"
+        );
+        assert_eq!(
+            after[2]["prev_hash"].as_str().unwrap(),
+            last_v1_hash,
+            "prev_hash must chain onto the v1 tail's entry_hash"
+        );
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "a v1 tail continued by a real append()'d v2 entry must verify intact"
+        );
+        assert_eq!(result.chain_entries, 3);
+        assert_eq!(result.v1_entries, 2);
+        assert_eq!(result.v2_entries, 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #177 B3 (Codex Round 1 P1): shape-enumeration release blocker T-08
+    /// (`verify_chain`'s raw-JSON fallback peek must not misreport a
+    /// genuinely corrupted but *supported*-version entry as "unrecognized
+    /// version"). Corrupts `pid`'s type (not `chain_version`/`seq`, which
+    /// the fallback peek itself reads) on a v1 entry — `AuditEvent`
+    /// deserialization fails entirely, but the peek still succeeds and
+    /// finds `chain_version: 1`, a supported value, so this must fall
+    /// through to `torn_lines`, not get classified as an unrecognized
+    /// version and tell the operator to upgrade omamori for what is
+    /// actually plain corruption on an already-current binary.
+    #[test]
+    fn verify_v1_corruption_is_torn_not_unrecognized_version() {
+        let dir = test_dir("verify-v1-corruption-torn");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        let entries: [(&str, &str); 1] = [("cmd0", "2026-01-01T00:00:00Z")];
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["chain_version"], serde_json::json!(1));
+        event["pid"] = serde_json::json!("not-a-number");
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        )
+        .unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.torn_lines, 1,
+            "type-corrupted v1 line must fail AuditEvent deserialization and count as torn"
+        );
+        assert_eq!(
+            result.unknown_version_at, None,
+            "a corrupted-but-SUPPORTED (v1) chain_version must never be reported as an \
+             unrecognized version — T-08"
+        );
+        assert_eq!(result.chain_entries, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #177 B3 (Codex Phase 6-B, Finding 5): the shape-enumeration report's
+    /// F-I shape ("legacy → v1 → v2", the longest-lived possible log) —
+    /// no existing test combined all three eras in one file. Legacy is
+    /// hand-written (no `chain_version` key, genuine pre-#164 history), v1
+    /// is hand-built (`logger.append()` can't produce it post-flip), and v2
+    /// is appended through the real production writer, continuing the v1
+    /// tail — proving `legacy_entries`/`v1_entries`/`v2_entries` are each
+    /// counted correctly and the whole chain verifies intact end to end.
+    #[test]
+    fn verify_legacy_then_v1_then_v2_chain() {
+        let dir = test_dir("verify-legacy-v1-v2");
+        let logger = test_logger(&dir);
+        let path = logger.path.clone();
+
+        let legacy = serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "provider": "test",
+            "command": "old",
+            "action": "passthrough",
+            "result": "passthrough",
+            "target_count": 0,
+            "target_hash": "legacy"
+        });
+        fs::write(&path, serde_json::to_string(&legacy).unwrap() + "\n").unwrap();
+
+        let genesis = genesis_hash(Some(&TEST_SECRET));
+        let mut v1_event = make_event("cmd-v1");
+        v1_event.chain_version = Some(1);
+        v1_event.seq = Some(0);
+        v1_event.prev_hash = Some(genesis);
+        v1_event.key_id = Some("default".to_string());
+        v1_event.entry_hash = Some(
+            compute_entry_hash(Some(&TEST_SECRET), &v1_event)
+                .expect_hash("verify_legacy_then_v1_then_v2_chain: v1"),
+        );
+        let mut content = fs::read_to_string(&path).unwrap();
+        content.push_str(&serde_json::to_string(&v1_event).unwrap());
+        content.push('\n');
+        fs::write(&path, content).unwrap();
+
+        logger.append(make_event("cmd-v2-a")).unwrap();
+        logger.append(make_event("cmd-v2-b")).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "legacy -> v1 -> v2 chain must verify intact end to end"
+        );
+        assert_eq!(result.legacy_entries, 1);
+        assert_eq!(result.chain_entries, 3);
+        assert_eq!(result.v1_entries, 1);
+        assert_eq!(result.v2_entries, 2);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1116,18 +1493,25 @@ mod tests {
     //     fields invalidates these entry-hash goldens even if the HMAC
     //     algorithm itself is unchanged)
     //
-    // How to regenerate (if a deliberate algorithm change lands):
-    //   Run `chain_integrity_verification` with a temporary
-    //   `println!("{events:#?}");` inserted after `read_events(&logger.path)`.
-    //   Read the printed `entry_hash` and `prev_hash` fields
-    //   (events[0].prev_hash == genesis). Paste below and delete the
-    //   `println!`. Do NOT regenerate by calling `compute_entry_hash`
-    //   directly on a `make_event(...)` result — the chain fields
-    //   (seq / prev_hash / key_id) would be `None` and the digest would
-    //   diverge from what `append` writes. Changing `test_logger` defaults
-    //   (key_id, retention_days, etc.) also invalidates these goldens.
+    // #177 B3: this golden set is FROZEN. `GOLDEN_ENTRY_HASHES_V1`'s 5
+    // values were captured before CHAIN_VERSION ever left `1` and must
+    // NEVER be regenerated — they are the only remaining byte-level proof
+    // that V1 hashing is unchanged after V2 was introduced. The "how to
+    // regenerate" recipe that used to live here (run
+    // `chain_integrity_verification` with a temporary `println!`, since it
+    // used the real `AuditLogger::append()` writer path) is GONE on
+    // purpose: `append()` now writes whatever CHAIN_VERSION currently is
+    // (v2), so running that recipe today would silently produce V2 hashes
+    // and, if pasted here by mistake, permanently destroy the V1 proof.
+    // V1-hashing regression coverage lives in `hash_v1_algorithm_is_frozen`
+    // below, which builds a V1-tagged fixture directly (not via `append()`)
+    // and re-derives these exact literals from it.
+    //
+    // If GOLDEN_ENTRY_HASHES_V1 ever needs to change, that is not a
+    // "regeneration" — it is a NEW chain_version (3) with its own
+    // GOLDEN_ENTRY_HASHES_V3 database. Never edit these 5 values in place.
     const GOLDEN_GENESIS: &str = "d9c14c4fc7dbc19fce81268a054a22fa092e4946cc762823bd641e156233030b";
-    const GOLDEN_ENTRY_HASHES: [&str; 5] = [
+    const GOLDEN_ENTRY_HASHES_V1: [&str; 5] = [
         // seq=0, command="cmd0"
         "ff8d28e58ca55a781c908beb827387f22418350d8b7399b2fdecae1a1f805bf2",
         // seq=1, command="cmd1"
@@ -1139,6 +1523,78 @@ mod tests {
         // seq=4, command="cmd4"
         "3554f31aac0e3a9ea21afb2f572e09e343c841c21faf2ebf2208f89fc687d165",
     ];
+
+    /// #177 B3: `chain_integrity_verification` and the `chain_tamper_*`
+    /// tests below all build their fixtures via `logger.append()` — the
+    /// real production writer path (see "WHY golden vectors" above), which
+    /// writes whatever `CHAIN_VERSION` currently is. That is now `2`, so
+    /// these are the V2 goldens, captured once via `append()` immediately
+    /// after the version flip (same one-time-capture discipline as V1 had
+    /// before it was frozen). If `CHAIN_VERSION` ever moves to `3`, these
+    /// 5 values freeze in turn and a `GOLDEN_ENTRY_HASHES_V3` set takes
+    /// over the tests below — do not edit these in place either.
+    const GOLDEN_ENTRY_HASHES_V2: [&str; 5] = [
+        // seq=0, command="cmd0"
+        "5a058a41787911477162e2ec1630527bbb68cabd989628f5ca5d0973ad7ffeb4",
+        // seq=1, command="cmd1"
+        "d0d0de2d965fe5c8ea3bbae211da6890d54af5ed4a35fc88900ce08bf4a9e11c",
+        // seq=2, command="cmd2"
+        "0b607702134d38ef8f0631af11c0fcb8eacedac17a0af76ef38b1a1914f2a358",
+        // seq=3, command="cmd3"
+        "bf80f841b96df92a8fb789896f8809e8158ba4dff9c84d8a298bebc83b97321a",
+        // seq=4, command="cmd4"
+        "25880d3a375eecd6d0873b548ea73dee044edb00784bbfc73d849dca69fcb8f5",
+    ];
+
+    /// #177 B3: `chain_integrity_verification` below moved to testing V2
+    /// (it uses `logger.append()`, the real writer, which now produces V2)
+    /// — this is what keeps `GOLDEN_ENTRY_HASHES_V1` from becoming
+    /// unreachable dead weight. Builds a V1-tagged fixture directly via
+    /// `write_chain_entries(.., 1)` (bypassing the current-version-only
+    /// writer path) and re-derives the exact frozen literals, proving V1
+    /// hashing is byte-for-byte unchanged after V2 was introduced.
+    #[test]
+    fn hash_v1_algorithm_is_frozen() {
+        let dir = test_dir("hash-v1-algorithm-is-frozen");
+        let path = dir.join("audit.jsonl");
+        // Fixed timestamp for every entry, matching `make_event`'s default
+        // (not per-index) — `GOLDEN_ENTRY_HASHES_V1` was originally captured
+        // via `make_event(&format!("cmd{i}"))`, whose timestamp field is a
+        // constant regardless of `i`. `write_chain_entries` goes through
+        // `make_event_with_timestamp`, which only differs from `make_event`
+        // if given a different timestamp — passing this same constant
+        // reproduces the identical fixture.
+        let ts = "2026-01-01T00:00:00Z";
+        let entries: [(&str, &str); 5] = [
+            ("cmd0", ts),
+            ("cmd1", ts),
+            ("cmd2", ts),
+            ("cmd3", ts),
+            ("cmd4", ts),
+        ];
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
+
+        let events = read_events(&path);
+        assert_eq!(events.len(), 5);
+
+        assert_eq!(
+            events[0]["prev_hash"].as_str().unwrap(),
+            GOLDEN_GENESIS,
+            "V1 genesis hash must remain byte-identical — this is the frozen proof, \
+             never regenerate this value"
+        );
+        for (i, expected) in GOLDEN_ENTRY_HASHES_V1.iter().enumerate() {
+            assert_eq!(
+                events[i]["entry_hash"].as_str().unwrap(),
+                *expected,
+                "V1 entry_hash at seq={i} drifted — GOLDEN_ENTRY_HASHES_V1 must be frozen; \
+                 if this fails, V1 hashing changed and every existing user's audit.jsonl \
+                 will fail verification"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn chain_integrity_verification() {
@@ -1163,7 +1619,7 @@ mod tests {
         // Pin each entry's recorded entry_hash + prev_hash chain against
         // the golden. Using hardcoded hex breaks the symmetry of the old
         // self-verifying helper (compute_entry_hash on both sides).
-        for (i, expected) in GOLDEN_ENTRY_HASHES.iter().enumerate() {
+        for (i, expected) in GOLDEN_ENTRY_HASHES_V2.iter().enumerate() {
             assert_eq!(
                 events[i]["entry_hash"].as_str().unwrap(),
                 *expected,
@@ -1172,7 +1628,7 @@ mod tests {
             let expected_prev = if i == 0 {
                 GOLDEN_GENESIS
             } else {
-                GOLDEN_ENTRY_HASHES[i - 1]
+                GOLDEN_ENTRY_HASHES_V2[i - 1]
             };
             assert_eq!(
                 events[i]["prev_hash"].as_str().unwrap(),
@@ -1210,15 +1666,15 @@ mod tests {
         // a future algorithm change can't paper over a real tamper.
         let parsed_seq1: AuditEvent = serde_json::from_value(events[1].clone()).unwrap();
         let recomputed_seq1 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq1)
-            .expect_hash("chain_tamper_detected: seq=1 is a real v1 entry");
+            .expect_hash("chain_tamper_detected: seq=1 is a real v2 entry");
 
         assert_eq!(
             events[1]["entry_hash"].as_str().unwrap(),
-            GOLDEN_ENTRY_HASHES[1],
+            GOLDEN_ENTRY_HASHES_V2[1],
             "tampered line should still carry the pre-tamper recorded hash"
         );
         assert_ne!(
-            recomputed_seq1, GOLDEN_ENTRY_HASHES[1],
+            recomputed_seq1, GOLDEN_ENTRY_HASHES_V2[1],
             "recomputed hash over tampered payload must diverge from golden — \
              this is the tamper signal"
         );
@@ -1267,12 +1723,12 @@ mod tests {
         // adjacent-pair linkage breaks.
         assert_eq!(
             events[1]["entry_hash"].as_str().unwrap(),
-            GOLDEN_ENTRY_HASHES[2],
+            GOLDEN_ENTRY_HASHES_V2[2],
             "reordered position 1 carries original seq=2's entry_hash (unchanged by reorder)"
         );
         assert_eq!(
             events[1]["prev_hash"].as_str().unwrap(),
-            GOLDEN_ENTRY_HASHES[1],
+            GOLDEN_ENTRY_HASHES_V2[1],
             "position 1's prev_hash still references its original predecessor (seq=1)"
         );
         assert_ne!(
@@ -1327,12 +1783,12 @@ mod tests {
         // Surviving on-disk position 1 = original seq=2.
         assert_eq!(
             events[1]["entry_hash"].as_str().unwrap(),
-            GOLDEN_ENTRY_HASHES[2],
+            GOLDEN_ENTRY_HASHES_V2[2],
             "surviving position 1 carries original seq=2's entry_hash"
         );
         assert_eq!(
             events[1]["prev_hash"].as_str().unwrap(),
-            GOLDEN_ENTRY_HASHES[1],
+            GOLDEN_ENTRY_HASHES_V2[1],
             "surviving position 1 still references the deleted seq=1's hash"
         );
         assert_ne!(
@@ -1443,14 +1899,14 @@ mod tests {
         // chain_tamper_detected above, applied to the genesis event.
         assert_eq!(
             events[0]["entry_hash"].as_str().unwrap(),
-            GOLDEN_ENTRY_HASHES[0],
+            GOLDEN_ENTRY_HASHES_V2[0],
             "attacker only flipped prev_hash bytes; entry_hash byte sequence unchanged"
         );
         let parsed_seq0: AuditEvent = serde_json::from_value(events[0].clone()).unwrap();
         let recomputed_seq0 = compute_entry_hash(Some(&TEST_SECRET), &parsed_seq0)
-            .expect_hash("chain_tamper_genesis_rewrite_detected: seq=0 is a real v1 entry");
+            .expect_hash("chain_tamper_genesis_rewrite_detected: seq=0 is a real v2 entry");
         assert_ne!(
-            recomputed_seq0, GOLDEN_ENTRY_HASHES[0],
+            recomputed_seq0, GOLDEN_ENTRY_HASHES_V2[0],
             "recomputed entry_hash over tampered (prev_hash-rewritten) genesis payload \
              diverges from golden — this is the genesis-rewrite tamper signal"
         );
@@ -1989,6 +2445,15 @@ mod tests {
             result.unverified_entries_after, 3,
             "the unknown-version entry itself plus the 2 fake-v1 lines after it"
         );
+        // #177 B3 (Codex Phase 6-B): the 2 entries before the cutoff were
+        // written by logger.append() — the current writer, chain_version 2
+        // — and must be the only ones counted. The 2 fake-v1 lines after
+        // unknown_version_at claim chain_version 1 but were never verified
+        // (VerifyResult's own doc comment: entries at or after
+        // unknown_version_at are excluded from v1_entries/v2_entries,
+        // since counting them would assert a version for unverified data).
+        assert_eq!(result.v1_entries, 0);
+        assert_eq!(result.v2_entries, 2);
         assert!(result.broken_at.is_none());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2019,6 +2484,7 @@ mod tests {
                 ("cmd1", "2026-01-01T00:00:01Z"),
                 ("cmd2", "2026-01-01T00:00:02Z"),
             ],
+            1,
         );
         append_unknown_version_line(&path, 3);
 
@@ -2473,18 +2939,30 @@ mod tests {
     }
 
     /// Write chain entries directly with given timestamps (bypass append to control timestamps).
-    fn write_chain_entries(path: &Path, secret: &[u8; 32], entries: &[(&str, &str)]) {
+    /// `version` is explicit, not `CHAIN_VERSION` (#177 B3, shape
+    /// enumeration T-01): before B3 this always meant "the current
+    /// version" because only one existed. Once `CHAIN_VERSION` can flip,
+    /// defaulting to it here would silently rewrite every one of this
+    /// helper's ~10 call sites (mostly prune/retention fixtures) to whatever
+    /// version happens to be current, erasing their v1-specific coverage
+    /// with no signal that anything changed. Uses `compute_entry_hash`
+    /// directly (not `compute_entry_hash_for_write`, T-06): the writer-only
+    /// helper's `debug_assert_eq!(chain_version, CHAIN_VERSION)` exists to
+    /// catch production writer bugs, and would wrongly panic here whenever
+    /// this fixture helper is asked for a non-current version on purpose.
+    fn write_chain_entries(path: &Path, secret: &[u8; 32], entries: &[(&str, &str)], version: u32) {
         let genesis = genesis_hash(Some(secret));
         let mut prev_hash = genesis;
         let mut content = String::new();
 
         for (seq, (command, timestamp)) in entries.iter().enumerate() {
             let mut event = make_event_with_timestamp(command, timestamp);
-            event.chain_version = Some(CHAIN_VERSION);
+            event.chain_version = Some(version);
             event.seq = Some(seq as u64);
             event.prev_hash = Some(prev_hash.clone());
             event.key_id = Some("default".to_string());
-            event.entry_hash = Some(compute_entry_hash_for_write(Some(secret), &event));
+            event.entry_hash =
+                Some(compute_entry_hash(Some(secret), &event).expect_hash("write_chain_entries"));
             prev_hash = event.entry_hash.clone().unwrap();
             content.push_str(&serde_json::to_string(&event).unwrap());
             content.push('\n');
@@ -2550,7 +3028,7 @@ mod tests {
         }
 
         let refs: Vec<(&str, &str)> = entries.to_vec();
-        write_chain_entries(&path, &TEST_SECRET, &refs);
+        write_chain_entries(&path, &TEST_SECRET, &refs, 1);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -2587,7 +3065,7 @@ mod tests {
 
         let new_ts = "2026-04-04T00:00:00Z";
         let entries: Vec<(&str, &str)> = (0..1100).map(|_| ("cmd", new_ts)).collect();
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -2622,7 +3100,7 @@ mod tests {
         for _ in 0..500 {
             entries.push(("new", new_ts));
         }
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -2650,7 +3128,7 @@ mod tests {
 
         let old_ts = "2020-01-01T00:00:00Z";
         let entries: Vec<(&str, &str)> = (0..100).map(|_| ("cmd", old_ts)).collect();
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -2685,7 +3163,7 @@ mod tests {
         for _ in 0..1100 {
             entries.push(("new", new_ts));
         }
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -2721,7 +3199,7 @@ mod tests {
 
         let ts = "2026-04-04T00:00:00Z";
         let entries: Vec<(&str, &str)> = (0..10).map(|_| ("cmd", ts)).collect();
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let events = read_events(&path);
         let retained = &events[5..];
@@ -2762,7 +3240,7 @@ mod tests {
         for _ in 0..1100 {
             entries.push(("new", new_ts));
         }
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -2819,7 +3297,7 @@ mod tests {
         for _ in 0..1100 {
             entries.push(("new", new_ts));
         }
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -2892,7 +3370,7 @@ mod tests {
 
         let ts = "2026-04-04T00:00:00Z";
         let entries: Vec<(&str, &str)> = (0..5).map(|_| ("cmd", ts)).collect();
-        write_chain_entries(&path, &TEST_SECRET, &entries);
+        write_chain_entries(&path, &TEST_SECRET, &entries, 1);
 
         let content = fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -3414,10 +3892,176 @@ mod tests {
         );
         assert_eq!(
             json, expected,
-            "HashableEvent field order has changed! \
-            This WILL break verify_chain on all existing audit.jsonl files. \
-            If this is intentional (new chain_version), update this test and bump CHAIN_VERSION."
+            "HashableEvent (V1) field order has changed! This WILL break verify_chain on all \
+            existing audit.jsonl files. V1 is frozen — never edit this expectation. A new \
+            chain_version gets a new HashableEventVn + its own golden test (see GR-002-V2)."
         );
+    }
+
+    // --- GR-002-V2: HashableEventV2 serialization order golden test (#177 B3) ---
+
+    /// #177 B3: mirrors GR-002 above for `chain_version: 2`. The 5 new
+    /// fields (`pid`/`ppid`/`parent_process`/`cwd_hash`/`wrapper_kind`) are
+    /// pairwise same-typed (`Option<u32>` × 2, `Option<String>` × 3) —
+    /// deliberately given 5 *distinct*, non-`None` values here (never all
+    /// `None`) so a field-swap bug in `HashableEventV2::from_event` (e.g.
+    /// `ppid: event.pid`) shows up as a JSON diff instead of silently
+    /// passing (shape enumeration T-05, architect subagent finding).
+    #[test]
+    fn hashable_event_v2_serialization_order_is_stable() {
+        let event = AuditEvent {
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            provider: "test-provider".to_string(),
+            command: "rm -rf /".to_string(),
+            rule_id: Some("test-rule".to_string()),
+            action: "block".to_string(),
+            result: "blocked".to_string(),
+            target_count: 1,
+            target_hash: "abc123".to_string(),
+            detection_layer: Some("layer1".to_string()),
+            unwrap_chain: None,
+            raw_input_hash: None,
+            chain_version: Some(2),
+            seq: Some(42),
+            prev_hash: Some("prev000".to_string()),
+            key_id: Some("default".to_string()),
+            entry_hash: None,
+            pid: Some(4242),
+            ppid: Some(1717),
+            parent_process: Some("/bin/parent".to_string()),
+            cwd_hash: Some("cwdhash".to_string()),
+            wrapper_kind: Some("env".to_string()),
+        };
+        let json = serde_json::to_string(&HashableEventV2::from_event(&event)).unwrap();
+
+        let expected = concat!(
+            r#"{"chain_version":2,"seq":42,"prev_hash":"prev000","key_id":"default","#,
+            r#""timestamp":"2026-01-01T00:00:00Z","provider":"test-provider","#,
+            r#""command":"rm -rf /","rule_id":"test-rule","action":"block","#,
+            r#""result":"blocked","target_count":1,"target_hash":"abc123","#,
+            r#""detection_layer":"layer1","unwrap_chain":null,"raw_input_hash":null,"#,
+            r#""pid":4242,"ppid":1717,"parent_process":"/bin/parent","#,
+            r#""cwd_hash":"cwdhash","wrapper_kind":"env"}"#,
+        );
+        assert_eq!(
+            json, expected,
+            "HashableEventV2 field order has changed! This WILL break verify_chain on all \
+            existing v2 audit.jsonl entries. If intentional, this is itself a new \
+            chain_version (3) and needs its own HashableEventV3 + golden test — never repurpose \
+            this one."
+        );
+    }
+
+    /// #177 B3: proves each of the 5 new V2-only fields is actually
+    /// included in the hash — not just present in the struct definition.
+    /// Mutation-tested by construction: for each field, two events that
+    /// differ ONLY in that field must hash differently.
+    #[test]
+    fn hash_v2_includes_all_five_new_fields() {
+        fn base_event() -> AuditEvent {
+            let mut e = make_event("cmd0");
+            e.chain_version = Some(2);
+            e.seq = Some(0);
+            e.prev_hash = Some("genesis".to_string());
+            e.key_id = Some("default".to_string());
+            e
+        }
+
+        let baseline = base_event();
+        let baseline_hash = compute_entry_hash(Some(&TEST_SECRET), &baseline).expect_hash("base");
+
+        let mut varied = base_event();
+        varied.pid = Some(999);
+        assert_ne!(
+            compute_entry_hash(Some(&TEST_SECRET), &varied).expect_hash("pid"),
+            baseline_hash,
+            "pid must be part of the V2 hash"
+        );
+
+        let mut varied = base_event();
+        varied.ppid = Some(999);
+        assert_ne!(
+            compute_entry_hash(Some(&TEST_SECRET), &varied).expect_hash("ppid"),
+            baseline_hash,
+            "ppid must be part of the V2 hash"
+        );
+
+        let mut varied = base_event();
+        varied.parent_process = Some("/bin/other".to_string());
+        assert_ne!(
+            compute_entry_hash(Some(&TEST_SECRET), &varied).expect_hash("parent_process"),
+            baseline_hash,
+            "parent_process must be part of the V2 hash"
+        );
+
+        let mut varied = base_event();
+        varied.cwd_hash = Some("other-cwd-hash".to_string());
+        assert_ne!(
+            compute_entry_hash(Some(&TEST_SECRET), &varied).expect_hash("cwd_hash"),
+            baseline_hash,
+            "cwd_hash must be part of the V2 hash"
+        );
+
+        let mut varied = base_event();
+        varied.wrapper_kind = Some("sudo".to_string());
+        assert_ne!(
+            compute_entry_hash(Some(&TEST_SECRET), &varied).expect_hash("wrapper_kind"),
+            baseline_hash,
+            "wrapper_kind must be part of the V2 hash"
+        );
+    }
+
+    /// #177 B3: `chain_version` sits first in both `HashableEvent` and
+    /// `HashableEventV2`'s preimage, so a V1 and a V2 event that are
+    /// otherwise identical (same seq/prev_hash/timestamp/etc., V2's 5 extra
+    /// fields all `None`) must never hash to the same value — the version
+    /// tag itself acts as a domain separator. Without this, a downgrade
+    /// forgery (rewrite `chain_version: 2` to `1` on a real V2 entry, or
+    /// vice versa) could theoretically collide.
+    #[test]
+    fn v1_and_v2_hashes_never_collide_for_equivalent_events() {
+        let mut v1_event = make_event("cmd0");
+        v1_event.chain_version = Some(1);
+        v1_event.seq = Some(0);
+        v1_event.prev_hash = Some("genesis".to_string());
+        v1_event.key_id = Some("default".to_string());
+
+        let mut v2_event = v1_event.clone();
+        v2_event.chain_version = Some(2);
+
+        let v1_hash = compute_entry_hash(Some(&TEST_SECRET), &v1_event).expect_hash("v1");
+        let v2_hash = compute_entry_hash(Some(&TEST_SECRET), &v2_event).expect_hash("v2");
+        assert_ne!(
+            v1_hash, v2_hash,
+            "V1 and V2 preimages must never collide even for field-identical events"
+        );
+    }
+
+    /// #177 B3 (/simplify, 4-way convergent finding): `SUPPORTED_CHAIN_VERSIONS`
+    /// (chain.rs) and `compute_entry_hash`'s literal `match` arms are two
+    /// independently-maintained lists of the same versions — a future
+    /// bump that adds a version to one without the other would let
+    /// `read_chain_state`/`verify_chain` treat it as safe to
+    /// append-after/authenticate while `compute_entry_hash` still reports
+    /// `UnsupportedVersion`. Closes that split at test time: every version
+    /// the array claims support for must actually produce a hash.
+    #[test]
+    fn all_supported_chain_versions_produce_a_hash() {
+        for version in SUPPORTED_CHAIN_VERSIONS {
+            let mut event = make_event("cmd0");
+            event.chain_version = Some(version);
+            event.seq = Some(0);
+            event.prev_hash = Some("genesis".to_string());
+            event.key_id = Some("default".to_string());
+            match compute_entry_hash(Some(&TEST_SECRET), &event) {
+                RecomputedHash::Hash(_) => {}
+                other => panic!(
+                    "SUPPORTED_CHAIN_VERSIONS claims {version} is supported, but \
+                     compute_entry_hash returned {other:?} instead of Hash(_) — \
+                     the array and the hasher match arms have drifted apart"
+                ),
+            }
+        }
     }
 
     /// Codex test-adversarial review (#177 B2): `AuditEvent.wrapper_kind`

@@ -9,7 +9,7 @@
 | Contract version | v1 |
 | Effective date | 2026-07-17 |
 | Applies to | Current releases through `1.0.0` and beyond, governed by the [breaking-change policy](#breaking-change-policy) below |
-| Revision policy | Revised only for (a) a breaking change to a guarantee — bumps this contract's version, or (b) a wording clarification that changes no guarantee's scope — logged in the [revision log](#contract--crate-version-mapping--revision-log), no version bump |
+| Revision policy | Revised only for (a) a breaking change to a guarantee — bumps this contract's version, (b) a wording clarification that changes no guarantee's scope — logged in the [revision log](#contract--crate-version-mapping--revision-log), no version bump, or (c) an expansion of a guarantee's scope (more is now verifiably true, nothing that previously verified stops verifying) — also logged in the revision log, no version bump; the [breaking-change policy](#breaking-change-policy) below already defines "adding new coverage" as non-breaking, so (c) makes that consequence explicit here rather than leaving expansions to be squeezed into (b)'s "wording only" framing |
 
 ---
 
@@ -77,7 +77,7 @@ This guarantee covers the entries that make it into the chain, not the completen
 
 - **Mechanism**: `AuditLogger::append` on the Layer 1/2 deny paths. Layer 1 append-on-deny is tool-agnostic (fires for any detected AI environment). Layer 2 audit-chain integration is currently Claude Code / Codex CLI only — Cursor's Layer 2 denies are stderr-only today and do not reach the audit chain at all (see the Boundary link below).
 - **Verification**: Claude Code.
-- **Contract**: Claude Code only. Recorded events only — this does not extend to fields SECURITY.md documents as outside the hash chain (e.g. process-provenance fields, see [SECURITY.md → Process Provenance](../SECURITY.md#process-provenance-v0131-420)), nor to events an append failure kept out of the chain in the first place.
+- **Contract**: Claude Code only. Recorded events only — this does not extend to events an append failure kept out of the chain in the first place, nor, on a `chain_version: 1` entry specifically, to fields SECURITY.md documents as outside that entry's hash (process-provenance fields and `wrapper_kind`; see [SECURITY.md → Process Provenance](../SECURITY.md#process-provenance-v0131-420) and [SECURITY.md → Channel separation](../SECURITY.md#channel-separation-v095-invariant-maintained)). On a `chain_version: 2` entry, both are covered — see the `CHAIN_VERSION` 2 revision log entry below.
 
 **Verify:**
 ```bash
@@ -190,7 +190,7 @@ Effective from `1.0.0` onward, a change is breaking (requires a major version bu
 
 `config.toml` schema compatibility is explicitly **not** one of these three surfaces (see [Not guaranteed](#not-guaranteed--10-out-of-scope) above).
 
-Two changes are already planned before 1.0 and are accounted for by this policy rather than exceptions to it: [#177](https://github.com/yottayoshida/omamori/issues/177) (an audit-chain schema version bump, shipped with a verification migration path) and [#175](https://github.com/yottayoshida/omamori/issues/175) (a `normalize_path` public API signature change). Neither requires this contract's wording to change — the policy is written at the level of "does verification survive," not at the level of a specific schema value or function signature.
+Two changes were accounted for by this policy before 1.0, rather than treated as exceptions to it: [#175](https://github.com/yottayoshida/omamori/issues/175) (a `normalize_path` public API signature change) and [#177](https://github.com/yottayoshida/omamori/issues/177) (an audit-chain schema version bump — `CHAIN_VERSION` 1→2, shipped with a verification migration path that keeps every prior `chain_version: 1` entry verifiable unchanged). Neither required this contract's wording to change — the policy is written at the level of "does verification survive," not at the level of a specific schema value or function signature.
 
 ---
 
@@ -200,6 +200,7 @@ Two changes are already planned before 1.0 and are accounted for by this policy 
 |---|---|---|
 | v1 | `0.13.1` onward | Initial publication |
 | v1 | (pending next release) | [#423](https://github.com/yottayoshida/omamori/issues/423): SECURITY.md/RELEASE.md/README.md's Codex CLI language reconciled with the Tier 2 definition above ("expected to work, not contractually guaranteed"), closing the "Known inconsistency" this document previously disclosed. Wording clarification only — no guarantee's scope changed, no contract version bump. |
+| v1 | (pending next release) | [#177](https://github.com/yottayoshida/omamori/issues/177) B3: `CHAIN_VERSION` 1→2. G-2's hash-chain protection now additionally covers `wrapper_kind` and the four process-provenance fields (`pid`/`ppid`/`parent_process`/`cwd_hash`) on `chain_version: 2` entries — previously excluded by design (ADR-0006). Every existing `chain_version: 1` entry remains verifiable unchanged; those fields stay outside the hash on v1 entries permanently (existing bytes are never rewritten, ADR-0007). Revision policy category (c): a scope expansion, not a breaking change or a wording-only clarification — added to the revision policy line above by this same change. No contract version bump. |
 
 Revisions are appended below, never rewritten in place, so the history of what changed and why stays visible.
 
