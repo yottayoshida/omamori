@@ -2842,7 +2842,10 @@ fn an_edited_key_id_does_not_buy_an_assurance_of_innocence() {
     // second is what used to launder it.
     lines[1] = lines[1]
         .replace("\"key_id\":\"default\"", "\"key_id\":\"key-99\"")
-        .replace("\"command\":", "\"command\":\"ATTACKER-HID-THIS\",\"orig_command\":");
+        .replace(
+            "\"command\":",
+            "\"command\":\"ATTACKER-HID-THIS\",\"orig_command\":",
+        );
     assert!(
         lines[1].contains("key-99"),
         "fixture did not apply: the entry must actually name a bogus key"

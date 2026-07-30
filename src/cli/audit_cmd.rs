@@ -200,9 +200,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 // Parity with the exit-4 branch, which suppresses the same
                 // check for the same reason and says so. Omitting it here made
                 // exit 2 the quieter of the two states to arrive at.
-                eprintln!(
-                    "  Tail-truncation detection is suspended while this entry is present."
-                );
+                eprintln!("  Tail-truncation detection is suspended while this entry is present.");
                 Ok(2)
             } else if result.chain_entries == 0 && result.legacy_entries > 0 {
                 eprintln!(

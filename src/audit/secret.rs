@@ -515,9 +515,7 @@ pub(super) fn is_writer_emitted_key_id(id: &str) -> bool {
     match id.strip_prefix("key-") {
         // Canonical decimal only: `key-01` and `key-2 ` are not ids this
         // program writes, and the round-trip is what rejects them.
-        Some(n) => n
-            .parse::<u32>()
-            .is_ok_and(|v| v >= 2 && v.to_string() == n),
+        Some(n) => n.parse::<u32>().is_ok_and(|v| v >= 2 && v.to_string() == n),
         None => false,
     }
 }
