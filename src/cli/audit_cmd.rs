@@ -4,6 +4,7 @@ use std::ffi::OsString;
 
 use crate::AppError;
 use crate::audit;
+use crate::audit::KeyUnavailableKind;
 use crate::config::load_config;
 use crate::engine::guard::guard_ai_config_modification;
 use crate::engine::shim::emit_config_warnings;
@@ -69,10 +70,33 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
 
     match audit::verify_chain(&load_result.config.audit) {
         Ok(result) => {
+            // #457: keyring problems are reported whatever the verdict turns
+            // out to be. A truncated or partly-unreadable ring changes what
+            // "chain intact" actually covers, and a shorter key set that
+            // verifies fewer entries is indistinguishable from a complete one
+            // unless it is said out loud.
+            for warning in &result.keyring_warnings {
+                eprintln!("omamori warning: {warning}");
+            }
             if let Some(seq) = result.broken_at {
                 eprintln!("omamori audit verify: chain broken at entry #{seq}");
                 eprintln!("  The audit log may have been tampered with.");
-                eprintln!("  Inspect: omamori audit show --last 10");
+                eprintln!("  Do not delete audit.jsonl — copy it aside first.");
+                // #457: a break near the head is common — every chain spanning
+                // a key rotation broke at #0 — and `--last 10` shows the tail,
+                // the opposite end of the file. Point at where the break is.
+                //
+                // `--json` is not decoration. The break is identified by seq,
+                // and the human table has no seq column (TIMESTAMP / PROVIDER
+                // / COMMAND / ACTION / RESULT / RULE), so the plain form
+                // cannot answer "which line is #{seq}". `--json` emits one
+                // object per line, seq included. `audit show --first`/`--around`
+                // would be the better answer and are tracked separately.
+                if seq < 10 {
+                    eprintln!("  Inspect: omamori audit show --all --json | head -20");
+                } else {
+                    eprintln!("  Inspect: omamori audit show --last 10 --json");
+                }
                 Ok(1)
             } else if let (Some(seq), Some(chain_version)) =
                 (result.unknown_version_at, result.unknown_chain_version)
@@ -96,6 +120,90 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                      Tail-truncation detection is suspended while this entry is present."
                 );
                 Ok(4)
+            } else if let (Some(seq), Some(key_id)) = (
+                result.key_unavailable_at,
+                result.key_unavailable_id.as_deref(),
+            ) {
+                // #457 A5: exit 2 (cannot verify), not 1 (tampered) and not 4
+                // (upgrade omamori). Exit 4's remedy is "install a newer
+                // build", which does nothing for a missing key file; exit 1
+                // accuses the operator of an attack that did not happen.
+                eprintln!(
+                    "omamori audit verify: cannot verify from entry #{seq} — it names \
+                     key \"{key_id}\", which is not in the keyring."
+                );
+                eprintln!(
+                    "  {} entries verified before this point; unable to verify {} \
+                     entries at or after it.",
+                    result.chain_entries, result.unverified_entries_after
+                );
+                // #457 Phase 8: this used to be a flat "This is not evidence
+                // of tampering." followed by "the key file is missing" —
+                // an exoneration asserted from a field the attacker writes.
+                // Each arm below says only what the evidence supports.
+                match result.key_unavailable_kind.as_ref() {
+                    Some(KeyUnavailableKind::NeverProtected) => {
+                        eprintln!(
+                            "  omamori wrote this entry itself, while the key directory could \
+                             not be listed, so it carries no HMAC and never did. No key file \
+                             is missing and restoring one will not help; the entry stays \
+                             unverifiable. Check the permissions on the directory holding \
+                             audit.jsonl so later entries are protected."
+                        );
+                    }
+                    Some(KeyUnavailableKind::NotWriterEmitted) => {
+                        eprintln!(
+                            "  No omamori build writes a key_id of this shape, so a missing \
+                             key file does not explain it — this entry's key_id has been \
+                             altered. Treat it as possible tampering."
+                        );
+                    }
+                    Some(KeyUnavailableKind::KeyFileAbsent {
+                        expected_file,
+                        beyond_known_epochs: None,
+                    }) => {
+                        eprintln!(
+                            "  Most likely the key file is missing, renamed, or unreadable: \
+                             look for {expected_file}, in the directory holding audit.jsonl, \
+                             and re-run."
+                        );
+                        eprintln!(
+                            "  If you did not rename, move or delete a key file, treat this \
+                             as possible tampering — key_id is an ordinary field of the log \
+                             and editing it produces this same state."
+                        );
+                    }
+                    Some(KeyUnavailableKind::KeyFileAbsent {
+                        beyond_known_epochs: Some(highest),
+                        ..
+                    }) => {
+                        // Sending the operator after `audit-secret.98.retired`
+                        // on a store that reached epoch 2 wastes their time and
+                        // dresses an edit up as their own filing error. State
+                        // the observation instead; it is checkable, and it is
+                        // the one thing here that is not a guess.
+                        eprintln!(
+                            "  The highest key epoch this store currently shows is \
+                             {highest} — there is no key file for a higher epoch here \
+                             to have gone missing."
+                        );
+                        eprintln!(
+                            "  Either this entry's key_id has been altered, or retired key \
+                             files were deleted from the directory holding audit.jsonl. \
+                             Nothing on disk records the store's epoch history, so omamori \
+                             cannot tell those apart. If you did not delete any, treat this \
+                             as possible tampering."
+                        );
+                    }
+                    None => {}
+                }
+                // Parity with the exit-4 branch, which suppresses the same
+                // check for the same reason and says so. Omitting it here made
+                // exit 2 the quieter of the two states to arrive at.
+                eprintln!(
+                    "  Tail-truncation detection is suspended while this entry is present."
+                );
+                Ok(2)
             } else if result.chain_entries == 0 && result.legacy_entries > 0 {
                 eprintln!(
                     "omamori audit verify: no chain entries found ({} legacy entries skipped)",
@@ -140,6 +248,19 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
             eprintln!("omamori audit verify: no audit log found");
             Ok(2)
         }
+        // #457: an unlistable key directory. Reported as cannot-verify rather
+        // than allowed to masquerade as tampering — on a rotated store,
+        // continuing would resolve every `"default"` to the active key and
+        // fail the whole chain over a permissions problem.
+        Err(audit::AuditError::KeyringUnusable(reason)) => {
+            eprintln!("omamori audit verify: cannot verify \u{2014} {reason}");
+            eprintln!("  Check the permissions on the directory holding audit-secret and re-run.");
+            Ok(2)
+        }
+        // No catch-all: `#[non_exhaustive]` constrains other crates, not this
+        // one, so the compiler still requires every variant here — which is
+        // what should happen. A new failure mode deserves its own wording, not
+        // a generic fallback that silently absorbs it.
         Err(audit::AuditError::Io(e)) => {
             eprintln!("omamori audit verify: {e}");
             Ok(2)
@@ -216,11 +337,26 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
             println!("omamori audit: no entries recorded yet");
             Ok(0)
         }
+        Err(e) if is_broken_pipe(&e) => Ok(0),
         Err(e) => {
             eprintln!("omamori audit show: {e}");
             Ok(1)
         }
     }
+}
+
+/// Did the reader on the other end of stdout go away?
+///
+/// Rust disables the default `SIGPIPE` handler at startup, so `cmd | head -20`
+/// does not kill the process the way a C program would — the write returns
+/// `EPIPE` and it surfaces as an error. Printing `Broken pipe (os error 32)`
+/// and exiting 1 for what is a normal, deliberate way to read a long log is
+/// wrong, and #457 made it worse by adding a recovery hint (`audit show --all
+/// | head -20`) that walks straight into it: measured, that exact command
+/// printed the error whenever the log outgrew the pipe buffer — which is
+/// precisely when a user would reach for it.
+fn is_broken_pipe(e: &audit::AuditError) -> bool {
+    matches!(e, audit::AuditError::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe)
 }
 
 /// `omamori audit unknown` — show all `unknown_tool_fail_open` events.
@@ -273,6 +409,7 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
             println!("omamori audit: no entries recorded yet");
             Ok(0)
         }
+        Err(e) if is_broken_pipe(&e) => Ok(0),
         Err(e) => {
             eprintln!("omamori audit unknown: {e}");
             Ok(1)
@@ -295,13 +432,41 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
             };
 
             eprintln!("omamori: rotating audit HMAC key...");
-            eprintln!("  Old entries will still verify against the retired key backup.");
+            // Not "the retired key backup": the lines printed on success go on
+            // to tell the operator that copies of this file are not backups,
+            // and calling the file itself a backup twelve lines earlier
+            // invites exactly the tidying-up they warn against.
+            eprintln!("  Old entries will still verify against the retired key file.");
 
             match audit::rotate_key(&path) {
                 Ok(result) => {
                     eprintln!("omamori: key rotation complete.");
                     eprintln!("  New key ID: {}", result.new_key_id);
                     eprintln!("  Retired key: {}", result.retired_path.display());
+                    // #457: this line used to print a path and nothing else,
+                    // which reads as an invitation to tidy it up or back it up
+                    // — and both of those broke verification. Say what the file
+                    // is for.
+                    // One `eprintln!` with continuation strings, like the exit-2
+                    // and exit-4 messages above — the terminal wraps it. The
+                    // hand-wrapped version broke at ~70 columns in the middle
+                    // of a clause on anything wider.
+                    //
+                    // The earlier wording ("copies under a different name are
+                    // ignored") was false in the one case that matters: a copy
+                    // named `audit-secret.<number>.retired` is not ignored, it
+                    // is registered as that epoch. Copying `.1.retired` to
+                    // `.2.retired` gives `key-2` the epoch-1 bytes while the
+                    // active key moves to `key-3`, so entries already labelled
+                    // `key-2` stop verifying — a permanent false tampering
+                    // verdict produced by following the advice.
+                    eprintln!(
+                        "  Keep that file. Entries written before now can only be verified \
+                         with it. If you want a spare, copy it somewhere outside this \
+                         directory: a copy left beside it as audit-secret.<number>.retired \
+                         is read as another key epoch, which relabels new entries and makes \
+                         existing ones fail to verify."
+                    );
                     eprintln!("  Run `omamori audit verify` to confirm chain integrity.");
                     Ok(0)
                 }

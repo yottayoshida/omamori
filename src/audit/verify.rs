@@ -7,7 +7,10 @@ use super::chain::{
     prune_genesis_hash,
 };
 use super::retention::is_prune_point;
-use super::secret::{flock_shared, load_keyring, open_read_nofollow, read_secret, secret_path_for};
+use super::secret::{
+    UNRESOLVED_KEY_ID, expected_key_file, flock_shared, is_writer_emitted_key_id, load_keyring,
+    open_read_nofollow, read_secret, secret_path_for,
+};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
 
@@ -15,10 +18,19 @@ use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
 // Error type
 // ---------------------------------------------------------------------------
 
+// #457: gains a variant, so it closes the exhaustive-match door before 1.0 for
+// the same reason `VerifyResult` and `ChainStatus` do.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AuditError {
     SecretUnavailable,
     FileNotFound,
+    /// #457: the key directory could not be listed, so which epochs exist is
+    /// unknown. Kept apart from `SecretUnavailable` (the active key itself is
+    /// often readable in this state) and emphatically apart from a tampering
+    /// verdict — resolving `"default"` to the active key on a rotated store
+    /// would make every entry look altered.
+    KeyringUnusable(String),
     Io(std::io::Error),
 }
 
@@ -27,6 +39,7 @@ impl std::fmt::Display for AuditError {
         match self {
             Self::SecretUnavailable => write!(f, "HMAC secret unavailable"),
             Self::FileNotFound => write!(f, "audit log not found"),
+            Self::KeyringUnusable(reason) => write!(f, "{reason}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -47,6 +60,45 @@ impl From<std::io::Error> for AuditError {
 // gets `#[non_exhaustive]` in the same change, closing the exhaustive
 // struct-literal/destructure two-way door before 1.0 rather than after
 // (crates.io reverse dependencies verified at 0, same as B2's check).
+/// Why an entry's `key_id` did not resolve to a key.
+///
+/// The three cases carry different amounts of information about whether the
+/// log was attacked, and collapsing them is what made exit 2 exploitable
+/// (Phase 8): `key_id` is an ordinary field of `audit.jsonl`, so anyone who
+/// can write the file can move an entry from "tampered" to "cannot verify"
+/// by editing one string — no key material, no re-signing. Measured against
+/// v0.16.0: `exit 1  chain broken … may have been tampered with` became
+/// `exit 2  … This is not evidence of tampering.` for a one-field edit.
+///
+/// The classification stays at exit 2 — an unresolvable key genuinely cannot
+/// be checked, and calling that tampering is the false accusation #457 exists
+/// to remove. What changes is that the *explanation* is now derived from
+/// evidence rather than assumed.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyUnavailableKind {
+    /// The entry names [`UNRESOLVED_KEY_ID`]: omamori itself wrote it while
+    /// the key directory could not be enumerated, so it was never
+    /// HMAC-protected. Nothing is missing and nothing is restorable.
+    NeverProtected,
+    /// No omamori writer emits an id of this shape. The "a key file went
+    /// missing" story is not merely unproven here, it is contradicted — so no
+    /// reassurance is offered.
+    NotWriterEmitted,
+    /// A well-formed epoch id whose key file this host does not hold. A
+    /// renamed, deleted or unreadable key file explains it; so does an edit.
+    KeyFileAbsent {
+        /// Where to look, in the directory holding `audit.jsonl`.
+        expected_file: String,
+        /// Set when the named epoch is higher than any this store currently
+        /// shows — the epoch has no key file here to have lost. Carried as
+        /// the observed maximum rather than as a verdict, because deleting
+        /// retired key files lowers it too, and "you deleted old keys" and
+        /// "someone edited this field" are not distinguishable from disk.
+        beyond_known_epochs: Option<u32>,
+    },
+}
+
 #[derive(Default)]
 #[non_exhaustive]
 pub struct VerifyResult {
@@ -68,6 +120,26 @@ pub struct VerifyResult {
     pub unknown_version_at: Option<u64>,
     /// The unsupported `chain_version` value found at `unknown_version_at`.
     pub unknown_chain_version: Option<u32>,
+    /// #457 A5: seq of the first entry whose `key_id` names a key that is not
+    /// in the keyring. Like `unknown_version_at` this is *not* evidence of
+    /// tampering — the entry may be perfectly authentic, we simply have no way
+    /// to check it. Before #457 this case fell through to
+    /// `keyring.get(id).unwrap_or(&secret)`, which checked the entry against
+    /// the active key and reported the inevitable mismatch as "the audit log
+    /// may have been tampered with" — a false accusation triggered by nothing
+    /// more than a missing or renamed key file.
+    pub key_unavailable_at: Option<u64>,
+    /// The `key_id` named at `key_unavailable_at`.
+    pub key_unavailable_id: Option<String>,
+    /// Why that key could not be resolved — see [`KeyUnavailableKind`].
+    pub key_unavailable_kind: Option<KeyUnavailableKind>,
+    /// #457: non-fatal problems assembling the keyring — a truncated ring, or
+    /// a file shaped like a retired key that could not be read. Verification
+    /// still ran (the keys that loaded authenticate their own entries), but
+    /// the coverage is incomplete and saying so is the whole point: a shorter
+    /// key set that verifies fewer entries looks identical to a complete one
+    /// unless it is reported.
+    pub keyring_warnings: Vec<String>,
     /// Count of lines from `unknown_version_at` onward (inclusive) that
     /// could not be verified — once one entry's authenticity can't be
     /// confirmed, the `prev_hash` chain running through it means nothing
@@ -82,6 +154,42 @@ pub struct VerifyResult {
     /// asserting a version for them would be a claim about unverified data.
     pub v1_entries: u64,
     pub v2_entries: u64,
+}
+
+impl VerifyResult {
+    /// Verification stopped at an entry it could not authenticate, and every
+    /// line after that point is tallied rather than trusted.
+    ///
+    /// #457 (`/simplify`, three reviewers converged): the two terminal states
+    /// were spelled out longhand in both places that gate on them — the read
+    /// loop and the high-water-mark check. A third state would have to be
+    /// added to both, and neither is compiler-checked. The HWM gate is the
+    /// expensive one to miss: writing the mark from a run that stopped early
+    /// silently lowers it, which disables tail-truncation detection from then
+    /// on, with no error and no failing test.
+    ///
+    /// `broken_at` is deliberately *not* included. A broken chain `break`s out
+    /// of the loop entirely, and it must still reach the HWM check.
+    fn halted(&self) -> bool {
+        self.unknown_version_at.is_some() || self.key_unavailable_at.is_some()
+    }
+}
+
+/// The three prune-point values the next entry's prune-bind check needs, which
+/// are only meaningful together.
+///
+/// #457 (`/simplify`): A4 originally carried these as three parallel `Option`
+/// locals plus a `last_was_prune` flag. That is the shape this whole change
+/// exists to remove — `SigningKey`'s own doc argues that binding co-dependent
+/// values into one type is what stops a call site from pairing them wrongly,
+/// and then the prune path paired them by hand anyway. Concretely, the read
+/// site checked two of the three and used the key unconditionally, so an edit
+/// that set only two would have fed `hmac_bytes(None, ..)` — returning the
+/// `NO_HMAC_SECRET` sentinel — into the comparison as the expected value.
+struct PruneBind {
+    target_hash: String,
+    count: u64,
+    key: [u8; 32],
 }
 
 pub struct ShowOptions {
@@ -114,19 +222,86 @@ pub struct AuditSummary {
 // verify_chain
 // ---------------------------------------------------------------------------
 
-/// Records the point where an entry's `chain_version` became unverifiable
-/// and switches `result` into its terminal "unverifiable tail" state —
-/// `result.unknown_version_at.is_some()` *is* that state; the main loop
-/// checks it directly rather than tracking a separate local flag that
-/// could drift out of sync with it. Shared by both places `verify_chain`
-/// can discover this — the fast path (a successfully-parsed `AuditEvent`
-/// whose `chain_version` field is unsupported) and the raw-JSON fallback
-/// (an entry whose *shape* a future `chain_version` changed enough that
-/// `AuditEvent` can't even parse it).
+/// Records the point where an entry's `chain_version` became unverifiable and
+/// switches `result` into a terminal state. Shared by both places
+/// `verify_chain` can discover this — the fast path (a successfully-parsed
+/// `AuditEvent` whose `chain_version` field is unsupported) and the raw-JSON
+/// fallback (an entry whose *shape* a future `chain_version` changed enough
+/// that `AuditEvent` can't even parse it).
+///
+/// #457: this used to say "`unknown_version_at.is_some()` *is* that state",
+/// which stopped being true the moment a second terminal state existed.
+/// `VerifyResult::halted()` is now the single answer to "did verification
+/// stop?", and each `mark_*` function owns the transition into one of them —
+/// including `unverified_entries_after = 1`, which is what makes the count
+/// mean "this entry plus everything after it".
 fn mark_unverifiable_tail(result: &mut VerifyResult, seq: u64, chain_version: u32) {
     result.unknown_version_at = Some(seq);
     result.unknown_chain_version = Some(chain_version);
     result.unverified_entries_after = 1;
+}
+
+/// The other terminal state (#457): an entry names a key the keyring does not
+/// hold. Sibling of `mark_unverifiable_tail` — same shape, same ownership of
+/// `unverified_entries_after`, different reason. Kept as a function rather
+/// than three inline assignments so that adding a third terminal state means
+/// writing a third `mark_*` and one arm in `halted()`, not finding every place
+/// the transition was open-coded.
+fn mark_key_unavailable_tail(
+    result: &mut VerifyResult,
+    seq: u64,
+    key_id: &str,
+    highest_known_epoch: u32,
+) {
+    result.key_unavailable_at = Some(seq);
+    result.key_unavailable_id = Some(key_id.to_string());
+    result.key_unavailable_kind = Some(classify_unavailable_key(key_id, highest_known_epoch));
+    result.unverified_entries_after = 1;
+}
+
+/// Decide what can honestly be said about an unresolvable `key_id`.
+///
+/// Ordering matters: [`UNRESOLVED_KEY_ID`] is writer-emitted, so it has to be
+/// matched before the general writer-shape test would fold it in with the
+/// epochs.
+fn classify_unavailable_key(key_id: &str, highest_known_epoch: u32) -> KeyUnavailableKind {
+    if key_id == UNRESOLVED_KEY_ID {
+        return KeyUnavailableKind::NeverProtected;
+    }
+    if !is_writer_emitted_key_id(key_id) {
+        return KeyUnavailableKind::NotWriterEmitted;
+    }
+    match expected_key_file(key_id) {
+        Some(expected_file) => {
+            // Shape alone is a weak test: `key-99` looks exactly like an id a
+            // writer emits, so an attacker picking a large number lands in
+            // this arm and gets sent looking for `audit-secret.98.retired` —
+            // a file that never existed. Saying so is worth more than the
+            // path, and unlike the path it is checkable.
+            let named = epoch_of(key_id);
+            let beyond_known_epochs = match named {
+                Some(n) if n > highest_known_epoch => Some(highest_known_epoch),
+                _ => None,
+            };
+            KeyUnavailableKind::KeyFileAbsent {
+                expected_file,
+                beyond_known_epochs,
+            }
+        }
+        // `is_writer_emitted_key_id` accepted it, so `expected_key_file`
+        // returning None would mean the two disagree about what an epoch id
+        // looks like. Treat the disagreement as "cannot substantiate the
+        // missing-file story" rather than inventing a path.
+        None => KeyUnavailableKind::NotWriterEmitted,
+    }
+}
+
+/// The epoch number an id names: `"default"` is epoch 1, `key-N` is epoch N.
+fn epoch_of(key_id: &str) -> Option<u32> {
+    if key_id == "default" {
+        return Some(1);
+    }
+    key_id.strip_prefix("key-")?.parse().ok()
 }
 
 /// Minimal typed peek for the raw-JSON fallback (an entry whose full
@@ -149,9 +324,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
     let secret_path = secret_path_for(&path);
 
-    // Primary secret for genesis hash computation (always the active key).
-    // Read before keyring to preserve ELOOP (symlink attack) error distinction.
-    let secret = read_secret(&secret_path).map_err(|e| {
+    // #457: the active secret is no longer used as a hash key — the anchor and
+    // every entry are now verified with the key each one names. The read stays
+    // for two reasons that have nothing to do with hashing: it preserves the
+    // ELOOP (symlink attack on the secret path) error distinction, which must
+    // be reported before anything else touches the directory, and a store with
+    // no readable active secret is "cannot verify", not "chain intact".
+    read_secret(&secret_path).map_err(|e| {
         if e.to_string().contains("symlink") {
             return AuditError::Io(e);
         }
@@ -160,6 +339,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
 
     // Load keyring for multi-key verification (active + retired keys)
     let keyring = load_keyring(&secret_path);
+    // #457: an unlistable key directory is not "no retired keys". Continuing
+    // would resolve `"default"` to the active key and report every entry of a
+    // rotated store as tampered — a false accusation caused by a permissions
+    // problem. Stop before reading a single line.
+    if let Some(fatal) = keyring.fatal_anomaly() {
+        return Err(AuditError::KeyringUnusable(fatal.describe()));
+    }
 
     let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => AuditError::FileNotFound,
@@ -168,15 +354,24 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     flock_shared(&file)?;
 
     let reader = std::io::BufReader::new(&file);
-    let genesis = genesis_hash(Some(&secret));
-    let prune_genesis = prune_genesis_hash(Some(&secret));
 
-    let mut result = VerifyResult::default();
-    let mut expected_prev = genesis;
+    let mut result = VerifyResult {
+        keyring_warnings: keyring.anomalies().iter().map(|a| a.describe()).collect(),
+        ..Default::default()
+    };
+    // #457 A3: the chain's anchor is a function of the key, so it cannot be
+    // computed up front from the active secret — a chain that started before a
+    // rotation anchors to `genesis_hash(retired key)`. It is resolved in the
+    // `chain_entries == 0` branch below, from the key the head entry names.
+    // Only used from the second chain entry onward.
+    let mut expected_prev = String::new();
     let mut expected_seq: u64 = 0;
-    let mut last_was_prune = false;
-    let mut prune_target_hash: Option<String> = None;
-    let mut prune_target_count: Option<u64> = None;
+    // #457 A4: the prune-bind was written with the key active at prune time,
+    // so it has to be recomputed with *that* key — not with the key of the
+    // first retained entry, which belongs to whatever epoch that entry was
+    // written in. `Some` iff the previous line was a prune point, which also
+    // replaces the separate `last_was_prune` flag.
+    let mut prev_prune: Option<PruneBind> = None;
 
     for line in reader.lines() {
         let line = line?;
@@ -189,7 +384,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         // authenticated, the prev_hash chain running through it means
         // nothing after it can be trusted either — every remaining line
         // just gets tallied, not verified.
-        if result.unknown_version_at.is_some() {
+        // #457 A5: `key_unavailable_at` is the second terminal state with the
+        // same meaning — from here on, entries are tallied, not trusted.
+        if result.halted() {
             result.unverified_entries_after += 1;
             continue;
         }
@@ -263,10 +460,47 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         // nothing about it — including its own seq/prev_hash — is
         // trustworthy structural signal. Check this before the prev_hash
         // check below, not after. ---
+        // #457 (Codex Round 1 P1): version support is decided *before* the key
+        // lookup. An entry from a future chain format that also names a key we
+        // do not hold must report "upgrade omamori" (exit 4), not "restore the
+        // key" (exit 2) — restoring the key would not make this binary able to
+        // hash the entry. Resolving the key first inverted that precedence for
+        // any future entry whose shape still parses as an `AuditEvent`.
+        if let Some(version) = event.chain_version
+            && !is_supported_chain_version(version)
+        {
+            let reported_seq = event.seq.unwrap_or(expected_seq);
+            mark_unverifiable_tail(&mut result, reported_seq, version);
+            continue;
+        }
+
+        // `unwrap_or("default")` stays: a missing `key_id` field means an
+        // entry from before the field existed, and `"default"` is the id that
+        // epoch always carried. Only the *secret* fallback below is removed.
         let entry_key_id = event.key_id.as_deref().unwrap_or("default");
-        let entry_secret = keyring.get(entry_key_id).unwrap_or(&secret);
+        let Some(entry_secret) = keyring.get(entry_key_id) else {
+            // #457 A5: the entry names a key we do not hold. Falling back to
+            // the active secret here (the pre-#457 behaviour) guaranteed a
+            // hash mismatch and reported it as tampering. Stop and say what is
+            // actually true: this entry cannot be verified. Everything after
+            // it inherits that — the prev_hash chain runs through an entry
+            // whose authenticity is unknown.
+            mark_key_unavailable_tail(
+                &mut result,
+                event.seq.unwrap_or(expected_seq),
+                entry_key_id,
+                keyring.highest_known_epoch(),
+            );
+            continue;
+        };
         let recomputed = match compute_entry_hash(Some(entry_secret), &event) {
             RecomputedHash::Hash(h) => h,
+            // Unreachable as of #457 — the version gate above already
+            // `continue`d on any unsupported version. Kept because
+            // `compute_entry_hash` is the authority on which versions it can
+            // hash, and a future version added there but not to
+            // `SUPPORTED_CHAIN_VERSIONS` would arrive here rather than being
+            // silently mis-tallied. Behaviour is identical either way.
             RecomputedHash::UnsupportedVersion(v) => {
                 // Not evidence of tampering — evidence this binary
                 // predates the chain format (or a downgrade happened).
@@ -289,13 +523,18 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
 
         // --- prev_hash verification ---
         if result.chain_entries == 0 {
-            // First chain entry: genesis or prune_genesis
+            // First chain entry: genesis or prune_genesis.
+            // #457 A3: computed from the key THIS entry names, not from the
+            // active secret. `entry_secret` was already resolved above via
+            // `key_id`, and `genesis_hash` is HMAC(key, GENESIS_SEED) — so a
+            // chain whose head predates a rotation anchors to the retired
+            // key's genesis, which is exactly what is on disk.
             let expected = if is_prune {
-                &prune_genesis
+                prune_genesis_hash(Some(entry_secret))
             } else {
-                &expected_prev
+                genesis_hash(Some(entry_secret))
             };
-            if prev_hash != expected {
+            if prev_hash != expected.as_str() {
                 result.broken_at = Some(seq);
                 break;
             }
@@ -306,7 +545,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                     break;
                 }
             }
-        } else if last_was_prune {
+        } else if prev_prune.is_some() {
             // Prune gap: prev_hash won't match prune_point's entry_hash — allowed.
             // But verify the prune-bind: target_hash must bind this entry's hash.
             // (entry_hash verification below will confirm this entry is authentic)
@@ -327,16 +566,14 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             break;
         }
 
-        // --- prune-bind verification (after prune gap, use entry's key) ---
-        if last_was_prune
-            && let (Some(saved_target), Some(saved_count)) =
-                (&prune_target_hash, prune_target_count)
-        {
+        // --- prune-bind verification (after a prune gap, using the prune
+        // point's own key — see `PruneBind`) ---
+        if let Some(bind) = &prev_prune {
             let expected_bind = hmac_bytes(
-                Some(entry_secret),
-                format!("prune-bind:{saved_count}:{recorded_hash}").as_bytes(),
+                Some(&bind.key),
+                format!("prune-bind:{}:{recorded_hash}", bind.count).as_bytes(),
             );
-            if *saved_target != expected_bind {
+            if bind.target_hash != expected_bind {
                 result.broken_at = Some(seq);
                 break;
             }
@@ -346,11 +583,12 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         if is_prune {
             result.pruned = true;
             result.pruned_count = Some(event.target_count as u64);
-            prune_target_hash = Some(event.target_hash.clone());
-            prune_target_count = Some(event.target_count as u64);
         }
-
-        last_was_prune = is_prune;
+        prev_prune = is_prune.then(|| PruneBind {
+            target_hash: event.target_hash.clone(),
+            count: event.target_count as u64,
+            key: *entry_secret,
+        });
         expected_prev = recorded_hash.to_string();
         expected_seq = seq + 1;
         result.chain_entries += 1;
@@ -384,8 +622,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // expected_seq stopped advancing before the real end of file, so
     // writing/comparing the HWM here would compare against a false "end"
     // and could silently lower the high-water-mark on a later re-verify.
-    if result.broken_at.is_none() && result.unknown_version_at.is_none() && result.chain_entries > 0
-    {
+    if result.broken_at.is_none() && !result.halted() && result.chain_entries > 0 {
         let hwm_file = hwm_path_for(&path);
         let max_verified_seq = expected_seq.saturating_sub(1);
         match read_hwm(&hwm_file) {

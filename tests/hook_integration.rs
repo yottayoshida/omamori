@@ -2511,3 +2511,462 @@ fn hook_deny_audit_chain_is_seq_monotonic() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------------------------------------------------------------------------
+// #457: key rotation × chain verification, through the real CLI
+// ---------------------------------------------------------------------------
+
+/// `omamori audit key rotate` is blocked in AI sessions by
+/// `guard_ai_config_modification`. Tests drive it as a subprocess with the
+/// detector variables removed from **that subprocess only** — the session
+/// running these tests keeps its own guards intact.
+///
+/// Ported from `tests/cli.rs`, which had it and this file did not.
+fn clean_ai_env(cmd: &mut Command) -> &mut Command {
+    cmd.env_remove("CLAUDECODE")
+        .env_remove("CODEX_CI")
+        .env_remove("CURSOR_AGENT")
+        .env_remove("GEMINI_CLI")
+        .env_remove("CLINE_ACTIVE")
+        .env_remove("AI_GUARD")
+}
+
+/// Run an `omamori audit …` subcommand against a sandbox HOME and return
+/// (exit code, stdout, stderr).
+fn run_audit(base: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut cmd = Command::new(binary());
+    cmd.arg("audit")
+        .args(args)
+        .env("HOME", base)
+        .env("XDG_DATA_HOME", base.join(".local/share"))
+        .env("XDG_CONFIG_HOME", base.join(".config"));
+    let out = clean_ai_env(&mut cmd)
+        .output()
+        .expect("failed to run omamori audit");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// #457 V-001 — the minimal reproduction, end to end through the shipped
+/// binary. **Rotating is enough; no further activity is required.**
+///
+/// This is the case a user hits: run `omamori audit key rotate` once and every
+/// subsequent `omamori audit verify` returns exit 1 `chain broken at entry #0`,
+/// permanently. Measured against v0.16.0 before the fix; must be exit 0 now.
+#[test]
+fn rotation_alone_does_not_break_verify() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-rotate-verify");
+    let json = pretooluse_bash_json("rm -rf /");
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "setup: a deny must be recorded so there is a chain to verify"
+    );
+
+    let (code, _, _) = run_audit(&base, &["verify"]);
+    assert_eq!(code, 0, "precondition: the chain verifies before rotating");
+
+    let (rot_code, _, rot_err) = run_audit(&base, &["key", "rotate"]);
+    assert_eq!(rot_code, 0, "rotation must succeed (stderr={rot_err})");
+
+    // No appends between the rotation and this call — the defect fires on the
+    // rotation alone.
+    let (code, out, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 0,
+        "V-001: verify must still pass immediately after a rotation \
+         (stdout={out}, stderr={err})"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #457 V-031. The rotation output used to print the retired key's path and
+/// nothing else, which reads as an invitation to tidy it away or copy it —
+/// and both of those broke verification.
+#[test]
+fn rotation_output_says_to_keep_the_retired_key() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-rotate-message");
+    let json = pretooluse_bash_json("rm -rf /");
+    let _ = run_hook_script(&hook_path, &shim_dir, &json);
+
+    let (code, _, err) = run_audit(&base, &["key", "rotate"]);
+    assert_eq!(code, 0);
+    assert!(
+        err.contains("Keep that file"),
+        "V-031: the output must say the retired key has to be kept, got: {err}"
+    );
+    // Phase 8: this used to assert the wording "copies under a different name
+    // are not backups — they are ignored", which is false in the one case that
+    // matters. A copy named `audit-secret.<decimal>.retired` is not ignored;
+    // `scan_key_dir` registers it as that epoch, which relabels new entries
+    // and makes existing ones fail to verify. The message has to name the
+    // shape that is dangerous, not claim renaming is harmless.
+    assert!(
+        err.contains("outside this directory"),
+        "V-031: it must say where a spare copy belongs, got: {err}"
+    );
+    assert!(
+        err.contains("audit-secret.<number>.retired"),
+        "V-031: and name the shape that is read as another key epoch — a bare \
+         'copies are ignored' is wrong for exactly that shape, got: {err}"
+    );
+    assert!(
+        !err.to_lowercase().contains("they are ignored"),
+        "V-031: the false blanket claim must not come back, got: {err}"
+    );
+    // The word "backup" must not be applied to the retired key file itself
+    // either: the same output goes on to warn against treating copies as
+    // backups, and calling the file a backup twelve lines earlier undoes it.
+    assert!(
+        !err.to_lowercase().contains("retired key backup"),
+        "V-031: the retired key is not a backup, it is the key, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #457 V-008 + V-028. `report --json` and `doctor` must agree with `verify`
+/// about a rotated chain, and a missing key must read as *cannot verify*
+/// rather than as tampering — **in the wording, not only in the exit code**.
+#[test]
+fn report_and_doctor_agree_with_verify_across_a_rotation() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-report-doctor");
+    let json = pretooluse_bash_json("rm -rf /");
+    let _ = run_hook_script(&hook_path, &shim_dir, &json);
+    let (rot_code, _, _) = run_audit(&base, &["key", "rotate"]);
+    assert_eq!(rot_code, 0);
+
+    // V-008: healthy after rotation, on every surface.
+    let (code, _, _) = run_audit(&base, &["verify"]);
+    assert_eq!(code, 0);
+
+    let mut cmd = Command::new(binary());
+    cmd.arg("report")
+        .arg("--json")
+        .env("HOME", &base)
+        .env("XDG_DATA_HOME", base.join(".local/share"))
+        .env("XDG_CONFIG_HOME", base.join(".config"));
+    let out = clean_ai_env(&mut cmd).output().expect("report --json");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        stdout.contains("\"status\":\"intact\"") || stdout.contains("\"status\": \"intact\""),
+        "V-008: report must call a rotated chain intact, got: {stdout}"
+    );
+
+    // V-028: an entry naming a key we no longer hold must read as *cannot
+    // verify*, with wording that does not accuse anyone.
+    //
+    // A second rotation first. Deleting the *only* retired key leaves a store
+    // indistinguishable from one that never rotated — `"default"` then
+    // resolves to the active key and the result is exit 1 with the tampering
+    // wording (pinned as a known limitation in
+    // `deleting_the_last_retired_key_reads_as_tampering_known_limitation`).
+    // An earlier version of this test did exactly that and accepted
+    // `code == 1 || code == 2`, which admitted the pre-fix outcome and left
+    // the exit-2 branch unreached by the whole suite.
+    let (rot2, _, _) = run_audit(&base, &["key", "rotate"]);
+    assert_eq!(rot2, 0);
+    let retired1 = base.join(".local/share/omamori/audit-secret.1.retired");
+    let retired2 = base.join(".local/share/omamori/audit-secret.2.retired");
+    assert!(
+        retired1.exists() && retired2.exists(),
+        "precondition: two retired keys, so removing one still leaves the \
+         store recognizably rotated"
+    );
+    std::fs::remove_file(&retired1).unwrap();
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 2,
+        "V-028: a key we do not hold is cannot-verify, not tampering \
+         (stderr={err})"
+    );
+    assert!(
+        err.contains("not in the keyring"),
+        "V-028: the message must name the actual problem (stderr={err})"
+    );
+    assert!(
+        !err.contains("may have been tampered with"),
+        "V-028: exit 1's accusation must not appear — that is the whole point \
+         of the separate exit code (stderr={err})"
+    );
+    // Phase 8: what replaced the old blanket "This is not evidence of
+    // tampering." That sentence was an assurance derived from `key_id`, a
+    // plain field of `audit.jsonl` — so anyone who could edit the log could
+    // also decide what omamori said about it. Here the id *is* well-formed and
+    // the key file really is gone, which is the one case where the missing-file
+    // story is the likely one; the message may lead with it, but it may not
+    // rule out the alternative, and it has to say which file to look for.
+    assert!(
+        err.contains("audit-secret") && err.contains("retired"),
+        "V-028: the remedy must name a file — there is no file called \
+         \"default\", and the id→filename mapping is not something the \
+         operator should have to know (stderr={err})"
+    );
+    assert!(
+        err.contains("possible tampering"),
+        "V-028: an edited key_id produces this exact state, so the message \
+         must leave that reading open (stderr={err})"
+    );
+    assert!(
+        err.contains("Tail-truncation detection is suspended"),
+        "V-028: this state suppresses the HWM check just as exit 4 does, and \
+         exit 4 says so. Silence here made exit 2 the quieter way in \
+         (stderr={err})"
+    );
+
+    // The test is named for `doctor` too, and `doctor` has its own arm for
+    // this status — reached by nothing else in the suite until now
+    // (`/simplify`, two reviewers). It must agree with `verify`: the operator
+    // gets told the key is missing, not that the log was altered.
+    let mut cmd = Command::new(binary());
+    cmd.arg("doctor")
+        .env("HOME", &base)
+        .env("XDG_DATA_HOME", base.join(".local/share"))
+        .env("XDG_CONFIG_HOME", base.join(".config"));
+    let doc = clean_ai_env(&mut cmd).output().expect("doctor");
+    let doc_out = String::from_utf8_lossy(&doc.stdout).into_owned();
+    assert!(
+        doc_out.contains("cannot verify"),
+        "V-008: doctor must surface the same cannot-verify state (stdout={doc_out})"
+    );
+    assert!(
+        !doc_out.contains("chain: broken"),
+        "V-008: doctor must not call a missing key a broken chain (stdout={doc_out})"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #457 V-030. The break-position hint used to point at the tail
+/// (`--last 10`) no matter where the break was — and a rotation-era break is
+/// at entry #0, the opposite end of the file.
+#[test]
+fn break_hint_points_at_the_break_not_the_tail() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-break-hint");
+    let json = pretooluse_bash_json("rm -rf /");
+    let _ = run_hook_script(&hook_path, &shim_dir, &json);
+
+    // Corrupt the head so the break lands at a low seq.
+    let log = base.join(".local/share/omamori/audit.jsonl");
+    let content = std::fs::read_to_string(&log).unwrap();
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    lines[0] = lines[0].replace("\"command\":", "\"command\":\"TAMPERED\",\"orig_command\":");
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(code, 1, "a corrupted head must report as broken");
+    assert!(
+        err.contains("--all --json | head"),
+        "V-030: a break near the head must not send the reader to the tail; \
+         got: {err}"
+    );
+    assert!(
+        !err.contains("--last 10"),
+        "V-030: the tail hint must not be the one shown for a head break; \
+         got: {err}"
+    );
+    // Phase 8: `--json` is load-bearing. The break is named by seq and the
+    // human table has no seq column, so the plain form cannot answer "which
+    // line is #0" — the hint would send the reader to the right end of the
+    // file with no way to identify the entry once there.
+    assert!(
+        err.contains("--json"),
+        "V-030: the suggested command must be one in which seq is visible; \
+         got: {err}"
+    );
+    assert!(
+        err.contains("Do not delete audit.jsonl"),
+        "V-030: the only remedy a user reaches unaided is deleting the log — \
+         the message that reports the break is where that has to be headed \
+         off; got: {err}"
+    );
+
+    // Phase 8: and the suggested command must not fail when run. Rust
+    // disables SIGPIPE, so `| head` used to produce
+    // `omamori audit show: Broken pipe (os error 32)` and exit 1 once the log
+    // outgrew the pipe buffer — precisely the situation this hint is for.
+    let mut cmd = Command::new(binary());
+    cmd.arg("audit")
+        .args(["show", "--all", "--json"])
+        .env("HOME", &base)
+        .env("XDG_DATA_HOME", base.join(".local/share"))
+        .env("XDG_CONFIG_HOME", base.join(".config"))
+        .stdout(std::process::Stdio::piped());
+    let mut child = clean_ai_env(&mut cmd).spawn().expect("audit show");
+    // Drop the read end immediately: the harshest form of `| head`, where the
+    // reader is gone before the first write.
+    drop(child.stdout.take());
+    let status = child.wait().expect("audit show exits");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a reader going away is not an error"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #457, Phase 8. Plan success criterion 7 — "tamper detection has not
+/// weakened" — measured as FAIL, and this is what it measured.
+///
+/// `key_id` is a plain field of `audit.jsonl`. Editing it to name a key that
+/// does not exist costs an attacker nothing (no key material, no re-signing)
+/// and used to move the verdict from exit 1 `chain broken … may have been
+/// tampered with` to exit 2 `… This is not evidence of tampering.` — omamori
+/// vouching for a log on the strength of a field the attacker wrote.
+///
+/// Verification still stops here, and still at exit 2: an entry whose key is
+/// unresolvable genuinely cannot be checked, and calling that tampering is the
+/// false accusation #457 exists to remove. What must not survive is the
+/// unconditional reassurance.
+#[test]
+fn an_edited_key_id_does_not_buy_an_assurance_of_innocence() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-keyid-edit");
+    let json = pretooluse_bash_json("rm -rf /");
+    for _ in 0..3 {
+        let _ = run_hook_script(&hook_path, &shim_dir, &json);
+    }
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(code, 0, "precondition: a healthy chain (stderr={err})");
+
+    let log = base.join(".local/share/omamori/audit.jsonl");
+    let content = std::fs::read_to_string(&log).unwrap();
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    // Hide the command *and* rename the key. The first is the attack; the
+    // second is what used to launder it.
+    lines[1] = lines[1]
+        .replace("\"key_id\":\"default\"", "\"key_id\":\"key-99\"")
+        .replace("\"command\":", "\"command\":\"ATTACKER-HID-THIS\",\"orig_command\":");
+    assert!(
+        lines[1].contains("key-99"),
+        "fixture did not apply: the entry must actually name a bogus key"
+    );
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 2,
+        "an unresolvable key stays cannot-verify (stderr={err})"
+    );
+    assert!(
+        !err.contains("not evidence of tampering"),
+        "the assurance must be gone — nothing here rules tampering out \
+         (stderr={err})"
+    );
+    // Asserted without an `||`. The first version of this test accepted
+    // "altered" *or* "possible tampering", and passed on the second — while
+    // `key-99` was in fact taking the missing-key-file arm and telling the
+    // operator to go looking for `audit-secret.98.retired`, a file that has
+    // never existed on this store. A disjunction over two arms cannot tell
+    // you which arm ran.
+    assert!(
+        err.contains("highest key epoch this store currently shows is 1"),
+        "this store has one epoch, so no key file for epoch 99 can have gone \
+         missing — the message must say that rather than name a path \
+         (stderr={err})"
+    );
+    assert!(
+        !err.contains("audit-secret.98.retired"),
+        "sending the operator after a file that never existed dresses an edit \
+         up as their own filing error (stderr={err})"
+    );
+    assert!(
+        err.contains("possible tampering"),
+        "the reading the attacker is trying to suppress must stay on screen \
+         (stderr={err})"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #457, Phase 8. The other half: an id no writer emits at all.
+///
+/// Separated from the test above because they take different arms, and one
+/// test asserting a disjunction over both proves neither.
+#[test]
+fn a_key_id_of_a_shape_no_writer_emits_is_reported_as_altered() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-keyid-shape");
+    let json = pretooluse_bash_json("rm -rf /");
+    for _ in 0..3 {
+        let _ = run_hook_script(&hook_path, &shim_dir, &json);
+    }
+
+    let log = base.join(".local/share/omamori/audit.jsonl");
+    let content = std::fs::read_to_string(&log).unwrap();
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+    lines[1] = lines[1].replace("\"key_id\":\"default\"", "\"key_id\":\"KEY-2\"");
+    assert!(
+        lines[1].contains("KEY-2"),
+        "fixture did not apply: the entry must actually name a bogus key"
+    );
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(code, 2, "still cannot-verify (stderr={err})");
+    assert!(
+        err.contains("has been altered"),
+        "case is upper, so no omamori build wrote it — the message may state \
+         that outright rather than hedge (stderr={err})"
+    );
+    assert!(
+        !err.contains("not evidence of tampering") && !err.contains("Most likely the key file"),
+        "no missing-key-file story is available for a shape no writer emits \
+         (stderr={err})"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #457 V-027. Once the chain verifies again after a rotation, verification
+/// reaches the end of the file — and therefore reaches the high-water-mark
+/// check it used to stop short of.
+///
+/// A rotated store whose tail was truncated will now report exit 3 where it
+/// previously reported exit 1. That is correct, but it is a *new* signal for
+/// those users, so it is pinned rather than left to be discovered.
+#[test]
+fn truncated_tail_after_rotation_reports_the_hwm_warning() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-hwm-after-rotation");
+    for _ in 0..3 {
+        let json = pretooluse_bash_json("rm -rf /");
+        let _ = run_hook_script(&hook_path, &shim_dir, &json);
+    }
+    let (rot_code, _, _) = run_audit(&base, &["key", "rotate"]);
+    assert_eq!(rot_code, 0);
+
+    // One more entry after the rotation, then verify so the HWM is recorded
+    // at the true end of the chain.
+    let json = pretooluse_bash_json("rm -rf /");
+    let _ = run_hook_script(&hook_path, &shim_dir, &json);
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 0,
+        "precondition: the rotated chain verifies (err={err})"
+    );
+
+    // Drop the last entry, leaving the high-water-mark ahead of the chain.
+    let log = base.join(".local/share/omamori/audit.jsonl");
+    let content = std::fs::read_to_string(&log).unwrap();
+    let mut lines: Vec<&str> = content.lines().collect();
+    lines.pop();
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 3,
+        "V-027: truncation must surface as the HWM warning, not as tampering \
+         and not as success (stderr={err})"
+    );
+    assert!(
+        err.contains("truncated"),
+        "V-027: the wording must name truncation, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

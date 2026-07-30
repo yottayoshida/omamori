@@ -152,13 +152,24 @@ pub fn hash_cwd_candidates(
 ) -> Option<Vec<(String, &'static str, String)>> {
     let audit_path = super::resolved_audit_path(audit_config)?;
     let secret_path = super::secret::secret_path_for(&audit_path);
-    let mut keyring: Vec<(String, [u8; 32])> = super::secret::load_keyring(&secret_path)
-        .into_iter()
-        .collect();
-    if keyring.is_empty() {
+    let ring = super::secret::load_keyring(&secret_path);
+    if ring.is_empty() {
         return None;
     }
-    keyring.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic output order
+
+    // #457 P4-b: a truncated or partly-unreadable keyring is a forensic false
+    // negative here — the investigator gets a shorter candidate list with no
+    // sign that the key which would have matched was never tried. `verify`
+    // turns these into exit 2; this surface has no exit code to spend, so it
+    // says so on stderr rather than quietly returning less.
+    for anomaly in ring.anomalies() {
+        eprintln!("omamori warning: {}", anomaly.describe());
+    }
+
+    // `Keyring` is backed by a `BTreeMap`, so iteration is already in key_id
+    // order — the explicit sort this replaced is no longer needed to make the
+    // output deterministic.
+    let keyring: Vec<(&String, &[u8; 32])> = ring.iter().collect();
 
     let mut forms: Vec<(&'static str, std::ffi::OsString)> =
         vec![("raw", candidate.as_os_str().to_owned())];
@@ -169,7 +180,7 @@ pub fn hash_cwd_candidates(
     }
 
     let mut out = Vec::with_capacity(keyring.len() * forms.len());
-    for (key_id, secret) in &keyring {
+    for (key_id, secret) in keyring {
         for (label, form) in &forms {
             out.push((key_id.clone(), *label, hmac_cwd(Some(secret), form)));
         }
@@ -518,7 +529,7 @@ mod tests {
         let original_secret = *logger_before
             .secret_ref()
             .expect("from_config must create a secret in a fresh dir");
-        let original_key_id = logger_before.key_id.clone();
+        let original_key_id = logger_before.key_id().to_string();
 
         let rotation =
             rotate_key(&audit_path).expect("rotation succeeds against an existing secret");

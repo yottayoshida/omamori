@@ -10,6 +10,7 @@ use time::OffsetDateTime;
 
 use super::AuditEvent;
 use super::chain::{CHAIN_VERSION, compute_entry_hash_for_write, hmac_bytes, prune_genesis_hash};
+use super::secret::SigningKey;
 use super::{hwm_path_for, write_hwm};
 
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
@@ -24,13 +25,13 @@ pub(super) const PRUNE_RESULT: &str = "pruned";
 /// Best-effort: errors are silently ignored (prune is not critical path).
 pub(super) fn try_prune(
     file: &mut fs::File,
-    secret: Option<&[u8; 32]>,
+    signing_key: &SigningKey,
     retention_days: u32,
     audit_path: Option<&std::path::Path>,
 ) -> Result<u64, std::io::Error> {
     try_prune_at(
         file,
-        secret,
+        signing_key,
         retention_days,
         audit_path,
         OffsetDateTime::now_utc(),
@@ -39,7 +40,7 @@ pub(super) fn try_prune(
 
 pub(super) fn try_prune_at(
     file: &mut fs::File,
-    secret: Option<&[u8; 32]>,
+    signing_key: &SigningKey,
     retention_days: u32,
     audit_path: Option<&std::path::Path>,
     now: OffsetDateTime,
@@ -105,7 +106,7 @@ pub(super) fn try_prune_at(
         return Ok(0);
     }
 
-    let prune_point = build_prune_point(secret, prune_count, &first_retained_hash);
+    let prune_point = build_prune_point(signing_key, prune_count, &first_retained_hash, now);
 
     // In-place rewrite: prune_point + retained lines
     let estimated_size = content.len(); // upper bound; retained portion is smaller
@@ -152,18 +153,33 @@ pub(super) fn try_prune_at(
     Ok(prune_count)
 }
 
+/// Build the prune point that replaces the pruned range.
+///
+/// #457 Bug 1: this used to take a bare secret and write `key_id: "default"`
+/// unconditionally. After a rotation, `"default"` names the *epoch-1* key
+/// (`secret::load_keyring`), so the entry was signed with one key and labelled
+/// with another — the verifier then recomputed its hash with the wrong key and
+/// reported the chain as tampered. Taking a `SigningKey` makes the two
+/// impossible to disagree: the same value supplies both the bytes and the id.
+///
+/// `now` is a parameter rather than `OffsetDateTime::now_utc()` because the
+/// enclosing `try_prune_at` already threads a deterministic clock through for
+/// tests; leaving this one call non-deterministic made a byte-level golden
+/// test of the prune point structurally impossible to write.
 pub(super) fn build_prune_point(
-    secret: Option<&[u8; 32]>,
+    signing_key: &SigningKey,
     prune_count: u64,
     first_retained_hash: &str,
+    now: OffsetDateTime,
 ) -> AuditEvent {
+    let secret = signing_key.secret();
     let target_hash = hmac_bytes(
         secret,
         format!("prune-bind:{prune_count}:{first_retained_hash}").as_bytes(),
     );
 
     let mut event = AuditEvent {
-        timestamp: OffsetDateTime::now_utc()
+        timestamp: now
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
         provider: "omamori".to_string(),
@@ -179,7 +195,7 @@ pub(super) fn build_prune_point(
         chain_version: Some(CHAIN_VERSION),
         seq: Some(0),
         prev_hash: Some(prune_genesis_hash(secret)),
-        key_id: Some("default".to_string()),
+        key_id: Some(signing_key.id.clone()),
         entry_hash: None,
         pid: None,
         ppid: None,
