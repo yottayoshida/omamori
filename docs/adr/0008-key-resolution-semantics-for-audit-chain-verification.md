@@ -1,0 +1,194 @@
+# ADR-0008: Key resolution semantics for audit-chain verification
+
+- **Status**: Accepted
+- **Date**: 2026-07-30
+- **Plan**: `.claude/plans/2026-07-30-omamori-457-key-rotation-verify.md`
+- **Issue**: [#457](https://github.com/yottayoshida/omamori/issues/457)
+
+## Context
+
+`omamori audit key rotate` shipped in v0.8.0 (2026-04-11) alongside a changelog line reading
+"Multi-key verification in `verify_chain()` — old entries verify against retired key". That
+sentence was never true. Running the command once made `omamori audit verify` return exit 1
+`chain broken at entry #0` from then on, with no way back: `ADR-0007` forbids rewriting existing
+entries, no `unrotate` exists, and `docs/FAQ.md` has no entry for a broken chain. The only remedy
+a user can reach on their own is deleting `audit.jsonl` — destroying the very record the tool
+exists to protect.
+
+The multi-key design itself was already in the codebase and already correct in places:
+`verify_chain` resolved each entry's HMAC key through `keyring.get(entry.key_id)`, and
+`provenance::hash_cwd_candidates` tried every key in the ring. What was missing was consistency.
+Three values were still computed from whichever key happened to be active at verification time,
+regardless of which key had actually produced them:
+
+| Value | Written with | Verified with (before this ADR) |
+|---|---|---|
+| `genesis_hash` anchor of the first chain entry | the key active when the chain started | the key active *now* |
+| `prune_genesis_hash` anchor of a prune point | the key active when the prune ran | the key active *now* |
+| `prune-bind` `target_hash` | the key active when the prune ran | the key of the *first retained entry* |
+
+Separately, `build_prune_point` stamped `key_id: "default"` unconditionally while signing with the
+active secret, and `AuditLogger::from_config` resolved the secret and the `key_id` through two
+independent directory reads. Every one of these is the same shape: **a value signed with one key
+while labelled as, or checked against, another.**
+
+## Decision
+
+### 1. A value is verified with the key it names
+
+`genesis_hash` and `prune_genesis_hash` are computed from the key named by the entry being
+anchored, not from the active secret. `prune-bind` is recomputed with the key that authenticated
+the prune point, carried forward alongside the target hash and count. Writers take a `SigningKey`
+— one value holding both the bytes and the `key_id` — so a call site cannot name a key it did not
+sign with.
+
+### 2. `"default"` is an alias for epoch 1, not a wildcard
+
+`"default"` names the first key a store ever had. Before any rotation that is the active key;
+afterwards it is `audit-secret.1.retired`. Both registrations point at the same bytes. This was
+already true in the code and is now stated explicitly, because a plausible-looking "fix" is to
+renumber `"default"` to `"key-1"` — which would break unrotated stores, where `"key-1"` is not in
+the ring at all.
+
+### 3. A key we do not hold is *cannot verify*, not *tampered*
+
+`keyring.get(id).unwrap_or(&active)` is removed. An entry naming an absent key stops verification
+with exit **2** (cannot verify), the code already used for "secret unavailable / file missing /
+legacy-only". Not exit 1: the entry may be entirely authentic and merely uncheckable, and
+accusing an operator of tampering because a key file was renamed is a false alarm in the
+strongest wording the product has. Not exit 4 either: that code's message tells the reader to
+upgrade omamori, which does nothing for a missing key.
+
+This also closes a **false negative**. The old fallback checked such an entry against the active
+key; when that happened to be the signing key — the common case, since a stray
+`audit-secret.bak.retired` shifted every new entry's label without changing which key signed them
+— the entry passed and the verifier reported "chain intact" about an entry it had not
+authenticated under the key the entry named. Measured against v0.16.0: exit 0.
+
+### 4. Key epochs are derived from the highest index present, and the directory is enumerated
+
+Retired keys are found by reading the directory once and parsing `audit-secret.{N}.retired` as a
+canonical decimal. Non-numeric suffixes are ignored rather than counted; the next epoch is
+`highest + 1` rather than `count + 1`; gaps do not hide the keys beyond them.
+
+Building a path and opening it was independently unsafe: on a case-insensitive filesystem (APFS
+default) `open("audit-secret.1.retired")` succeeds for a file named `audit-secret.1.RETIRED`,
+which a literal name-match count never saw. One such file made a never-rotated host report
+`chain broken at #0`.
+
+### 5. The verifier does not search for a key the entry did not name
+
+When an entry's declared key fails to authenticate it, verification stops. It does **not** try the
+rest of the ring looking for a key that works.
+
+Trying would recover some already-damaged logs — prune points written by the pre-fix writer, which
+name `"default"` but were signed with the active key. It was rejected anyway, for a reason
+unrelated to whether it works: it would make the verifier absorb the exact class of bug this
+change exists to remove. A future writer that labelled entries wrongly would produce logs that
+still verify, and nothing would report the drift. Verification would repair the symptom and
+destroy the signal.
+
+The population able to benefit is small by construction: it requires `[audit] retention_days > 0`
+(default 0, absent from `config init`'s template) **and** a completed rotation **and** at least
+1000 retained entries. If such a log ever turns up, the answer is an explicit repair command with
+its own name and its own confirmation — not a verifier that quietly accepts mislabelled data.
+
+### 6. What the verifier may *say* about a key it cannot resolve
+
+§3 decides the classification. It does not license an explanation. `key_id` is an ordinary field of
+`audit.jsonl`, so an entry naming an absent key is reached by two very different routes: a key file
+that was renamed or deleted, and someone editing one string. Editing costs an attacker nothing —
+no key material, no re-signing — so the first version of this change handed them something for
+free: exit 1 `chain broken … The audit log may have been tampered with.` became exit 2 `… **This
+is not evidence of tampering.** The key file for "key-99" is missing, renamed, or unreadable`
+(measured against v0.16.0 on identical fixtures). omamori vouched for the log on the strength of a
+field the attacker wrote.
+
+The classification stands — an unresolvable entry genuinely cannot be checked, and calling that
+tampering is the false accusation this ADR exists to remove. What the verifier may assert is
+narrowed to what it can substantiate:
+
+| Observation | What may be said |
+|---|---|
+| The id is the reserved `unresolved` | omamori wrote this itself with no key. Nothing is missing; restoring a file will not help |
+| The id is of a shape no writer emits (`key-1`, `key-02`, `KEY-2`, anything non-decimal) | A missing key file does not explain it. The field has been altered |
+| A well-formed epoch, within the epochs this store shows | The key file is the likely cause — name it — **and** an edit produces the same state |
+| A well-formed epoch above them | No key file for that epoch is here to have gone missing. Either the field was altered or retired keys were deleted; nothing on disk distinguishes them |
+
+The last row is stated as an observation, not a verdict, because deleting retired key files lowers
+the observed maximum too — the same gap that makes deleting the last retired key read as tampering.
+An accusation resting on it would be wrong for an operator who tidied their key directory.
+
+Exit 2 also states that tail-truncation detection is suspended, which exit 4 already said for the
+same reason. Omitting it made exit 2 the quieter of the two ways to reach a halt, and reaching it
+is cheaper: forging a `chain_version` versus editing one label.
+
+### 7. The accepted set widens by one entry, and that is deliberate
+
+Deciding §1 has a cost. Before it, the head entry's anchor was computed from the active key, which
+meant an attacker holding only a *retired* key could not forge a chain head — the forged anchor
+would not match. After it, the head is anchored with whatever key it names, so such a forgery is
+accepted.
+
+This is accepted, for three reasons:
+
+- The protection was **incidental, not designed**. Nothing in `SECURITY.md` or `docs/CONTRACT.md`
+  claims it; it fell out of an implementation detail that this ADR is correcting.
+- It covers **one entry**. `verify_chain` performs no monotonicity check on key epochs, so an
+  attacker holding a retired key can already forge any *non-head* entry by naming that key
+  (`SECURITY.md`, "Key rotation" section). The head was the sole exception.
+- **There is no version of the fix that keeps it.** Verifying a rotation-spanning chain requires
+  anchoring on the key the chain started with, and a forger can name that key too.
+
+`prune_point_written_after_rotation_verifies` and the tests around it pin the intended behaviour;
+a test also pins the widened acceptance itself, so that a later change cannot narrow or widen it
+silently. Making rotation provide real forward security requires per-entry epoch monotonicity —
+tracked separately, out of scope here.
+
+## Alternatives Considered
+
+| Option | Rejected because |
+|---|---|
+| **Append a rotation marker to the chain and re-anchor there** | Does not address the prune-point defects at all, cannot help any log already written, and couples key management to log state — `rotate_key` would begin failing when the log's tail carries an unrecognized `chain_version`, and a crash between rename and append would leave the key rotated with no record of it. |
+| **Re-sign existing entries under the current key** | Forbidden by `ADR-0007` §"Never do this". Also self-defeating: re-signing requires holding every retired key, while the reason to rotate is that an old key may be compromised. |
+| **Make `genesis_hash` key-independent** | Every existing chain head would stop matching — precisely the breaking change `docs/CONTRACT.md`'s audit-chain row exists to prevent. Gating it behind a new `chain_version` would mean a third format one release after the second. |
+| **Renumber `"default"` to `"key-1"`** | Unrotated stores have no `"key-1"` in the ring, so every entry would fall through to an implicit fallback — replacing explicit resolution with the very thing §3 removes. |
+| **Search the keyring on authentication failure (§5)** | See §5. |
+| **Reorder rotation to temp-create → rename → rename** (create `audit-secret.pending`, rename the active key to `.N.retired`, then rename `.pending` into place) | **Not rejected — deferred, and cheaper than the option this ADR does defer.** It closes the interrupted-rotation window without adding any on-disk *format* element: the extra name is transient, does not end in `.retired`, and `write_hwm` already uses the same temp-plus-atomic-rename pattern. It is out of this change's scope only because rotation ordering is not what #457 is about. Recorded here so the next person to look at the interrupted-rotation residual sees three options rather than two. |
+
+## Consequences
+
+- A chain that spans one or more rotations verifies, with no file rewriting: the values on disk
+  were always correct, only the verifier's choice of key was wrong.
+- Entries written while the key directory could not be enumerated carry a reserved `key_id` that
+  no keyring can hold, so they report as *cannot verify* with their real reason. The first version
+  labelled them `"default"`, which on a rotated store resolved to `.1.retired` and made them read
+  as tampering once permissions were restored — permanently, since ADR-0007 forbids rewriting
+  them. Measured against v0.16.0, which wrote a real HMAC in that state and reported `intact`: a
+  regression introduced by the fail-closed branch itself, and one its own comment claimed to be
+  avoiding.
+- No lock omamori takes waits indefinitely. `flock` works on a read-only descriptor, so a blocking
+  `LOCK_EX` on a hot-path file let any local process stall every omamori surface — `verify`,
+  `doctor`, `report`, every guarded command, and `hook-check` before it printed its deny verdict,
+  which hands the outcome to the host's hook-timeout policy. Acquisition is bounded and then
+  degrades to unlocked (key store) or reports contention (audit log). Read-side opens carry
+  `O_NONBLOCK` for the same reason, and `read_secret` re-checks the file type and bounds the read
+  on the opened descriptor: the `stat` pre-check it shipped with is a race, not a control.
+- `omamori audit verify` gains no new exit code; exit 2 covers one more situation. `ChainStatus`
+  gains a variant and `#[non_exhaustive]`, following the precedent `VerifyResult` set in #177 B3.
+- A missing or unreadable key file now stops verification instead of being masked. Stores that
+  reported "intact" while carrying entries nobody had actually checked will now say so — visible
+  as a behaviour change, though what changed is the honesty of the report, not the data.
+- `hash_cwd_candidates` warns when the keyring is truncated or partly unreadable. Silence there
+  is a forensic false negative: a shorter candidate list with no sign that the matching key was
+  never tried.
+- Rotation can no longer overwrite a retired key. The numbering change already makes the next
+  slot free; the explicit refusal remains for the case where the directory scan itself fails.
+- An interrupted rotation (retired keys present, no active key) is reported when detected, and the
+  residual is pinned by a test rather than left to be rediscovered. Two ways to close it properly
+  are recorded in Alternatives: reordering rotation so the window does not exist (cheaper, no
+  format change), and having each key file record its own epoch (more general, adds an on-disk
+  element 1.0 would freeze). Note the asymmetry in that second one: **if 1.0 freezes on-disk
+  elements, adding one afterwards is harder, not easier** — so "defer past 1.0" is the wrong frame
+  for it. It is deferred because #457 is about key *resolution*, not key *storage*, and the
+  reordering option closes the same window without touching storage at all.

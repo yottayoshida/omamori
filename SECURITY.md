@@ -615,7 +615,7 @@ Each JSONL entry contains:
 | `chain_version` | Chain format version. Currently `2`; existing `1` entries remain valid and are never rewritten (see [Forward-Unknown Chain Versions](#forward-unknown-chain-versions-177) and ADR-0007) |
 | `seq` | Monotonic sequence number |
 | `prev_hash` | HMAC of the previous entry (genesis for first entry) |
-| `key_id` | HMAC key identifier (for future key rotation) |
+| `key_id` | Identifier of the HMAC key that produced this entry's `entry_hash`. `"default"` names the store's first key epoch; `"key-N"` names epoch N. Verification resolves the key through this field — see "Key rotation" below |
 | `timestamp` | RFC 3339 UTC timestamp |
 | `provider` | AI tool that triggered the command |
 | `command` | Command name (e.g., `rm`, `git`) |
@@ -673,7 +673,10 @@ Layer 1 (PATH shim) audit events carry a best-effort process snapshot — `pid`,
 - **Per-install secret**: 32 bytes from `/dev/urandom`, stored at `~/.local/share/omamori/audit-secret` (chmod 0600)
 - **target_hash**: `HMAC-SHA256(secret, targets)` — file paths are never stored in plaintext
 - **entry_hash**: `HMAC-SHA256(secret, canonical_json(entry))` — computed over a fixed-field-order canonical struct, selected per-entry by its own declared `chain_version`: `HashableEvent` (15 fields) for `chain_version: 1`, `HashableEventV2` (20 fields — `HashableEvent`'s 15 plus `pid`/`ppid`/`parent_process`/`cwd_hash`/`wrapper_kind`) for `chain_version: 2` (#177 B3). Either way, the struct ensures deterministic hashing regardless of serde serialization options
-- **Genesis**: First entry's `prev_hash` = `HMAC-SHA256(secret, "omamori-genesis-v1")`
+- **Genesis**: First entry's `prev_hash` = `HMAC-SHA256(key, "omamori-genesis-v1")`, where *key* is
+  the one named by that entry's `key_id` — **not** whichever key is active at verification time. A
+  chain that began before a rotation is anchored to the retired key's genesis and stays anchored
+  there; nothing on disk is rewritten when a rotation happens
 
 ### Hash Chain
 
@@ -743,6 +746,87 @@ If the secret file is deleted or unreadable:
 - `omamori audit verify` (v0.7.1) will flag these entries
 - **Strict mode** (v0.7.3): When `audit.strict = true`, AI commands intercepted by the PATH shim are blocked if the secret is unavailable after re-creation attempt. Hook-only commands (not matching any shim rule) are not affected
 
+### Key Rotation (v0.8.0+, semantics fixed in #457)
+
+`omamori audit key rotate` renames the active secret to `audit-secret.{N}.retired` and generates a
+new one. Entries written from that point carry `key_id: "key-{N+1}"`; entries written earlier keep
+the id of the epoch that signed them (`"default"` for the store's first key).
+
+**Retired key files must be kept.** They are not backups — they are the only way to verify entries
+from their epoch, and deleting one is not recoverable.
+
+What happens when one is missing depends on whether *any* retired key remains:
+
+- **Some remain.** The entries signed by the deleted key report as **cannot verify** (exit 2),
+  naming the key id that could not be resolved
+- **None remain.** The store becomes indistinguishable from one that never rotated. `"default"`
+  then resolves to the *active* key — an id that exists, holding the wrong bytes — so the affected
+  entries report as **tampering** (exit 1), not as cannot-verify
+
+The second case is a known limitation, not a judgement about the log: telling "this key is gone"
+apart from "this entry was altered" would require each key file to record which epoch it belongs
+to. That is deferred (see ADR-0008) because it adds an on-disk element that 1.0 would freeze.
+
+#### What rotation guarantees
+
+- Entries written before the rotation continue to verify, against the retired key, with no
+  rewriting of anything on disk. The chain's genesis anchor and every prune point are recomputed
+  with the key each one names, not with whichever key is currently active
+- New entries are signed with the new key
+- A key that cannot be found is reported as **cannot verify** (exit 2), distinctly from tampering
+  (exit 1) and from an unrecognized `chain_version` (exit 4). "The key file is gone" and "the log
+  was altered" are different situations with different remedies
+
+#### What rotation does *not* guarantee
+
+**Rotating does not neutralize a leaked key.** `verify_chain` resolves each entry's key from the
+`key_id` that entry declares, and performs no check that key epochs advance monotonically along
+the chain. An attacker holding any past key — active or retired — can forge an entry that names
+that key, and it will verify. Rotation limits which *future* entries a leaked key can produce; it
+does not invalidate the leaked key for the purpose of forging entries labelled as belonging to its
+own epoch.
+
+Treat a leaked audit key as a permanent loss of tamper-evidence for the epochs it covers. Rotation
+is hygiene against future exposure, not remediation of past exposure.
+
+#### Operational notes
+
+- Files matching `audit-secret.*.retired` whose suffix is not a canonical decimal number (for
+  example `audit-secret.bak.retired`) are ignored, not counted as rotations. Before #457 such a
+  file shifted the `key_id` of every subsequent entry and could make an unrotated store report a
+  broken chain
+- The converse is **not** true, and it is the more dangerous case: a copy whose suffix *is* a
+  canonical decimal is not ignored, it is registered as that epoch. Copying
+  `audit-secret.1.retired` to `audit-secret.2.retired` gives `key-2` epoch 1's bytes while the
+  active key moves to `key-3`, so entries already labelled `key-2` stop verifying — a permanent
+  false tampering verdict, produced with no attacker. Keep spare copies **outside** the data
+  directory
+- The next retired slot is chosen from the highest index present, and rotation refuses to
+  overwrite an existing retired key
+- The keyring loads at most 256 keys, keeping the highest indices. If more exist, `verify` reports
+  the truncation rather than silently verifying against a partial set
+- A rotation interrupted between the rename and the new key's creation leaves retired keys with no
+  active key. omamori warns when it sees this: the next append would otherwise mint a second,
+  different secret under the same `key_id` the interrupted rotation was heading for. **The warning
+  is all that happens** — those entries do become permanently unverifiable, and the verifier
+  reports them as tampering rather than as cannot-verify, because the id resolves and only the
+  bytes differ. Distinguishing the two would require each key file to record its own epoch; see
+  ADR-0008
+- The data directory contains an `audit-secret.lock` file. It holds no data and is used only as an
+  `flock` target, so that resolving the active key and rotating it cannot interleave. It is not a
+  key and is never treated as one. It is recreated on demand, so losing it costs nothing beyond
+  the serialization it provides — but note that `PROTECTED_FILE_PATTERNS` matches it (the rule is
+  a `audit-secret` filename prefix), so an AI session cannot delete it through the shim or hook
+  layers
+- **No lock omamori takes is allowed to block indefinitely.** Acquisition uses `LOCK_NB` with a
+  bounded retry budget (100 × 5 ms) and then proceeds without the lock. This is not a performance
+  choice. `flock` works on a read-only descriptor, so any local process able to open one of these
+  files could otherwise hold a lock forever and stall every omamori surface — including
+  `hook-check`, which would hang *before* printing its deny verdict and leave the outcome to the
+  host's hook-timeout policy rather than to omamori. `PROTECTED_FILE_PATTERNS` does not help here:
+  it governs AI-mediated file operations, not an interpreter calling `flock` directly. The lock
+  file is created `0600`, like every other file omamori writes in this directory
+
 ### Strict Mode (v0.7.3+)
 
 Opt-in fail-close mode. When enabled, AI commands intercepted by the PATH shim are blocked if the audit HMAC secret is unavailable, preventing unverifiable command execution. Commands that only pass through Layer 2 hooks (not matching any shim rule) are not affected — the hook path does not hold an `AuditLogger` instance.
@@ -772,20 +856,27 @@ strict = true  # default: false
 
 All audit file operations use `O_NOFOLLOW` to reject symlinks at the kernel level. This prevents symlink attacks where an attacker replaces `audit.jsonl` or `audit-secret` with a symlink to `/dev/null` or a controlled location.
 
-**Symlink-protected operations** (8 total — 6 via `O_NOFOLLOW`, 2 via `lstat`/atomic-rename, see Note below):
+**Symlink-protected operations** (9 total — 6 via `O_NOFOLLOW`, 3 via `lstat`/atomic-rename, see Note below):
 
 | Operation | File | Effect on symlink |
 |-----------|------|-------------------|
 | `append()` | audit.jsonl | `ELOOP` error, entry not written |
-| `read_secret()` | audit-secret | `ELOOP` error, secret not loaded |
+| `read_secret()` | audit-secret | Rejected before open, "possible attack" error, secret not loaded |
 | `create_secret()` | audit-secret | `ELOOP` error, secret not created |
 | `verify_chain()` | audit.jsonl | `ELOOP` error, verify fails |
 | `show_entries()` | audit.jsonl | `ELOOP` error, show fails |
 | `audit_summary()` | audit.jsonl | `ELOOP` error, count returns 0 |
+| `with_key_store_lock()` | audit-secret.lock | `ELOOP` error, lock skipped; non-regular files rejected after open |
 | `write_hwm()` | audit.jsonl.hwm | Refuses to write; final/temp symlink rejected before open |
 | `read_hwm()` | audit.jsonl.hwm | Symlink treated as tampered, not followed |
 
-*Note: the HWM sidecar's mechanism differs slightly from the six operations above — `read_hwm()` detects a symlink via `symlink_metadata` (lstat) rather than an `O_NOFOLLOW` open, and `write_hwm()` publishes the final file via atomic `rename` (which cannot land on a symlink at the destination) rather than an `O_NOFOLLOW` open of the final path directly. `O_NOFOLLOW` is still used for the temp file during write.*
+*Note: three of the nine do not rely on an `O_NOFOLLOW` open.*
+
+- *`read_hwm()` detects a symlink via `symlink_metadata` (lstat).*
+- *`write_hwm()` publishes the final file via atomic `rename`, which cannot land on a symlink at the destination. `O_NOFOLLOW` is still used for the temp file during write.*
+- *`read_secret()` gained an `lstat` pre-check in #457. It rejects a symlink **before** reaching its `O_NOFOLLOW` open, and its symlink branch deliberately keeps the same "possible attack" wording the `O_NOFOLLOW` path produced, since `verify_chain` distinguishes a symlinked secret from an ordinary missing one by that phrase.*
+
+*A stat followed by an open is a TOCTOU window, so the pre-check is an early rejection with a precise message, **not** the enforcement. The two hazards it names are closed at the descriptor instead: every read-side open passes `O_NONBLOCK` (a FIFO cannot make `open()` wait for a writer), `read_secret()` re-checks `is_file()` on the opened file, and the read is bounded with `take()` rather than by the pre-check's `len()`. omamori reads this file on every command, so an attacker racing the window gets unlimited attempts; a check that only inspects the name is not a control.*
 
 **Limitations**:
 
@@ -809,9 +900,9 @@ retention_days = 90  # 0 = unlimited (default)
 
 | Property | Mechanism |
 |----------|-----------|
-| Prune_point authenticity | `entry_hash` = HMAC-SHA256 over all fields (secret required to forge) |
-| Prune_point anchoring | `prev_hash` = HMAC(secret, "omamori-prune-v1") — distinct from chain genesis |
-| First-retained binding | `target_hash` = HMAC(secret, "prune-bind:{count}:{first_retained_entry_hash}") |
+| Prune_point authenticity | `entry_hash` = HMAC-SHA256 over all fields, computed with the key the prune point's `key_id` names (that key is required to forge it) |
+| Prune_point anchoring | `prev_hash` = HMAC(key, "omamori-prune-v1") — distinct from chain genesis. *key* is again the one the prune point names, not whichever key is active at verification time; a prune that ran before a rotation stays anchored to the key it ran under |
+| First-retained binding | `target_hash` = HMAC(key, "prune-bind:{count}:{first_retained_entry_hash}"), where *key* is the prune point's own — the same one its `key_id` names and its `entry_hash` authenticates under. Not the key of the first retained entry, which may belong to an earlier epoch |
 | Minimum retention | 7 days enforced (values < 7 clamped with warning) |
 | Minimum entry count | 1000 entries always retained regardless of age |
 | Config protection | `omamori/config.toml` protected by `PROTECTED_FILE_PATTERNS` |
