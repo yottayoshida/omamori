@@ -282,10 +282,10 @@ fn print_risk_signals_section(ai_env: bool) {
 
     let has_blocks = report.total_blocks > 0;
     let has_unknown = report.unknown_tool_fail_opens > 0;
-    let chain_broken = matches!(
-        report.chain_status,
-        ChainStatus::Broken { .. } | ChainStatus::Truncated | ChainStatus::Unverifiable { .. }
-    );
+    // Wider than tampering: truncation and every unverifiable state qualify.
+    // The list itself lives on `ChainStatus` as an exhaustive match, so a new
+    // variant cannot be silently treated as healthy here (#457).
+    let chain_broken = report.chain_status.needs_attention();
     let audit_unwritable = load_result.config.audit.enabled
         && matches!(
             audit_path_is_writable(&load_result.config.audit),
@@ -342,7 +342,40 @@ fn print_risk_signals_section(ai_env: bool) {
                 );
             }
         }
-        _ => {}
+        // #457 A5: deliberately worded away from "tampered"/"broken" — a key
+        // file that is missing or renamed is an operator-recoverable state,
+        // and the remedy is to restore the key, not to distrust the log.
+        ChainStatus::KeyUnavailable { key_id, .. } => {
+            if ai_env {
+                println!("    chain: cannot verify (key \"{key_id}\" not in keyring)");
+            } else {
+                println!(
+                    "    chain: cannot verify — entry names key \"{key_id}\", which is not \
+                     in the keyring; restore the retired key file and re-run \
+                     omamori audit verify"
+                );
+            }
+        }
+        // #457 (Codex Round 2): must appear here as well as in `chain_broken`
+        // above. Landing in the `_` arm would print nothing while the section
+        // header claimed a risk signal existed.
+        ChainStatus::KeyringUnusable { reason, .. } => {
+            if ai_env {
+                println!("    chain: cannot verify ({reason})");
+            } else {
+                println!(
+                    "    chain: cannot verify — {reason}; fix the permissions on the \
+                     directory holding audit-secret and re-run omamori audit verify"
+                );
+            }
+        }
+        // Listed rather than caught by `_`. `needs_attention()` is exhaustive
+        // and its doc comment claims that makes a silently-healthy new variant
+        // impossible — but a `_` here reopens exactly that: the author sets
+        // `needs_attention()` to true, the compiler is satisfied, the section
+        // header announces a risk signal, and this match prints nothing.
+        // These two are the only variants that legitimately print nothing.
+        ChainStatus::Intact | ChainStatus::Unavailable => {}
     }
     if report.hwm_tampered {
         if ai_env {

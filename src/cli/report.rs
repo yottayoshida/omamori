@@ -140,6 +140,20 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
                 println!("  Audit log: unverifiable (unrecognized chain_version)");
             }
         }
+        ChainStatus::KeyUnavailable { at_seq, key_id } => {
+            if verbose {
+                println!(
+                    "  Audit log: cannot verify from seq {at_seq} — entry names key \
+                     \"{key_id}\", which is not in the keyring (not tampering; the key \
+                     file is missing, renamed, or unreadable)"
+                );
+            } else {
+                println!("  Audit log: cannot verify (key \"{key_id}\" not in keyring)");
+            }
+        }
+        ChainStatus::KeyringUnusable { reason, .. } => {
+            println!("  Audit log: cannot verify — {reason}");
+        }
         ChainStatus::Unavailable => println!("  Audit log: unavailable"),
     }
 
@@ -148,10 +162,7 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
     if report.unknown_tool_fail_opens > 0 {
         follow_ups.push("review unknown tools: omamori audit unknown");
     }
-    if matches!(
-        report.chain_status,
-        ChainStatus::Broken { .. } | ChainStatus::Truncated | ChainStatus::Unverifiable { .. }
-    ) {
+    if report.chain_status.needs_attention() {
         follow_ups.push("verify chain: omamori audit verify");
     }
     if !follow_ups.is_empty() {

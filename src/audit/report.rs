@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::secret::open_read_nofollow;
-use super::verify::verify_chain;
+use super::verify::{AuditError, verify_chain};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 
 /// Chain integrity status. Originally 3-state per SEC-R8; #177 B1 step 2
@@ -27,6 +27,12 @@ use super::{AuditConfig, AuditEvent, resolved_audit_path};
 /// tampered with" for what may just be "upgrade omamori."
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
+// #457 A5 adds a variant. `VerifyResult` already carries `#[non_exhaustive]`
+// (verify.rs) on the same reasoning — a public type that will keep gaining
+// cases should close the exhaustive-match door before 1.0, not after. Within
+// this crate the compiler still checks every `match` for completeness, so this
+// costs nothing internally.
+#[non_exhaustive]
 pub enum ChainStatus {
     Intact,
     Broken {
@@ -39,6 +45,40 @@ pub enum ChainStatus {
         at_seq: u64,
         chain_version: u32,
     },
+    /// #457 A5: an entry names a `key_id` that is not in the keyring. This is
+    /// *not* tampering — the entry may be perfectly authentic and merely
+    /// uncheckable, which is what happens when a retired key file is deleted,
+    /// renamed, or made unreadable. Kept distinct from `Broken` so a missing
+    /// file cannot masquerade as evidence of an attack, and from
+    /// `Unverifiable` (an unrecognized `chain_version`) because the remedy is
+    /// different: restore the key, not upgrade the binary.
+    KeyUnavailable {
+        #[serde(skip_serializing)]
+        at_seq: u64,
+        key_id: String,
+    },
+    /// #457 (Codex Round 2): the key directory could not be listed, so *no*
+    /// entry can be checked against the key it names.
+    ///
+    /// Kept out of `Unavailable` deliberately. `Unavailable` also covers "audit
+    /// is switched off" and "there is no log", which `doctor` correctly treats
+    /// as quiet — folding this in would make an actionable, recoverable fault
+    /// disappear from the risk signals, and it used to surface (as `Broken`)
+    /// before #457 made the verifier stop early. That would be a regression in
+    /// the one surface an operator actually watches.
+    KeyringUnusable {
+        /// Human-facing text. Carries the directory path, so it is **not**
+        /// serialized: `report --json` is the form most likely to be pasted
+        /// into an issue, and the path contains the operator's home
+        /// directory. Every other variant already keeps its internals out of
+        /// the JSON (`at_seq` on both `Broken` and `KeyUnavailable`); this one
+        /// shipped as the first to leak, which the reason-free `kind` below
+        /// corrects.
+        #[serde(skip_serializing)]
+        reason: String,
+        /// The path-free classification, for machine consumers.
+        kind: &'static str,
+    },
     Unavailable,
 }
 
@@ -49,7 +89,36 @@ impl ChainStatus {
             Self::Broken { .. } => "broken",
             Self::Truncated => "truncated",
             Self::Unverifiable { .. } => "unverifiable",
+            // Underscore, not hyphen: the enum serializes with
+            // `rename_all = "snake_case"`, so the JSON tag is
+            // `key_unavailable`. Every pre-existing variant is a single word,
+            // which is why this is the first place the two could disagree.
+            Self::KeyUnavailable { .. } => "key_unavailable",
+            Self::KeyringUnusable { .. } => "keyring_unusable",
             Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// Whether this status is worth putting in front of an operator — wider
+    /// than tampering, and deliberately excluding `Unavailable`, which also
+    /// means "audit is switched off" and "there is no log yet".
+    ///
+    /// #457 (`/simplify`, three reviewers converged): this list was
+    /// hand-maintained as a `matches!` in both `doctor` and `report`, each
+    /// carrying its own comment warning that `matches!` gets no exhaustiveness
+    /// check. Warning about a hazard twice is not closing it. As an exhaustive
+    /// `match` here the compiler closes it — `#[non_exhaustive]` constrains
+    /// other crates, not this one — so a new variant cannot be silently
+    /// treated as healthy. `doctor` had already been bitten by exactly that
+    /// during this PR's review.
+    pub fn needs_attention(&self) -> bool {
+        match self {
+            Self::Intact | Self::Unavailable => false,
+            Self::Broken { .. }
+            | Self::Truncated
+            | Self::Unverifiable { .. }
+            | Self::KeyUnavailable { .. }
+            | Self::KeyringUnusable { .. } => true,
         }
     }
 }
@@ -134,12 +203,26 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
                     at_seq,
                     chain_version,
                 }
+            } else if let (Some(at_seq), Some(key_id)) = (
+                verify_result.key_unavailable_at,
+                verify_result.key_unavailable_id.clone(),
+            ) {
+                ChainStatus::KeyUnavailable { at_seq, key_id }
             } else if verify_result.tail_truncated {
                 ChainStatus::Truncated
             } else {
                 ChainStatus::Intact
             }
         }
+        // #457: an unusable keyring is not the same as "no audit log" —
+        // mapping it to `Unavailable` would hide it from doctor's risk signals.
+        Err(AuditError::KeyringUnusable(reason)) => ChainStatus::KeyringUnusable {
+            reason,
+            // One producer today (`KeyringAnomaly::DirectoryUnreadable`), so
+            // one kind. It exists so `--json` consumers have something stable
+            // to branch on that is not the free-text reason.
+            kind: "directory_unreadable",
+        },
         Err(_) => ChainStatus::Unavailable,
     };
 
@@ -301,6 +384,71 @@ mod tests {
         assert_eq!(ChainStatus::Broken { at_seq: 42 }.as_str(), "broken");
         assert_eq!(ChainStatus::Truncated.as_str(), "truncated");
         assert_eq!(ChainStatus::Unavailable.as_str(), "unavailable");
+        // #457: distinct from "broken" on purpose — a missing key file is not
+        // an allegation of tampering, and consumers keying on this string must
+        // be able to tell the two apart.
+        assert_eq!(
+            ChainStatus::KeyUnavailable {
+                at_seq: 7,
+                key_id: "key-3".to_string(),
+            }
+            .as_str(),
+            "key_unavailable"
+        );
+    }
+
+    /// #457 (Codex Round 1 P3). The JSON shape of a new public variant is part
+    /// of the `omamori report --json` surface, so it gets the same coverage the
+    /// older variants have: `at_seq` stays internal (`skip_serializing`), the
+    /// key id does not.
+    #[test]
+    fn key_unavailable_serializes_without_leaking_seq() {
+        let value = serde_json::to_value(ChainStatus::KeyUnavailable {
+            at_seq: 7,
+            key_id: "key-3".to_string(),
+        })
+        .unwrap();
+        assert_eq!(value["status"], "key_unavailable");
+        assert_eq!(value["key_id"], "key-3");
+        assert!(
+            value.get("at_seq").is_none(),
+            "at_seq is skip_serializing, matching Broken/Unverifiable"
+        );
+    }
+
+    /// #457 (Codex Round 3 issue proposal, revised in Phase 8). Coverage
+    /// symmetry with the variant above. The reason carries the key
+    /// directory's absolute path — which includes the operator's home
+    /// directory — so it must stay out of the JSON exactly as `at_seq` does,
+    /// and the reason-free `kind` is what machine consumers get instead.
+    /// The first version of this test asserted the opposite (`value["reason"]
+    /// == "cannot list /x: …"`); it passed, and pinned the leak.
+    #[test]
+    fn keyring_unusable_serializes_its_kind_and_not_the_path() {
+        let value = serde_json::to_value(ChainStatus::KeyringUnusable {
+            reason: "cannot list /Users/someone/.local/share/omamori: Permission denied"
+                .to_string(),
+            kind: "directory_unreadable",
+        })
+        .unwrap();
+        assert_eq!(value["status"], "keyring_unusable");
+        assert_eq!(value["kind"], "directory_unreadable");
+        assert!(
+            value.get("reason").is_none(),
+            "reason is skip_serializing — it embeds the key directory's path"
+        );
+        assert!(
+            !serde_json::to_string(&value).unwrap().contains("someone"),
+            "no part of the home path may reach the JSON surface"
+        );
+        assert_eq!(
+            ChainStatus::KeyringUnusable {
+                reason: String::new(),
+                kind: "directory_unreadable",
+            }
+            .as_str(),
+            "keyring_unusable"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub use provenance::hash_cwd_candidates;
 pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, rotate_key};
 pub use verify::{
-    AuditError, AuditSummary, ShowOptions, VerifyResult, audit_summary,
+    AuditError, AuditSummary, KeyUnavailableKind, ShowOptions, VerifyResult, audit_summary,
     count_unknown_tool_fail_opens_within, show_entries, verify_chain,
 };
 
@@ -28,8 +28,7 @@ use chain::{CHAIN_VERSION, ChainTailState, compute_entry_hash_for_write, read_ch
 use provenance::ProcessProvenance;
 use retention::{PRUNE_CHECK_INTERVAL, try_prune};
 use secret::{
-    current_key_id, flock_exclusive, hmac_targets, load_or_create_secret, open_audit_rw,
-    secret_path_for,
+    SigningKey, flock_exclusive, hmac_targets, load_signing_key, open_audit_rw, secret_path_for,
 };
 
 use std::fs;
@@ -163,14 +162,19 @@ pub(crate) fn resolved_audit_path(config: &AuditConfig) -> Option<PathBuf> {
 
 pub struct AuditLogger {
     pub(super) path: PathBuf,
-    pub(super) secret: Option<[u8; 32]>,
+    /// #457: the signing key and the `key_id` that names it are one value, not
+    /// two fields that call sites can pair up incorrectly. Private rather than
+    /// `pub(super)` — reaching the bytes goes through `secret_ref()` and the
+    /// label through `key_id()`, so no caller outside this impl can hold one
+    /// without the other. (`mod tests` is a child module and can still build
+    /// the struct directly, which is what the fixtures need.)
+    signing_key: SigningKey,
     pub(super) retention_days: u32,
-    pub(super) key_id: String,
 }
 
 impl AuditLogger {
     pub fn secret_available(&self) -> bool {
-        self.secret.is_some()
+        self.signing_key.secret().is_some()
     }
 
     /// Narrow crate-internal accessor for computing provenance fields
@@ -179,7 +183,15 @@ impl AuditLogger {
     /// `AuditEvent` rather than going through `create_event`. Not part of
     /// the public API: intentionally `pub(crate)`, not `pub`.
     pub(crate) fn secret_ref(&self) -> Option<&[u8; 32]> {
-        self.secret.as_ref()
+        self.signing_key.secret()
+    }
+
+    /// The `key_id` this logger labels its entries with. Reading it through
+    /// the `SigningKey` rather than a standalone field is the point of #457's
+    /// A1 — there is no way to get the label without going through the value
+    /// that also holds the bytes.
+    pub(super) fn key_id(&self) -> &str {
+        &self.signing_key.id
     }
 
     pub fn from_config(config: &AuditConfig) -> Option<Self> {
@@ -188,13 +200,11 @@ impl AuditLogger {
         }
         let (validated, _warnings) = config.validate();
         let path = resolved_audit_path(&validated)?;
-        let secret = load_or_create_secret(&secret_path_for(&path));
-        let key_id = current_key_id(&secret_path_for(&path));
+        let signing_key = load_signing_key(&secret_path_for(&path));
         Some(Self {
             path,
-            secret,
+            signing_key,
             retention_days: validated.retention_days,
-            key_id,
         })
     }
 
@@ -212,7 +222,7 @@ impl AuditLogger {
     ) -> AuditEvent {
         let targets = invocation.target_args();
         let (pid, ppid, parent_process, cwd_hash) =
-            ProcessProvenance::as_audit_fields(provenance, self.secret.as_ref());
+            ProcessProvenance::as_audit_fields(provenance, self.signing_key.secret());
         AuditEvent {
             timestamp: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
@@ -228,7 +238,7 @@ impl AuditLogger {
                 .unwrap_or_else(|| "passthrough".to_string()),
             result: outcome.label().to_string(),
             target_count: targets.len(),
-            target_hash: hmac_targets(self.secret.as_ref(), &targets),
+            target_hash: hmac_targets(self.signing_key.secret(), &targets),
             detection_layer: Some("layer1".to_string()),
             unwrap_chain: None,
             raw_input_hash: None,
@@ -274,7 +284,7 @@ impl AuditLogger {
         // site's existing Err handling already treats a non-strict Err as a warning,
         // not a block — Err doesn't change that, it only makes strict mode able to
         // see this case at all.
-        let (seq, prev_hash) = match read_chain_state(&mut file, self.secret.as_ref()) {
+        let (seq, prev_hash) = match read_chain_state(&mut file, self.signing_key.secret()) {
             ChainTailState::UnsupportedVersion { chain_version } => {
                 return Err(std::io::Error::other(format!(
                     "audit log tail declares chain_version {chain_version}, which this \
@@ -294,8 +304,11 @@ impl AuditLogger {
         event.chain_version = Some(CHAIN_VERSION);
         event.seq = Some(seq);
         event.prev_hash = Some(prev_hash);
-        event.key_id = Some(self.key_id.clone());
-        event.entry_hash = Some(compute_entry_hash_for_write(self.secret.as_ref(), &event));
+        event.key_id = Some(self.key_id().to_string());
+        event.entry_hash = Some(compute_entry_hash_for_write(
+            self.signing_key.secret(),
+            &event,
+        ));
 
         // Ensure new entry starts on its own line (torn lines may lack trailing newline)
         let len = file.seek(SeekFrom::End(0))?;
@@ -348,7 +361,7 @@ impl AuditLogger {
             && seq % PRUNE_CHECK_INTERVAL == 0
             && let Err(e) = try_prune(
                 &mut file,
-                self.secret.as_ref(),
+                &self.signing_key,
                 self.retention_days,
                 Some(&self.path),
             )
@@ -532,8 +545,35 @@ mod tests {
         prune_genesis_hash,
     };
     use retention::{MIN_RETENTION_DAYS, build_prune_point, try_prune_at};
-    use secret::{create_secret, decode_hex_secret, flock_exclusive, read_secret};
-    use verify::{AuditError, display_timestamp};
+    use secret::{
+        KeyringAnomaly, MAX_KEYRING_KEYS, UNRESOLVED_KEY_ID, create_secret, decode_hex_secret,
+        expected_key_file, flock_exclusive, is_writer_emitted_key_id, load_keyring,
+        load_or_create_secret, load_signing_key, open_read_nofollow, read_secret,
+    };
+    use verify::{AuditError, KeyUnavailableKind, display_timestamp};
+
+    /// Run `f` on a worker thread and fail the test if it has not finished
+    /// within `limit`.
+    ///
+    /// The defects these guard against (`flock` without `LOCK_NB`, `open`
+    /// without `O_NONBLOCK`) fail by *not returning*, and a test that simply
+    /// calls them would hang rather than fail — indistinguishable from a slow
+    /// machine, and it takes the whole test binary with it. Timing out into an
+    /// assertion turns "it blocks forever" into an ordinary red test.
+    fn must_finish_within<T: Send + 'static>(
+        limit: std::time::Duration,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(limit) {
+            Ok(value) => value,
+            Err(_) => panic!("{what} did not return within {limit:?} — it blocked"),
+        }
+    }
 
     const TEST_SECRET: [u8; 32] = [0x42u8; 32];
 
@@ -546,10 +586,17 @@ mod tests {
 
         AuditLogger {
             path,
-            secret: Some(TEST_SECRET),
+            signing_key: SigningKey::for_test("default", Some(TEST_SECRET)),
             retention_days: 0,
-            key_id: "default".to_string(),
         }
+    }
+
+    /// #457 A2: `try_prune_at` / `build_prune_point` take the key and the
+    /// `key_id` that names it as one value. Most fixtures only care about the
+    /// bytes, so this wraps `TEST_SECRET` under the id an unrotated store
+    /// would carry. Fixtures that exercise rotation build their own.
+    fn test_signing_key() -> SigningKey {
+        SigningKey::for_test("default", Some(TEST_SECRET))
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -626,7 +673,7 @@ mod tests {
             strict: false,
         };
         let logger = AuditLogger::from_config(&config).expect("should create logger");
-        assert!(logger.secret.is_some());
+        assert!(logger.secret_available());
         assert!(dir.join("audit-secret").exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1360,9 +1407,8 @@ mod tests {
 
         let strict_logger = AuditLogger {
             path: logger.path.clone(),
-            secret: logger.secret,
+            signing_key: SigningKey::for_test(logger.key_id(), logger.secret_ref().copied()),
             retention_days: logger.retention_days,
-            key_id: logger.key_id.clone(),
         };
         let event = strict_logger.create_event(
             &CommandInvocation::new("cmd1".to_string(), vec![]),
@@ -2017,9 +2063,8 @@ mod tests {
         let dir = test_dir("event-no-secret");
         let logger = AuditLogger {
             path: dir.join("audit.jsonl"),
-            secret: None,
+            signing_key: SigningKey::for_test("default", None),
             retention_days: 0,
-            key_id: "default".to_string(),
         };
         let invocation = CommandInvocation::new("ls".to_string(), vec![]);
         let outcome = ActionOutcome::PassedThrough { exit_code: 0 };
@@ -2159,9 +2204,8 @@ mod tests {
     fn append_io_error() {
         let logger = AuditLogger {
             path: PathBuf::from("/nonexistent/dir/audit.jsonl"),
-            secret: Some(TEST_SECRET),
+            signing_key: SigningKey::for_test("default", Some(TEST_SECRET)),
             retention_days: 0,
-            key_id: "default".to_string(),
         };
         assert!(logger.append(make_event("ls")).is_err());
     }
@@ -2928,9 +2972,8 @@ mod tests {
         fs::write(&secret_file, &hex).unwrap();
         AuditLogger {
             path,
-            secret: Some(TEST_SECRET),
+            signing_key: SigningKey::for_test("default", Some(TEST_SECRET)),
             retention_days,
-            key_id: "default".to_string(),
         }
     }
 
@@ -3038,7 +3081,7 @@ mod tests {
         flock_exclusive(&file).unwrap();
         let pruned = try_prune_at(
             &mut file,
-            Some(&TEST_SECRET),
+            &test_signing_key(),
             90,
             None,
             retention_test_now(),
@@ -3075,7 +3118,7 @@ mod tests {
         flock_exclusive(&file).unwrap();
         let pruned = try_prune_at(
             &mut file,
-            Some(&TEST_SECRET),
+            &test_signing_key(),
             90,
             None,
             retention_test_now(),
@@ -3110,7 +3153,7 @@ mod tests {
         flock_exclusive(&file).unwrap();
         let pruned = try_prune_at(
             &mut file,
-            Some(&TEST_SECRET),
+            &test_signing_key(),
             90,
             None,
             retention_test_now(),
@@ -3138,7 +3181,7 @@ mod tests {
         flock_exclusive(&file).unwrap();
         let pruned = try_prune_at(
             &mut file,
-            Some(&TEST_SECRET),
+            &test_signing_key(),
             36500,
             None,
             retention_test_now(),
@@ -3173,7 +3216,7 @@ mod tests {
         flock_exclusive(&file).unwrap();
         let pruned = try_prune_at(
             &mut file,
-            Some(&TEST_SECRET),
+            &test_signing_key(),
             90,
             None,
             retention_test_now(),
@@ -3206,7 +3249,14 @@ mod tests {
 
         let bad_secret = [0x99u8; 32];
         let first_retained_hash = retained[0]["entry_hash"].as_str().unwrap();
-        let forged = build_prune_point(Some(&bad_secret), 5, first_retained_hash);
+        // The forging key is not in the keyring at all — that is what makes
+        // this test discriminating, and #457's fix must not change it.
+        let forged = build_prune_point(
+            &SigningKey::for_test("default", Some(bad_secret)),
+            5,
+            first_retained_hash,
+            retention_test_now(),
+        );
 
         let mut content = serde_json::to_string(&forged).unwrap();
         content.push('\n');
@@ -3220,6 +3270,1615 @@ mod tests {
         assert!(
             result.broken_at.is_some(),
             "forged prune_point should be detected"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // #457: key rotation × chain verification
+    // -----------------------------------------------------------------
+
+    /// Build a 1200-entry chain under the store's first key, rotate with the
+    /// **production** `rotate_key`, and prune the 100 oldest under the
+    /// post-rotation key resolved by the **production** `load_signing_key`.
+    /// This is the sequence a user hits when `[audit] retention_days > 0` and
+    /// the 1000-entry prune trigger fires after a rotation.
+    ///
+    /// An earlier version reimplemented rotation locally (rename + write,
+    /// mirroring `rotate_key`'s steps) and hand-built the post-rotation
+    /// `SigningKey`. Codex flagged it as a mirror helper: a fixture that
+    /// reimplements the thing under test stops being evidence the moment the
+    /// two drift. Both halves now go through production code.
+    ///
+    /// Returns the log path and both epoch keys, which callers need in order
+    /// to recompute hashes independently.
+    fn pruned_across_rotation_fixture(dir: &Path) -> (std::path::PathBuf, [u8; 32], [u8; 32]) {
+        let path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key is created");
+
+        let old_ts = "2025-01-01T00:00:00Z";
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..100 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..1100 {
+            entries.push(("new", new_ts));
+        }
+        write_chain_entries(&path, &epoch1, &entries, 2);
+
+        let rotation = super::rotate_key(&path).expect("rotation succeeds");
+        assert_eq!(rotation.new_key_id, "key-2");
+        let epoch2 = read_secret(&secret_path).expect("the new active key is readable");
+
+        let signing_key = load_signing_key(&secret_path);
+        assert_eq!(
+            signing_key.id, "key-2",
+            "the writer must resolve the post-rotation epoch, or this fixture \
+             is not exercising what the prune path actually does"
+        );
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned = try_prune_at(&mut file, &signing_key, 90, None, retention_test_now()).unwrap();
+        assert_eq!(pruned, 100, "the 100 old-timestamped entries are prunable");
+        drop(file);
+
+        (path, epoch1, epoch2)
+    }
+
+    /// #457 Bug 1 + Bug 1b (V-010). The whole chain must verify after a prune
+    /// that ran under a rotated key. Two independent defects sit on this path:
+    ///
+    /// - **Bug 1** — `build_prune_point` wrote `key_id: "default"` while
+    ///   signing with the active secret; after a rotation `"default"` names
+    ///   the *epoch-1* key, so the prune point failed at seq 0.
+    /// - **Bug 1b** — the prune-bind `target_hash` is computed by the writer
+    ///   with the key active at prune time (`retention.rs`) but recomputed by
+    ///   the verifier with the key of the *first retained entry*
+    ///   (`verify.rs`). Different epochs, so it fails at the first retained
+    ///   entry (seq 100 in this fixture), not at the prune point.
+    ///
+    /// The break moving from seq 0 to seq 100 as A2 lands is the evidence that
+    /// these are two defects and not one symptom seen twice.
+    #[test]
+    fn prune_point_written_after_rotation_verifies() {
+        let dir = test_dir("457-prune-after-rotation");
+        pruned_across_rotation_fixture(&dir);
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "a prune point written after a key rotation must verify; \
+             broken_at = {:?}",
+            result.broken_at
+        );
+        assert!(result.pruned, "the prune point must still be recognized");
+        assert_eq!(result.pruned_count, Some(100));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 Bug 1 (V-011), asserted at the writer rather than through
+    /// `verify_chain`. `build_prune_point` must stamp the id of the key it
+    /// actually signed with — after a rotation that is `key-2`, not the
+    /// hardcoded `"default"` the old code wrote.
+    ///
+    /// Separating this from `prune_point_written_after_rotation_verifies`
+    /// keeps the two defects independently observable: reverting A2 turns this
+    /// test red on its own, while reverting A4 leaves it green and only turns
+    /// the whole-chain test red.
+    #[test]
+    fn prune_point_is_labelled_with_the_key_that_signed_it() {
+        let dir = test_dir("457-prune-point-label");
+        let (path, _epoch1, epoch2) = pruned_across_rotation_fixture(&dir);
+
+        let events = read_events(&path);
+        assert_eq!(
+            events[0]["key_id"].as_str(),
+            Some("key-2"),
+            "the prune point must name the post-rotation active key"
+        );
+
+        // Not just the label: the entry must actually authenticate under the
+        // key it names. A writer that stamped the right id while signing with
+        // a different key would pass the assertion above.
+        let prune_point: AuditEvent = serde_json::from_value(events[0].clone()).unwrap();
+        let recorded = prune_point.entry_hash.clone().unwrap();
+        assert_eq!(
+            compute_entry_hash(Some(&epoch2), &prune_point).expect_hash("prune point"),
+            recorded,
+            "the prune point must authenticate under the key its key_id names"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 (V-003). A chain that continues across a real rotation, exercised
+    /// end to end through the production writer and the production
+    /// `rotate_key` — no hand-built fixture, no simulated rotation.
+    ///
+    /// The first version of this test wrote *both* halves with the pre-rotation
+    /// key and labelled them all `"default"`, a state no writer can produce. It
+    /// passed, and it did catch the anchor mutation, but what it actually
+    /// exercised was "a head naming a retired key is accepted" — not "a chain
+    /// spanning a rotation verifies". Both Codex reviews flagged it
+    /// independently (Round 1 P1, test review #1).
+    ///
+    /// Going through `AuditLogger` also pins the labels the writer really
+    /// stamps, which a fixture can only assert about itself.
+    #[test]
+    fn chain_spanning_a_real_rotation_verifies_end_to_end() {
+        let dir = test_dir("457-real-rotation");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        assert_eq!(
+            logger.key_id(),
+            "default",
+            "an unrotated store signs under epoch 1"
+        );
+        logger.append(make_event("before-rotation")).unwrap();
+        drop(logger);
+
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        assert_eq!(
+            logger.key_id(),
+            "key-2",
+            "after one rotation the writer must stamp the new epoch"
+        );
+        logger.append(make_event("after-rotation")).unwrap();
+        drop(logger);
+
+        let events = read_events(&audit_path);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["key_id"].as_str(), Some("default"));
+        assert_eq!(
+            events[1]["key_id"].as_str(),
+            Some("key-2"),
+            "the two halves must be labelled with different epochs, or this \
+             fixture is not exercising a rotation at all"
+        );
+
+        let result = verify_chain(&config).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "a chain spanning a rotation must verify; broken_at = {:?}",
+            result.broken_at
+        );
+        assert!(
+            result.key_unavailable_at.is_none(),
+            "both keys are present; nothing should be unresolvable"
+        );
+        assert_eq!(result.chain_entries, 2);
+        // V-003: both epochs must be counted as one verified chain, not
+        // silently dropped from the tally. `broken_at.is_none()` alone would
+        // also hold for a verifier that stopped early without saying so.
+        assert_eq!(
+            result.v2_entries, 2,
+            "both entries are chain_version 2 and both must be counted"
+        );
+        assert_eq!(result.legacy_entries, 0);
+        assert_eq!(result.unverified_entries_after, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-005. Two rotations, log started in epoch 1. The head names
+    /// `"default"`, so the anchor must come from the oldest retired key.
+    ///
+    /// **Its unique-kill set is empty** — measured, not assumed. `/simplify`
+    /// ran five anchor-resolution mutations against the suite; every one this
+    /// test kills is also killed by seven or eight others, and the two that
+    /// isolate a single test both point at V-006, not here. Kept anyway: it is
+    /// a named item in the plan's V-ID table, and it states a property the
+    /// others do not say out loud — that after *two* rotations `"default"`
+    /// still means epoch 1, not "whatever was retired most recently".
+    ///
+    /// If test runtime ever needs trimming, this is the first candidate, and
+    /// V-006's doc comment already carries the contrast that makes it
+    /// redundant.
+    #[test]
+    fn head_anchor_after_two_rotations_uses_the_epoch_the_head_names() {
+        let dir = test_dir("457-two-rotations");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("first")).unwrap();
+        logger.append(make_event("second")).unwrap();
+        drop(logger);
+
+        super::rotate_key(&audit_path).expect("rotation 1");
+        super::rotate_key(&audit_path).expect("rotation 2");
+
+        let events = read_events(&audit_path);
+        assert_eq!(
+            events[0]["key_id"].as_str(),
+            Some("default"),
+            "precondition: the head belongs to epoch 1"
+        );
+
+        let result = verify_chain(&config).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "broken_at = {:?}",
+            result.broken_at
+        );
+        assert_eq!(result.chain_entries, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-006 (and V-004: this is the "log started after a rotation" shape
+    /// — rotate, discard the log, start fresh — which no other fixture covers)
+    /// — the discriminating case QA called the strongest cell.
+    ///
+    /// Three rotations, but the log starts in **epoch 2**. The head names
+    /// `key-2`, while the oldest retired key is `key-1` and the most recently
+    /// retired is `key-3`. A fix that reached for either the oldest or the
+    /// newest retired key would pass V-005 and fail here.
+    #[test]
+    fn head_anchor_after_three_rotations_uses_a_middle_epoch() {
+        let dir = test_dir("457-three-rotations");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        // Epoch 1: write and discard, so the surviving log starts later.
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1-discarded")).unwrap();
+        drop(logger);
+        super::rotate_key(&audit_path).expect("rotation 1");
+        fs::remove_file(&audit_path).unwrap();
+        let _ = fs::remove_file(hwm_path_for(&audit_path));
+
+        // Epoch 2: this is the log that survives, so its head names `key-2`.
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        assert_eq!(logger.key_id(), "key-2");
+        logger.append(make_event("epoch-2-head")).unwrap();
+        drop(logger);
+
+        super::rotate_key(&audit_path).expect("rotation 2");
+        super::rotate_key(&audit_path).expect("rotation 3");
+
+        let events = read_events(&audit_path);
+        assert_eq!(
+            events[0]["key_id"].as_str(),
+            Some("key-2"),
+            "precondition: the head is neither the oldest nor the newest epoch"
+        );
+
+        let result = verify_chain(&config).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "the anchor must come from key-2 — not key-1 (oldest) and not key-3 \
+             (most recently retired); broken_at = {:?}",
+            result.broken_at
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-007. `verify.rs` computes two anchors on adjacent lines —
+    /// `genesis` and `prune_genesis`. A fix that converts only one of them
+    /// passes every other test in this file.
+    ///
+    /// The reason is fixture ordering. `pruned_across_rotation_fixture` prunes
+    /// *after* rotating, so the prune point is signed by the key that is also
+    /// active at verification time — exactly where the old active-key-anchored
+    /// code happens to agree with the correct answer. Pruning *before*
+    /// rotating separates them: the prune point is anchored to the retired
+    /// key's `prune_genesis`, and computing that from the active key fails.
+    ///
+    /// Mutation-verified. Reverting `prune_genesis_hash(Some(entry_secret))` to
+    /// the active secret produced exactly one failure — this test:
+    ///
+    /// ```text
+    /// prune_genesis_is_resolved_from_the_prune_points_own_key ... FAILED
+    /// prune_point_written_after_rotation_verifies             ... ok
+    /// prune_point_is_labelled_with_the_key_that_signed_it     ... ok
+    /// verify_pruned_chain_intact                              ... ok
+    /// ```
+    ///
+    /// Without it, a fix that converted `genesis` and left `prune_genesis`
+    /// anchored to the active key would have shipped green.
+    #[test]
+    fn prune_genesis_is_resolved_from_the_prune_points_own_key() {
+        let dir = test_dir("457-prune-then-rotate");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+
+        let old_ts = "2025-01-01T00:00:00Z";
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..100 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..1100 {
+            entries.push(("new", new_ts));
+        }
+        write_chain_entries(&audit_path, &epoch1, &entries, 2);
+
+        // Prune while epoch 1 is still active: the prune point is signed by
+        // epoch 1 and labelled `"default"`.
+        let signing_key = load_signing_key(&secret_path);
+        assert_eq!(signing_key.id, "default", "still unrotated at prune time");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&audit_path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned = try_prune_at(&mut file, &signing_key, 90, None, retention_test_now()).unwrap();
+        assert_eq!(pruned, 100);
+        drop(file);
+
+        // Only now rotate. `"default"` from here on names the retired key.
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+
+        let events = read_events(&audit_path);
+        assert_eq!(
+            events[0]["key_id"].as_str(),
+            Some("default"),
+            "precondition: the prune point belongs to epoch 1"
+        );
+
+        let result = verify_chain(&config).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "the prune point's anchor must be computed from the key it names, \
+             not from whichever key is active now; broken_at = {:?}",
+            result.broken_at
+        );
+        assert!(result.pruned);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-018. The forged-prune-point test must keep discriminating once a
+    /// keyring holds several keys — a fix that widened key resolution too far
+    /// would let a forgery find *some* key that validates it.
+    ///
+    /// The forging key (`[0x99; 32]`) is in no keyring, so the only way this
+    /// passes is if verification still refuses keys it was not given.
+    #[test]
+    fn forged_prune_point_is_still_rejected_with_several_keys_in_the_ring() {
+        let dir = test_dir("457-forged-multikey");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+
+        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+        for _ in 0..3 {
+            super::rotate_key(&audit_path).expect("rotation succeeds");
+        }
+        let ring = load_keyring(&secret_path);
+        assert!(
+            ring.get("key-1").is_some() && ring.get("key-4").is_some(),
+            "precondition: several epochs are present"
+        );
+
+        let ts = "2026-04-04T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..10).map(|_| ("cmd", ts)).collect();
+        write_chain_entries(&audit_path, &epoch1, &entries, 2);
+
+        let events = read_events(&audit_path);
+        let retained = &events[5..];
+        let bad_secret = [0x99u8; 32];
+        let forged = build_prune_point(
+            &SigningKey::for_test("default", Some(bad_secret)),
+            5,
+            retained[0]["entry_hash"].as_str().unwrap(),
+            retention_test_now(),
+        );
+
+        let mut content = serde_json::to_string(&forged).unwrap();
+        content.push('\n');
+        for ev in retained {
+            content.push_str(&serde_json::to_string(ev).unwrap());
+            content.push('\n');
+        }
+        fs::write(&audit_path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_some(),
+            "a prune point forged with a key outside the ring must be rejected \
+             no matter how many keys the ring holds"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-019 — pins the acceptance widening that ADR-0008 §7 records as a
+    /// deliberate cost. **This is the test ADR-0008 and CHANGELOG refer to when
+    /// they say the widening cannot change silently.**
+    ///
+    /// Anchoring on the key the head entry names means a chain whose head was
+    /// signed by a *retired* key is accepted. Before #457 the anchor came from
+    /// the active key, so such a head was rejected — incidentally, as a side
+    /// effect of the defect, not by design. An attacker holding only a retired
+    /// key can therefore now forge a chain head as well as the non-head entries
+    /// they could already forge (no epoch-monotonicity check exists).
+    ///
+    /// The assertion is deliberately `broken_at.is_none()`: it asserts that
+    /// forged-with-a-retired-key **verifies**. If a later change tightens this,
+    /// the test fails and whoever tightened it has to decide consciously
+    /// whether ADR-0008 §7 still holds.
+    #[test]
+    fn a_chain_forged_with_only_a_retired_key_is_accepted_documented_tradeoff() {
+        let dir = test_dir("457-retired-key-forgery");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        // Establish epoch 1 and rotate, so epoch-1 becomes the retired key.
+        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+        let epoch2 = read_secret(&secret_path).expect("epoch-2 is active");
+        assert_ne!(epoch1, epoch2);
+
+        // An attacker who exfiltrated only the retired key writes a whole
+        // chain with it, labelling it `"default"` — which is what that key is
+        // called. No part of this uses the active key.
+        let ts = "2026-04-04T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..3).map(|_| ("forged", ts)).collect();
+        write_chain_entries(&audit_path, &epoch1, &entries, 2);
+
+        let result = verify_chain(&config).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "ADR-0008 §7 accepts this: anchoring on the named key means a \
+             retired-key forgery verifies. broken_at = {:?}",
+            result.broken_at
+        );
+        assert_eq!(result.chain_entries, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-032 — the machine check behind CHANGELOG's "needs no re-audit".
+    ///
+    /// The claim being verified: v0.16.0 reporting `chain broken` on a rotated
+    /// log was a **false positive**, not a missed detection. That only holds if
+    /// the fixed verifier still catches real tampering on exactly the kind of
+    /// chain that used to fail spuriously.
+    ///
+    /// A BASE comparison cannot establish this — v0.16.0 returns `broken` for a
+    /// rotated chain whether or not it was altered, so it cannot distinguish
+    /// the two. What has to be shown is that the *fixed* verifier does.
+    #[test]
+    fn tampering_is_still_detected_on_a_chain_that_spans_a_rotation() {
+        let dir = test_dir("457-tamper-across-rotation");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("before")).unwrap();
+        drop(logger);
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        logger.append(make_event("after")).unwrap();
+        logger.append(make_event("after-2")).unwrap();
+        drop(logger);
+
+        let clean = fs::read_to_string(&audit_path).unwrap();
+        assert!(
+            verify_chain(&config).unwrap().broken_at.is_none(),
+            "control: the unaltered rotated chain must verify"
+        );
+
+        // Alter an entry on the far side of the rotation boundary.
+        let mut events = read_events(&audit_path);
+        events[1]["command"] = serde_json::Value::String("TAMPERED".to_string());
+        let altered: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        fs::write(&audit_path, altered).unwrap();
+
+        let result = verify_chain(&config).unwrap();
+        assert!(
+            result.broken_at.is_some(),
+            "tampering on a rotated chain must still be detected — this is what \
+             makes v0.16.0's report a false positive rather than a missed \
+             detection, and it is what CHANGELOG's \"needs no re-audit\" rests on"
+        );
+
+        // Restoring must clear it: a verifier that always says "broken" would
+        // satisfy the assertion above while proving nothing.
+        fs::write(&audit_path, clean).unwrap();
+        assert!(
+            verify_chain(&config).unwrap().broken_at.is_none(),
+            "restoring the original bytes must clear the verdict"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-024 — pins the property ADR-0008 and SECURITY.md describe as
+    /// *not* guaranteed, so that "we deferred this" cannot quietly become "we
+    /// fixed this" or "we broke this further" without a test changing.
+    ///
+    /// `verify_chain` performs no check that key epochs advance monotonically
+    /// along the chain. An entry naming an older epoch after entries naming a
+    /// newer one verifies fine, provided each authenticates under the key it
+    /// names.
+    #[test]
+    fn key_epochs_are_not_checked_for_monotonicity_documented_gap() {
+        let dir = test_dir("457-epoch-monotonicity");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+        let epoch2 = read_secret(&secret_path).expect("epoch-2 is active");
+
+        // Build a chain that goes epoch-2, epoch-2, then *back* to epoch-1.
+        let ts = "2026-04-04T00:00:00Z";
+        let mut prev = genesis_hash(Some(&epoch2));
+        let mut content = String::new();
+        for (seq, (key, key_id)) in [(&epoch2, "key-2"), (&epoch2, "key-2"), (&epoch1, "default")]
+            .iter()
+            .enumerate()
+        {
+            let mut event = make_event_with_timestamp("cmd", ts);
+            event.chain_version = Some(2);
+            event.seq = Some(seq as u64);
+            event.prev_hash = Some(prev.clone());
+            event.key_id = Some((*key_id).to_string());
+            event.entry_hash =
+                Some(compute_entry_hash(Some(*key), &event).expect_hash("epoch-mix"));
+            prev = event.entry_hash.clone().unwrap();
+            content.push_str(&serde_json::to_string(&event).unwrap());
+            content.push('\n');
+        }
+        fs::write(&audit_path, content).unwrap();
+
+        let result = verify_chain(&config).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "documented gap: epochs going backwards along the chain is not \
+             checked. If this starts failing, rotation gained forward security \
+             — update ADR-0008 §7 and SECURITY.md's \"What rotation does not \
+             guarantee\" rather than just fixing the test"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 V-020. `hmac_bytes(None, ..)` returns the literal `NO_HMAC_SECRET`.
+    /// An attacker who writes that string into `entry_hash` must not have it
+    /// accepted as a valid hash by any path.
+    #[test]
+    fn no_hmac_secret_sentinel_is_never_accepted_as_a_hash() {
+        let dir = test_dir("457-sentinel");
+        let path = dir.join("audit.jsonl");
+        test_logger(&dir);
+
+        let ts = "2026-04-04T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..3).map(|_| ("cmd", ts)).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+
+        let mut events = read_events(&path);
+        events[1]["entry_hash"] = serde_json::Value::String("NO_HMAC_SECRET".to_string());
+        let content: String = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        fs::write(&path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at,
+            Some(1),
+            "the sentinel must fail the hash comparison like any other wrong value"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 (test review blind spot 2, shape D27) — this pins a **limitation**,
+    /// not a fix.
+    ///
+    /// Deleting the last retired key does *not* read as "cannot verify". With
+    /// no `.retired` files left, the store is indistinguishable from one that
+    /// never rotated, so `"default"` resolves to the **active** key: an id that
+    /// exists, holding the wrong bytes. `key_unavailable` cannot fire — the id
+    /// resolved — and the entry fails its hash, so it reports as tampering.
+    ///
+    /// A5 cannot reclassify this, for the same reason it cannot reclassify an
+    /// interrupted rotation: both produce a resolvable id paired with the wrong
+    /// key. Telling them apart requires each key file to record its own epoch,
+    /// which ADR-0008 defers because it adds an on-disk element frozen at 1.0.
+    ///
+    /// The test exists so the deferral stays visible. If a later change makes
+    /// this report cannot-verify instead, that is an improvement — but it must
+    /// be a deliberate one, with this test updated to say so.
+    #[test]
+    fn deleting_the_last_retired_key_reads_as_tampering_known_limitation() {
+        let dir = test_dir("457-deleted-retired");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        logger.append(make_event("epoch-2")).unwrap();
+        drop(logger);
+
+        // Sanity: both keys present, chain verifies. Without this the
+        // assertions below could pass on a chain that was already broken.
+        assert!(verify_chain(&config).unwrap().broken_at.is_none());
+
+        fs::remove_file(dir.join("audit-secret.1.retired")).unwrap();
+
+        let result = verify_chain(&config).unwrap();
+        assert_eq!(
+            result.broken_at,
+            Some(0),
+            "documented limitation: with no retired keys left, \"default\" \
+             resolves to the active key and the epoch-1 head fails its hash"
+        );
+        assert!(
+            result.key_unavailable_at.is_none(),
+            "the id resolves — it just resolves to the wrong bytes — so the \
+             cannot-verify path cannot catch this"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 A5 (V-028), category D — BASE green, FIXED non-zero.
+    ///
+    /// An entry that names a `key_id` absent from the keyring is *not*
+    /// evidence of tampering: the entry may be entirely authentic and merely
+    /// uncheckable. Before #457, `keyring.get(id).unwrap_or(&secret)` quietly
+    /// checked such an entry against the **active** key. When that happened to
+    /// be the signing key — which is the common case, since a stray
+    /// `audit-secret.bak.retired` inflates `retired_key_count` and shifts
+    /// every new entry's label without changing which key signs them — the
+    /// entry passed. The verifier reported "chain intact" about an entry it
+    /// had not actually authenticated under the key the entry named.
+    ///
+    /// This test therefore does not go red on BASE. It pins the *new*
+    /// contract: name a key we do not hold and verification stops and says so.
+    #[test]
+    fn entry_naming_an_absent_key_is_unverifiable_not_tampered() {
+        let dir = test_dir("457-absent-key");
+        let path = dir.join("audit.jsonl");
+        test_logger(&dir);
+
+        let ts = "2026-04-04T00:00:00Z";
+        let entries: Vec<(&str, &str)> = (0..4).map(|_| ("cmd", ts)).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+
+        // Relabel entry #2 to name a key that does not exist, and re-sign it
+        // with the *real* key. The entry is authentic in every sense except
+        // that its label points at nothing — exactly the shape a stray
+        // `.retired` file produces.
+        let events = read_events(&path);
+        let mut relabelled: AuditEvent = serde_json::from_value(events[2].clone()).unwrap();
+        relabelled.key_id = Some("key-99".to_string());
+        // `entry_hash` is left for the relink pass below, which re-signs every
+        // entry from #1 onward with the real key.
+
+        // Re-signing entry #2 changed its hash, so every later entry's
+        // `prev_hash` now points at a value that no longer exists. Relink them
+        // — otherwise the fixture carries a second, unrelated defect (a broken
+        // chain link) and the test would pass for the wrong reason: the
+        // verifier stops at #2 and never reaches the damage at #3. Measured
+        // against the BASE binary, the un-relinked fixture reported
+        // "chain broken at entry #3", which is not the property under test.
+        let mut rebuilt: Vec<AuditEvent> = Vec::with_capacity(events.len());
+        let mut prev = String::new();
+        for (i, ev) in events.iter().enumerate() {
+            let mut event: AuditEvent = if i == 2 {
+                relabelled.clone()
+            } else {
+                serde_json::from_value(ev.clone()).unwrap()
+            };
+            if i > 0 {
+                event.prev_hash = Some(prev.clone());
+                event.entry_hash = None;
+                event.entry_hash = Some(
+                    compute_entry_hash(Some(&TEST_SECRET), &event).expect_hash("relinked entry"),
+                );
+            }
+            prev = event.entry_hash.clone().unwrap();
+            rebuilt.push(event);
+        }
+
+        let mut content = String::new();
+        for event in &rebuilt {
+            content.push_str(&serde_json::to_string(event).unwrap());
+            content.push('\n');
+        }
+        fs::write(&path, content).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        assert!(
+            result.broken_at.is_none(),
+            "an absent key must not be reported as tampering; broken_at = {:?}",
+            result.broken_at
+        );
+        assert_eq!(
+            result.key_unavailable_at,
+            Some(2),
+            "verification must stop at the entry whose key is missing"
+        );
+        assert_eq!(result.key_unavailable_id.as_deref(), Some("key-99"));
+        assert_eq!(
+            result.chain_entries, 2,
+            "the two entries before it were verified"
+        );
+        assert_eq!(
+            result.unverified_entries_after, 2,
+            "the naming entry and everything after it are tallied, not trusted"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // #457 P4: key-directory scanning
+    // -----------------------------------------------------------------
+
+    fn write_key_file(path: &Path, secret: &[u8; 32]) {
+        let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+        fs::write(path, hex).unwrap();
+    }
+
+    /// #457 P4-a (V-014). Taking a backup of the active key must not change
+    /// which epoch the writer thinks it is in.
+    ///
+    /// The old `retired_key_count` counted every name matching
+    /// `audit-secret.*.retired` without parsing the index, so
+    /// `audit-secret.bak.retired` — a name an operator produces by following
+    /// the rotation command's own output, which prints the retired key's path
+    /// — silently incremented the count. Every entry written afterwards was
+    /// labelled `key-2` while still being signed by the same key, and the next
+    /// real rotation skipped to `.2.retired`, leaving `load_keyring`'s
+    /// sequential probe to stop at the missing `.1` and lose epoch 1 entirely.
+    #[test]
+    fn stray_backup_file_does_not_shift_key_ids() {
+        let dir = test_dir("457-stray-backup");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+        write_key_file(&dir.join("audit-secret.bak.retired"), &[0x77u8; 32]);
+        write_key_file(&dir.join("audit-secret.old.retired"), &[0x88u8; 32]);
+
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "default",
+            "non-numeric suffixes are not rotations and must not shift the key id"
+        );
+
+        let ring = load_keyring(&secret_path);
+        assert!(
+            ring.get("key-2").is_none(),
+            "a backup file must not materialize an epoch that never happened"
+        );
+        assert!(
+            ring.get("default").is_some(),
+            "the active key is still epoch 1"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-b. On a case-insensitive filesystem (APFS default) the old code
+    /// built `audit-secret.1.retired` and opened it — which **succeeds** for a
+    /// file actually named `audit-secret.1.RETIRED`. `retired_key_count`, which
+    /// matched names literally, never saw that file. The two disagreed, and one
+    /// stray file was enough to make a never-rotated host report a broken chain.
+    ///
+    /// Enumerating with `read_dir` and matching the name as it is removes the
+    /// disagreement: the file is simply not a retired key.
+    ///
+    /// **Limitation** (Codex test review #2): on a *case-sensitive* filesystem
+    /// this test is non-discriminating — reverting to constructed-path probing
+    /// would still pass, because `audit-secret.1.retired` genuinely does not
+    /// open `audit-secret.1.RETIRED` there. It discriminates on macOS (APFS
+    /// default) and on any case-insensitive mount, which is where the defect
+    /// was found. The `read_dir` behaviour it pins is filesystem-independent;
+    /// only this test's ability to catch a regression is not.
+    #[test]
+    fn case_variant_retired_file_is_not_treated_as_a_rotation() {
+        let dir = test_dir("457-case-variant");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+        write_key_file(&dir.join("audit-secret.1.RETIRED"), &[0x99u8; 32]);
+
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "default",
+            "an upper-case suffix is not the retired-key name"
+        );
+
+        let ring = load_keyring(&secret_path);
+        assert_eq!(
+            ring.get("default"),
+            Some(&TEST_SECRET),
+            "\"default\" must still resolve to the real active key, not the decoy"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-a (test review #3). The canonical-decimal guard had no test, so
+    /// deleting `index.to_string() == middle` from `scan_key_dir` went
+    /// unnoticed by the suite.
+    ///
+    /// Each decoy below parses as a number but is not the canonical spelling of
+    /// a usable epoch. Admitting any of them either shifts every subsequent
+    /// `key_id` (the "backup file" failure) or makes which file wins depend on
+    /// `read_dir` order (`01` and `1` mapping to the same index).
+    #[test]
+    fn only_canonical_decimal_indices_count_as_rotations() {
+        let dir = test_dir("457-canonical-index");
+        let secret_path = dir.join("audit-secret");
+        let real = [0x11u8; 32];
+        let decoy = [0xEEu8; 32];
+        write_key_file(&secret_path, &TEST_SECRET);
+        write_key_file(&dir.join("audit-secret.1.retired"), &real);
+        write_key_file(&dir.join("audit-secret.01.retired"), &decoy);
+        write_key_file(&dir.join("audit-secret.+1.retired"), &decoy);
+        write_key_file(&dir.join("audit-secret.0.retired"), &decoy);
+        write_key_file(&dir.join("audit-secret.4294967295.retired"), &decoy);
+
+        let ring = load_keyring(&secret_path);
+        assert_eq!(
+            ring.get("key-1"),
+            Some(&real),
+            "the canonically-named .1 must be the one that loads"
+        );
+        assert_eq!(
+            ring.get("default"),
+            Some(&real),
+            "\"default\" aliases epoch 1, so it must resolve to the same bytes"
+        );
+        assert!(
+            ring.get("key-0").is_none(),
+            "epochs start at 1 — a key-0 is an id no writer can produce"
+        );
+        assert!(
+            ring.get("key-4294967295").is_none(),
+            "the u32 ceiling is excluded because the next epoch would overflow"
+        );
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-2",
+            "only .1 counts as a rotation, so the next epoch is 2 — if any \
+             decoy were admitted this would be higher"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-e — pins the **residual**, which is what the plan asked for and
+    /// what `SECURITY.md`'s "omamori warns when it sees this" needs behind it.
+    ///
+    /// A rotation interrupted between the rename and the new key's creation
+    /// leaves retired keys with no active key. The next append mints a fresh
+    /// secret under the *same* `key-{N+1}` label the interrupted rotation was
+    /// heading for. Two different secrets then share one id, and no
+    /// verifier-side repair can untangle that: the id resolves, the bytes are
+    /// simply wrong, so A5's cannot-verify path cannot fire either.
+    ///
+    /// Detection (a warning at the moment it happens) is all this PR does.
+    /// The complete fix needs each key file to record its own epoch, deferred
+    /// in ADR-0008 because it adds an on-disk element 1.0 would freeze. This
+    /// test exists so that deferral cannot quietly become "handled".
+    #[test]
+    fn interrupted_rotation_leaves_two_secrets_under_one_id_known_residual() {
+        let dir = test_dir("457-interrupted-rotation");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        assert_eq!(logger.key_id(), "key-2");
+        logger.append(make_event("epoch-2")).unwrap();
+        drop(logger);
+        assert!(
+            verify_chain(&config).unwrap().broken_at.is_none(),
+            "control: the completed rotation verifies"
+        );
+
+        // Simulate the crash window: the retired key is in place, the active
+        // key is not.
+        let epoch2 = read_secret(&secret_path).unwrap();
+        fs::remove_file(&secret_path).unwrap();
+
+        // The next resolution warns (stderr) and mints a replacement — under
+        // the same id the interrupted rotation had already used.
+        let replacement = load_signing_key(&secret_path);
+        assert_eq!(
+            replacement.id, "key-2",
+            "the new secret reuses the interrupted rotation's label — this is \
+             the residual"
+        );
+        assert_ne!(
+            replacement.secret(),
+            Some(&epoch2),
+            "it is a different secret, not a recovery of the old one"
+        );
+
+        // Consequence: the epoch-2 entry now names a key whose bytes changed.
+        let result = verify_chain(&config).unwrap();
+        assert_eq!(
+            result.broken_at,
+            Some(1),
+            "known residual: two secrets under one id read as tampering. If \
+             this starts passing, the epoch-recording fix landed — update \
+             ADR-0008 and SECURITY.md rather than just the assertion"
+        );
+        assert!(
+            result.key_unavailable_at.is_none(),
+            "A5 cannot reclassify this: the id resolves, only the bytes differ"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 (Codex Round 2 follow-up). Failing closed on an unreadable key
+    /// directory must not catch the case where the directory does not exist
+    /// yet — that is every fresh install.
+    ///
+    /// The first version of that change returned a keyless `SigningKey` before
+    /// `load_or_create_secret` could create the tree, so a new install recorded
+    /// entries with no HMAC at all. Only an existing directory that cannot be
+    /// listed is a fault; `NotFound` is just "nothing has happened yet".
+    ///
+    /// The regression was caught by an unrelated `hash-cwd` test. This one
+    /// names the property directly.
+    #[test]
+    fn fresh_install_with_no_data_directory_still_gets_a_key() {
+        let dir = test_dir("457-fresh-install");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.exists(), "precondition: the directory must be absent");
+
+        let secret_path = dir.join("audit-secret");
+        let key = load_signing_key(&secret_path);
+
+        assert!(
+            key.secret().is_some(),
+            "a fresh install must still receive an HMAC key — without one every \
+             entry it writes is unprotected"
+        );
+        assert_eq!(key.id, "default", "a store with no rotations is epoch 1");
+        assert!(secret_path.exists(), "the key must have been persisted");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 (Codex Round 1 P0). An unlistable key directory is not "no
+    /// rotations have happened". Treating it as such makes `"default"` resolve
+    /// to the active key on a rotated store, and every entry then fails its
+    /// hash — reporting a permissions problem as tampering.
+    #[cfg(unix)]
+    #[test]
+    fn unlistable_key_directory_is_cannot_verify_not_tampering() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("457-unlistable-keydir");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        logger.append(make_event("epoch-2")).unwrap();
+        drop(logger);
+        assert!(verify_chain(&config).unwrap().broken_at.is_none());
+
+        // Drop **read** on the directory but keep **execute**. On Unix these
+        // are separate: `r` allows listing, `x` allows resolving a name inside
+        // it. Removing both (e.g. 0o600) also makes the key files unopenable,
+        // so `read_secret` fails first and the test measures
+        // `SecretUnavailable` instead of the unlistable-directory path it is
+        // supposed to be measuring.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o100)).unwrap();
+        let outcome = verify_chain(&config);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        match outcome {
+            Err(AuditError::KeyringUnusable(reason)) => {
+                assert!(
+                    reason.contains("cannot list"),
+                    "the error must name the real cause, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected KeyringUnusable, got {other:?}"),
+            Ok(result) => panic!(
+                "an unlistable key directory must not produce a verdict; \
+                 broken_at = {:?}",
+                result.broken_at
+            ),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457, Phase 8. Acquiring a held lock gives up instead of waiting.
+    ///
+    /// The first version called `flock(LOCK_EX)` with no `LOCK_NB`, which
+    /// waits for as long as the holder likes. Measured: with an unrelated
+    /// process holding the lock, `audit verify`, `doctor`, `report`,
+    /// `exec -- true` and `hook-check` all stalled indefinitely — and the lock
+    /// file was created world-readable, so a read-only descriptor was enough
+    /// to take it. `hook-check` stalling is the serious one: it hangs before
+    /// printing its deny verdict, leaving the outcome to the host's hook
+    /// timeout rather than to omamori.
+    #[test]
+    #[cfg(unix)]
+    fn a_held_lock_is_given_up_on_rather_than_waited_for() {
+        let dir = test_dir("457-flock-bounded");
+        let path = dir.join("locked");
+        fs::write(&path, b"").unwrap();
+
+        // flock is per open-file-description, so two opens in one process
+        // contend exactly as two processes would.
+        let holder = fs::File::open(&path).unwrap();
+        flock_exclusive(&holder).expect("first acquisition succeeds");
+
+        let contender = fs::File::open(&path).unwrap();
+        let err = must_finish_within(
+            std::time::Duration::from_secs(5),
+            "flock_exclusive on a held lock",
+            move || flock_exclusive(&contender).unwrap_err(),
+        );
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "giving up must be distinguishable from a real I/O failure, got: {err}"
+        );
+
+        drop(holder);
+        let after = fs::File::open(&path).unwrap();
+        flock_exclusive(&after).expect("the lock is free again once released");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457, Phase 8. The key store lock is best-effort in *both* directions.
+    ///
+    /// Creation failure was already documented as non-fatal; acquisition
+    /// failure was not, and that asymmetry was the whole bug — a lock omamori
+    /// cannot take must not stop it from resolving a key, or every guarded
+    /// command stops with it.
+    #[test]
+    #[cfg(unix)]
+    fn a_held_key_store_lock_does_not_stop_key_resolution() {
+        let dir = test_dir("457-keystore-lock-held");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+
+        let lock_path = dir.join("audit-secret.lock");
+        fs::write(&lock_path, b"").unwrap();
+        let holder = fs::File::open(&lock_path).unwrap();
+        flock_exclusive(&holder).expect("holder takes the lock");
+
+        let probe = secret_path.clone();
+        let key = must_finish_within(
+            std::time::Duration::from_secs(5),
+            "load_signing_key with the key store lock held",
+            move || load_signing_key(&probe),
+        );
+        assert_eq!(key.id, "default");
+        assert_eq!(
+            key.secret(),
+            Some(&TEST_SECRET),
+            "the key still resolves; the lock is an optimisation, not a gate"
+        );
+
+        drop(holder);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-d, Phase 8 security review. `open` must not be the thing that
+    /// blocks.
+    ///
+    /// `read_secret` rejects a FIFO by stat'ing the path first, which is a
+    /// TOCTOU window: swap the path for a FIFO between the stat and the open
+    /// and the open hangs anyway, on a path omamori runs for every command.
+    /// `O_NONBLOCK` is what actually closes it — the stat only produces a
+    /// better message. Without the flag this test does not fail, it hangs,
+    /// which is why it runs under a watchdog.
+    #[test]
+    #[cfg(unix)]
+    fn opening_a_fifo_for_reading_returns_instead_of_waiting_for_a_writer() {
+        let dir = test_dir("457-fifo-nonblock");
+        let fifo = dir.join("fifo-secret");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let probe = fifo.clone();
+        let opened = must_finish_within(
+            std::time::Duration::from_secs(5),
+            "open_read_nofollow on a FIFO with no writer",
+            move || open_read_nofollow(&probe).is_ok(),
+        );
+        assert!(
+            opened,
+            "the open must succeed immediately; rejecting a FIFO is the caller's job, \
+             and it cannot do that job if the open never returns"
+        );
+
+        // `read_secret` still refuses it — the point is that it refuses
+        // rather than hangs.
+        let err = read_secret(&fifo).expect_err("a FIFO is not a secret file");
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected message: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457, Phase 8. Which explanations the verifier is entitled to give.
+    ///
+    /// `key_id` is an ordinary field of `audit.jsonl`. Before this, an
+    /// unresolvable one produced a flat "This is not evidence of tampering",
+    /// so editing one string moved an entry from exit 1 to exit 2 *and*
+    /// bought an assertion of innocence — for free, with no key material.
+    #[test]
+    fn unresolvable_key_ids_are_classified_by_whether_a_writer_could_have_made_them() {
+        assert!(is_writer_emitted_key_id("default"));
+        assert!(is_writer_emitted_key_id("key-2"));
+        assert!(is_writer_emitted_key_id("key-4294967295"));
+        assert!(is_writer_emitted_key_id(UNRESOLVED_KEY_ID));
+
+        // `key-1` is never written: epoch 1 is `"default"`.
+        assert!(!is_writer_emitted_key_id("key-1"));
+        assert!(!is_writer_emitted_key_id("key-0"));
+        // Non-canonical decimals round-trip differently and are not ours.
+        assert!(!is_writer_emitted_key_id("key-02"));
+        assert!(!is_writer_emitted_key_id("key-2 "));
+        assert!(!is_writer_emitted_key_id("key-+2"));
+        assert!(!is_writer_emitted_key_id("key-99999999999999999999"));
+        assert!(!is_writer_emitted_key_id(""));
+        assert!(!is_writer_emitted_key_id("KEY-2"));
+
+        // The remedy must name a file. There is no file called "default".
+        let default_file = expected_key_file("default").expect("epoch 1 has a file");
+        assert!(default_file.contains("audit-secret"));
+        assert!(
+            expected_key_file("key-3")
+                .expect("epoch 3 has a file")
+                .contains("audit-secret.2.retired"),
+            "key-N is retired index N-1"
+        );
+        assert!(expected_key_file("nonsense").is_none());
+    }
+
+    /// #457, Phase 8 QA. The writer-side sibling of the test above, and the
+    /// one that was missing: that test only exercised the verifier, so the
+    /// fail-closed branch on the *writing* side went out unmeasured.
+    ///
+    /// What it caught: the first version stamped `key_id: "default"` on
+    /// entries written while the directory could not be listed, alongside
+    /// `entry_hash: NO_HMAC_SECRET`. Once permissions came back, `"default"`
+    /// resolved, the recomputed HMAC did not match the sentinel, and the entry
+    /// read as **tampering** — permanently, since ADR-0007 forbids rewriting
+    /// it. Measured against v0.16.0, which wrote a real HMAC here and reported
+    /// `chain intact`: a regression, produced by the branch whose comment
+    /// claimed it was avoiding exactly that outcome.
+    ///
+    /// `UNRESOLVED_KEY_ID` cannot be in any keyring, so the entry now lands in
+    /// the cannot-verify terminal state with its real reason.
+    #[test]
+    #[cfg(unix)]
+    fn an_unlistable_key_directory_does_not_make_the_writer_manufacture_tampering() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("457-unlistable-writer");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("before")).unwrap();
+        drop(logger);
+        // Rotate first: on an unrotated store `"default"` and the active key
+        // are the same bytes, so the mislabel would be invisible. The rotated
+        // store is where `"default"` means `.1.retired` and the wrong label
+        // becomes a tampering verdict.
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o100)).unwrap();
+        let blind = AuditLogger::from_config(&config).expect("logger still constructs");
+        assert_eq!(
+            blind.key_id(),
+            UNRESOLVED_KEY_ID,
+            "a key epoch that could not be determined must not be guessed at"
+        );
+        blind.append(make_event("written-blind")).unwrap();
+        drop(blind);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = verify_chain(&config).expect("verification runs once the directory is back");
+        assert!(
+            result.broken_at.is_none(),
+            "an entry omamori itself wrote without a key is not evidence of tampering; \
+             broken_at = {:?}",
+            result.broken_at
+        );
+        assert_eq!(
+            result.key_unavailable_id.as_deref(),
+            Some(UNRESOLVED_KEY_ID),
+            "the entry must be reported under the id that says why it is unverifiable"
+        );
+        assert_eq!(
+            result.key_unavailable_kind,
+            Some(KeyUnavailableKind::NeverProtected),
+            "and classified as never-protected, not as a key file the operator lost"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-b (V-016). A gap in the retired indices must not hide the keys
+    /// beyond it. The old loop probed 1, 2, 3, … and stopped at the first
+    /// miss, so a missing `.2` made `.3` unreachable — permanently
+    /// unverifiable entries with the key sitting right there on disk.
+    #[test]
+    fn keyring_tolerates_a_gap_in_retired_indices() {
+        let dir = test_dir("457-index-gap");
+        let secret_path = dir.join("audit-secret");
+        let epoch1 = [0x11u8; 32];
+        let epoch3 = [0x33u8; 32];
+        write_key_file(&secret_path, &TEST_SECRET);
+        write_key_file(&dir.join("audit-secret.1.retired"), &epoch1);
+        write_key_file(&dir.join("audit-secret.3.retired"), &epoch3);
+
+        let ring = load_keyring(&secret_path);
+        assert_eq!(ring.get("key-1"), Some(&epoch1));
+        assert_eq!(
+            ring.get("key-3"),
+            Some(&epoch3),
+            "the key past the gap must still load"
+        );
+        assert_eq!(
+            ring.get("default"),
+            Some(&epoch1),
+            "\"default\" is an alias for epoch 1, which is .1.retired once rotated"
+        );
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-4",
+            "the next id comes from the highest index, not from a count"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-a/P4-c (V-015). A gap in the indices used to make the next
+    /// rotation destroy a key.
+    ///
+    /// With `.1` and `.3` present, the old count-based numbering said "two
+    /// rotations so far, the next is `.3`" and `fs::rename` overwrote the
+    /// existing `.3.retired` without a word. That key was the only copy; every
+    /// entry from its epoch became permanently unverifiable, with nothing left
+    /// on disk to explain why.
+    ///
+    /// Index-based numbering picks `.4` — above the highest present, so by
+    /// construction free. The explicit refusal added to `rotate_key` is a
+    /// backstop for the case this arithmetic cannot cover: if the directory
+    /// scan itself fails (unreadable directory), the highest index reads as 0
+    /// and the next slot would be `.1`, which may well exist.
+    #[test]
+    fn rotation_after_a_gap_does_not_destroy_the_occupied_slot() {
+        let dir = test_dir("457-gap-rotation");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let epoch3 = [0x33u8; 32];
+        write_key_file(&secret_path, &TEST_SECRET);
+        write_key_file(&dir.join("audit-secret.1.retired"), &[0x11u8; 32]);
+        write_key_file(&dir.join("audit-secret.3.retired"), &epoch3);
+
+        let rotation = super::rotate_key(&audit_path).expect("rotation succeeds");
+
+        assert_eq!(
+            read_secret(&dir.join("audit-secret.3.retired")).unwrap(),
+            epoch3,
+            "the pre-existing retired key must survive the rotation"
+        );
+        assert_eq!(
+            read_secret(&dir.join("audit-secret.4.retired")).unwrap(),
+            TEST_SECRET,
+            "the rotated-out key goes to the slot above the highest index"
+        );
+        assert_eq!(
+            rotation.new_key_id, "key-5",
+            "the new active key is named for the slot after the one just used"
+        );
+
+        // The freshly created active key must be a real, distinct key.
+        let new_active = read_secret(&secret_path).expect("a new active key is created");
+        assert_ne!(new_active, TEST_SECRET);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-d. A FIFO at a key path makes `open(O_RDONLY)` block until
+    /// someone writes to it — which would hang `verify` *and every hook
+    /// append*, i.e. omamori silently stops protecting anything. The check is
+    /// a `stat`, which never blocks.
+    ///
+    /// If this regresses, the test does not fail — it hangs. That is the
+    /// failure mode being guarded, so there is no way to assert it more gently.
+    #[test]
+    fn fifo_at_a_key_path_is_rejected_instead_of_blocking() {
+        let dir = test_dir("457-fifo");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+
+        let fifo_path = dir.join("audit-secret.1.retired");
+        let c_path = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo must succeed for this test to mean anything");
+
+        assert!(
+            read_secret(&fifo_path).is_err(),
+            "a FIFO is not a key file and must be rejected before opening"
+        );
+
+        // The ring still loads; the FIFO is reported rather than hung on.
+        // Assert the anomaly *class* and the file it names — "non-empty" would
+        // pass on any anomaly at all, including an unrelated one (test review
+        // #5).
+        let ring = load_keyring(&secret_path);
+        let named: Vec<&str> = ring
+            .anomalies()
+            .iter()
+            .filter_map(|a| match a {
+                KeyringAnomaly::Unreadable { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            named,
+            vec!["audit-secret.1.retired"],
+            "the FIFO must be reported as an unreadable key file, by name"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 (test review blind spot 5, shapes D19-D22). Every way a file can
+    /// occupy a retired-key name without being a usable key must be reported
+    /// rather than skipped: a directory, a file with the wrong content, and one
+    /// the process cannot open. Each takes a different path out of
+    /// `read_secret` (file-type check, hex decode, `open`), so a fix that
+    /// covers one does not necessarily cover the others.
+    #[cfg(unix)]
+    #[test]
+    fn unusable_retired_key_shapes_are_each_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("457-unusable-shapes");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+
+        // D19: a directory where a key should be.
+        fs::create_dir(dir.join("audit-secret.1.retired")).unwrap();
+        // D21: right shape, wrong content.
+        fs::write(dir.join("audit-secret.2.retired"), "not-hex").unwrap();
+        // D22: unopenable.
+        let unreadable = dir.join("audit-secret.3.retired");
+        write_key_file(&unreadable, &[0x33u8; 32]);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        // D20 (V-023): a symlink where a key should be. `read_secret` rejects
+        // it before `open`, with the "possible attack" wording rather than the
+        // generic not-a-regular-file one — a symlinked key is an attack shape,
+        // not a mistake shape.
+        let real = dir.join("real-key");
+        write_key_file(&real, &[0x44u8; 32]);
+        std::os::unix::fs::symlink(&real, dir.join("audit-secret.4.retired")).unwrap();
+
+        let ring = load_keyring(&secret_path);
+        let mut reported: Vec<&str> = ring
+            .anomalies()
+            .iter()
+            .filter_map(|a| match a {
+                KeyringAnomaly::Unreadable { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        reported.sort_unstable();
+        assert_eq!(
+            reported,
+            vec![
+                "audit-secret.1.retired",
+                "audit-secret.2.retired",
+                "audit-secret.3.retired",
+                "audit-secret.4.retired",
+            ],
+            "all four unusable shapes must be named, not silently dropped"
+        );
+
+        // The symlink specifically must carry the attack wording, not the
+        // generic file-type rejection.
+        let symlink_reason = ring
+            .anomalies()
+            .iter()
+            .find_map(|a| match a {
+                KeyringAnomaly::Unreadable { name, reason } if name == "audit-secret.4.retired" => {
+                    Some(reason.as_str())
+                }
+                _ => None,
+            })
+            .expect("the symlinked key must be reported");
+        assert!(
+            symlink_reason.contains("possible attack"),
+            "a symlinked key file is an attack shape, not a mistake shape; got: {symlink_reason}"
+        );
+
+        // None of them registered a key, so nothing can be verified against a
+        // partially-loaded ring while believing it is complete.
+        assert!(ring.get("key-1").is_none());
+        assert!(ring.get("key-2").is_none());
+        assert!(ring.get("key-3").is_none());
+        assert!(ring.get("key-4").is_none());
+
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-d. `read_to_string` would materialize the whole file before the
+    /// 64-character check could reject it.
+    #[test]
+    fn oversized_secret_file_is_rejected_before_reading() {
+        let dir = test_dir("457-oversized");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+
+        let big = dir.join("audit-secret.1.retired");
+        fs::write(&big, "0".repeat(64 * 1024)).unwrap();
+
+        let err = read_secret(&big).expect_err("an oversized file is not a key");
+        assert!(
+            format!("{err}").contains("expected at most"),
+            "the error must name the limit, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #457 P4-b. Beyond the cap, the **newest** keys are the ones kept —
+    /// dropping those would make the current epoch unverifiable, while the
+    /// oldest keys are the ones whose entries are most likely already pruned.
+    /// A `1..`-style loop that stopped at the cap would have done the reverse.
+    #[test]
+    fn keyring_cap_keeps_the_newest_keys_and_reports_the_truncation() {
+        let dir = test_dir("457-keyring-cap");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+
+        let over = MAX_KEYRING_KEYS + 5;
+        for n in 1..=over {
+            let mut secret = [0u8; 32];
+            secret[0] = (n % 251) as u8;
+            secret[1] = (n / 251) as u8;
+            write_key_file(&dir.join(format!("audit-secret.{n}.retired")), &secret);
+        }
+
+        let ring = load_keyring(&secret_path);
+        assert!(
+            ring.get(&format!("key-{over}")).is_some(),
+            "the newest retired key must be loaded"
+        );
+        assert!(
+            ring.get("key-1").is_none(),
+            "the oldest keys are the ones dropped at the cap"
+        );
+        // Assert the class and its numbers, not just that *something* was
+        // reported (test review #5).
+        let truncation = ring
+            .anomalies()
+            .iter()
+            .find_map(|a| match a {
+                KeyringAnomaly::Truncated {
+                    found,
+                    loaded,
+                    lowest_loaded_index,
+                } => Some((*found, *loaded, *lowest_loaded_index)),
+                _ => None,
+            })
+            .expect(
+                "truncation must not be silent — a shorter keyring is a \
+                 forensic false negative, not a smaller problem",
+            );
+        assert_eq!(truncation.0, over, "all retired keys are counted as found");
+        assert_eq!(truncation.1, MAX_KEYRING_KEYS, "exactly the cap is loaded");
+        assert_eq!(
+            truncation.2,
+            (over - MAX_KEYRING_KEYS + 1) as u32,
+            "the lowest loaded index must be the oldest key that survived the cap"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -3250,7 +4909,7 @@ mod tests {
         flock_exclusive(&file).unwrap();
         try_prune_at(
             &mut file,
-            Some(&TEST_SECRET),
+            &test_signing_key(),
             90,
             None,
             retention_test_now(),
@@ -3307,7 +4966,7 @@ mod tests {
         flock_exclusive(&file).unwrap();
         let pruned1 = try_prune_at(
             &mut file,
-            Some(&TEST_SECRET),
+            &test_signing_key(),
             90,
             None,
             retention_test_now(),
@@ -3329,8 +4988,14 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned2 =
-            try_prune_at(&mut file, Some(&TEST_SECRET), 1, None, retention_test_now()).unwrap();
+        let pruned2 = try_prune_at(
+            &mut file,
+            &test_signing_key(),
+            1,
+            None,
+            retention_test_now(),
+        )
+        .unwrap();
         assert!(pruned2 <= 100, "second prune should respect min retain");
         drop(file);
 
@@ -3350,7 +5015,7 @@ mod tests {
         test_logger(&dir);
         let path = dir.join("audit.jsonl");
 
-        let prune = build_prune_point(Some(&TEST_SECRET), 50, "");
+        let prune = build_prune_point(&test_signing_key(), 50, "", retention_test_now());
         let content = serde_json::to_string(&prune).unwrap() + "\n";
         fs::write(&path, content).unwrap();
 
@@ -3392,7 +5057,7 @@ mod tests {
         test_logger(&dir);
         let path = dir.join("audit.jsonl");
 
-        let prune = build_prune_point(Some(&TEST_SECRET), 42, "hash123");
+        let prune = build_prune_point(&test_signing_key(), 42, "hash123", retention_test_now());
         let mut content = serde_json::to_string(&prune).unwrap() + "\n";
 
         let ts = "2026-04-04T00:00:00Z";
@@ -3616,14 +5281,15 @@ mod tests {
 
         let logger = AuditLogger {
             path: symlink_path,
-            secret: Some(TEST_SECRET),
+            signing_key: SigningKey::for_test("default", Some(TEST_SECRET)),
             retention_days: 0,
-            key_id: "default".to_string(),
         };
         let err = logger.append(make_event("ls")).unwrap_err();
         assert!(
-            err.to_string().contains("symlink"),
-            "expected symlink error, got: {err}"
+            // See the note on the other symlink fixtures: the path is in the
+            // message, so matching "symlink" would match the directory name.
+            err.to_string().contains("possible attack"),
+            "expected the symlink/possible-attack error, got: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3639,9 +5305,16 @@ mod tests {
         std::os::unix::fs::symlink(&real_secret, &symlink_secret).unwrap();
 
         let err = read_secret(&symlink_secret).unwrap_err();
+        // Match on "possible attack", not on "symlink": the error text embeds
+        // the path, and `test_dir("symlink-secret-read")` puts the word
+        // "symlink" in that path — so a `contains("symlink")` assertion passes
+        // no matter what the error actually says. It did exactly that when
+        // #457's file-type pre-check briefly replaced this error with a
+        // generic "not a regular file" (caught in Codex review, not by this
+        // test). "possible attack" appears only in the intended message.
         assert!(
-            err.to_string().contains("symlink"),
-            "expected symlink error, got: {err}"
+            err.to_string().contains("possible attack"),
+            "expected the symlink/possible-attack error, got: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3657,8 +5330,14 @@ mod tests {
 
         let err = create_secret(&symlink_secret).unwrap_err();
         assert!(
-            err.to_string().contains("symlink") || err.kind() == std::io::ErrorKind::AlreadyExists,
-            "expected symlink or AlreadyExists error, got: {err}"
+            // `create_new(true)` may report `AlreadyExists` before the
+            // O_NOFOLLOW path is reached, so both outcomes are legitimate here.
+            // The text arm matches "possible attack" rather than "symlink" for
+            // the same reason as the other fixtures — the directory name
+            // contains "symlink".
+            err.to_string().contains("possible attack")
+                || err.kind() == std::io::ErrorKind::AlreadyExists,
+            "expected the symlink/possible-attack or AlreadyExists error, got: {err}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -3677,8 +5356,14 @@ mod tests {
         let config = verify_config(&dir);
         match verify_chain(&config) {
             Err(AuditError::Io(e)) => assert!(
-                e.to_string().contains("symlink"),
-                "expected symlink error, got: {e}"
+                // "possible attack", not "symlink": these fixtures use
+                // `test_dir` names containing the word "symlink", and the error
+                // embeds the path — so `contains("symlink")` passes regardless
+                // of what the error says. Found by same-class scan after Codex
+                // Round 1 flagged the same defect in
+                // `read_secret_rejects_symlink` (#457).
+                e.to_string().contains("possible attack"),
+                "expected the symlink/possible-attack error, got: {e}"
             ),
             Err(other) => panic!("expected Io error, got: {other}"),
             Ok(_) => panic!("expected error for symlink path"),
@@ -3710,8 +5395,14 @@ mod tests {
         let err = show_entries(&config, &opts, &mut buf).unwrap_err();
         match err {
             AuditError::Io(e) => assert!(
-                e.to_string().contains("symlink"),
-                "expected symlink error, got: {e}"
+                // "possible attack", not "symlink": these fixtures use
+                // `test_dir` names containing the word "symlink", and the error
+                // embeds the path — so `contains("symlink")` passes regardless
+                // of what the error says. Found by same-class scan after Codex
+                // Round 1 flagged the same defect in
+                // `read_secret_rejects_symlink` (#457).
+                e.to_string().contains("possible attack"),
+                "expected the symlink/possible-attack error, got: {e}"
             ),
             other => panic!("expected Io error, got: {other}"),
         }
@@ -3795,9 +5486,8 @@ mod tests {
         let dir = test_dir("strict-avail-false");
         let logger = AuditLogger {
             path: dir.join("audit.jsonl"),
-            secret: None,
+            signing_key: SigningKey::for_test("default", None),
             retention_days: 0,
-            key_id: "default".to_string(),
         };
         assert!(!logger.secret_available());
         let _ = fs::remove_dir_all(&dir);
@@ -3845,8 +5535,14 @@ mod tests {
         let config = verify_config(&dir);
         match verify_chain(&config) {
             Err(AuditError::Io(e)) => assert!(
-                e.to_string().contains("symlink"),
-                "expected symlink error, got: {e}"
+                // "possible attack", not "symlink": these fixtures use
+                // `test_dir` names containing the word "symlink", and the error
+                // embeds the path — so `contains("symlink")` passes regardless
+                // of what the error says. Found by same-class scan after Codex
+                // Round 1 flagged the same defect in
+                // `read_secret_rejects_symlink` (#457).
+                e.to_string().contains("possible attack"),
+                "expected the symlink/possible-attack error, got: {e}"
             ),
             Err(other) => panic!("expected Io error, got: {other}"),
             Ok(_) => panic!("expected error for symlink secret"),
