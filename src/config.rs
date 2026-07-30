@@ -10,6 +10,13 @@ use crate::context::ContextConfig;
 use crate::detector::DetectorConfig;
 use crate::rules::{ActionKind, RuleConfig};
 
+/// Upper bound on `config.toml`. #468: these reads go through
+/// `atomic_file::read_to_string_capped` rather than `fs::read_to_string`
+/// because a FIFO at the config path made `omamori doctor` and `omamori
+/// status` hang indefinitely (measured). 1 MiB is far past any hand-written
+/// config and keeps a hostile file from being pulled into memory whole.
+const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -173,7 +180,8 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
                 ));
                 Config::default()
             } else {
-                let content = fs::read_to_string(&path)?;
+                let content =
+                    crate::atomic_file::read_to_string_capped(&path, MAX_CONFIG_FILE_BYTES)?;
                 match toml::from_str::<UserConfig>(&content) {
                     Ok(user_config) => build_merged_config(user_config, &mut warnings),
                     Err(error) => {
@@ -214,7 +222,7 @@ pub(crate) fn raw_rule_names(path: &Path) -> Result<HashSet<String>, AppError> {
     if !path.exists() {
         return Ok(HashSet::new());
     }
-    let content = fs::read_to_string(path)?;
+    let content = crate::atomic_file::read_to_string_capped(path, MAX_CONFIG_FILE_BYTES)?;
     let Ok(value) = toml::from_str::<toml::Value>(&content) else {
         return Ok(HashSet::new());
     };
@@ -274,7 +282,7 @@ pub(crate) fn read_raw_rule_state(path: &Path, name: &str) -> Result<RawRuleArra
             enabled: true,
         });
     }
-    let content = fs::read_to_string(path)?;
+    let content = crate::atomic_file::read_to_string_capped(path, MAX_CONFIG_FILE_BYTES)?;
     let Ok(value) = toml::from_str::<toml::Value>(&content) else {
         return Ok(RawRuleArrayState {
             count: 0,
@@ -311,7 +319,7 @@ pub(crate) fn raw_override_disables(path: &Path, name: &str) -> Result<bool, App
     if !path.exists() {
         return Ok(false);
     }
-    let content = fs::read_to_string(path)?;
+    let content = crate::atomic_file::read_to_string_capped(path, MAX_CONFIG_FILE_BYTES)?;
     let Ok(value) = toml::from_str::<toml::Value>(&content) else {
         return Ok(false);
     };

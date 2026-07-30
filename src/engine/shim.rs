@@ -20,6 +20,11 @@ use time::OffsetDateTime;
 
 use crate::util::{clone_lossy, resolve_real_command, should_block_for_sudo};
 
+/// Upper bound on the hook script and `settings.json` reads on this path
+/// (#468). See `atomic_file::read_to_string_capped`: a non-regular file here
+/// would otherwise block the shim, which runs ahead of every guarded command.
+const MAX_READ_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Shim entry point
 // ---------------------------------------------------------------------------
@@ -190,9 +195,28 @@ fn ensure_hooks_current_at_with_verifier_and_exe(
 ) -> bool {
     let hook_path = base_dir.join("hooks/claude-pretooluse.sh");
 
-    let content = match std::fs::read_to_string(&hook_path) {
+    // #468: the read now refuses symlinks (`O_NOFOLLOW`) and non-regular
+    // files. `Err(_) => return false` was safe while the read *followed* a
+    // symlink — the target's content failed the hash check and regeneration
+    // repaired the attack. Refusing to read must not turn that repair off:
+    // `false` here means "nothing to do", which is the one thing that is not
+    // true when someone has planted a symlink at the hook path.
+    // `hooks_symlink_attack_triggers_regen` catches exactly this.
+    let content = match crate::atomic_file::read_to_string_capped(&hook_path, MAX_READ_FILE_BYTES) {
         Ok(c) => c,
-        Err(_) => return false,
+        // Nothing installed yet. Installing hooks is `omamori install`'s job,
+        // not something a guarded command should do behind the user.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        // Something is there that is not a readable regular file. An empty
+        // body matches neither the version nor the hash, so it falls into the
+        // same regeneration branch a tampered script does.
+        Err(e) => {
+            eprintln!(
+                "omamori: hook script at {} is not a readable regular file ({e}) — regenerating",
+                hook_path.display()
+            );
+            String::new()
+        }
     };
 
     let regen = |base_dir: &Path| -> Result<installer::HookOutcome, std::io::Error> {
@@ -315,9 +339,27 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
         return false;
     }
     let settings_path = claude_dir.join("settings.json");
-    let raw = match std::fs::read_to_string(&settings_path) {
+    let raw = match crate::atomic_file::read_to_string_capped(&settings_path, MAX_READ_FILE_BYTES) {
         Ok(c) => c,
-        Err(_) => return false,
+        // No settings.json, or Claude Code is not set up here. Silence is
+        // right: this runs ahead of every guarded command.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        // #468: the read now refuses symlinks and non-regular files. The
+        // *outcome* is unchanged — `merge_claude_settings` already returned
+        // `Skipped` for a symlinked settings.json and
+        // `ensure_settings_symlink_returns_false` pins that — but the refusal
+        // now happens before the merge, so the warning the merge used to
+        // print has to be issued here instead. Rewriting the file is not an
+        // option: the user's real settings live at the other end of the link.
+        Err(e) => {
+            eprintln!(
+                "omamori: {} is not a readable regular file ({e}) — omamori's hook entry \
+                 cannot be kept in sync. Replace it with a regular file and run: \
+                 omamori install --hooks",
+                settings_path.display()
+            );
+            return false;
+        }
     };
     let doc: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
