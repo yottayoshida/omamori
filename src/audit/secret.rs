@@ -761,19 +761,10 @@ pub(super) fn read_secret(path: &Path) -> Result<[u8; 32], std::io::Error> {
         ));
     }
 
+    // The post-open re-check that used to sit here moved into
+    // `atomic_file::open_read_regular` (#468): keeping it on this caller is
+    // what let the next caller ship without one.
     let file = open_read_nofollow(path)?;
-    // Post-open re-check, on the opened descriptor rather than the path. This
-    // is what actually closes the FIFO hole; the `symlink_metadata` above only
-    // gives a better message in the non-adversarial case.
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "audit secret path is not a regular file: {}",
-                path.display()
-            ),
-        ));
-    }
     let mut hex = String::new();
     // `take` bounds the read at the descriptor. The `meta.len()` check above
     // cannot: a file that passed it can be extended before this line runs.
@@ -848,14 +839,7 @@ pub(super) fn decode_hex_secret(hex: &str) -> Result<[u8; 32], std::io::Error> {
 /// that care must still confirm the opened descriptor is a regular file;
 /// `O_NONBLOCK` stops the hang, it does not make a FIFO a valid input.
 pub(super) fn open_read_nofollow(path: &Path) -> Result<fs::File, std::io::Error> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    opts.open(path).map_err(|e| eloop_message(e, path))
+    crate::atomic_file::open_read_regular(path).map_err(|e| eloop_message(e, path))
 }
 
 /// Open audit.jsonl for read+write+create, refusing symlinks on Unix and
@@ -874,7 +858,13 @@ pub(super) fn open_audit_rw(path: &Path) -> Result<fs::File, std::io::Error> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    opts.open(path).map_err(|e| eloop_message(e, path))
+    let file = opts.open(path).map_err(|e| eloop_message(e, path))?;
+    // Cannot use `open_read_regular` (this one creates and writes), so it
+    // shares the rule through `reject_non_regular` instead of restating it.
+    // Without this, `append` writes audit entries *into a FIFO* — they leave
+    // the process and land nowhere, and the log looks empty afterwards.
+    crate::atomic_file::reject_non_regular(&file, path)?;
+    Ok(file)
 }
 
 /// Convert ELOOP into a user-friendly error message.

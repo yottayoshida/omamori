@@ -121,6 +121,114 @@ pub(crate) fn is_symlink(path: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical read side (#468)
+// ---------------------------------------------------------------------------
+
+/// Open `path` for reading, refusing symlinks and anything that is not a
+/// regular file, and never blocking on the `open` itself.
+///
+/// Unlike the symlink check above, this is **not** caller-side by design. It
+/// is the check whose absence #468 is about, and the reason it belongs here
+/// is a measured one: `read_secret` had a per-caller version of it, and the
+/// next caller added in the same change did not get one. A check that lives
+/// on callers does not reach the next caller.
+///
+/// Three things, none of which is redundant:
+///
+/// - `O_NOFOLLOW` — a symlink at `path` is refused by the kernel rather than
+///   followed to wherever it points.
+/// - `O_NONBLOCK` — `open(O_RDONLY)` on a FIFO otherwise waits for a writer
+///   that may never come. Measured on omamori: a FIFO at `audit.jsonl.hwm`
+///   hung `verify`, `exec`, `doctor`, `report` **and `hook-check`** — the
+///   last of those before it printed its deny verdict, which turns a local
+///   `mkfifo` into a silent disabling of the enforcement path. On a regular
+///   file the flag changes nothing about reads.
+/// - `fstat` on the **opened descriptor** — `O_NONBLOCK` stops the hang, it
+///   does not make a FIFO a valid input, and reads from one return
+///   `EWOULDBLOCK`/`ENOTSUP` rather than an error naming the real problem.
+///   Checking the descriptor rather than the path also closes the
+///   check-then-act window that `symlink_metadata`-then-`open` leaves open.
+pub(crate) fn open_read_regular(path: &Path) -> io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(path)?;
+    reject_non_regular(&file, path)?;
+    Ok(file)
+}
+
+/// Fail unless `file` is a regular file. Split out so the read+write opens
+/// that cannot use [`open_read_regular`] still share one definition of the
+/// rule and one wording.
+pub(crate) fn reject_non_regular(file: &std::fs::File, path: &Path) -> io::Result<()> {
+    let meta = file.metadata()?;
+    if meta.is_file() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "{} is {}, not a regular file",
+            path.display(),
+            describe_file_type(&meta)
+        ),
+    ))
+}
+
+/// Name the thing that was found, so the message says what to remove rather
+/// than only what was expected.
+fn describe_file_type(meta: &std::fs::Metadata) -> &'static str {
+    let ft = meta.file_type();
+    if ft.is_dir() {
+        return "a directory";
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if ft.is_fifo() {
+            return "a FIFO";
+        }
+        if ft.is_socket() {
+            return "a socket";
+        }
+        if ft.is_block_device() {
+            return "a block device";
+        }
+        if ft.is_char_device() {
+            return "a character device";
+        }
+    }
+    "not a regular file"
+}
+
+/// Read a whole file as UTF-8, refusing non-regular files and bounding the
+/// read at `max_bytes`.
+///
+/// The bound is applied to the descriptor via `take`, not to a prior `stat`:
+/// a file that passed a size check can be extended before the read runs, and
+/// omamori re-reads these paths on every command, so an attacker racing that
+/// window gets unlimited attempts.
+pub(crate) fn read_to_string_capped(path: &Path, max_bytes: u64) -> io::Result<String> {
+    use std::io::Read;
+    let file = open_read_regular(path)?;
+    let mut buf = String::new();
+    io::BufReader::new(file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(buf)
+}
+
+// ---------------------------------------------------------------------------
 // Internals (Unix)
 // ---------------------------------------------------------------------------
 
@@ -306,6 +414,131 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Run `f` on a worker thread and fail if it has not finished in time.
+    ///
+    /// The defect these guard against (`open` without `O_NONBLOCK` on a FIFO)
+    /// fails by *not returning*. A test that simply called it would hang and
+    /// take the whole test binary with it, which is indistinguishable from a
+    /// slow machine; timing out into an assertion makes it an ordinary red
+    /// test.
+    fn must_finish_within<T: Send + 'static>(
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(v) => v,
+            Err(_) => panic!("{what} did not return within 5s — it blocked"),
+        }
+    }
+
+    fn mkfifo_at(path: &Path) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // open_read_regular / read_to_string_capped (#468)
+    // -----------------------------------------------------------------
+
+    /// The regression this helper exists for: `fs::read_to_string` on a FIFO
+    /// waits for a writer forever. Measured before the fix, a FIFO at
+    /// `audit.jsonl.hwm` hung `verify`, `exec`, `doctor`, `report` and
+    /// `hook-check` — the last of those before it printed its deny verdict.
+    #[test]
+    fn a_fifo_is_refused_rather_than_waited_on() {
+        let dir = test_dir("read-fifo");
+        let fifo = dir.join("f");
+        mkfifo_at(&fifo);
+
+        let p = fifo.clone();
+        let err = must_finish_within("read_to_string_capped on a FIFO", move || {
+            read_to_string_capped(&p, 1024).expect_err("a FIFO is not a regular file")
+        });
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("is a FIFO"),
+            "the message must name what was found, not only what was expected: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every shape that is not a regular file, refused with its own name.
+    /// A directory and a socket reach different `open` outcomes than a FIFO,
+    /// so one case does not stand in for the others.
+    #[test]
+    fn every_non_regular_shape_is_refused_and_named() {
+        let dir = test_dir("read-shapes");
+
+        let subdir = dir.join("d");
+        std::fs::create_dir(&subdir).unwrap();
+        let err = open_read_regular(&subdir).expect_err("a directory is not a regular file");
+        assert!(err.to_string().contains("a directory"), "{err}");
+
+        // A symlink never reaches the file-type check: `O_NOFOLLOW` refuses
+        // it at the kernel. Pinned so that a later refactor cannot quietly
+        // start following links and then report on the *target's* type.
+        let target = dir.join("real");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.join("l");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = open_read_regular(&link).expect_err("a symlink must not be followed");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::InvalidInput,
+            "a symlink must fail at the open, not at the file-type check: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "x",
+            "and the target must be untouched"
+        );
+
+        // A regular file still works.
+        assert!(open_read_regular(&target).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cap is enforced, and enforced on the descriptor rather than on a
+    /// prior `stat` — a file that grows after a size check cannot slip past
+    /// one that never happened.
+    ///
+    /// **Measured limits of this test.** Reverting the `take(max + 1)` to an
+    /// unbounded read leaves it green: the length check below still rejects
+    /// the oversized file, because the bytes have already been read. `take`
+    /// is what stops a hostile file being pulled into memory *in full* before
+    /// the rejection, and that is not observable from here — the only tests
+    /// that would discriminate it depend on allocating hundreds of megabytes
+    /// and on timing, which is worse in CI than an honest note. Recorded
+    /// rather than papered over.
+    #[test]
+    fn the_cap_is_enforced_without_a_prior_stat() {
+        let dir = test_dir("read-cap");
+        let path = dir.join("big");
+        std::fs::write(&path, "x".repeat(2048)).unwrap();
+
+        let err = read_to_string_capped(&path, 1024).expect_err("2048 bytes exceeds a 1024 cap");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds 1024 bytes"), "{err}");
+
+        // Exactly at the cap is allowed; the +1 is only there to detect
+        // overrun, not to shift the limit.
+        std::fs::write(&path, "y".repeat(1024)).unwrap();
+        assert_eq!(read_to_string_capped(&path, 1024).unwrap().len(), 1024);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------

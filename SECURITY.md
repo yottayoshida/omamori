@@ -854,9 +854,11 @@ strict = true  # default: false
 
 ### Symlink Protection (v0.7.3+)
 
-All audit file operations use `O_NOFOLLOW` to reject symlinks at the kernel level. This prevents symlink attacks where an attacker replaces `audit.jsonl` or `audit-secret` with a symlink to `/dev/null` or a controlled location.
+Every file omamori reads is opened with `O_NOFOLLOW`, so a symlink is rejected by the kernel rather than followed to wherever it points. This prevents symlink attacks where an attacker replaces `audit.jsonl`, `audit-secret`, `config.toml` or a hook script with a link to `/dev/null` or a location they control.
 
-**Symlink-protected operations** (9 total — 6 via `O_NOFOLLOW`, 3 via `lstat`/atomic-rename, see Note below):
+The rule is enforced in **one place** — `atomic_file::open_read_regular` for reads, `atomic_file`'s `create_new`/rename helpers for writes — rather than restated per call site. That is a correction, not a style preference: the earlier per-caller form left three paths unprotected (`audit.jsonl.hwm`, `break-glass.json`, `config.toml`), two of which could hang `hook-check` before it printed its deny verdict. A check that lives on callers does not reach the next caller (#468).
+
+The table below enumerates the **audit-file** operations specifically, because their individual failure modes differ. It is not the full set of protected reads; that set is "every read", by construction of the helper.
 
 | Operation | File | Effect on symlink |
 |-----------|------|-------------------|
@@ -868,15 +870,16 @@ All audit file operations use `O_NOFOLLOW` to reject symlinks at the kernel leve
 | `audit_summary()` | audit.jsonl | `ELOOP` error, count returns 0 |
 | `with_key_store_lock()` | audit-secret.lock | `ELOOP` error, lock skipped; non-regular files rejected after open |
 | `write_hwm()` | audit.jsonl.hwm | Refuses to write; final/temp symlink rejected before open |
-| `read_hwm()` | audit.jsonl.hwm | Symlink treated as tampered, not followed |
+| `read_hwm()` | audit.jsonl.hwm | `ELOOP` at the open, reported as tampered; a FIFO or directory there is refused the same way |
 
-*Note: three of the nine do not rely on an `O_NOFOLLOW` open.*
+*Note: one of these does not rely on an `O_NOFOLLOW` open.*
 
-- *`read_hwm()` detects a symlink via `symlink_metadata` (lstat).*
 - *`write_hwm()` publishes the final file via atomic `rename`, which cannot land on a symlink at the destination. `O_NOFOLLOW` is still used for the temp file during write.*
 - *`read_secret()` gained an `lstat` pre-check in #457. It rejects a symlink **before** reaching its `O_NOFOLLOW` open, and its symlink branch deliberately keeps the same "possible attack" wording the `O_NOFOLLOW` path produced, since `verify_chain` distinguishes a symlinked secret from an ordinary missing one by that phrase.*
 
-*A stat followed by an open is a TOCTOU window, so the pre-check is an early rejection with a precise message, **not** the enforcement. The two hazards it names are closed at the descriptor instead: every read-side open passes `O_NONBLOCK` (a FIFO cannot make `open()` wait for a writer), `read_secret()` re-checks `is_file()` on the opened file, and the read is bounded with `take()` rather than by the pre-check's `len()`. omamori reads this file on every command, so an attacker racing the window gets unlimited attempts; a check that only inspects the name is not a control.*
+*A stat followed by an open is a TOCTOU window, so the pre-check is an early rejection with a precise message, **not** the enforcement. Both hazards are closed at the descriptor instead, by one shared helper (`atomic_file::open_read_regular`) that every read in omamori goes through: `O_NOFOLLOW | O_NONBLOCK` on the open (a FIFO cannot make `open()` wait for a writer), an `fstat` on the resulting descriptor that refuses anything which is not a regular file, and a `take()` bound applied there rather than to a prior `len()`. These paths are re-read on every command, so an attacker racing the window gets unlimited attempts; a check that only inspects the name is not a control.*
+
+*The helper is shared rather than per-caller for a measured reason (#468). The first version of the check lived on `read_secret`, and the next caller added in the same change shipped without one. Three further paths — `audit.jsonl.hwm`, `break-glass.json` and `config.toml` — were still hanging afterwards, two of them hanging `hook-check` before it printed its deny verdict. A check that lives on callers does not reach the next caller.*
 
 **Limitations**:
 

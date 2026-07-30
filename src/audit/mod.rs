@@ -462,18 +462,39 @@ pub(crate) enum HwmState {
     Tampered,
 }
 
+/// The HWM file holds one decimal integer. 64 bytes is far past `u64::MAX`'s
+/// 20 digits and still small enough that a hostile file cannot be read into
+/// memory in bulk.
+const MAX_HWM_FILE_BYTES: u64 = 64;
+
 fn read_hwm(hwm_path: &std::path::Path) -> HwmState {
-    match fs::symlink_metadata(hwm_path) {
-        Err(_) => return HwmState::Missing,
-        Ok(meta) if meta.file_type().is_symlink() => return HwmState::Tampered,
-        Ok(_) => {}
+    // #468: this used to `symlink_metadata` and then `fs::read_to_string`,
+    // which handled symlinks and nothing else. A FIFO here made
+    // `read_to_string` block forever — measured as an indefinite hang of
+    // `verify`, `exec`, `doctor`, `report` and `hook-check`, the last of
+    // those before it printed its deny verdict. It survived the round of
+    // fixes that closed the same hole on `audit.jsonl` because it never went
+    // through the shared open helper.
+    //
+    // `Tampered` is the right bucket for the shapes this now rejects: a
+    // FIFO, directory or symlink at this path is not a file omamori wrote,
+    // which is exactly what the symlink arm already said.
+    let file = match crate::atomic_file::open_read_regular(hwm_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HwmState::Missing,
+        Err(_) => return HwmState::Tampered,
+    };
+    let mut content = String::new();
+    if std::io::BufReader::new(file)
+        .take(MAX_HWM_FILE_BYTES)
+        .read_to_string(&mut content)
+        .is_err()
+    {
+        return HwmState::Tampered;
     }
-    match fs::read_to_string(hwm_path) {
+    match content.trim().parse::<u64>() {
+        Ok(v) => HwmState::Valid(v),
         Err(_) => HwmState::Tampered,
-        Ok(content) => match content.trim().parse::<u64>() {
-            Ok(v) => HwmState::Valid(v),
-            Err(_) => HwmState::Tampered,
-        },
     }
 }
 
@@ -4450,18 +4471,24 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// #457 P4-d, Phase 8 security review. `open` must not be the thing that
-    /// blocks.
+    /// #457 P4-d / #468. `open` must not be the thing that blocks, and the
+    /// rejection must not be the caller's job.
     ///
-    /// `read_secret` rejects a FIFO by stat'ing the path first, which is a
-    /// TOCTOU window: swap the path for a FIFO between the stat and the open
-    /// and the open hangs anyway, on a path omamori runs for every command.
-    /// `O_NONBLOCK` is what actually closes it — the stat only produces a
-    /// better message. Without the flag this test does not fail, it hangs,
-    /// which is why it runs under a watchdog.
+    /// Two properties, and the second replaced an earlier version of this
+    /// test. `read_secret` used to reject a FIFO by stat'ing the path first,
+    /// which is a TOCTOU window — swap the path for a FIFO between the stat
+    /// and the open and the open hangs anyway, on a path omamori runs for
+    /// every command. `O_NONBLOCK` closes that. But this test then asserted
+    /// that the *helper* returned `Ok`, on the reasoning that "rejecting a
+    /// FIFO is the caller's job" — which is the reasoning #468 exists to
+    /// retire: a check that lives on callers does not reach the next caller,
+    /// and it demonstrably did not.
+    ///
+    /// Without `O_NONBLOCK` this does not fail, it hangs, which is why it
+    /// runs under a watchdog.
     #[test]
     #[cfg(unix)]
-    fn opening_a_fifo_for_reading_returns_instead_of_waiting_for_a_writer() {
+    fn opening_a_fifo_for_reading_is_refused_rather_than_waited_on() {
         let dir = test_dir("457-fifo-nonblock");
         let fifo = dir.join("fifo-secret");
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
@@ -4473,19 +4500,18 @@ mod tests {
         );
 
         let probe = fifo.clone();
-        let opened = must_finish_within(
+        let err = must_finish_within(
             std::time::Duration::from_secs(5),
             "open_read_nofollow on a FIFO with no writer",
-            move || open_read_nofollow(&probe).is_ok(),
+            move || open_read_nofollow(&probe).expect_err("a FIFO is not a readable file"),
         );
         assert!(
-            opened,
-            "the open must succeed immediately; rejecting a FIFO is the caller's job, \
-             and it cannot do that job if the open never returns"
+            err.to_string().contains("is a FIFO"),
+            "the helper itself must refuse it, and name what it found so the \
+             operator knows what to remove; got: {err}"
         );
 
-        // `read_secret` still refuses it — the point is that it refuses
-        // rather than hangs.
+        // And the caller inherits the refusal rather than restating it.
         let err = read_secret(&fifo).expect_err("a FIFO is not a secret file");
         assert!(
             err.to_string().contains("not a regular file"),

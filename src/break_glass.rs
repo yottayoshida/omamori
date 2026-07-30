@@ -18,6 +18,10 @@ use crate::config;
 
 const STATE_FILE_NAME: &str = "break-glass.json";
 const STATE_VERSION: u32 = 1;
+/// The state file holds a handful of scalar fields. 64 KiB is orders of
+/// magnitude past anything omamori writes, and bounds what a hostile file
+/// can pull into memory on a path that runs for every hook invocation.
+const MAX_STATE_FILE_BYTES: u64 = 64 * 1024;
 pub(crate) const MAX_CONCURRENT: usize = 3;
 pub(crate) const DEFAULT_DURATION_SECS: u64 = 3600; // 1h
 const MIN_DURATION_SECS: u64 = 300; // 5m
@@ -118,7 +122,10 @@ fn is_bypassed_inner(rule_id: &str, path: &Path) -> bool {
         return false;
     }
 
-    let content = match fs::read_to_string(path) {
+    // #468: `read_to_string` on a FIFO blocks until a writer appears, and
+    // this runs on the hook path — measured, a FIFO here hung `hook-check`,
+    // `doctor` and `status`. The symlink check above never covered it.
+    let content = match crate::atomic_file::read_to_string_capped(path, MAX_STATE_FILE_BYTES) {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -168,7 +175,7 @@ fn read_state(path: &Path) -> Option<BreakGlassState> {
     if meta.file_type().is_symlink() {
         return None;
     }
-    let content = fs::read_to_string(path).ok()?;
+    let content = crate::atomic_file::read_to_string_capped(path, MAX_STATE_FILE_BYTES).ok()?;
     let state: BreakGlassState = serde_json::from_str(&content).ok()?;
     if state.version != STATE_VERSION {
         return None;

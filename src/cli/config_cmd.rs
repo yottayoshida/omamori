@@ -16,6 +16,10 @@ use crate::integrity;
 use crate::rules;
 use crate::util::{USAGE_HINT, flag_value_str};
 
+/// Upper bound on `config.toml` reads in this module (#468). See
+/// `atomic_file::read_to_string_capped`.
+const MAX_READ_FILE_BYTES: u64 = 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // config subcommand
 // ---------------------------------------------------------------------------
@@ -222,7 +226,7 @@ pub(crate) fn mutate_config<F>(config_path: &Path, mutate: F) -> Result<(), AppE
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> Result<(), AppError>,
 {
-    let content = std::fs::read_to_string(config_path)?;
+    let content = crate::atomic_file::read_to_string_capped(config_path, MAX_READ_FILE_BYTES)?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| AppError::Config(format!("failed to parse config as TOML: {e}")))?;
@@ -942,7 +946,7 @@ fn run_override_disable(rule_name: &str) -> Result<i32, AppError> {
         config::write_default_config(&config_path, false)?;
     }
 
-    let content = std::fs::read_to_string(&config_path)?;
+    let content = crate::atomic_file::read_to_string_capped(&config_path, MAX_READ_FILE_BYTES)?;
     if content
         .parse::<toml_edit::DocumentMut>()
         .ok()

@@ -13,6 +13,16 @@ use sha2::{Digest, Sha256};
 use crate::AppError;
 use crate::installer;
 
+/// Upper bound on any file the integrity baseline reads back (#468).
+///
+/// These reads go through `atomic_file::read_to_string_capped` rather than
+/// `fs::read_to_string` because a FIFO planted at one of these paths makes
+/// the read block until a writer appears — measured: a FIFO at `config.toml`
+/// hung `omamori doctor` and `omamori status` indefinitely. Hook scripts,
+/// `settings.json` and `config.toml` are all hand-editable files a same-user
+/// process can replace with something that is not a file at all.
+const MAX_TRACKED_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -153,7 +163,9 @@ pub fn generate_baseline(base_dir: &Path) -> Result<IntegrityBaseline, AppError>
     ];
     for name in &hook_files {
         let path = hooks_dir.join(name);
-        if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(content) =
+            crate::atomic_file::read_to_string_capped(&path, MAX_TRACKED_FILE_BYTES)
+        {
             hooks.push(HookEntry {
                 name: name.to_string(),
                 sha256: sha256_hex(&content),
@@ -201,7 +213,7 @@ pub fn read_baseline(base_dir: &Path) -> Result<Option<IntegrityBaseline>, AppEr
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(&path)?;
+    let content = crate::atomic_file::read_to_string_capped(&path, MAX_TRACKED_FILE_BYTES)?;
     let baseline: IntegrityBaseline =
         serde_json::from_str(&content).map_err(|e| AppError::Config(e.to_string()))?;
     Ok(Some(baseline))
@@ -406,7 +418,7 @@ fn check_cursor_snippet(path: &Path, resolved_exe: &ResolvedExe) -> CheckItem {
         };
     }
 
-    let actual = match fs::read_to_string(path) {
+    let actual = match crate::atomic_file::read_to_string_capped(path, MAX_TRACKED_FILE_BYTES) {
         Ok(s) => s,
         Err(_) => {
             return CheckItem {
@@ -546,18 +558,19 @@ fn check_claude_settings_integration_with_verifier(
         };
     }
 
-    let raw = match fs::read_to_string(&settings_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return CheckItem {
-                category,
-                name,
-                status: CheckStatus::Warn,
-                detail: format!("(read error: {e})"),
-                remediation: Some(Remediation::RunInstall),
-            };
-        }
-    };
+    let raw =
+        match crate::atomic_file::read_to_string_capped(&settings_path, MAX_TRACKED_FILE_BYTES) {
+            Ok(c) => c,
+            Err(e) => {
+                return CheckItem {
+                    category,
+                    name,
+                    status: CheckStatus::Warn,
+                    detail: format!("(read error: {e})"),
+                    remediation: Some(Remediation::RunInstall),
+                };
+            }
+        };
 
     let doc: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
@@ -681,18 +694,19 @@ fn check_claude_settings_integration_with_verifier(
         }
     }
 
-    let actual = match fs::read_to_string(script_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return CheckItem {
-                category,
-                name,
-                status: CheckStatus::Warn,
-                detail: format!("(script read error: {e})"),
-                remediation: Some(Remediation::RegenerateHooks),
-            };
-        }
-    };
+    let actual =
+        match crate::atomic_file::read_to_string_capped(script_path, MAX_TRACKED_FILE_BYTES) {
+            Ok(c) => c,
+            Err(e) => {
+                return CheckItem {
+                    category,
+                    name,
+                    status: CheckStatus::Warn,
+                    detail: format!("(script read error: {e})"),
+                    remediation: Some(Remediation::RegenerateHooks),
+                };
+            }
+        };
     let installed = installer::parse_hook_version(&actual);
     let omamori_exe = match resolve_exe_or_warn(resolved_exe, category, name.clone(), installed) {
         Ok(exe) => exe,
@@ -880,7 +894,8 @@ fn check_hook_hash(
     // unreadable file is itself a concrete, actionable diagnosis (pinned by
     // `check_claude_hook_hash_unreadable_and_exe_both_fail_reports_unreadable`
     // below) rather than an untested side effect.
-    let actual = match fs::read_to_string(&hook_path) {
+    let actual = match crate::atomic_file::read_to_string_capped(&hook_path, MAX_TRACKED_FILE_BYTES)
+    {
         Ok(c) => c,
         Err(_) => {
             return CheckItem {
@@ -1265,7 +1280,8 @@ fn read_config_entry() -> Option<ConfigEntry> {
     if !config_path.exists() {
         return None;
     }
-    let content = fs::read_to_string(&config_path).ok()?;
+    let content =
+        crate::atomic_file::read_to_string_capped(&config_path, MAX_TRACKED_FILE_BYTES).ok()?;
     let mode = file_mode(&config_path);
     Some(ConfigEntry {
         path: config_path.display().to_string(),
