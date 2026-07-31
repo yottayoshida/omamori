@@ -2573,13 +2573,110 @@ fn rotation_alone_does_not_break_verify() {
     let (rot_code, _, rot_err) = run_audit(&base, &["key", "rotate"]);
     assert_eq!(rot_code, 0, "rotation must succeed (stderr={rot_err})");
 
-    // No appends between the rotation and this call — the defect fires on the
-    // rotation alone.
+    // Nothing runs between the rotation and this call — since #457 PR2 the
+    // rotation's own record is the one append that happens, and the defect
+    // this pins fired without even that.
     let (code, out, err) = run_audit(&base, &["verify"]);
     assert_eq!(
         code, 0,
         "V-001: verify must still pass immediately after a rotation \
          (stdout={out}, stderr={err})"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #457 PR2 (V-026, corrected form): on a store that already holds ordinary
+/// entries and already verifies, recording the rotation leaves the verdict
+/// where it was.
+///
+/// V-026 was originally written as "the record never affects the verdict",
+/// full stop. That is false — on an *empty* store the rotation event is the
+/// difference between `exit 2, no chain entries` and `exit 0`, and several
+/// other starting states flip likewise. What actually holds is this narrower
+/// statement, and it needs a chain that was verifying beforehand for its
+/// precondition to exist at all. `tests/cli.rs`'s rotation tests cannot host
+/// it: they start from a bare key with no way to produce an ordinary entry,
+/// so every chain there is made of rotation events only.
+///
+/// The `report` assertion covers a second property from the same Phase 2
+/// enumeration: `report`'s `total_blocks` counts `action == "block"`, so a new
+/// action value must leave it alone. Counting one more block because a key was
+/// rotated would be a quietly wrong security number.
+#[test]
+fn recording_a_rotation_leaves_an_already_verifying_chain_verifying() {
+    let (base, hook_path, shim_dir) = setup_hook_env("457-pr2-mixed-chain");
+    let json = pretooluse_bash_json("rm -rf /");
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "setup: an ordinary entry must exist, so the chain is not made of rotation events alone"
+    );
+
+    let audit_path = audit_path_for(&base);
+    let before = std::fs::read_to_string(&audit_path).expect("read audit.jsonl");
+    let entries_before = before.lines().filter(|l| !l.trim().is_empty()).count();
+
+    let (code, _, _) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 0,
+        "precondition: the chain must verify before the rotation, or the assertion below \
+         would pass for the wrong reason"
+    );
+    // Asserted against `report --json`, not `audit show --action block`.
+    // Those are different code paths — `show` filters entries, `report`
+    // aggregates — and it is the aggregate that carries a security number a
+    // reader would act on. A version of this test that counted `show` output
+    // let a mutation making `report` count `audit-key-rotate` as a block
+    // survive the entire suite.
+    let total_blocks = |base: &Path| -> u64 {
+        let mut cmd = Command::new(binary());
+        clean_ai_env(&mut cmd);
+        let out = cmd
+            .args(["report", "--json"])
+            .env("HOME", base)
+            .env("XDG_DATA_HOME", base.join(".local/share"))
+            .env("XDG_CONFIG_HOME", base.join(".config"))
+            .output()
+            .expect("failed to run omamori report --json");
+        assert!(out.status.success(), "report --json must succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
+            .expect("report --json must emit JSON");
+        parsed["total_blocks"]
+            .as_u64()
+            .expect("report --json must carry total_blocks")
+    };
+    let blocks_before = total_blocks(&base);
+
+    let (rot_code, _, rot_err) = run_audit(&base, &["key", "rotate"]);
+    assert_eq!(rot_code, 0, "rotation must succeed (stderr={rot_err})");
+
+    let after = std::fs::read_to_string(&audit_path).expect("read audit.jsonl");
+    let lines: Vec<&str> = after.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        entries_before + 1,
+        "exactly one event may be appended, and it must be appended — not replace anything"
+    );
+    let recorded: serde_json::Value =
+        serde_json::from_str(lines[lines.len() - 1]).expect("the appended line must be JSON");
+    assert_eq!(
+        recorded["action"], "audit-key-rotate",
+        "the rotation event must be the entry that landed last, after the ordinary one"
+    );
+
+    let (code, out, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 0,
+        "V-026: a chain that verified before the rotation must still verify with the \
+         rotation recorded in it (stdout={out}, stderr={err})"
+    );
+
+    assert_eq!(
+        total_blocks(&base),
+        blocks_before,
+        "a rotation is not a block; report's block count must not move"
     );
 
     let _ = std::fs::remove_dir_all(&base);

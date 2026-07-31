@@ -6,6 +6,18 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+
+- **`omamori audit key rotate` now records the rotation in the audit log.** One event per successful rotation — `action: "audit-key-rotate"`, `detection_layer: "key-rotation"`, `result: "rotated default -> key-2"` naming both epochs. It is written after the rename and signed with the new key, so it is the first entry of the new epoch. ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
+  This closes a hole the fix above opened. Until #457, a rotation was visible in the log precisely *because* it broke the chain; making rotated chains verify cleanly removed that side effect and left rotation with no trace at all. The event is deliberately **not a marker**: `verify` does not re-anchor at it, infer an epoch from it, or consult it in any key-resolution decision. It is an ordinary entry, authenticated against the key its own `key_id` names exactly like every other line — which is precisely why the rejected alternative in `ADR-0008` ("append a rotation marker and re-anchor there") does not apply: what that rejects is the *re-anchoring*, not the record.
+
+  Scope, stated plainly: only rotations run through this command leave an event. Renaming the key files by hand reaches the same on-disk state silently, and so does a crash between the rename and the append. **An absent record is not evidence that no rotation happened.**
+
+  Appending is best-effort. The rename has already happened and is never rolled back, so a failure to append prints a warning and the command still exits 0 — reusing exit 1 would make "nothing was rotated" and "only the log line failed" indistinguishable, and a caller that retries on failure would mint a second epoch. Two states print a warning instead of writing: auditing is disabled, and the key directory cannot be listed. In the second, the entry would be unauthenticated and labelled `unresolved`, and since `ADR-0007` forbids rewriting entries it would pin the store at exit 2 permanently — including after the permissions are fixed.
+
+- **BREAKING**: `audit::RotationResult` gains a `retired_key_id: String` field (the id of the epoch the rotation ended — `"default"` when it was the store's first) and is now marked `#[non_exhaustive]`. Zero known reverse dependencies on crates.io — same check and same precedent as `AuditEvent` (#177 B2), `VerifyResult` (#177 B3), and `ChainStatus`/`AuditError` (#457). The value is returned rather than derived by the caller because the only thing that determines it is the retired slot number, which exists nowhere but inside `rotate_key`; recovering it from `retired_path` would reintroduce deriving an id from a path — the shape #457 removed when it deleted `current_key_id`. Library-API only; `cargo install`/Homebrew users are unaffected. ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
 ### Fixed
 
 - **After upgrading, run `omamori audit verify` once.** It is the only way to learn whether your

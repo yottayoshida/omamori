@@ -904,25 +904,10 @@ fn audit_key_rotate_errors_actionably_when_home_is_empty_string() {
 /// `audit-secret.1.retired` file landing next to the fresh `audit-secret`.
 #[test]
 fn audit_key_rotate_succeeds_end_to_end_with_absolute_home() {
-    let home = unique_dir("audit-rotate-happy-home");
-    let secret_dir = home.join(".local").join("share").join("omamori");
-    fs::create_dir_all(&secret_dir).unwrap();
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-happy-home");
     let secret_path = secret_dir.join("audit-secret");
-    fs::write(&secret_path, "0".repeat(64)).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
-    }
 
-    let mut cmd = Command::new(binary());
-    clean_ai_env(&mut cmd);
-    let output = cmd
-        .args(["audit", "key", "rotate"])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .output()
-        .expect("failed to run audit key rotate");
+    let output = rotate_in(&home);
 
     assert!(
         output.status.success(),
@@ -941,6 +926,410 @@ fn audit_key_rotate_succeeds_end_to_end_with_absolute_home() {
     assert!(
         secret_path.exists(),
         "a fresh secret must be generated at the active path"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+// --- #457 PR2 (A6): key rotation is recorded as an audit event ---
+
+/// Seed an isolated `HOME` holding nothing but a 64-byte active audit secret,
+/// the shape every PR2 rotation test starts from.
+fn seed_rotatable_home(name: &str) -> (PathBuf, PathBuf) {
+    let home = unique_dir(name);
+    let secret_dir = home.join(".local").join("share").join("omamori");
+    fs::create_dir_all(&secret_dir).unwrap();
+    let secret_path = secret_dir.join("audit-secret");
+    fs::write(&secret_path, "0".repeat(64)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    (home, secret_dir)
+}
+
+fn rotate_in(home: &std::path::Path) -> std::process::Output {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(["audit", "key", "rotate"])
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("failed to run audit key rotate")
+}
+
+fn verify_in(home: &std::path::Path) -> std::process::Output {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(["audit", "verify"])
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("failed to run audit verify")
+}
+
+fn audit_entries(secret_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let log = secret_dir.join("audit.jsonl");
+    let Ok(content) = fs::read_to_string(&log) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("every audit line must be valid JSON"))
+        .collect()
+}
+
+/// #457 PR2 (V-026, V-033, V-034): rotating through the CLI records the
+/// rotation, and a chain built entirely out of those records verifies across
+/// two epoch boundaries.
+///
+/// Rotating twice is what makes this discriminating rather than decorative.
+/// The first rotation's event is signed by `key-2` and the second's by
+/// `key-3`, so the log holds entries from two different epochs; a verifier
+/// that resolved anchors from whichever key happens to be active — the #457
+/// Bug 2 shape — would reject entry #0. Verifying clean here is PR1's A3
+/// still holding with PR2's writer as its only producer.
+///
+/// The ids are pinned literally because the numbering is easy to get wrong in
+/// the other direction: the first rotation produces `key-2`, never `key-1`.
+/// Epoch 1 is called `"default"` and no writer emits `key-1` (`secret.rs`'s
+/// `is_writer_emitted_key_id` requires `N >= 2`), so a fixture expecting
+/// `key-1` would be asserting a state omamori cannot reach.
+#[test]
+fn audit_key_rotate_records_the_rotation_and_the_chain_still_verifies() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-records");
+
+    let first = rotate_in(&home);
+    assert!(
+        first.status.success(),
+        "first rotation must succeed; stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let after_first = audit_entries(&secret_dir);
+    assert_eq!(
+        after_first.len(),
+        1,
+        "the first rotation must append exactly one event, got: {after_first:?}"
+    );
+    let event = &after_first[0];
+    assert_eq!(
+        event["key_id"], "key-2",
+        "the event is the first entry of the new epoch, so it carries the new key's id"
+    );
+    assert_eq!(
+        event["action"], "audit-key-rotate",
+        "action must be the rotation verb"
+    );
+    assert_eq!(
+        event["result"], "rotated default -> key-2",
+        "the record must name both the epoch that ended and the one that started"
+    );
+    // The prune point is identified by a `command`/`action`/`result` triple
+    // (`retention.rs`'s `is_prune_point`), and two of its three comparisons
+    // (`retention.rs:73`, `:137`) look at `command` alone. A rotation event
+    // that reused `_prune` would be read as a prune boundary.
+    assert_ne!(
+        event["command"], "_prune",
+        "the rotation event must not collide with the prune-point marker"
+    );
+
+    let second = rotate_in(&home);
+    assert!(
+        second.status.success(),
+        "second rotation must succeed; stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let after_second = audit_entries(&secret_dir);
+    assert_eq!(
+        after_second.len(),
+        2,
+        "the second rotation must append exactly one more event"
+    );
+    assert_eq!(after_second[1]["key_id"], "key-3");
+    assert_eq!(
+        after_second[1]["result"], "rotated key-2 -> key-3",
+        "the second rotation retires an epoch that is no longer the default one"
+    );
+
+    let verified = verify_in(&home);
+    assert!(
+        verified.status.success(),
+        "a chain of rotation events must verify across both epoch boundaries; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #457 PR2 (V-038): the rotation event is authenticated like any other
+/// entry, not exempted from verification.
+///
+/// The happy-path test above cannot show this on its own. Its data agrees
+/// with *both* readings — a verifier that checks the rotation event and one
+/// that skips `audit-key-rotate` entries entirely (or treats them as
+/// key-transition markers and re-anchors there) each report a clean chain on
+/// a log where every claim happens to be true. Altering one field of the
+/// event separates them: a verifier that checks it says tampered, a verifier
+/// that skips it says intact.
+///
+/// `result` is the field altered because it is the one this PR introduced and
+/// the one carrying the rotation's *claim*. It is part of the hashed
+/// projection, so a verifier that dropped rotation events from that
+/// projection — which is what "observational" would mean if taken too far —
+/// would stop detecting this.
+#[test]
+fn a_tampered_rotation_event_is_detected_like_any_other_entry() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-tampered");
+
+    assert!(rotate_in(&home).status.success());
+    assert!(rotate_in(&home).status.success());
+    assert!(
+        verify_in(&home).status.success(),
+        "the untouched chain must verify before we alter it — otherwise the assertion below \
+         would pass for the wrong reason"
+    );
+
+    let log = secret_dir.join("audit.jsonl");
+    let mut lines: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| line.to_string())
+        .collect();
+    assert_eq!(lines.len(), 2, "two rotations, two events");
+    // Entry #1 rather than #0: entry #0 is the chain's genesis and is
+    // anchored differently, so altering it would exercise the anchor path
+    // instead of ordinary entry authentication.
+    let mut entry: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    entry["result"] = serde_json::Value::String("rotated key-2 -> key-9".to_string());
+    lines[1] = serde_json::to_string(&entry).unwrap();
+    fs::write(&log, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let verified = verify_in(&home);
+    assert_eq!(
+        verified.status.code(),
+        Some(1),
+        "altering the rotation event must be reported as tampering (exit 1); stdout: {} stderr: {}",
+        String::from_utf8_lossy(&verified.stdout),
+        String::from_utf8_lossy(&verified.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #457 PR2 (V-039): a gap in the retired-key numbering does not desynchronize
+/// the two ids the event records.
+///
+/// With `.1.retired` and `.3.retired` present and `.2` missing, the active
+/// key is epoch 4 and the next rotation produces epoch 5 — a store where
+/// every number in play differs from the file count. `retired_key_id` is
+/// derived with the same `key_id_for_index` the writer uses to label ordinary
+/// entries, so the label the event records is the one the retired key
+/// actually held; deriving it from the count of `.retired` files instead
+/// would say `key-3` here.
+///
+/// This is the shape #457 P4-a fixed on the rotation side, re-checked from
+/// the recording side.
+#[test]
+fn rotation_across_a_numbering_gap_records_the_ids_the_writer_uses() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-gap");
+    for index in [1u32, 3] {
+        let retired = secret_dir.join(format!("audit-secret.{index}.retired"));
+        fs::write(&retired, format!("{index}").repeat(64)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&retired, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    let output = rotate_in(&home);
+    assert!(
+        output.status.success(),
+        "rotation must succeed across a gap; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        secret_dir.join("audit-secret.4.retired").exists(),
+        "the next slot comes from the highest index present, not from the file count"
+    );
+    assert_eq!(
+        fs::read_to_string(secret_dir.join("audit-secret.3.retired")).unwrap(),
+        "3".repeat(64),
+        "the occupied slot must be untouched"
+    );
+
+    let entries = audit_entries(&secret_dir);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["key_id"], "key-5");
+    assert_eq!(entries[0]["result"], "rotated key-4 -> key-5");
+
+    assert!(
+        verify_in(&home).status.success(),
+        "the recorded event must verify against the key it names"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #457 PR2 (V-035, decision D3): when the key directory cannot be
+/// enumerated, the rotation still happens but is **not** recorded.
+///
+/// This is the one shape where recording would cost more than it buys.
+/// `load_signing_key` cannot tell which epoch is active without listing the
+/// directory, so it returns `UNRESOLVED_KEY_ID` with no secret; an entry
+/// written then is unauthenticated and labelled with an id no keyring can
+/// hold. `ADR-0007` forbids rewriting existing entries, so that single line
+/// pins the store at exit 2 **permanently** — including after the operator
+/// fixes the permissions. Skipping the append keeps a recoverable
+/// misconfiguration recoverable.
+#[cfg(unix)]
+#[test]
+fn audit_key_rotate_skips_the_record_when_the_key_directory_cannot_be_listed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-unlistable");
+    // Write + execute, but not read: opening `audit-secret` by name still
+    // works, listing the directory to learn which epochs exist does not.
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let output = rotate_in(&home);
+    let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
+
+    assert!(
+        output.status.success(),
+        "rotation itself must still succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    restored.unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Both skip arms say "not recorded", so that substring alone does not
+    // distinguish this one from the auditing-disabled arm — swapping the two
+    // messages would leave both tests green. The second assertion is what
+    // pins which arm ran.
+    assert!(
+        stderr.contains("not recorded") && stderr.contains("could not be signed"),
+        "the operator must be told the rotation went unrecorded, and why: {stderr}"
+    );
+
+    // Without these two, a rotation that silently did nothing at all would
+    // satisfy every other assertion here: exit 0, a "not recorded" warning,
+    // and an empty log are exactly what a no-op produces. What this test
+    // claims is narrower and stronger — the rotation happened *and* went
+    // unrecorded.
+    assert!(
+        secret_dir.join("audit-secret.1.retired").exists(),
+        "the rotation must really have happened, not been skipped along with the record"
+    );
+    assert!(
+        secret_dir.join("audit-secret").exists(),
+        "a fresh active key must exist after the rotation"
+    );
+
+    // Asserted on the path, not on `audit_entries`: that helper returns an
+    // empty vector for a log that is missing, unreadable, or not a file, so an
+    // empty result would also be produced by a log we simply failed to read.
+    // `!exists()` is the strictly stronger claim and entails the other.
+    assert!(
+        !secret_dir.join("audit.jsonl").exists(),
+        "no log may be created at all while the secret cannot be resolved"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #457 PR2 (V-036, decision D4): with auditing switched off there is nowhere
+/// to record the rotation, and saying so beats silence — a silent no-op
+/// reproduces the very invisibility A6 exists to close.
+#[test]
+fn audit_key_rotate_says_so_when_auditing_is_disabled() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-disabled");
+    let config_dir = home.join(".config").join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "[audit]\nenabled = false\n").unwrap();
+    // Without 0600 omamori refuses the file as world-readable and falls back
+    // to built-in defaults — where auditing is *on*. The test would then be
+    // exercising the ordinary append path while claiming to cover the
+    // disabled one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = rotate_in(&home);
+    assert!(
+        output.status.success(),
+        "rotation must succeed with auditing off; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `"auditing is disabled"` is what separates this arm from the
+    // cannot-be-signed one; both say "not recorded".
+    assert!(
+        stderr.contains("not recorded") && stderr.contains("auditing is disabled"),
+        "the operator must be told the rotation went unrecorded, and why: {stderr}"
+    );
+    assert!(
+        secret_dir.join("audit-secret.1.retired").exists(),
+        "the rotation must still happen when auditing is off"
+    );
+    assert!(
+        !secret_dir.join("audit.jsonl").exists(),
+        "auditing is off, so no log may be created — asserted on the path itself, since an \
+         empty entry list would also be produced by a log we simply could not read"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #457 PR2 (V-037): a failed append after a successful rotation is a
+/// warning, not a failure.
+///
+/// The rotation has already renamed the key by the time the event is built,
+/// and there is no rollback. Returning a non-zero exit would make this
+/// indistinguishable from `Ok(1)` two arms up, which means "nothing was
+/// rotated" — and a caller that retries on failure would rotate a second
+/// time, minting another epoch and another retired key for a log line that
+/// was the only thing that failed.
+///
+/// The append is made to fail by putting a directory where the log belongs,
+/// which fails at `open` on every unix regardless of who is running the test
+/// — a read-only file would not fail for root.
+#[test]
+fn audit_key_rotate_warns_but_still_succeeds_when_the_record_cannot_be_written() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-append-fails");
+    fs::create_dir_all(secret_dir.join("audit.jsonl")).unwrap();
+
+    let output = rotate_in(&home);
+
+    assert!(
+        output.status.success(),
+        "an unwritable log must not turn a completed rotation into a failure; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to audit-log key rotation"),
+        "the failure to record must be reported: {stderr}"
+    );
+    assert!(
+        secret_dir.join("audit-secret.1.retired").exists(),
+        "the rotation really happened, and is not rolled back"
+    );
+    // Both halves, not just the rename: a "completed" rotation that retired
+    // the old key without minting a new one is the interrupted-rotation state
+    // `load_signing_key` warns about, and asserting only the retired file
+    // would call that a success.
+    assert!(
+        secret_dir.join("audit-secret").exists(),
+        "a fresh active key must exist even though the record could not be written"
     );
 
     let _ = fs::remove_dir_all(&home);

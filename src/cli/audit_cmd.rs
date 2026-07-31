@@ -466,6 +466,11 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
                          existing ones fail to verify."
                     );
                     eprintln!("  Run `omamori audit verify` to confirm chain integrity.");
+                    append_key_rotation_event(
+                        &load_result.config.audit,
+                        &result.retired_key_id,
+                        &result.new_key_id,
+                    );
                     Ok(0)
                 }
                 Err(audit::AuditError::SecretUnavailable) => {
@@ -484,6 +489,103 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
         None => Err(AppError::Usage(format!(
             "audit key requires a subcommand\n\n{AUDIT_USAGE_HINT}"
         ))),
+    }
+}
+
+/// The audit event a completed key rotation leaves behind (#457 A6).
+///
+/// Field values mirror `config_cmd`'s `build_config_mutation_event`, which
+/// describes the other class of CLI-initiated state change omamori records.
+///
+/// `command` is deliberately not `_prune`: `retention.rs` identifies a prune
+/// point by a `command`/`action`/`result` triple, and two of its three checks
+/// look at `command` alone, so any other value keeps the two apart.
+///
+/// The retired key's path is **not** recorded — it would put the user's home
+/// directory in the log for nothing, since the filename is derivable from the
+/// epoch id this event already carries.
+///
+/// Not because paths are never logged in the clear: `parent_process` is one,
+/// deliberately (`SECURITY.md`'s "Why `parent_process` is plaintext but
+/// `cwd_hash` is hashed"). The distinction is what the plaintext buys — there,
+/// naming the launching application is the whole point of the field; here it
+/// duplicates an id that is already present.
+fn build_key_rotation_event(retired_key_id: &str, new_key_id: &str) -> audit::AuditEvent {
+    audit::AuditEvent {
+        timestamp: time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+        provider: "cli".to_string(),
+        command: "audit key rotate".to_string(),
+        rule_id: None,
+        action: "audit-key-rotate".to_string(),
+        result: format!("rotated {retired_key_id} -> {new_key_id}"),
+        target_count: 0,
+        target_hash: String::new(),
+        detection_layer: Some("key-rotation".to_string()),
+        unwrap_chain: None,
+        raw_input_hash: None,
+        chain_version: None,
+        seq: None,
+        prev_hash: None,
+        key_id: None,
+        entry_hash: None,
+        pid: None,
+        ppid: None,
+        parent_process: None,
+        cwd_hash: None,
+        wrapper_kind: None,
+    }
+}
+
+/// Best-effort audit append for a completed key rotation (#457 A6), mirroring
+/// `config_cmd`'s `append_config_mutation_event`: the key has already been
+/// renamed by the time this runs, so nothing here rolls that back and nothing
+/// here turns a completed rotation into a failure.
+///
+/// **Not a marker.** `verify` does not re-anchor at this event, infer an epoch
+/// from it, or consult it in any key-resolution decision — it is an ordinary
+/// entry, authenticated against the key its own `key_id` names like every
+/// other line, and altering it is detected exactly as altering any other entry
+/// is. What it is *not* is exempt from verification, and the claim is
+/// deliberately no stronger than that. The event exists because PR1 removed
+/// the only signal a rotation used to leave: before #457 rotating broke the
+/// chain, and that breakage was how a rotation became visible at all.
+///
+/// Two states end in a warning instead of an entry — auditing being off, and
+/// the secret being unresolvable — and both say "not recorded" so the operator
+/// is never left to infer it from silence. `SECURITY.md`'s "Key rotation
+/// events" carries the reasoning for the second one, which is where an
+/// operator would look for it.
+fn append_key_rotation_event(
+    audit_config: &audit::AuditConfig,
+    retired_key_id: &str,
+    new_key_id: &str,
+) {
+    let Some(logger) = audit::AuditLogger::from_config(audit_config) else {
+        eprintln!(
+            "omamori warning: auditing is disabled, so this key rotation was not recorded \
+             in the audit log. The rotation itself completed."
+        );
+        return;
+    };
+    if !logger.secret_available() {
+        // Says only that the entry could not be signed, not why. There are two
+        // causes — an unlistable key directory, and a readable one whose
+        // secret could not be loaded — and only the first leaves the epoch
+        // unknown. `load_signing_key` has already printed the specific
+        // condition; naming a cause here would be guessing at which one.
+        eprintln!(
+            "omamori warning: this key rotation was not recorded in the audit log — the \
+             entry could not be signed, and an unsigned one cannot be repaired later \
+             (ADR-0007 forbids rewriting entries), so it would leave `omamori audit verify` \
+             reporting cannot-verify permanently. The rotation itself completed; fix the \
+             condition reported above."
+        );
+        return;
+    }
+    if let Err(e) = logger.append(build_key_rotation_event(retired_key_id, new_key_id)) {
+        eprintln!("omamori warning: failed to audit-log key rotation: {e}");
     }
 }
 
