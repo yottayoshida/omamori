@@ -3,9 +3,11 @@
 //! SECURITY: Functions that touch raw key material (`[u8; 32]` secret bytes)
 //! are `pub(super)` — they must NEVER be `pub(crate)` or `pub`. `rotate_key`
 //! is the sole, intentional exception: it crosses the module boundary into
-//! `cli::audit_cmd` as the sanctioned rotation entry point, but never
-//! returns key bytes — only `RotationResult { new_key_id: String,
-//! retired_path: PathBuf }` — so it doesn't violate the invariant above.
+//! `cli::audit_cmd` as the sanctioned rotation entry point, but never returns
+//! key bytes — only labels and paths — so it doesn't violate the invariant
+//! above. Stated as the invariant rather than as an inventory of
+//! `RotationResult`'s fields: the type is `#[non_exhaustive]` precisely
+//! because that list is expected to grow, and a list is what goes stale.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -266,11 +268,19 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // The distinction the original comment was reaching for — do not write a
     // label you cannot stand behind — is preserved by naming the absence
     // rather than guessing an epoch.
+    // States the condition, not the consequence. This runs from
+    // `AuditLogger::from_config`, i.e. before any caller has decided whether to
+    // append at all — and two callers decide not to. `shim.rs`'s strict gate
+    // builds a logger purely to test `secret_available()` and then blocks the
+    // command without appending; `cli::audit_cmd`'s rotation record skips the
+    // append on purpose. Asserting "this entry is recorded without HMAC
+    // protection" told the operator, in both of those, that something was
+    // written when nothing was.
     if let Some(reason) = &scan.unreadable {
         eprintln!(
-            "omamori warning: {reason} — cannot determine which key epoch is active, so this \
-             entry is recorded without HMAC protection rather than under a label that may be \
-             wrong. Fix the directory permissions and re-run to restore protection."
+            "omamori warning: {reason} — cannot determine which key epoch is active, so no \
+             entry written from here on can be HMAC-protected or labelled with a key epoch. \
+             Fix the directory permissions and re-run to restore protection."
         );
         return SigningKey {
             id: UNRESOLVED_KEY_ID.to_string(),
@@ -881,8 +891,29 @@ fn eloop_message(e: std::io::Error, path: &Path) -> std::io::Error {
 // ---------------------------------------------------------------------------
 
 /// Result of a key rotation operation.
+///
+/// `#[non_exhaustive]` so later fields are not a breaking change (the same
+/// check and the same precedent as `AuditEvent`, `VerifyResult`, `ChainStatus`
+/// and `AuditError`: zero reverse dependencies on crates.io).
+#[non_exhaustive]
 pub struct RotationResult {
     pub new_key_id: String,
+    /// The id of the epoch this rotation ended — `"default"` when it was the
+    /// store's first, `"key-{N}"` otherwise.
+    ///
+    /// Returned rather than left to the caller because it is derived from the
+    /// retired slot number, which this function computes and does not
+    /// otherwise expose. Recovering it from `retired_path` would mean
+    /// deriving an id from a path, which is the shape #457 removed when it
+    /// deleted `current_key_id`.
+    ///
+    /// It is only as good as the directory scan that produced that number.
+    /// `rotate_key_locked` takes `max_index()` without branching on
+    /// `KeyDirScan.unreadable`, so on a store whose key directory cannot be
+    /// listed this names the epoch the scan *could see*, not necessarily the
+    /// one that was active. Every other consumer of that scan fails closed;
+    /// rotation is the exception, and it predates this field.
+    pub retired_key_id: String,
     pub retired_path: PathBuf,
 }
 
@@ -974,8 +1005,16 @@ fn rotate_key_locked(secret_path: &Path) -> Result<RotationResult, AuditError> {
     // Generate new secret
     create_secret(&secret_path).map_err(AuditError::Io)?;
 
+    // The pre-rotation max index names the epoch this rotation just ended.
+    // `key_id_for_index` owns the `"default"`-vs-`key-N` rule; restating it
+    // here is what would let the two drift.
+    //
+    // `new_key_id` keeps its own `format!` so that `next_id` — which exists to
+    // make the overflow check above cover *both* increments — still guards a
+    // value something reads.
     Ok(RotationResult {
         new_key_id: format!("key-{next_id}"),
+        retired_key_id: key_id_for_index(max_retired),
         retired_path,
     })
 }

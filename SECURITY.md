@@ -636,6 +636,25 @@ Each JSONL entry contains:
 
 `override disable`/`override enable` (which mutate core-rule overrides, a more consequential class of change than a custom rule's toggle) are not yet covered by this audit trail — tracked as a follow-up.
 
+### Key rotation events (#457)
+
+`audit key rotate` appends one event on success — `action` is `audit-key-rotate`, `detection_layer` is `key-rotation`, `provider` is `cli`, and `result` names both epochs (`rotated default -> key-2`). It is written after the rename and signed with the new key, so it is the first entry of the new epoch. The retired key's *path* is not recorded, only the two epoch ids: the path is derivable from the id, and storing it would put the user's home directory in the log in the clear.
+
+**`verify` does not special-case the event.** It is not a marker: nothing re-anchors at it, no epoch is inferred from it, and no key-resolution decision consults it. What it *is* is an ordinary chain entry — parsed, authenticated against the key its own `key_id` names, and counted in the `seq`/`prev_hash` continuity like every other line. Appending one to a chain that verifies leaves it verifying; the event carries no verification semantics beyond that of any other entry.
+
+Appending is best-effort in the same sense as config mutation events: the rename has already happened and is never rolled back, so a failure to append is a warning and the command still exits 0. Reusing a non-zero exit would also make "the rotation failed" and "only the log line failed" indistinguishable to a caller — and a caller that retries would rotate a second time.
+
+`[audit] strict = true` is **not** consulted here, nor for config mutations, nor for a break-glass *activation*. The rule is about ordering, not about the command: strict withholds an action whose audit entry would be written *before* it happens, and each of those three is already on disk by the time its record is attempted, so there is nothing left to withhold. A break-glass **bypass** is the opposite case — the guarded command has not run yet — and it does consult strict, blocking with exit 2 when its entry cannot be written.
+
+The `result` text (`rotated default -> key-2`) is written for a human reading `omamori audit show`. It is **not a parse contract** — the epoch a given entry belongs to is `key_id`, which is a real field. Building a monitor on the shape of this sentence is building on something free to change; giving these events dedicated columns instead is tracked with the same follow-up as `unknown_tool_fail_open`'s borrowed `target_count`.
+
+Two states produce a warning saying the rotation was **not recorded**, rather than an entry:
+
+- auditing is disabled, so there is nowhere to write it
+- the key directory cannot be listed, so which epoch is active is unknown. An entry written then would be unauthenticated and labelled `unresolved`; since `ADR-0007` forbids rewriting entries, that single line would leave the store reporting cannot-verify **permanently**, including after the permissions are fixed. A lost record is recoverable, that is not
+
+**What this does not cover.** Only rotations performed through this command leave an event. Renaming the key files by hand reaches the same on-disk state with no record of it, and a crash between the rename and the append leaves the key rotated and unrecorded. The event is evidence that a rotation happened, never evidence that one did not.
+
 ### Process Provenance (v0.13.1, #420)
 
 Layer 1 (PATH shim) audit events carry a best-effort process snapshot — `pid`, `ppid`, `parent_process`, `cwd_hash` — so a future incident's actor can be correlated across entries from the audit log alone, without cross-referencing shell history, hook configuration, or process tables by hand. This was added after a real incident (2026-07-16) where a repeating destructive command pair had to be traced using only `target_hash`, with no way to tell whether the same launcher fired all 16 occurrences.
@@ -776,6 +795,9 @@ to. That is deferred (see ADR-0008) because it adds an on-disk element that 1.0 
 - A key that cannot be found is reported as **cannot verify** (exit 2), distinctly from tampering
   (exit 1) and from an unrecognized `chain_version` (exit 4). "The key file is gone" and "the log
   was altered" are different situations with different remedies
+- A rotation run through this command leaves a record of itself in the log — see
+  [Key rotation events](#key-rotation-events-457). Before #457 a rotation was visible only because
+  it broke the chain; fixing that removed the signal, and this replaces it with an explicit one
 
 #### What rotation does *not* guarantee
 
@@ -788,6 +810,12 @@ own epoch.
 
 Treat a leaked audit key as a permanent loss of tamper-evidence for the epochs it covers. Rotation
 is hygiene against future exposure, not remediation of past exposure.
+
+**The rotation record does not prove a rotation did not happen.** It is written only by
+`omamori audit key rotate`; renaming the key files directly produces the same result silently, and
+so does a crash between the rename and the append. An absent record is not evidence of an absent
+rotation, and the record itself is an ordinary log entry — anyone who can write `audit.jsonl` can
+remove it, exactly as they can any other.
 
 #### Operational notes
 
