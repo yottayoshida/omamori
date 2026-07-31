@@ -1653,7 +1653,7 @@ Codex (GPT-5.3) adversarial test review + Claude (Opus 4.6) CLI reproduction + 2
 - Quick Start section in README.
 - 14 new unit tests covering all v0.1.1 fixes.
 
-## [Unreleased]
+## [0.1.0] - 2026-03-13
 
 ### Added
 
