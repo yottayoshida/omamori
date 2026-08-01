@@ -651,9 +651,13 @@ The `result` text (`rotated default -> key-2`) is written for a human reading `o
 Two states produce a warning saying the rotation was **not recorded**, rather than an entry:
 
 - auditing is disabled, so there is nowhere to write it
-- the key directory cannot be listed, so which epoch is active is unknown. An entry written then would be unauthenticated and labelled `unresolved`; since `ADR-0007` forbids rewriting entries, that single line would leave the store reporting cannot-verify **permanently**, including after the permissions are fixed. A lost record is recoverable, that is not
+- the key store degraded between the rename and the record — the secret deleted, made unreadable, or replaced — so the entry could not be signed. An unsigned entry is unauthenticated and labelled `unresolved`; since `ADR-0007` forbids rewriting entries, that single line would leave the store reporting cannot-verify **permanently**, including after the condition is fixed. A lost record is recoverable, that is not
+
+An unlistable key directory used to be the second of those. It no longer reaches the record at all — since #477 rotation refuses that state outright, before any key file is renamed or created, so there is no completed rotation left to describe.
 
 **What this does not cover.** Only rotations performed through this command leave an event. Renaming the key files by hand reaches the same on-disk state with no record of it, and a crash between the rename and the append leaves the key rotated and unrecorded. The event is evidence that a rotation happened, never evidence that one did not.
+
+**Two classes, one rule.** Operations that *change* the key store refuse when the epoch in play cannot be established — there is no safe guess, and a wrong one is unrecoverable. Ordinary appends do the opposite: they record without HMAC protection and let `verify` report cannot-verify, because for a shim decision or a Layer 2 deny the record is the only durable trace there is, and [absence of a row means the command was allowed](#forensic-semantics-v098). The dividing line is whether anything else on disk survives to say the event happened.
 
 ### Process Provenance (v0.13.1, #420)
 
@@ -831,6 +835,17 @@ remove it, exactly as they can any other.
   directory
 - The next retired slot is chosen from the highest index present, and rotation refuses to
   overwrite an existing retired key
+- **Rotation requires a complete listing of the key directory, and refuses without one** (#477).
+  Every other reader of that listing already failed closed; rotation is the only one that *changes*
+  the store, and it was taking the highest index from a scan it never asked about. On a store whose
+  low retired slots were tidied away, a failed scan reads as "never rotated", so the current key
+  goes into `audit-secret.1.retired` and the new one is named after an epoch that already exists —
+  and once the directory is readable again those entries resolve to the wrong bytes and report as
+  tampering, permanently, with no attacker involved. The refusal renames and creates no key file
+  and exits 1 — `audit-secret.lock` may already exist by then, which holds no key material and is
+  recreated on demand; re-run once the directory can be listed. A listing that *stops partway* counts as no
+  listing: an error mid-enumeration ends the iteration, so the unread remainder — which is where
+  the highest epochs sort — would otherwise be silently absent from a result that looks complete
 - The keyring loads at most 256 keys, keeping the highest indices. If more exist, `verify` reports
   the truncation rather than silently verifying against a partial set
 - A rotation interrupted between the rename and the new key's creation leaves retired keys with no
@@ -847,8 +862,10 @@ remove it, exactly as they can any other.
   a `audit-secret` filename prefix), so an AI session cannot delete it through the shim or hook
   layers
 - **No lock omamori takes is allowed to block indefinitely.** Acquisition uses `LOCK_NB` with a
-  bounded retry budget (100 × 5 ms) and then proceeds without the lock. This is not a performance
-  choice. `flock` works on a read-only descriptor, so any local process able to open one of these
+  bounded retry budget (100 × 5 ms). What happens when that budget runs out differs by site, and
+  only one of the three proceeds anyway: the key-store lock degrades to unlocked — rotation says
+  so when it does — while `append` and `verify_chain` return the failure to their caller. This is
+  not a performance choice. `flock` works on a read-only descriptor, so any local process able to open one of these
   files could otherwise hold a lock forever and stall every omamori surface — including
   `hook-check`, which would hang *before* printing its deny verdict and leave the outcome to the
   host's hook-timeout policy rather than to omamori. `PROTECTED_FILE_PATTERNS` does not help here:
@@ -857,7 +874,7 @@ remove it, exactly as they can any other.
 
 ### Strict Mode (v0.7.3+)
 
-Opt-in fail-close mode. When enabled, AI commands intercepted by the PATH shim are blocked if the audit HMAC secret is unavailable, preventing unverifiable command execution. Commands that only pass through Layer 2 hooks (not matching any shim rule) are not affected — the hook path does not hold an `AuditLogger` instance.
+Opt-in fail-close mode. When enabled, AI commands intercepted by the PATH shim are blocked if the audit HMAC secret is unavailable, preventing unverifiable command execution. Commands that only pass through Layer 2 hooks (not matching any shim rule) are not affected — the secret-unavailable gate exists only on the shim path (`engine::shim`), which tests `secret_available()` before running the command. The hook path does build loggers, and consults `strict` too, but only in response to an append that actually failed.
 
 **Configuration**:
 ```toml

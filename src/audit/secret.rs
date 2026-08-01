@@ -44,9 +44,14 @@ const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5
 /// Take an flock, giving up once [`LOCK_ATTEMPTS`] have been spent.
 ///
 /// Returns [`std::io::ErrorKind::WouldBlock`] when the budget runs out, which
-/// callers must handle explicitly: `with_key_store_lock` proceeds unlocked
-/// (its exclusivity is an optimisation), while `append` and `verify_chain`
-/// propagate it (theirs is a correctness requirement).
+/// callers must handle explicitly: `with_key_store_lock` proceeds unlocked and
+/// reports it, while `append` and `verify_chain` propagate it.
+///
+/// The difference is not that one is an optimisation — the key store's
+/// exclusivity is a correctness property too, and #477 says so where rotation
+/// warns about losing it. It is that refusing to rotate on an unheld lock
+/// would let any local process stop rotation permanently, and that is the
+/// larger harm. So rotation degrades deliberately and says what it observed.
 #[cfg(unix)]
 fn flock_bounded(file: &fs::File, exclusive: bool) -> Result<(), std::io::Error> {
     use std::os::unix::io::AsRawFd;
@@ -158,6 +163,23 @@ impl SigningKey {
     }
 }
 
+/// What the attempt to take the key-store lock actually observed.
+///
+/// #477 gave rotation — the one caller that acts on this — a `bool`, which put
+/// four different facts under one value: the lock file could not be opened (on
+/// Unix that includes `O_NOFOLLOW` refusing a symlink planted at the path), it
+/// was not a regular file, another process was holding it, or `flock` failed
+/// some other way. The first two are the **only** signal the `O_NOFOLLOW` and
+/// file-type guards can ever produce, since both discard their own error, so
+/// collapsing them filed a tampering indicator as a benign concurrency note.
+///
+/// `Unheld` carries what was observed rather than a reading of it — the same
+/// rule [`fold_key_dir_entries`] follows for a listing that stopped partway.
+enum KeyStoreLock {
+    Held,
+    Unheld(String),
+}
+
 /// Serialize key-store observations against rotation.
 ///
 /// #457 (Codex Round 1 P0): binding the key and its label into one type is not
@@ -184,7 +206,22 @@ impl SigningKey {
 /// deny verdict (measured, Phase 8). The same argument that makes creation
 /// failure non-fatal makes acquisition failure non-fatal: a rare mislabel is
 /// the lesser harm.
-fn with_key_store_lock<T>(secret_path: &Path, exclusive: bool, f: impl FnOnce() -> T) -> T {
+/// #477: the non-fatal argument above is about *recording* — a hole in the log
+/// is worse than a rare mislabel. Rotation is not recording. It is the only
+/// caller that mutates the key store, and it asks for `exclusive` precisely so
+/// that readers cannot observe the rename half-done. Establishing "do not
+/// mutate on an observation you could not make" for the directory scan while
+/// staying silent about an observation the lock could not protect would defend
+/// one invariant at two different depths. So the outcome is handed to the
+/// callback rather than dropped — reported, not enforced: an unheld lock is a
+/// race window, while an unlistable directory is a certainty, and refusing to
+/// rotate because a lock file could not be opened would hand any local process
+/// a way to block rotation for good.
+fn with_key_store_lock<T>(
+    secret_path: &Path,
+    exclusive: bool,
+    f: impl FnOnce(&KeyStoreLock) -> T,
+) -> T {
     let lock_path = secret_path.with_file_name("audit-secret.lock");
     // `O_NOFOLLOW` is not optional here. #457 added a file-type pre-check to
     // `read_secret` precisely because an `open` that blocks forever stops
@@ -208,19 +245,40 @@ fn with_key_store_lock<T>(secret_path: &Path, exclusive: bool, f: impl FnOnce() 
         // contend for it on a shared host.
         opts.mode(0o600);
     }
-    let lock = opts.open(&lock_path).ok().filter(|f| {
-        // O_NONBLOCK stops a FIFO from blocking, but it does not make one a
-        // usable lock target — reject anything that is not a regular file.
-        f.metadata().map(|m| m.is_file()).unwrap_or(false)
-    });
-    if let Some(file) = &lock {
-        let _ = if exclusive {
-            flock_exclusive(file)
-        } else {
-            flock_shared(file)
-        };
-    }
-    let out = f();
+    let opened = match opts.open(&lock_path) {
+        Ok(file) => match file.metadata() {
+            Ok(m) if m.is_file() => Ok(file),
+            // O_NONBLOCK stops a FIFO from blocking, but it does not make one
+            // a usable lock target — reject anything that is not a regular
+            // file.
+            Ok(_) => Err(format!("{} is not a regular file", lock_path.display())),
+            Err(e) => Err(format!("cannot stat {}: {e}", lock_path.display())),
+        },
+        Err(e) => Err(format!("cannot open {}: {e}", lock_path.display())),
+    };
+    let (lock, state) = match opened {
+        Ok(file) => {
+            let acquired = if exclusive {
+                flock_exclusive(&file)
+            } else {
+                flock_shared(&file)
+            };
+            match acquired {
+                Ok(()) => (Some(file), KeyStoreLock::Held),
+                // Not "someone may be holding it": `flock_bounded` spent its
+                // whole budget and this is the error it ended on.
+                Err(e) => (
+                    Some(file),
+                    KeyStoreLock::Unheld(format!(
+                        "cannot acquire {} after {LOCK_ATTEMPTS} attempts: {e}",
+                        lock_path.display()
+                    )),
+                ),
+            }
+        }
+        Err(reason) => (None, KeyStoreLock::Unheld(reason)),
+    };
+    let out = f(&state);
     drop(lock); // releases the flock
     out
 }
@@ -234,7 +292,9 @@ fn with_key_store_lock<T>(secret_path: &Path, exclusive: bool, f: impl FnOnce() 
 /// reclassify, because the id is present and only the bytes are wrong. The two
 /// reads are now one value *and* one locked observation.
 pub(super) fn load_signing_key(secret_path: &Path) -> SigningKey {
-    with_key_store_lock(secret_path, false, || load_signing_key_locked(secret_path))
+    with_key_store_lock(secret_path, false, |_lock| {
+        load_signing_key_locked(secret_path)
+    })
 }
 
 fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
@@ -276,19 +336,28 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // append on purpose. Asserting "this entry is recorded without HMAC
     // protection" told the operator, in both of those, that something was
     // written when nothing was.
-    if let Some(reason) = &scan.unreadable {
-        eprintln!(
-            "omamori warning: {reason} — cannot determine which key epoch is active, so no \
-             entry written from here on can be HMAC-protected or labelled with a key epoch. \
-             Fix the directory permissions and re-run to restore protection."
-        );
-        return SigningKey {
-            id: UNRESOLVED_KEY_ID.to_string(),
-            secret: None,
-        };
-    }
+    let retired = match scan {
+        KeyDirScan::Unlistable(reason) => {
+            eprintln!(
+                // Not "fix the condition and re-run to restore protection":
+                // the reason is inline in this same sentence rather than
+                // above it, nothing here is a command the operator ran, and
+                // "restore" reads as covering the entries written meanwhile —
+                // which `verify`'s own `NeverProtected` arm then denies.
+                "omamori warning: {reason} — cannot determine which key epoch is active, so no \
+                 entry written from here on can be HMAC-protected or labelled with a key epoch. \
+                 Entries written while this lasts carry no HMAC and stay unverifiable; clearing \
+                 the condition protects later ones, not those."
+            );
+            return SigningKey {
+                id: UNRESOLVED_KEY_ID.to_string(),
+                secret: None,
+            };
+        }
+        KeyDirScan::Listed(retired) => retired,
+    };
 
-    let max_retired = scan.max_index();
+    let max_retired = max_retired_index(&retired);
 
     // #457 P4-e: a rotation that crashed between `rename` and `create_secret`
     // leaves retired keys with no active key. `load_or_create_secret` below
@@ -369,6 +438,48 @@ fn symlink_attack_error(path: &Path) -> std::io::Error {
     )
 }
 
+/// The result of enumerating the key directory — either a listing that is
+/// known to be complete, or the reason it is not one.
+///
+/// **The discriminant is what enforces this**, not field privacy: Rust privacy
+/// is module-scoped and all three consumers live in this file, so a private
+/// field would protect nothing. What the discriminant buys is a change of
+/// *kind*. Reaching the number without a listing goes from something a caller
+/// can omit — #477 was exactly that omission, taking the index with no branch
+/// above it — to something a caller has to write out. Nothing stops this
+/// module from building `Listed(BTreeMap::new())` by hand, but stating a
+/// listing that was never made is a different and much louder mistake than
+/// forgetting to check one.
+///
+/// #457 (Codex Round 1, P0) established why collapsing "cannot list" into
+/// "no retired keys" is not a harmless default: on a rotated store it makes
+/// the writer label new entries `"default"` (naming epoch 1 while signing with
+/// epoch N), and it makes the verifier resolve `"default"` to the active key
+/// and report the mismatch as **tampering** — from nothing worse than an
+/// unreadable directory. That fix reached the writer and the verifier.
+///
+/// #477 is the same hazard on the one consumer it missed, and the only one
+/// that *mutates* the store.
+pub(super) enum KeyDirScan {
+    /// Parsed retired-key index → path, ordered by index.
+    Listed(BTreeMap<u32, PathBuf>),
+    /// The listing could not be obtained, or could not be trusted to be whole.
+    /// The string states what was observed, with no interpretation — callers
+    /// wrap it in whatever their own context can actually claim.
+    Unlistable(String),
+}
+
+/// Highest retired index present, or 0 when there are none. Replaces the old
+/// count-based derivation: with a gap (`.1` and `.3`, no `.2`) the count said
+/// 2 and named the next key `key-3`, colliding with the key `.3.retired`
+/// already holds.
+///
+/// Takes the map, not the scan: there is no way to ask for this number without
+/// first matching [`KeyDirScan::Listed`] to obtain one.
+pub(super) fn max_retired_index(retired: &BTreeMap<u32, PathBuf>) -> u32 {
+    retired.keys().next_back().copied().unwrap_or(0)
+}
+
 /// One `read_dir` pass over the key directory.
 ///
 /// #457 P4-a/P4-b: three functions used to each answer "how many rotations
@@ -383,38 +494,31 @@ fn symlink_attack_error(path: &Path) -> std::io::Error {
 /// a file named `audit-secret.1.RETIRED`, which the name-matching count never
 /// saw. Measured: one such file on a never-rotated host produced
 /// `chain broken at #0`.
-struct KeyDirScan {
-    /// Parsed retired-key index → path, ordered by index.
-    retired: BTreeMap<u32, PathBuf>,
-    /// The directory could not be enumerated.
-    ///
-    /// Codex Round 1 (P0): collapsing this into "no retired keys" is not a
-    /// harmless default. On a rotated store it makes the writer label new
-    /// entries `"default"` (naming epoch 1 while signing with epoch N), and it
-    /// makes the verifier resolve `"default"` to the active key and report the
-    /// resulting mismatch as **tampering** — from nothing worse than an
-    /// unreadable directory. Both surfaces must be able to tell the two apart.
-    unreadable: Option<String>,
-}
-
-impl KeyDirScan {
-    /// Highest retired index present, or 0 when there are none. Replaces the
-    /// old count-based derivation: with a gap (`.1` and `.3`, no `.2`) the
-    /// count said 2 and named the next key `key-3`, colliding with the key
-    /// `.3.retired` already holds.
-    fn max_index(&self) -> u32 {
-        self.retired.keys().next_back().copied().unwrap_or(0)
-    }
+/// The one place a listing failure is put into words.
+///
+/// `symlink_attack_error` makes the argument 60 lines up and it applies here
+/// unchanged: load-bearing text with two authors drifts. Five assertions and a
+/// `report.rs` redaction fixture key on the `cannot list` prefix, so the two
+/// failures state it once and differ only in what they actually observed —
+/// whether the listing never started, or stopped at a known position.
+fn unlistable(parent: &Path, stopped_after: Option<usize>, e: &std::io::Error) -> KeyDirScan {
+    KeyDirScan::Unlistable(match stopped_after {
+        None => format!("cannot list {}: {e}", parent.display()),
+        Some(seen) => format!(
+            "cannot list all of {} — the listing stopped after {seen} entries: {e}",
+            parent.display()
+        ),
+    })
 }
 
 fn scan_key_dir(secret_path: &Path) -> KeyDirScan {
-    let mut scan = KeyDirScan {
-        retired: BTreeMap::new(),
-        unreadable: None,
-    };
+    // `parent()` returning `None` is structurally unreachable here: every call
+    // site derives this path with `with_file_name`, which always appends a
+    // component, and `resolved_audit_path` admits only absolute paths. Handled
+    // as `Unlistable` rather than given its own variant, because a variant for
+    // an unreachable state is a variant nothing can test.
     let Some(parent) = secret_path.parent() else {
-        scan.unreadable = Some("audit secret path has no parent directory".to_string());
-        return scan;
+        return KeyDirScan::Unlistable("audit secret path has no parent directory".to_string());
     };
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
@@ -424,15 +528,49 @@ fn scan_key_dir(secret_path: &Path) -> KeyDirScan {
         // "unreadable" made `load_signing_key` bail out before the secret was
         // ever created, so a new install wrote entries with no HMAC at all.
         // Only an *existing* directory we cannot look into is a fault.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return scan,
-        Err(e) => {
-            scan.unreadable = Some(format!("cannot list {}: {e}", parent.display()));
-            return scan;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return KeyDirScan::Listed(BTreeMap::new());
         }
+        Err(e) => return unlistable(parent, None, &e),
     };
 
-    for entry in entries.filter_map(|e| e.ok()) {
-        let name = entry.file_name().to_string_lossy().into_owned();
+    fold_key_dir_entries(parent, entries.map(|e| e.map(|entry| entry.file_name())))
+}
+
+/// The listing half of [`scan_key_dir`], as a fold over names.
+///
+/// Split out because the failure this closes cannot be provoked through the
+/// real syscall from a test: a per-entry `Err` needs a removable volume, a
+/// network filesystem, or failing hardware. Taking an iterator instead of a
+/// `ReadDir` makes the branch reachable from a unit test, and costs nothing —
+/// `DirEntry::path()` is defined as `root.join(file_name)`, so rebuilding the
+/// path from the parent is the same value.
+///
+/// **A per-entry `Err` fails the whole listing.** It is tempting to skip the
+/// bad entry and keep the rest, which is what `filter_map(|e| e.ok())` did.
+/// Measured: enumerating a 300-file directory while its volume was detached
+/// returned 151 `Ok`s and then one `Err`, and `std` sets `end_of_stream` on
+/// that error — so the remainder was never read. Skipping the error does not
+/// drop one entry, it drops **everything after it, silently, as a listing that
+/// looks complete**. For a store whose highest epochs sort last, that is
+/// exactly the set that matters.
+pub(super) fn fold_key_dir_entries(
+    parent: &Path,
+    entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
+) -> KeyDirScan {
+    let mut retired = BTreeMap::new();
+
+    for (seen, entry) in entries.enumerate() {
+        let file_name = match entry {
+            Ok(name) => name,
+            // Deliberately not interpreting the errno: the reachable macOS case
+            // reports EINVAL, not the EIO the issue predicted, and the two
+            // platforms take different `ReadDir::next` bodies. State the
+            // position and the error; let the operator's context supply the
+            // cause.
+            Err(e) => return unlistable(parent, Some(seen), &e),
+        };
+        let name = file_name.to_string_lossy();
         let Some(middle) = name
             .strip_prefix("audit-secret.")
             .and_then(|rest| rest.strip_suffix(".retired"))
@@ -453,7 +591,7 @@ fn scan_key_dir(secret_path: &Path) -> KeyDirScan {
         //   1 P2).
         match middle.parse::<u32>() {
             Ok(index) if (1..u32::MAX).contains(&index) && index.to_string() == middle => {
-                scan.retired.insert(index, entry.path());
+                retired.insert(index, parent.join(&file_name));
             }
             // Anything else is not an epoch. **Ignored, not counted** — a user
             // taking a backup must not shift the `key_id` of every entry
@@ -463,7 +601,7 @@ fn scan_key_dir(secret_path: &Path) -> KeyDirScan {
         }
     }
 
-    scan
+    KeyDirScan::Listed(retired)
 }
 
 /// The `key_id` for a store whose highest retired index is `max_retired`.
@@ -585,6 +723,14 @@ impl Keyring {
         self.keys.get(id)
     }
 
+    /// Whether the ring holds no keys.
+    ///
+    /// Test-only on purpose. Production asks through [`Self::report_and_usable`]
+    /// so that the emptiness check cannot end up ahead of the anomaly report;
+    /// leaving a bare `is_empty` reachable would put that ordering back within
+    /// reach of the next edit. Tests assert on the key count itself, which is
+    /// the narrower claim.
+    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -616,6 +762,24 @@ impl Keyring {
             .unwrap_or(0)
     }
 
+    /// Print every anomaly on stderr, then say whether this ring can answer at
+    /// all.
+    ///
+    /// The two are one call because the order between them is load-bearing and
+    /// was previously only a convention. #477 made an unlistable directory
+    /// yield an *empty* ring, which put the emptiness check ahead of the
+    /// reporting loop on a surface that has no exit code to spend
+    /// (`hash_cwd_candidates`): it returned "nothing available" without ever
+    /// saying why, and the caller's message for that names a missing secret —
+    /// false, when the secret is readable and only the directory is not. A
+    /// caller that cannot sequence the two cannot reintroduce it.
+    pub(super) fn report_and_usable(&self) -> bool {
+        for anomaly in &self.anomalies {
+            eprintln!("omamori warning: {}", anomaly.describe());
+        }
+        !self.keys.is_empty()
+    }
+
     /// The first anomaly that makes verification untrustworthy, if any.
     ///
     /// Only `DirectoryUnreadable` qualifies: `"default"` would resolve to the
@@ -635,20 +799,28 @@ impl Keyring {
 /// load everything" is a value the caller must look at, instead of being
 /// indistinguishable from "there was nothing more to load".
 pub(super) fn load_keyring(secret_path: &Path) -> Keyring {
-    with_key_store_lock(secret_path, false, || load_keyring_locked(secret_path))
+    with_key_store_lock(secret_path, false, |_lock| load_keyring_locked(secret_path))
 }
 
 fn load_keyring_locked(secret_path: &Path) -> Keyring {
-    let scan = scan_key_dir(secret_path);
-    let max_retired = scan.max_index();
     let mut keys = BTreeMap::new();
     let mut anomalies = Vec::new();
 
-    if let Some(reason) = &scan.unreadable {
-        anomalies.push(KeyringAnomaly::DirectoryUnreadable {
-            reason: reason.clone(),
-        });
-    }
+    // An unlistable directory yields an **empty** ring, not a partial one.
+    // Registering the active key here would have to name it, and the only
+    // number available to name it with is the one the failed scan could not
+    // produce. `verify` never observes the difference — `fatal_anomaly` stops
+    // it first — but `hash_cwd_candidates` does not consult that, and handing
+    // an investigator a candidate list under a guessed epoch label is the
+    // forensic version of the same mislabelling #457 closed for the writer.
+    let retired = match scan_key_dir(secret_path) {
+        KeyDirScan::Unlistable(reason) => {
+            anomalies.push(KeyringAnomaly::DirectoryUnreadable { reason });
+            return Keyring { keys, anomalies };
+        }
+        KeyDirScan::Listed(retired) => retired,
+    };
+    let max_retired = max_retired_index(&retired);
 
     // Active key → the id the writer is currently stamping.
     if let Ok(secret) = read_secret(secret_path) {
@@ -661,10 +833,10 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
         }
     }
 
-    let found = scan.retired.len();
+    let found = retired.len();
     let skip = found.saturating_sub(MAX_KEYRING_KEYS);
     let mut lowest_loaded_index = None;
-    for (index, path) in scan.retired.iter().skip(skip) {
+    for (index, path) in retired.iter().skip(skip) {
         match read_secret(path) {
             Ok(secret) => {
                 lowest_loaded_index.get_or_insert(*index);
@@ -907,12 +1079,10 @@ pub struct RotationResult {
     /// deriving an id from a path, which is the shape #457 removed when it
     /// deleted `current_key_id`.
     ///
-    /// It is only as good as the directory scan that produced that number.
-    /// `rotate_key_locked` takes `max_index()` without branching on
-    /// `KeyDirScan.unreadable`, so on a store whose key directory cannot be
-    /// listed this names the epoch the scan *could see*, not necessarily the
-    /// one that was active. Every other consumer of that scan fails closed;
-    /// rotation is the exception, and it predates this field.
+    /// #477: on a store whose directory could not be listed, this used to name
+    /// the epoch the scan *could see* rather than the one that was actually
+    /// active. Rotation now refuses instead, so a value here means a whole
+    /// listing backed it — see [`KeyDirScan`].
     pub retired_key_id: String,
     pub retired_path: PathBuf,
 }
@@ -933,20 +1103,55 @@ pub fn rotate_key(path: &Path) -> Result<RotationResult, AuditError> {
     let secret_path = secret_path_for(path);
     // Exclusive: readers resolving a signing key or building a keyring must
     // not observe the store mid-rename (#457, Codex Round 1 P0).
-    with_key_store_lock(&secret_path, true, || rotate_key_locked(&secret_path))
+    with_key_store_lock(&secret_path, true, |lock| {
+        rotate_key_locked(&secret_path, lock)
+    })
 }
 
-fn rotate_key_locked(secret_path: &Path) -> Result<RotationResult, AuditError> {
+fn rotate_key_locked(
+    secret_path: &Path,
+    lock: &KeyStoreLock,
+) -> Result<RotationResult, AuditError> {
     let secret_path = secret_path.to_path_buf();
 
-    // Verify current secret exists
-    read_secret(&secret_path).map_err(|_| AuditError::SecretUnavailable)?;
+    // #477: refuse before touching the key store when the directory cannot be
+    // listed. (`with_key_store_lock` may already have created `audit-secret.lock`
+    // by this point — it holds no key material and is not a retired key, which
+    // is why the refusal test compares the listing against it rather than
+    // against an empty directory.)
+    //
+    // Rotation is the only consumer of this scan that *mutates*, and it
+    // was the only one that took the number without asking whether the listing
+    // was real. On a store missing its low retired slots — an operator tidying
+    // up after a prune — the failed scan reads as "never rotated", so the
+    // current key is renamed into `.1.retired` and the new one is named after
+    // an epoch that already exists. Once the directory is readable again those
+    // entries resolve to the wrong bytes and `verify` reports tampering,
+    // permanently, with no attacker involved (`ADR-0007` forbids rewriting).
+    //
+    // Ordered before `read_secret` deliberately: it makes the diagnosis right
+    // when *both* are unreadable (mode 000). The other order reported "no audit
+    // secret found — nothing to rotate", which is false — the secret is there.
+    let retired = match scan_key_dir(&secret_path) {
+        KeyDirScan::Unlistable(reason) => return Err(AuditError::KeyringUnusable(reason)),
+        KeyDirScan::Listed(retired) => retired,
+    };
+
+    // Verify current secret exists. The error body is kept rather than
+    // flattened with `|_|`: `read_secret` distinguishes a missing secret from a
+    // symlinked one ("possible attack") and from a non-regular file, and
+    // `verify` classifies on that text. Rotation was erasing the distinction
+    // and reporting all of them as "nothing to rotate".
+    read_secret(&secret_path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => AuditError::SecretUnavailable,
+        _ => AuditError::Io(e),
+    })?;
 
     // Determine retired key number from the highest index present, not from a
     // count of matching names (#457 P4-a): with a gap (`.1`, `.3`) the count
     // said 2 and picked `.2`, while `key_id` derivation said `key-3` — the two
     // disagreed about which epoch was which.
-    let max_retired = scan_key_dir(&secret_path).max_index();
+    let max_retired = max_retired_index(&retired);
     // #457 (Codex Round 2): `scan_key_dir` rejects `u32::MAX` itself, but
     // `u32::MAX - 1` is accepted — and the new key's id is `n + 1`, one past
     // the retired slot, so the arithmetic has to survive two increments, not
@@ -990,6 +1195,24 @@ fn rotate_key_locked(secret_path: &Path) -> Result<RotationResult, AuditError> {
                 retired_path.display()
             ),
         )));
+    }
+
+    // Placed here, past every refusal, rather than at the top: a rotation that
+    // is about to be declined has no window for anyone to observe, and warning
+    // about one would describe a risk this run never takes.
+    //
+    // The reason is quoted, not summarised. Two of the four ways to reach
+    // `Unheld` — the lock path is a symlink (`O_NOFOLLOW`) or is not a regular
+    // file — are the file-type guards firing, and this is the only place they
+    // can be heard; the previous wording named a concurrent reader, which is
+    // one of the other two.
+    if let KeyStoreLock::Unheld(reason) = lock {
+        eprintln!(
+            "omamori warning: proceeding without the audit key-store lock — {reason}. \
+             A reader resolving a key epoch during this rotation can pair the previous \
+             label with the new key's bytes, which `audit verify` later reports as \
+             tampering. omamori only ever puts a plain, empty file at that path."
+        );
     }
 
     // Rename active → retired

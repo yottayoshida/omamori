@@ -363,10 +363,20 @@ fn print_risk_signals_section(ai_env: bool) {
             if ai_env {
                 println!("    chain: cannot verify ({reason})");
             } else {
-                println!(
-                    "    chain: cannot verify — {reason}; fix the permissions on the \
-                     directory holding audit-secret and re-run omamori audit verify"
-                );
+                // Delegates rather than inlining the repair, like every
+                // sibling in this list ("chain: broken — run omamori audit
+                // verify"). #477 briefly inlined it and the line reached 384
+                // characters — five wrapped lines against a 44-character
+                // neighbour — while `audit verify`, the command this points
+                // at, already prints the repair on its own line.
+                //
+                // The reason ends its own sentence (`KeyringAnomaly::describe`
+                // finishes with "…the key it names."), so no separator goes
+                // between them. Rendered rather than assumed: this branch is
+                // unreachable from an AI session, so the #477 dry-run could
+                // not print it, and the separator that used to sit here landed
+                // straight after that full stop.
+                println!("    chain: cannot verify — {reason} Run omamori audit verify.");
             }
         }
         // Listed rather than caught by `_`. `needs_attention()` is exhaustive

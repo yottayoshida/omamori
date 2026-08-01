@@ -74,6 +74,12 @@ pub enum ChainStatus {
         /// the JSON (`at_seq` on both `Broken` and `KeyUnavailable`); this one
         /// shipped as the first to leak, which the reason-free `kind` below
         /// corrects.
+        ///
+        /// The line this draws is **machine-readable output stays path-free**,
+        /// not "paths are secret". The same string reaches `doctor`'s stdout,
+        /// `verify`'s stderr and `VerifyResult::keyring_warnings` with the path
+        /// intact, and it has to: an operator diagnosing a directory needs to
+        /// know which directory. Only the serialized form is redacted.
         #[serde(skip_serializing)]
         reason: String,
         /// The path-free classification, for machine consumers.
@@ -218,9 +224,14 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
         // mapping it to `Unavailable` would hide it from doctor's risk signals.
         Err(AuditError::KeyringUnusable(reason)) => ChainStatus::KeyringUnusable {
             reason,
-            // One producer today (`KeyringAnomaly::DirectoryUnreadable`), so
-            // one kind. It exists so `--json` consumers have something stable
-            // to branch on that is not the free-text reason.
+            // Still one kind, but no longer one producer: #477 added
+            // `rotate_key`, which returns the raw scan reason rather than a
+            // `KeyringAnomaly`. It does not reach here — `aggregate_report`
+            // maps only `verify_chain`'s result — and both producers describe
+            // the same condition, so a second kind would split a distinction
+            // `--json` consumers cannot act on. Said out loud because this
+            // field exists to be stable, and "one producer" was the reason
+            // given for it being safe.
             kind: "directory_unreadable",
         },
         Err(_) => ChainStatus::Unavailable,

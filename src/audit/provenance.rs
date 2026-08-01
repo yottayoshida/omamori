@@ -153,17 +153,17 @@ pub fn hash_cwd_candidates(
     let audit_path = super::resolved_audit_path(audit_config)?;
     let secret_path = super::secret::secret_path_for(&audit_path);
     let ring = super::secret::load_keyring(&secret_path);
-    if ring.is_empty() {
-        return None;
-    }
 
     // #457 P4-b: a truncated or partly-unreadable keyring is a forensic false
     // negative here — the investigator gets a shorter candidate list with no
     // sign that the key which would have matched was never tried. `verify`
     // turns these into exit 2; this surface has no exit code to spend, so it
     // says so on stderr rather than quietly returning less.
-    for anomaly in ring.anomalies() {
-        eprintln!("omamori warning: {}", anomaly.describe());
+    //
+    // #477: one call, so that reporting cannot end up behind the emptiness
+    // check. See `Keyring::report_and_usable`.
+    if !ring.report_and_usable() {
+        return None;
     }
 
     // `Keyring` is backed by a `BTreeMap`, so iteration is already in key_id
@@ -476,6 +476,57 @@ mod tests {
             result.is_none(),
             "no keyring exists yet — hash_cwd_candidates must return None, not an empty Vec"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #477 (V-A18): an unlistable key directory yields no candidates.
+    ///
+    /// A different fact from the `None` above: here a secret exists and is
+    /// readable. What cannot be read is the *directory*, so no epoch can be
+    /// named — and naming one anyway is what would hand an investigator a
+    /// candidate list under a guessed label.
+    ///
+    /// The stderr that must accompany it is pinned in `tests/cli.rs`
+    /// (`audit_hash_cwd_reports_an_unlistable_key_directory`), which runs the
+    /// binary; an in-process test cannot capture the process's own stderr.
+    /// The pair used to also cover an *ordering* between the report and the
+    /// emptiness check — `Keyring::report_and_usable` now makes that order
+    /// unwritable, so what is left here is this function's own contract.
+    #[cfg(unix)]
+    #[test]
+    fn hash_cwd_candidates_returns_none_when_the_key_directory_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = hash_cwd_test_dir("unlistable");
+        let audit_path = dir.join("audit.jsonl");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+        AuditLogger::from_config(&config).expect("logger constructs in a writable temp dir");
+
+        // Control: readable, so there are candidates and nothing to report.
+        assert!(
+            hash_cwd_candidates(&config, &dir).is_some(),
+            "precondition: a readable key directory yields candidates"
+        );
+
+        // Write + execute but not read. `audit-secret` still opens by name and
+        // the lock file can still be created, so the listing is the only thing
+        // that fails. The `0o100` fixtures in `audit::tests` also block the
+        // lock, which would leave two failures to tell apart.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let out = hash_cwd_candidates(&config, &dir);
+        let restored = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+
+        assert!(
+            out.is_none(),
+            "an unlistable directory must not produce candidates under a guessed epoch"
+        );
+        restored.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }

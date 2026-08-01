@@ -183,7 +183,16 @@ tracked separately, out of scope here.
   is a forensic false negative: a shorter candidate list with no sign that the matching key was
   never tried.
 - Rotation can no longer overwrite a retired key. The numbering change already makes the next
-  slot free; the explicit refusal remains for the case where the directory scan itself fails.
+  slot free; the explicit refusal remains as a backstop.
+
+  **Corrected in #477.** The sentence above originally read "the explicit refusal remains for the
+  case where the directory scan itself fails", which was not true of the code it described. The
+  refusal is `retired_path.exists()`, so it only fires when the guessed slot is *occupied* — and a
+  failed scan guesses slot 1, which on a store missing its low epochs is free. That is exactly the
+  case the sentence claimed to cover, and the one where the guess does damage: the current key was
+  filed under an epoch that already existed. #477 closes it upstream instead — rotation now refuses
+  before any key file is renamed or created when the key directory cannot be listed — so the scan-failure
+  case never reaches the slot check at all.
 - An interrupted rotation (retired keys present, no active key) is reported when detected, and the
   residual is pinned by a test rather than left to be rediscovered. Two ways to close it properly
   are recorded in Alternatives: reordering rotation so the window does not exist (cheaper, no
