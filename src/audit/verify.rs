@@ -8,8 +8,8 @@ use super::chain::{
 };
 use super::retention::is_prune_point;
 use super::secret::{
-    UNRESOLVED_KEY_ID, expected_key_file, flock_shared, is_writer_emitted_key_id, load_keyring,
-    open_read_nofollow, read_secret, secret_path_for,
+    UNRESOLVED_KEY_ID, classify_secret_failure, expected_key_file, flock_shared, is_symlink_attack,
+    is_writer_emitted_key_id, load_keyring, open_read_nofollow, read_secret, secret_path_for,
 };
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
@@ -31,6 +31,24 @@ pub enum AuditError {
     /// verdict — resolving `"default"` to the active key on a rotated store
     /// would make every entry look altered.
     KeyringUnusable(String),
+    /// #478: `rename` moved the key being replaced into its retired slot and
+    /// this rotation did not create the replacement.
+    ///
+    /// Not "the store now has no active key" — `source` can be `AlreadyExists`,
+    /// which says some other writer put a file at that path, possibly a usable
+    /// key. What the variant carries is what this process did, which is also
+    /// all the message built from it claims.
+    ///
+    /// Kept apart from `Io` because the store *changed*. The catch-all it came
+    /// from covered five situations, four of which left the key directory
+    /// exactly as they found it; reporting all five as `key rotation failed`
+    /// told the operator nothing about which one they were in, and the one that
+    /// matters is the one where the next append mints a second key under the id
+    /// this rotation was heading for.
+    RotationInterrupted {
+        retired_path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     Io(std::io::Error),
 }
 
@@ -40,6 +58,14 @@ impl std::fmt::Display for AuditError {
             Self::SecretUnavailable => write!(f, "HMAC secret unavailable"),
             Self::FileNotFound => write!(f, "audit log not found"),
             Self::KeyringUnusable(reason) => write!(f, "{reason}"),
+            Self::RotationInterrupted {
+                retired_path,
+                source,
+            } => write!(
+                f,
+                "the previous key was moved to {} and its replacement could not be created: {source}",
+                retired_path.display()
+            ),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -275,7 +301,7 @@ fn classify_unavailable_key(key_id: &str, highest_known_epoch: u32) -> KeyUnavai
         Some(expected_file) => {
             // Shape alone is a weak test: `key-99` looks exactly like an id a
             // writer emits, so an attacker picking a large number lands in
-            // this arm and gets sent looking for `audit-secret.98.retired` —
+            // this arm and gets sent looking for `audit-secret.99.retired` —
             // a file that never existed. Saying so is worth more than the
             // path, and unlike the path it is checkable.
             let named = epoch_of(key_id);
@@ -330,12 +356,28 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // ELOOP (symlink attack on the secret path) error distinction, which must
     // be reported before anything else touches the directory, and a store with
     // no readable active secret is "cannot verify", not "chain intact".
-    read_secret(&secret_path).map_err(|e| {
-        if e.to_string().contains("symlink") {
-            return AuditError::Io(e);
-        }
-        AuditError::SecretUnavailable
-    })?;
+    //
+    // #478: the read keeps its position; only the *generic* verdict moves. On a
+    // directory that can be neither listed nor searched, this read and the
+    // listing both fail, and "HMAC secret unavailable" names the symptom while
+    // the failed listing names the cause — `rotate` has scanned first since
+    // #477, so the two commands gave contradictory accounts of one store.
+    // Swapping the calls would fix that and lose something: at mode 0300 the
+    // directory is searchable but not listable, so a symlinked secret path is
+    // still observable, and a scan-first order would report "cannot list" and
+    // never mention the attack. Holding the verdict instead of moving the read
+    // keeps both. (At mode 0000 the symlink is not observable at all, so
+    // "cannot list" is the whole of what was seen.)
+    //
+    // Matched on the prefix, not on `contains("symlink")`: every rejection here
+    // ends with the path, so the old test made a FIFO under a directory named
+    // `symlink-something` read as an attack. `ErrorKind` cannot separate them —
+    // both are `InvalidInput`.
+    let secret_error = match read_secret(&secret_path) {
+        Ok(_) => None,
+        Err(e) if is_symlink_attack(&e) => return Err(AuditError::Io(e)),
+        Err(e) => Some(e),
+    };
 
     // Load keyring for multi-key verification (active + retired keys)
     let keyring = load_keyring(&secret_path);
@@ -345,6 +387,24 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // problem. Stop before reading a single line.
     if let Some(fatal) = keyring.fatal_anomaly() {
         return Err(AuditError::KeyringUnusable(fatal.describe()));
+    }
+    // Reached only with a listing in hand, which is what makes the secret's own
+    // failure the whole story rather than a consequence of not having one.
+    //
+    // The error body is kept rather than flattened, through the same function
+    // `rotate_key_locked` has used since #477: `read_secret` tells a missing
+    // secret apart from a non-regular one and from an unreadable one, and
+    // folding all of them into "HMAC secret unavailable" is the flattening this
+    // change removes elsewhere. Shared rather than repeated because the two
+    // commands disagreeing about one store is the defect being closed.
+    //
+    // Both of its arms are exit 2 (`audit_cmd.rs`), and `aggregate_report` maps
+    // every non-`KeyringUnusable` error to `ChainStatus::Unavailable`, so
+    // **choosing between them** does not move `report --json` or `doctor`.
+    // Reaching `KeyringUnusable` instead of either does, and that is the
+    // intended change on the branch above — the CHANGELOG records it.
+    if let Some(e) = secret_error {
+        return Err(classify_secret_failure(e));
     }
 
     let file = open_read_nofollow(&path).map_err(|e| match e.kind() {

@@ -190,7 +190,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                         beyond_known_epochs: Some(highest),
                         ..
                     }) => {
-                        // Sending the operator after `audit-secret.98.retired`
+                        // Sending the operator after `audit-secret.99.retired`
                         // on a store that reached epoch 2 wastes their time and
                         // dresses an edit up as their own filing error. State
                         // the observation instead; it is checkable, and it is
@@ -276,12 +276,28 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
             eprintln!("  To fix: make that directory listable again, then re-run.");
             Ok(2)
         }
+        // #478: `verify_chain` does not produce this — only `rotate_key` does.
+        // The arm exists because the match is exhaustive, and it prints rather
+        // than panicking: a verifier that aborts on an unexpected variant is
+        // worse than one that reports it, and the wording is still specific
+        // enough to be traced back here if it ever appears.
+        Err(e @ audit::AuditError::RotationInterrupted { .. }) => {
+            eprintln!("omamori audit verify: cannot verify \u{2014} {e}");
+            Ok(2)
+        }
         // No catch-all: `#[non_exhaustive]` constrains other crates, not this
         // one, so the compiler still requires every variant here — which is
         // what should happen. A new failure mode deserves its own wording, not
         // a generic fallback that silently absorbs it.
         Err(audit::AuditError::Io(e)) => {
-            eprintln!("omamori audit verify: {e}");
+            // #478: carries the verdict, like every other arm here. Keeping
+            // `read_secret`'s error body instead of flattening it routed four
+            // more store shapes through this arm — a non-regular secret, an
+            // oversize one, unreadable hex, a symlinked path — and each of them
+            // arrived as a bare errno with nothing saying what omamori had
+            // decided. The reason is more specific than "HMAC secret
+            // unavailable" was; it is not a substitute for the verdict.
+            eprintln!("omamori audit verify: cannot verify \u{2014} {e}");
             Ok(2)
         }
     }
@@ -528,6 +544,22 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
                     );
                     Ok(1)
                 }
+                // #478: the one rotation failure that leaves the store changed.
+                // Every refusal above this happens before the key directory is
+                // touched; here the rename has already run, so `key rotation
+                // failed` was being read as "nothing happened" in the single
+                // case where something did. Which file moved is the fact the
+                // operator needs, and the catch-all carried neither it nor the
+                // fact that the store is now interrupted.
+                Err(audit::AuditError::RotationInterrupted {
+                    retired_path,
+                    source,
+                }) => {
+                    for line in rotation_interrupted_lines(&retired_path, &source) {
+                        eprintln!("{line}");
+                    }
+                    Ok(1)
+                }
                 Err(e) => {
                     eprintln!("omamori: key rotation failed: {e}");
                     Ok(1)
@@ -541,6 +573,48 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
             "audit key requires a subcommand\n\n{AUDIT_USAGE_HINT}"
         ))),
     }
+}
+
+/// What `audit key rotate` prints when a rotation left the store mutated.
+///
+/// Split out so the wording is reachable from a test — the same move
+/// `fold_key_dir_entries` makes for a per-entry listing error, and for the same
+/// reason. Provoking this for real needs `rename` to succeed and
+/// `create_secret` to fail in the same call on the same directory, and the two
+/// need the same permissions: every state that stops the create stops the
+/// rename first. What is left is a concurrent writer taking the name (a race no
+/// test can schedule), `/dev/urandom` failing, ENOSPC and EMFILE. Taking the
+/// values instead of producing them makes the branch reachable.
+///
+/// **It says nothing about what the store holds now.** The first draft said the
+/// store "has retired keys and no active key" and that the next command "will
+/// create one". The first is false when the failure was `AlreadyExists` — some
+/// other writer put a file at that path, possibly a usable key — and the second
+/// predicts a mint that can fail exactly the way this one just did. Both are
+/// the shape #478 exists to remove, reintroduced inside the fix for it (Codex
+/// Round 1). What this process observed is that it moved one file and did not
+/// create another; the rest is left to `docs/FAQ.md`, which the operator reads
+/// with the directory in front of them.
+fn rotation_interrupted_lines(
+    retired_path: &std::path::Path,
+    source: &std::io::Error,
+) -> Vec<String> {
+    vec![
+        // Literal em dash, like the sibling arms in this command. An escaped
+        // codepoint is invisible to `check-invariants.sh`, which pins operator
+        // text with `grep -F` on the bytes a developer sees on screen.
+        format!("omamori: key rotation interrupted — {source}"),
+        format!(
+            "  The key being replaced has already moved to {}, and this rotation did not \
+             create its replacement.",
+            retired_path.display()
+        ),
+        "  What to do next turns on whether an audit-secret exists when you act: while none \
+         does, moving that file back restores the state from before the rotation; once one \
+         does, moving it back destroys the key that anything written in between was signed \
+         with. See the audit chapter of omamori's FAQ."
+            .to_string(),
+    ]
 }
 
 /// The audit event a completed key rotation leaves behind (#457 A6).
@@ -719,6 +793,57 @@ fn run_audit_hash_cwd(args: &[OsString]) -> Result<i32, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #478. The rotation failure that leaves the store mutated is the one this
+    /// arm exists for, and it is the one no end-to-end test can reach: `rename`
+    /// and `create_secret` need the same directory permissions, so the states
+    /// that stop the second stop the first. The wording is pinned here instead,
+    /// against the two claims the first draft made and could not support.
+    #[test]
+    fn rotation_interrupted_message_states_only_what_the_rotation_did() {
+        let lines = rotation_interrupted_lines(
+            std::path::Path::new("/data/audit-secret.2.retired"),
+            &std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File exists"),
+        );
+        let text = lines.join("\n");
+
+        // The headline. Without it a mutation of the one word that tells the
+        // operator this failure is different from the four refusals above it
+        // survives the suite (Phase 8 QA).
+        assert!(
+            text.contains("omamori: key rotation interrupted"),
+            "the verdict has to name the state, not just the errno: {text}"
+        );
+        assert!(
+            text.contains("/data/audit-secret.2.retired"),
+            "which file moved is the fact the operator needs: {text}"
+        );
+        assert!(
+            text.contains("did not create its replacement"),
+            "and what this rotation did not do: {text}"
+        );
+        // `AlreadyExists` is the shape that makes the withdrawn claim false:
+        // something is at that path, so "no active key" would be wrong, and it
+        // may be a usable key another writer minted.
+        assert!(
+            !text.contains("no active key"),
+            "the store's current contents are not something this process \
+             observed: {text}"
+        );
+        assert!(
+            !text.contains("will create one"),
+            "predicting the next mint is the shape #478 removes; it can fail \
+             exactly as this one did: {text}"
+        );
+        assert!(
+            text.contains("File exists"),
+            "the observed errno is quoted rather than summarised: {text}"
+        );
+        assert!(
+            text.contains("omamori's FAQ"),
+            "the procedure lives where the operator can follow it: {text}"
+        );
+    }
 
     /// #177 B3 (Codex Phase 6-B): the mixed-version parenthetical had zero
     /// test coverage of its own — the underlying `VerifyResult.v1_entries`/

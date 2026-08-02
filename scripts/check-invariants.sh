@@ -1229,6 +1229,97 @@ else
     fail=1
 fi
 
+# ---------- Invariant: retracted-recovery-clauses (#478) ----------
+#
+# Three clauses of the interrupted-rotation warning were false by the time an
+# operator could read them, and one of them named a recovery step that destroys
+# the key it claimed to protect. None of the three was pinned by anything: each
+# had exactly one occurrence in the repo — the line that printed it — so
+# deleting or restoring any of them left the suite green either way.
+#
+# The list is not duplicated here. It is read out of the test that rejects the
+# same strings at runtime, so a fourth clause added there is covered by this
+# check without a second edit, and the two cannot drift.
+#
+# **The corpus is whitespace-normalized first.** Rust wraps long string
+# literals with a trailing `\` and indents the continuation, so a withdrawn
+# wording does not appear as contiguous bytes in the file that printed it:
+# measured against `da54eb4`, a plain `grep -F` finds one of the three, and the
+# other two could be restored verbatim with this check still green. Joining
+# continuations and squeezing runs of whitespace is the same normalization
+# `contract-doc-sync` and `extdocs-doc-sync` apply before their forbidden-phrase
+# scans, with the Rust half added. It can over-match — text that is not
+# contiguous in the file can become contiguous here — which fails loudly rather
+# than passing silently, the right direction for a must-not-contain check.
+#
+# Scope is every tracked text file except two: `tests/` holds the list itself,
+# and `CHANGELOG.md` quotes the wordings in order to say what was withdrawn.
+# Taken from `git ls-files` rather than a hand-written directory list, so a new
+# operator-facing surface is covered the day it is added and a mistyped path
+# cannot make the scan read nothing.
+clause_src="tests/hook_integration.rs"
+clause_fail=0
+if [ ! -f "$clause_src" ]; then
+    echo "FAIL [invariant retracted-recovery-clauses/#478]: $clause_src not found"
+    clause_fail=1
+else
+    clauses=$(sed -n '/^const RETRACTED_CLAUSES/,/^];/p' "$clause_src" \
+        | grep -o '"[^"]*"' | tr -d '"' || true)
+    clause_count=$(printf '%s\n' "$clauses" | grep -c '[^[:space:]]' || true)
+    # One line per scanned file: `path<TAB>normalized-content`. Built in one
+    # pass so a match can still name the file it came from.
+    clause_corpus=$(git ls-files \
+        | grep -vE '^(tests/|CHANGELOG\.md$)' \
+        | while IFS= read -r clause_file; do
+              [ -f "$clause_file" ] || continue
+              # `grep -I` treats a binary file as non-matching, which is how a
+              # PNG or a fixture blob is kept out of the corpus.
+              grep -Iq . "$clause_file" 2>/dev/null || continue
+              printf '%s\t%s\n' "$clause_file" \
+                  "$(tr '\n' ' ' < "$clause_file" | sed 's/\\ */ /g' | tr -s ' ')"
+          done)
+    clause_file_count=$(printf '%s\n' "$clause_corpus" | grep -c '[^[:space:]]' || true)
+    # Both counts are asserted. An empty clause list and an empty corpus each
+    # look exactly like "no violations found" — the first guard was written for
+    # that hazard and stopped one file-list short of it. The previous form used
+    # `grep -r ... || true` over a hand-written path list, which swallowed
+    # grep's "no such file" exit and would have reported PASS having read
+    # nothing at all.
+    # A clause wrapped across source lines is split by the extraction above into
+    # fragments that still count as entries, so the `>= 3` guard would pass
+    # while the scan hunted for text nobody wrote. The array is data, not prose:
+    # require every entry to sit on one line.
+    clause_continuations=$(sed -n '/^const RETRACTED_CLAUSES/,/^];/p' "$clause_src" \
+        | grep -c '\\$' || true)
+    if [ "$clause_continuations" -ne 0 ]; then
+        echo "FAIL [invariant retracted-recovery-clauses/#478]: $clause_src's RETRACTED_CLAUSES has $clause_continuations line-continuation(s) -- a clause split across source lines is extracted as fragments and scanned for as fragments. Keep one clause per line."
+        clause_fail=1
+    elif [ "$clause_count" -lt 3 ]; then
+        echo "FAIL [invariant retracted-recovery-clauses/#478]: extracted $clause_count clauses from $clause_src's RETRACTED_CLAUSES (expected at least 3) -- array renamed or restructured?"
+        clause_fail=1
+    elif [ "$clause_file_count" -lt 20 ]; then
+        echo "FAIL [invariant retracted-recovery-clauses/#478]: corpus is $clause_file_count files (expected at least 20) -- not run from the repo root, or git ls-files is empty?"
+        clause_fail=1
+    else
+        while IFS= read -r clause; do
+            [ -n "$clause" ] || continue
+            hits=$(printf '%s\n' "$clause_corpus" | grep -F "$clause" | cut -f1 || true)
+            if [ -n "$hits" ]; then
+                echo "FAIL [invariant retracted-recovery-clauses/#478]: \"$clause\" is back in operator-facing text:"
+                printf '%s\n' "$hits" | sed 's/^/  /'
+                clause_fail=1
+            fi
+        done <<EOF
+$clauses
+EOF
+    fi
+fi
+if [ "$clause_fail" -eq 0 ]; then
+    echo "retracted-recovery-clauses OK: the $clause_count clauses #478 withdrew are absent from $clause_file_count tracked text files, whitespace-normalized (list read from $clause_src; tests/ and CHANGELOG.md excluded by design)"
+else
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"

@@ -4236,6 +4236,70 @@ mod tests {
     /// #457 P4-e — pins the **residual**, which is what the plan asked for and
     /// what `SECURITY.md`'s "omamori warns when it sees this" needs behind it.
     ///
+    /// #478 (V-B01). The state the plan calls S1: a rotation that stopped after
+    /// the rename and before anything was written under the new label. The
+    /// replacement it mints is the *first* key to carry that label, so nothing
+    /// resolves to the wrong bytes and the chain still verifies.
+    ///
+    /// **This is the evidence for minting at all.** The alternative weighed for
+    /// #478 — refuse and fail closed whenever retired keys exist with no active
+    /// key — was rejected on the grounds that it would break a store which
+    /// recovers on its own. That claim had no test, and this change moves the
+    /// warning that fires in exactly this state, so it is load-bearing here.
+    ///
+    /// The sibling below is S2, where a key *had* already been handed out under
+    /// that label. The two are indistinguishable from the key store — the
+    /// difference exists only in `audit.jsonl` — which is why both fixtures
+    /// have to exist. PR-C1's epoch record is what will tell them apart.
+    ///
+    /// `rotate_key` renames and mints but does not append; the rotation event
+    /// is the CLI's doing (`audit_cmd::append_key_rotation_event`). A
+    /// library-level rotation therefore leaves nothing labelled `key-2` behind,
+    /// which is what makes this the S1 window rather than S2.
+    #[test]
+    fn an_interrupted_rotation_that_handed_out_no_key_still_verifies() {
+        let dir = test_dir("478-interrupted-before-handout");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+
+        // The crash window, entered before the new epoch signed anything.
+        fs::remove_file(&secret_path).unwrap();
+
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        assert_eq!(
+            logger.key_id(),
+            "key-2",
+            "the replacement takes the label the interrupted rotation was heading for"
+        );
+        logger.append(make_event("after-recovery")).unwrap();
+        drop(logger);
+
+        let result = verify_chain(&config).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "no entry was signed under key-2 before the replacement, so none \
+             resolves to the wrong bytes"
+        );
+        assert_eq!(
+            result.key_unavailable_at, None,
+            "and every id in the log resolves: epoch 1 to .1.retired, key-2 to \
+             the replacement"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A rotation interrupted between the rename and the new key's creation
     /// leaves retired keys with no active key. The next append mints a fresh
     /// secret under the *same* `key-{N+1}` label the interrupted rotation was
@@ -4551,12 +4615,29 @@ mod tests {
         // The remedy must name a file. There is no file called "default".
         let default_file = expected_key_file("default").expect("epoch 1 has a file");
         assert!(default_file.contains("audit-secret"));
+        // #478: this used to pin `key-N` → `.{N-1}.retired`, which is the
+        // defect, not the contract. `rotate_key_locked` renames the key it
+        // displaces into `audit-secret.{max_retired + 1}.retired` and reports
+        // it as `key-{max_retired + 1}`, so the two numbers are the same one.
         assert!(
             expected_key_file("key-3")
                 .expect("epoch 3 has a file")
-                .contains("audit-secret.2.retired"),
-            "key-N is retired index N-1"
+                .contains("audit-secret.3.retired"),
+            "epoch N's key retires into slot N"
         );
+        // Stated as an exclusion so the fix cannot be read as "any decimal now
+        // gets a path": the slot below the one epoch 3 names must not appear.
+        assert!(
+            !expected_key_file("key-3")
+                .expect("epoch 3 has a file")
+                .contains("audit-secret.2.retired"),
+            "epoch 3 must not be filed under epoch 2's slot"
+        );
+        // Agrees with `is_writer_emitted_key_id`, which rejects both: epoch 1
+        // is `"default"`, and `.0.retired` is a slot the directory scan
+        // refuses. A path here would name a file omamori would not read.
+        assert!(expected_key_file("key-1").is_none());
+        assert!(expected_key_file("key-0").is_none());
         assert!(expected_key_file("nonsense").is_none());
     }
 

@@ -2962,9 +2962,15 @@ fn an_edited_key_id_does_not_buy_an_assurance_of_innocence() {
     // Asserted without an `||`. The first version of this test accepted
     // "altered" *or* "possible tampering", and passed on the second — while
     // `key-99` was in fact taking the missing-key-file arm and telling the
-    // operator to go looking for `audit-secret.98.retired`, a file that has
+    // operator to go looking for `audit-secret.99.retired`, a file that has
     // never existed on this store. A disjunction over two arms cannot tell
     // you which arm ran.
+    //
+    // #478 renumbered the path this test guards against. It said `.98.retired`
+    // while `expected_key_file` was off by one; once that was corrected the
+    // wrong arm would have printed `.99.retired`, so the old assertion could
+    // no longer fail for any input — a negative pin that survived the change
+    // it was pinning by ceasing to measure it.
     assert!(
         err.contains("highest key epoch this store currently shows is 1"),
         "this store has one epoch, so no key file for epoch 99 can have gone \
@@ -2972,7 +2978,7 @@ fn an_edited_key_id_does_not_buy_an_assurance_of_innocence() {
          (stderr={err})"
     );
     assert!(
-        !err.contains("audit-secret.98.retired"),
+        !err.contains("audit-secret.99.retired"),
         "sending the operator after a file that never existed dresses an edit \
          up as their own filing error (stderr={err})"
     );
@@ -3068,5 +3074,267 @@ fn truncated_tail_after_rotation_reports_the_hwm_warning() {
         "V-027: the wording must name truncation, got: {err}"
     );
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// --- #478 PR-B: the interrupted-rotation warning states what it observed ---
+
+/// The data directory of a hook-test base.
+fn store_dir(base: &Path) -> PathBuf {
+    base.join(".local/share/omamori")
+}
+
+/// Rotate once, then make the store look like the shape under test, then drive
+/// one blocked command through the hook so something resolves a signing key.
+///
+/// Rotation is the only way to get a `.retired` file through the shipped
+/// binary, and a hook invocation is the only surface that builds an
+/// `AuditLogger` in a store with no active key — `audit key rotate` itself
+/// refuses before constructing one.
+fn stderr_of_hook_after<F: FnOnce(&Path)>(case: &str, wreck: F) -> (PathBuf, String) {
+    let (base, hook_path, shim_dir) = setup_hook_env(case);
+    let json = pretooluse_bash_json("rm -rf /Users/nobody/scratch-dir");
+    // A fresh base has no key yet, and `rotate` refuses on a store with no
+    // active secret. One hook invocation mints epoch 1, which is also how a
+    // real store acquires its first key.
+    let (_, seed_err, _) = run_hook_script(&hook_path, &shim_dir, &json);
+    assert!(
+        store_dir(&base).join("audit-secret").exists(),
+        "the seeding hook must have minted epoch 1: {seed_err}"
+    );
+
+    let (code, _, err) = run_audit(&base, &["key", "rotate"]);
+    assert_eq!(code, 0, "the fixture needs a completed rotation: {err}");
+
+    wreck(&store_dir(&base));
+
+    let (_, stderr, _) = run_hook_script(&hook_path, &shim_dir, &json);
+    (base, stderr)
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The three clauses #478 is named for, each of which was false by the time
+/// anybody could read it. Kept in one place so every test below rejects the
+/// same set — the wording of the replacement may change, these must not return.
+const RETRACTED_CLAUSES: [&str; 3] = [
+    "A new key will be created",
+    "before anything appends",
+    "never got as far as creating a new key",
+];
+
+fn assert_no_retracted_clauses(stderr: &str) {
+    for clause in RETRACTED_CLAUSES {
+        assert!(
+            !stderr.contains(clause),
+            "#478: {clause:?} describes something that has not happened yet, or \
+             that the mint a few lines later falsifies: {stderr}"
+        );
+    }
+}
+
+/// #478. Retired keys with no `audit-secret` is the interrupted-rotation state,
+/// and it is still reported — but after the replacement key is minted, and
+/// about the store as it stands then.
+///
+/// Before this change the same call printed the warning *first* and described
+/// what it was about to do: a new key "will be created", act "before anything
+/// appends", and the rotation "never got as far as creating a new key". The
+/// mint on the next line falsified the third immediately and closed the window
+/// named by the second. Following the recovery it offered — copy the retired
+/// key over `audit-secret` — destroys the replacement's bytes while
+/// `max_retired` stays put, so the entries just written resolve to the wrong
+/// key and `verify` reports tampering, permanently (ADR-0007).
+///
+/// **No test asserted any of this before.** Each of the three clauses had
+/// exactly one occurrence in the repo — the line that printed it.
+#[test]
+fn interrupted_rotation_warning_describes_the_store_after_the_mint() {
+    let (base, stderr) = stderr_of_hook_after("478-interrupted-after-mint", |store| {
+        std::fs::remove_file(store.join("audit-secret")).unwrap();
+    });
+
+    assert!(
+        stderr.contains("a key rotation may have been interrupted"),
+        "the state is still reported: {stderr}"
+    );
+    assert!(
+        stderr.contains("audit-secret now holds an active key"),
+        "and described as it stands after the mint: {stderr}"
+    );
+    assert!(
+        stderr.contains("labelled key-2"),
+        "naming the label the entries written from here on will carry: {stderr}"
+    );
+    // The S1/S2 ambiguity, asserted in its own right. It is the second half of
+    // the same sentence as the clause above, and asserting only the first half
+    // left it unmeasured — removing it kept the suite green (Phase 6.5).
+    //
+    // "may", not "do": a rotation that stopped before handing out a key wrote
+    // no entry under this label, one whose key was lost afterwards wrote
+    // several, and the key store holds nothing that tells the two apart. The
+    // sibling unit tests `an_interrupted_rotation_that_handed_out_no_key_still_verifies`
+    // and `interrupted_rotation_leaves_two_secrets_under_one_id_known_residual`
+    // are the two halves. PR-C1's epoch record is what will separate them, and
+    // this assertion is what should go red when it does.
+    assert!(
+        stderr.contains(
+            "entries written before this may carry key-2 too, signed with different bytes"
+        ),
+        "the store cannot tell an interrupted rotation that handed out a key \
+         from one that did not, and the message must not pick one: {stderr}"
+    );
+    assert!(
+        stderr.contains("Do not copy a .retired file over audit-secret"),
+        "the instruction is inverted, not merely reworded — the old one \
+         destroyed the key it told the operator to protect: {stderr}"
+    );
+    assert_no_retracted_clauses(&stderr);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #478. The condition used to be "the active key could not be read", which
+/// `read_secret` satisfies thirteen ways. A data directory at mode 0400 lists
+/// completely and denies every `open` inside it, so a store whose key is
+/// present, valid and untouched was announced as an interrupted rotation — and
+/// told the operator to copy a retired key over that live key.
+///
+/// Measured against `da54eb4` on this fixture: the full warning, naming
+/// `audit-secret.1.retired` as the file to restore.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_key_directory_is_not_reported_as_an_interrupted_rotation() {
+    let (base, stderr) = stderr_of_hook_after("478-healthy-store-mode-0400", |store| {
+        set_mode(store, 0o400);
+    });
+
+    assert!(
+        !stderr.contains("rotation may have been interrupted"),
+        "nothing was interrupted — the key is intact behind a directory that \
+         denies open: {stderr}"
+    );
+    assert_no_retracted_clauses(&stderr);
+
+    set_mode(&store_dir(&base), 0o700);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #478. `AlreadyExists` from `O_CREAT|O_EXCL` is a sound observation that
+/// something occupies the path; a second read failing is what says why it
+/// cannot be used. Neither is evidence of a concurrent writer, and the ordinary
+/// cause is a file that has been sitting there unreadable all along. Calling it
+/// a race filed a standing permissions fault as transient contention.
+///
+/// The interrupted-rotation warning must also stay quiet here: an unreadable
+/// `audit-secret` is present, so no rotation stopped halfway.
+#[cfg(unix)]
+#[test]
+fn an_occupied_unreadable_secret_path_is_not_reported_as_a_race() {
+    let (base, stderr) = stderr_of_hook_after("478-secret-unreadable", |store| {
+        set_mode(&store.join("audit-secret"), 0o000);
+    });
+
+    assert!(
+        stderr.contains("something already occupies the audit secret path"),
+        "state what `AlreadyExists` actually establishes: {stderr}"
+    );
+    assert!(
+        !stderr.contains("audit secret race"),
+        "there is no race here, and naming one sends the operator to retry \
+         instead of to `ls -l`: {stderr}"
+    );
+    assert!(
+        !stderr.contains("rotation may have been interrupted"),
+        "audit-secret is present; nothing stopped halfway: {stderr}"
+    );
+
+    set_mode(&store_dir(&base).join("audit-secret"), 0o600);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The control. A rotated store in good health says none of this — which is
+/// what makes the assertions above about the *state* rather than about
+/// rotation having happened at all.
+#[test]
+fn a_healthy_rotated_store_reports_no_interrupted_rotation() {
+    let (base, stderr) = stderr_of_hook_after("478-healthy-control", |_store| {});
+
+    assert!(
+        !stderr.contains("rotation may have been interrupted"),
+        "a completed rotation is not an interrupted one: {stderr}"
+    );
+    assert!(
+        !stderr.contains("something already occupies"),
+        "and the secret it just created reads fine: {stderr}"
+    );
+    assert_no_retracted_clauses(&stderr);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #478, the other side of the mint. Retired keys, no `audit-secret`, and a
+/// directory that can be read and searched but not written: the replacement
+/// cannot be created, so the branch that says one exists must not run.
+///
+/// Added because a mutation that made that branch unconditional survived the
+/// suite — the failing side of the mint had no test at all, and the sentence it
+/// would have produced claims a key is present when none is.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_rotation_that_cannot_mint_does_not_claim_a_key_exists() {
+    let (base, stderr) = stderr_of_hook_after("478-mint-denied", |store| {
+        std::fs::remove_file(store.join("audit-secret")).unwrap();
+        set_mode(store, 0o500);
+    });
+
+    assert!(
+        stderr.contains("a replacement could not be created"),
+        "the failing mint is the fact to report: {stderr}"
+    );
+    assert!(
+        !stderr.contains("audit-secret now holds an active key"),
+        "nothing was created — claiming otherwise is the branch this pins: {stderr}"
+    );
+    // What this state actually costs, which is not what the other no-HMAC
+    // warning costs. This branch returns a *resolvable* epoch label with no
+    // secret behind it, so clearing the fault mints a key under that label and
+    // the entries written meanwhile are then checked against it, fail, and are
+    // reported as tampering — permanently (ADR-0007). The wording was shared
+    // with the unlistable-directory warning for one round, which told this
+    // operator the opposite; nothing caught it until a mutation dropped the
+    // sentence and the suite stayed green (Phase 8 UX).
+    assert!(
+        stderr.contains("reported as tampering"),
+        "the operator has to be told what clearing the fault turns these \
+         entries into: {stderr}"
+    );
+    assert!(
+        !stderr.contains("They stay unverifiable"),
+        "that is the other warning's consequence, and it is false here: {stderr}"
+    );
+    // Bounded, not permanent: this is a permissions fault the operator clears,
+    // after which later entries are protected again (Codex Round 1).
+    //
+    // Asserted as one span reaching from the discriminating clause into the
+    // bound, not as a bare `contains("while this lasts")`. Both no-HMAC
+    // warnings share that sentence through one constant, so on its own the
+    // phrase says nothing about *which* warning printed it — and this test
+    // exists to pin the one that did.
+    assert!(
+        stderr.contains(
+            "a replacement could not be created — a key rotation may have been \
+             interrupted. Entries written while this lasts"
+        ),
+        "the claim has to stop at the condition, not run forever — and the bound \
+         has to be on this warning: {stderr}"
+    );
+    assert_no_retracted_clauses(&stderr);
+
+    set_mode(&store_dir(&base), 0o700);
     let _ = std::fs::remove_dir_all(&base);
 }
