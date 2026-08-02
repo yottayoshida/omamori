@@ -949,24 +949,27 @@ fn seed_rotatable_home(name: &str) -> (PathBuf, PathBuf) {
     (home, secret_dir)
 }
 
-fn rotate_in(home: &std::path::Path) -> std::process::Output {
+/// Run the binary against a sandboxed `HOME`.
+///
+/// The env isolation is the point, and it is stated once: a test that forgets
+/// `clean_ai_env` runs against the AI guard, and one that forgets
+/// `XDG_CONFIG_HOME` reads the developer's real config.
+fn run_in(home: &std::path::Path, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
-    cmd.args(["audit", "key", "rotate"])
+    cmd.args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
-        .expect("failed to run audit key rotate")
+        .unwrap_or_else(|e| panic!("failed to run omamori {}: {e}", args.join(" ")))
+}
+
+fn rotate_in(home: &std::path::Path) -> std::process::Output {
+    run_in(home, &["audit", "key", "rotate"])
 }
 
 fn verify_in(home: &std::path::Path) -> std::process::Output {
-    let mut cmd = Command::new(binary());
-    clean_ai_env(&mut cmd);
-    cmd.args(["audit", "verify"])
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .output()
-        .expect("failed to run audit verify")
+    run_in(home, &["audit", "verify"])
 }
 
 fn audit_entries(secret_dir: &std::path::Path) -> Vec<serde_json::Value> {
@@ -1176,20 +1179,210 @@ fn rotation_across_a_numbering_gap_records_the_ids_the_writer_uses() {
     let _ = fs::remove_dir_all(&home);
 }
 
-/// #457 PR2 (V-035, decision D3): when the key directory cannot be
-/// enumerated, the rotation still happens but is **not** recorded.
+/// Every name in a directory, sorted.
 ///
-/// This is the one shape where recording would cost more than it buys.
-/// `load_signing_key` cannot tell which epoch is active without listing the
-/// directory, so it returns `UNRESOLVED_KEY_ID` with no secret; an entry
-/// written then is unauthenticated and labelled with an id no keyring can
-/// hold. `ADR-0007` forbids rewriting existing entries, so that single line
-/// pins the store at exit 2 **permanently** — including after the operator
-/// fixes the permissions. Skipping the append keeps a recoverable
-/// misconfiguration recoverable.
+/// Unfiltered on purpose: the refusal tests compare the whole listing rather
+/// than checking `!exists()` per file, so that a refusal which leaves some
+/// *other* file behind fails instead of passing.
+#[cfg(unix)]
+fn dir_entry_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Everything that must hold of *any* unlistable-directory refusal.
+///
+/// Exit 1 alone does not identify this arm — four other refusals share it
+/// (unresolvable HOME, missing secret, an occupied retired slot, the `u32`
+/// ceiling) — so the arm is pinned by its own text and the siblings are ruled
+/// out. A refusal for the wrong reason would otherwise pass as this one.
+///
+/// Shared because the two refusal tests differ only in *fixture*, and the
+/// inline copies had already drifted: the gapped-store test asserted nothing
+/// but the exit code, so an early return added anywhere above the scan would
+/// have satisfied it.
+#[cfg(unix)]
+fn assert_refused_as_unlistable(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "rotation must refuse; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("key rotation refused") && stderr.contains("cannot list"),
+        "must be the keyring-unusable refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains("No key file was renamed or created"),
+        "the operator needs to know no key moved: {stderr}"
+    );
+    // The other two lines of the arm. Both were unpinned, so deleting either
+    // left the suite green — and this arm is the whole of what the operator
+    // gets. The consequence line is what makes the refusal legible as a choice
+    // rather than a malfunction; the repair names *writable* because rotation
+    // renames and creates, which a directory made merely readable does not
+    // allow.
+    assert!(
+        stderr.contains("under the wrong epoch number"),
+        "the refusal must say what it prevented, or it reads as a malfunction: {stderr}"
+    );
+    assert!(
+        stderr.contains("listable and writable again"),
+        "and the repair must name both properties rotation needs: {stderr}"
+    );
+    for sibling in [
+        "no audit secret found",
+        "cannot resolve audit path",
+        "refusing to overwrite an existing retired key",
+        "at the representable limit",
+    ] {
+        assert!(
+            !stderr.contains(sibling),
+            "refused through the wrong arm ({sibling}): {stderr}"
+        );
+    }
+    // Not an exhaustive list of refusals — a bare `Io` error is a fifth, and
+    // mode 0500 reaches it. These four are the ones whose wording could be
+    // mistaken for this arm's.
+    //
+    // The preamble belongs to the success path. Printed before the attempt it
+    // greeted refusals too, promising a retired key file that does not exist
+    // here — and on this refusal `audit verify` cannot verify anything at all.
+    assert!(
+        !stderr.contains("Old entries will still verify"),
+        "a refusal must not promise a retired key file it did not create: {stderr}"
+    );
+    stderr
+}
+
+/// #477: a symlink at the secret path is reported as one, not as an empty store.
+///
+/// `rotate_key_locked` used to flatten `read_secret`'s error with
+/// `map_err(|_| SecretUnavailable)`, so every unreadable shape came out as "no
+/// audit secret found — nothing to rotate". For a planted symlink that turns
+/// omamori's own attack signal into an invitation to set the store up again.
+/// `verify` classifies on this text (`verify.rs` checks for "symlink" before
+/// anything else touches the directory), and rotation was the one caller
+/// erasing it.
+///
+/// The fix is one `match` on `ErrorKind`, and nothing covered it: reverting it
+/// left the entire suite green.
+///
+/// The fixture is named away from the words asserted below. Every message here
+/// quotes the sandbox path, so a fixture called `…-symlinked-secret` would
+/// satisfy `contains("symlink")` on its own name — the assertion would pass
+/// against any message at all.
 #[cfg(unix)]
 #[test]
-fn audit_key_rotate_skips_the_record_when_the_key_directory_cannot_be_listed() {
+fn audit_key_rotate_reports_a_symlinked_secret_as_an_attack_not_an_empty_store() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-planted-key");
+    let elsewhere = secret_dir.join("elsewhere");
+    fs::rename(secret_dir.join("audit-secret"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, secret_dir.join("audit-secret")).unwrap();
+
+    let output = rotate_in(&home);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "rotation must not proceed on a secret it could not open: {stderr}"
+    );
+    assert!(
+        stderr.contains("possible attack"),
+        "the operator must be told what was found, in the wording `verify` \
+         classifies on: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no audit secret found"),
+        "the secret is present — calling the store empty invites recreating it, \
+         which is the one response that destroys the evidence: {stderr}"
+    );
+    assert!(
+        !secret_dir.join("audit-secret.1.retired").exists(),
+        "and nothing may be filed while the secret cannot be read: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #477: `audit verify` fails closed on an unlistable key directory, and says
+/// how to clear it.
+///
+/// The property #457 established and this change builds on — an unusable
+/// keyring is cannot-verify (exit 2), never `intact` and never tampering. It
+/// was pinned nowhere: turning that arm's `Ok(2)` into `Ok(0)` left the whole
+/// suite green, and so did deleting its repair line.
+#[cfg(unix)]
+#[test]
+fn audit_verify_fails_closed_and_says_how_to_clear_an_unlistable_key_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, secret_dir) = seed_rotatable_home("verify-unlistable");
+    fs::write(secret_dir.join("audit.jsonl"), "").unwrap();
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let output = verify_in(&home);
+    let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Every assertion below is on a phrase that cannot occur inside a path.
+    // The obvious `stderr.contains("listable")` passed with the repair line
+    // deleted: this test's sandbox is named `…-verify-unlistable-…`, and
+    // "unlistable" contains "listable", so the check was reading the fixture's
+    // own name out of the quoted path. Stripping the path is not enough either
+    // — stderr also carries the config path, and on macOS the printed form can
+    // be `/private/var/…` where the fixture holds `/var/…`.
+    let said = stderr.replace(&secret_dir.display().to_string(), "<dir>");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unusable keyring is cannot-verify, not success and not tampering: {said}"
+    );
+    assert!(
+        said.contains("cannot verify") && said.contains("cannot list"),
+        "and the verdict must name the cause: {said}"
+    );
+    assert!(
+        said.contains("To fix: make that directory listable"),
+        "the operator needs the property to restore, not just the verdict: {said}"
+    );
+    assert!(
+        !said.contains("tamper"),
+        "a directory that cannot be listed is not evidence of tampering: {said}"
+    );
+    restored.unwrap();
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #477 (V-A02): when the key directory cannot be listed, rotation refuses —
+/// **even on a store where guessing would have been right**.
+///
+/// This fixture is a fresh store, so slot 1 really is free and the pre-#477
+/// guess landed correctly. That is the point. Rotation cannot tell this store
+/// from the one in
+/// `audit_key_rotate_refuses_rather_than_guessing_past_a_gap` below, where the
+/// same guess silently files the current key under an epoch that already
+/// exists. The rule is not "refuse when the guess would be wrong" — nothing can
+/// know that without the listing — it is **do not guess**.
+///
+/// Replaces `..._skips_the_record_when_the_key_directory_cannot_be_listed`,
+/// whose thesis was that the rotation still happens and only the record is
+/// skipped. It no longer happens at all, so three of that test's five
+/// assertions were inverted; keeping the name would have left the old claim
+/// standing over new behaviour.
+#[cfg(unix)]
+#[test]
+fn audit_key_rotate_refuses_when_the_key_directory_cannot_be_listed() {
     use std::os::unix::fs::PermissionsExt;
 
     let (home, secret_dir) = seed_rotatable_home("audit-rotate-unlistable");
@@ -1199,45 +1392,328 @@ fn audit_key_rotate_skips_the_record_when_the_key_directory_cannot_be_listed() {
 
     let output = rotate_in(&home);
     let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
+    assert_refused_as_unlistable(&output);
+    restored.unwrap();
 
+    // "Refused" has to mean the store is as it was. `audit-secret.lock` is the
+    // one expected addition: `with_key_store_lock` creates it before the
+    // refusal is reached, and it holds no key material.
+    assert_eq!(
+        dir_entry_names(&secret_dir),
+        vec!["audit-secret".to_string(), "audit-secret.lock".to_string()],
+        "a refusal must leave the key store byte-identical apart from the lock file"
+    );
+    assert_eq!(
+        fs::read_to_string(secret_dir.join("audit-secret")).unwrap(),
+        "0".repeat(64),
+        "the active key must not have been rewritten"
+    );
+
+    // And the refusal must not be terminal: with the directory readable again,
+    // the same store rotates normally. This is what separates "refused" from
+    // "broke it".
+    let retry = rotate_in(&home);
     assert!(
-        output.status.success(),
-        "rotation itself must still succeed; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        retry.status.success(),
+        "the same store must rotate once the directory is readable; stderr: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(
+        secret_dir.join("audit-secret.1.retired").exists(),
+        "and it lands in the slot the listing actually supports"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #477 (V-A19): with the directory unreadable *and* the secret unreachable
+/// through it, rotation says the directory could not be listed — not that the
+/// secret is missing.
+///
+/// Mode 000 is what separates this from the tests above. At 0300 the secret is
+/// still openable by name, so the scan and `read_secret` disagree about
+/// nothing; at 000 both fail, and which one runs first decides the diagnosis.
+/// Before #477 `read_secret` ran first and the operator was told "no audit
+/// secret found — nothing to rotate", which reads as an empty store and invites
+/// exactly the wrong repair. The secret is right there.
+///
+/// Pins the ordering, which no other test does: reordering the scan after
+/// `read_secret` leaves every 0300 fixture green.
+#[cfg(unix)]
+#[test]
+fn audit_key_rotate_blames_the_directory_not_the_secret_when_neither_is_readable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-mode-000");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = rotate_in(&home);
+    let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
+    // The shared assertion already rules out "no audit secret found" — which
+    // is precisely the message this test exists to keep away from a store
+    // whose secret is intact.
+    assert_refused_as_unlistable(&output);
+    restored.unwrap();
+
+    // The secret really is intact, which is what makes the old message wrong
+    // rather than merely imprecise.
+    assert_eq!(
+        fs::read_to_string(secret_dir.join("audit-secret")).unwrap(),
+        "0".repeat(64),
+        "the secret must be untouched and readable once the directory is"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #477 (Phase 8 dry-run): `doctor` states the cause and delegates the repair,
+/// on the branch an AI session cannot reach.
+///
+/// `doctor` picks its wording from `is_ai_environment()`. The AI half prints
+/// the bare reason; the half a human reads is the one that carries the
+/// follow-up — and no dry-run from inside an agent can print it. It had no test
+/// either, which is how two defects survived: a separator landing straight
+/// after `KeyringAnomaly::describe()`'s own full stop, and a repair sentence
+/// inlined here that took the line to 384 characters against a 44-character
+/// neighbour.
+///
+/// Pins the shape rather than the wording: the cause is named, `audit verify`
+/// is where the repair lives, the reason's full stop is not followed by a
+/// separator, and the line stays within sight of its siblings.
+#[cfg(unix)]
+#[test]
+fn doctor_names_the_cause_and_points_at_verify_for_an_unlistable_key_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, secret_dir) = seed_rotatable_home("doctor-unlistable");
+    // An empty log is enough: `verify_chain` stops on the fatal keyring
+    // anomaly before it reads a single entry.
+    fs::write(secret_dir.join("audit.jsonl"), "").unwrap();
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let output = run_in(&home, &["doctor"]);
+    let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("chain: cannot verify"))
+        .unwrap_or_else(|| panic!("doctor must surface the unusable keyring: {stdout}"))
+        .to_string();
+    assert!(
+        line.contains("cannot list"),
+        "the risk signal must name the cause, not just the verdict: {line}"
+    );
+    assert!(
+        line.contains("omamori audit verify"),
+        "and point at the command that carries the repair: {line}"
+    );
+    assert!(
+        !line.contains(".;"),
+        "no separator after the reason's own full stop: {line}"
+    );
+    // Measured with the path removed. The sandbox path here runs to ~140
+    // characters against roughly 40 for a real `~/.local/share/omamori`, so a
+    // bound on the whole line would be measuring the fixture rather than this
+    // branch's own wording. The siblings are one short clause ("chain: broken
+    // — run omamori audit verify"); inlining the repair here took the wording
+    // alone past 250.
+    let path = secret_dir.display().to_string();
+    let wording = line.replace(&path, "");
+    assert!(
+        wording.len() < 250,
+        "the branch's own wording must stay readable next to its siblings, was {} chars \
+         excluding the path: {wording}",
+        wording.len()
     );
     restored.unwrap();
 
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #477 (`/simplify`, Altitude): the unheld-lock warning quotes what it
+/// observed instead of naming a cause.
+///
+/// `Unheld` has four causes and only one of them is a concurrent reader. The
+/// wording this replaces named that reader unconditionally, so a lock path an
+/// attacker had planted was reported as routine contention — and this warning
+/// is the only place it can ever be heard, because `open` and the file-type
+/// check both discard their own error.
+///
+/// **Which arm each shape takes, measured rather than assumed.** A planted
+/// lock path fails at `open`, not at the `is_file()` check: a directory gives
+/// `EISDIR`, a symlink gives `ELOOP` (that is `O_NOFOLLOW` doing its job), and
+/// a FIFO with no reader gives `ENXIO` (`O_NONBLOCK` doing its). All three
+/// surface through the "cannot open" reason. Reaching the `is not a regular
+/// file` arm needs an `open` that *succeeds* on a non-regular file — a FIFO
+/// with a live reader attached — which is **not covered here**: it needs a
+/// reader held open across a subprocess spawn, and the property that matters
+/// (the reason is quoted, not guessed) is already pinned by the two below.
+///
+/// Also pins that this stays a **warning**: an unheld lock is a race window,
+/// not a certainty, and refusing here would let any local process block
+/// rotation for good.
+#[cfg(unix)]
+#[test]
+fn audit_key_rotate_says_why_the_key_store_lock_was_not_held() {
+    for shape in ["directory", "symlink"] {
+        let (home, secret_dir) = seed_rotatable_home(&format!("audit-rotate-lock-{shape}"));
+        let lock = secret_dir.join("audit-secret.lock");
+        match shape {
+            "directory" => fs::create_dir(&lock).unwrap(),
+            _ => std::os::unix::fs::symlink(secret_dir.join("elsewhere"), &lock).unwrap(),
+        }
+
+        let output = rotate_in(&home);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "[{shape}] an unheld lock is reported, not enforced — rotation still completes: {stderr}"
+        );
+        assert!(
+            stderr.contains("proceeding without the audit key-store lock"),
+            "[{shape}] the operator must be told the rotation ran unlocked: {stderr}"
+        );
+        assert!(
+            stderr.contains("audit-secret.lock"),
+            "[{shape}] the reason must name what was actually observed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("another process"),
+            "[{shape}] no holder was observed — naming one asserts a cause this run \
+             never checked, and that reading is what hid a planted lock path: {stderr}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+/// #477 (V-A18): `audit hash-cwd` names the unreadable directory instead of
+/// blaming a missing secret.
+///
+/// The only surface where the empty-keyring change is observable. `verify`
+/// never gets there — it stops on the fatal anomaly before consulting the ring
+/// — so this command is what decides whether the operator learns the real
+/// cause. An unlistable directory now yields an empty ring, and the anomaly is
+/// printed **before** that emptiness is acted on; with the print after it, the
+/// investigator sees only "no audit path or HMAC secret available", which is
+/// false here: the secret is readable, the directory is not.
+///
+/// Has to run through the binary. The ordering is a difference in what reaches
+/// stderr, and both orders return `None` — an in-process assertion on the
+/// return value would stay green through the mutation.
+#[cfg(unix)]
+#[test]
+fn audit_hash_cwd_reports_an_unlistable_key_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, secret_dir) = seed_rotatable_home("audit-hashcwd-unlistable");
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let output = run_in(&home, &["audit", "hash-cwd", "/tmp"]);
+    let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
+
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Both skip arms say "not recorded", so that substring alone does not
-    // distinguish this one from the auditing-disabled arm — swapping the two
-    // messages would leave both tests green. The second assertion is what
-    // pins which arm ran.
     assert!(
-        stderr.contains("not recorded") && stderr.contains("could not be signed"),
-        "the operator must be told the rotation went unrecorded, and why: {stderr}"
+        stderr.contains("cannot list"),
+        "the operator must be told the directory could not be listed: {stderr}"
+    );
+    // Both halves of the outcome, not just the message. Without these the test
+    // stays green if `hash_cwd_candidates` starts returning an empty list and
+    // exiting 0 — an investigator would then get a warning and a successful
+    // command offering nothing, which reads as "there is nothing to find".
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unlistable directory must not produce a successful lookup: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("Candidate cwd_hash values"),
+        "and no candidates may be offered under a guessed epoch: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    restored.unwrap();
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #477 (V-A01): the shape the refusal exists for — a store whose low retired
+/// slots were deleted, where guessing files the current key under an epoch that
+/// is already taken.
+///
+/// Measured against the pre-fix binary: with `.3.retired` present, `.1` and
+/// `.2` gone, and the directory unlistable, rotation **succeeded** (exit 0),
+/// moved the epoch-4 key into `audit-secret.1.retired`, and announced
+/// `New key ID: key-2` — an epoch `.3.retired` already covers. Neither warning
+/// it printed mentioned the key at all; both were about the record. Once the
+/// directory was readable again, entries signed by epoch 4 resolved to the
+/// wrong bytes and read as tampering, permanently (`ADR-0007`).
+///
+/// `0o300` alone does not reproduce that: on a store with `.1.retired` present
+/// the existing overwrite guard refuses first. **The gap is what makes the
+/// guess wrong**, which is why this fixture and V-A02's are both needed.
+#[cfg(unix)]
+#[test]
+fn audit_key_rotate_refuses_rather_than_guessing_past_a_gap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-gap-unlistable");
+    // Epoch 4 is current; epoch 3 is retired; epochs 1 and 2 were tidied away.
+    fs::write(secret_dir.join("audit-secret"), "4".repeat(64)).unwrap();
+    fs::write(secret_dir.join("audit-secret.3.retired"), "3".repeat(64)).unwrap();
+    for name in ["audit-secret", "audit-secret.3.retired"] {
+        fs::set_permissions(secret_dir.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+    let output = rotate_in(&home);
+    let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
+    assert_refused_as_unlistable(&output);
+    restored.unwrap();
+
+    // The pre-fix binary created `audit-secret.1.retired` here, holding epoch
+    // 4's bytes. `audit-secret.lock` is the one expected addition.
+    assert_eq!(
+        dir_entry_names(&secret_dir),
+        vec![
+            "audit-secret".to_string(),
+            "audit-secret.3.retired".to_string(),
+            "audit-secret.lock".to_string()
+        ],
+        "no key may be filed under a guessed epoch"
+    );
+    assert_eq!(
+        fs::read_to_string(secret_dir.join("audit-secret")).unwrap(),
+        "4".repeat(64),
+        "epoch 4 must still be the active key"
+    );
+    assert_eq!(
+        fs::read_to_string(secret_dir.join("audit-secret.3.retired")).unwrap(),
+        "3".repeat(64),
+        "the occupied slot must be untouched"
     );
 
-    // Without these two, a rotation that silently did nothing at all would
-    // satisfy every other assertion here: exit 0, a "not recorded" warning,
-    // and an empty log are exactly what a no-op produces. What this test
-    // claims is narrower and stronger — the rotation happened *and* went
-    // unrecorded.
+    // With the listing available, rotation picks the slot the store actually
+    // supports — `.4`, not the `.1` the blind scan reached for.
+    let retry = rotate_in(&home);
     assert!(
-        secret_dir.join("audit-secret.1.retired").exists(),
-        "the rotation must really have happened, not been skipped along with the record"
+        retry.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&retry.stderr)
     );
     assert!(
-        secret_dir.join("audit-secret").exists(),
-        "a fresh active key must exist after the rotation"
+        secret_dir.join("audit-secret.4.retired").exists(),
+        "epoch 4 belongs in slot 4"
     );
-
-    // Asserted on the path, not on `audit_entries`: that helper returns an
-    // empty vector for a log that is missing, unreadable, or not a file, so an
-    // empty result would also be produced by a log we simply failed to read.
-    // `!exists()` is the strictly stronger claim and entails the other.
     assert!(
-        !secret_dir.join("audit.jsonl").exists(),
-        "no log may be created at all while the secret cannot be resolved"
+        !secret_dir.join("audit-secret.1.retired").exists(),
+        "slot 1 belongs to epoch 1, which this store no longer has"
+    );
+    assert!(
+        String::from_utf8_lossy(&retry.stderr).contains("key-5"),
+        "and the new key is epoch 5, not the key-2 the guess produced: {}",
+        String::from_utf8_lossy(&retry.stderr)
     );
 
     let _ = fs::remove_dir_all(&home);
@@ -1337,11 +1813,17 @@ fn audit_key_rotate_warns_but_still_succeeds_when_the_record_cannot_be_written()
 
 /// #371 Phase 8 QA finding (V-007): `rotate_key`'s missing-secret path
 /// (`read_secret` fails before any `fs::rename`/`create_secret` mutation,
-/// so `SecretUnavailable` propagates with zero filesystem side effects) was
+/// so `SecretUnavailable` propagates with no key file touched) was
 /// previously verified only by code inspection, never through the compiled
 /// binary. HOME resolves successfully here (unlike the sibling
 /// HOME-unusable tests above) — the failure is specifically "no secret
 /// exists yet", not "path unresolvable".
+///
+/// Since #477 the directory scan runs *before* `read_secret`, so reaching this
+/// arm now also means the directory listed cleanly. The store is empty, which
+/// lists fine, so the fixture is unchanged — but the assertion below (nothing
+/// is left behind) is what keeps the scan from acquiring side effects of its
+/// own.
 #[test]
 fn audit_key_rotate_reports_missing_secret_without_partial_files() {
     let home = unique_dir("audit-rotate-nosecret-home");

@@ -142,13 +142,26 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 // an exoneration asserted from a field the attacker writes.
                 // Each arm below says only what the evidence supports.
                 match result.key_unavailable_kind.as_ref() {
+                    // "already cleared", not "make the directory readable":
+                    // `verify_chain` stops at the fatal keyring anomaly before
+                    // it reads any entry, so this arm is only ever reached once
+                    // the directory is listable again. The old wording sent the
+                    // operator to check a permission that was already correct.
+                    //
+                    // **Not covered by a test.** Reaching it needs an entry
+                    // appended while the epoch could not be resolved, and the
+                    // only writers that do that are the shim and hook paths —
+                    // no `tests/cli.rs` command appends one (measured: `config
+                    // disable` refuses a core rule, `override disable` writes
+                    // no audit entry). It belongs in `hook_integration.rs`.
                     Some(KeyUnavailableKind::NeverProtected) => {
                         eprintln!(
                             "  omamori wrote this entry itself, while the key directory could \
                              not be listed, so it carries no HMAC and never did. No key file \
                              is missing and restoring one will not help; the entry stays \
-                             unverifiable. Check the permissions on the directory holding \
-                             audit.jsonl so later entries are protected."
+                             unverifiable. The key directory is listable again — this run \
+                             just listed it — so the condition that produced this entry \
+                             has already cleared."
                         );
                     }
                     Some(KeyUnavailableKind::NotWriterEmitted) => {
@@ -252,7 +265,15 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
         // fail the whole chain over a permissions problem.
         Err(audit::AuditError::KeyringUnusable(reason)) => {
             eprintln!("omamori audit verify: cannot verify \u{2014} {reason}");
-            eprintln!("  Check the permissions on the directory holding audit-secret and re-run.");
+            // "listable", not "check the permissions": the cause is already in
+            // `{reason}` above, in one wording, from one constructor
+            // (`secret::unlistable`). #477 first tried sharing this sentence
+            // across the four sites instead, which put a cause in each of them
+            // and made three wrong — rotation also needs the directory
+            // *writable*, and the per-entry arm below is only reached once it
+            // is readable again. Name the property that failed; let the reason
+            // say why.
+            eprintln!("  To fix: make that directory listable again, then re-run.");
             Ok(2)
         }
         // No catch-all: `#[non_exhaustive]` constrains other crates, not this
@@ -430,15 +451,18 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
             };
 
             eprintln!("omamori: rotating audit HMAC key...");
-            // Not "the retired key backup": the lines printed on success go on
-            // to tell the operator that copies of this file are not backups,
-            // and calling the file itself a backup twelve lines earlier
-            // invites exactly the tidying-up they warn against.
-            eprintln!("  Old entries will still verify against the retired key file.");
 
             match audit::rotate_key(&path) {
                 Ok(result) => {
                     eprintln!("omamori: key rotation complete.");
+                    // Moved here from before the call (#477). Printed up front
+                    // it also greeted every refusal, where no retired key file
+                    // exists to verify anything against — and on the refusal
+                    // #477 adds, `audit verify` cannot verify at all. Not "the
+                    // retired key backup": the lines below tell the operator
+                    // that copies of this file are not backups, and calling it
+                    // one first invites the tidying-up they warn against.
+                    eprintln!("  Old entries will still verify against the retired key file.");
                     eprintln!("  New key ID: {}", result.new_key_id);
                     eprintln!("  Retired key: {}", result.retired_path.display());
                     // #457: this line used to print a path and nothing else,
@@ -475,6 +499,33 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
                 }
                 Err(audit::AuditError::SecretUnavailable) => {
                     eprintln!("omamori: no audit secret found — nothing to rotate");
+                    Ok(1)
+                }
+                // #477: its own arm, not the catch-all below. A refusal the
+                // operator cannot act on is barely better than the silent
+                // mislabelling it replaces, and `audit verify` established the
+                // shape — say what was observed, then what to do about it.
+                Err(audit::AuditError::KeyringUnusable(reason)) => {
+                    eprintln!("omamori: key rotation refused — {reason}");
+                    eprintln!(
+                        "  Rotating without a complete listing of the key directory would \
+                         retire the current key under the wrong epoch number, and entries \
+                         signed by it would later read as tampered."
+                    );
+                    // "No key file was renamed or created" rather than
+                    // "nothing was changed": `with_key_store_lock` may already
+                    // have created `audit-secret.lock`, which holds no key
+                    // material and is recreated on demand. The refusal test
+                    // allows exactly that one file, and this line is what the
+                    // operator reads instead of the test.
+                    // "listable **and writable**": rotation renames and
+                    // creates, so a directory made merely readable still fails
+                    // here — measured at mode 0500, where both the rename and
+                    // the create return EACCES.
+                    eprintln!(
+                        "  No key file was renamed or created. To fix: make that directory \
+                         listable and writable again, then re-run."
+                    );
                     Ok(1)
                 }
                 Err(e) => {
@@ -552,11 +603,12 @@ fn build_key_rotation_event(retired_key_id: &str, new_key_id: &str) -> audit::Au
 /// the only signal a rotation used to leave: before #457 rotating broke the
 /// chain, and that breakage was how a rotation became visible at all.
 ///
-/// Two states end in a warning instead of an entry — auditing being off, and
-/// the secret being unresolvable — and both say "not recorded" so the operator
-/// is never left to infer it from silence. `SECURITY.md`'s "Key rotation
-/// events" carries the reasoning for the second one, which is where an
-/// operator would look for it.
+/// Two states end in a warning instead of an entry, and both say "not
+/// recorded" so the operator is never left to infer it from silence: auditing
+/// being off, and — since #477 made rotation refuse an unlistable directory
+/// upstream — a key store that degraded *during* the rotation. `SECURITY.md`'s
+/// "Key rotation events" carries the reasoning for the second one, which is
+/// where an operator would look for it.
 fn append_key_rotation_event(
     audit_config: &audit::AuditConfig,
     retired_key_id: &str,
@@ -570,11 +622,19 @@ fn append_key_rotation_event(
         return;
     };
     if !logger.secret_available() {
-        // Says only that the entry could not be signed, not why. There are two
-        // causes — an unlistable key directory, and a readable one whose
-        // secret could not be loaded — and only the first leaves the epoch
-        // unknown. `load_signing_key` has already printed the specific
-        // condition; naming a cause here would be guessing at which one.
+        // A backstop against a **race**, not a policy. #477 made rotation
+        // refuse upstream when the directory cannot be listed, so what is left
+        // here is the key store degrading between `rotate_key` returning and
+        // this logger being built (the secret deleted, chmod'd, replaced with
+        // a symlink; the directory made unlistable). Kept rather than deleted
+        // because the asymmetry of the outcomes has not changed — a lost
+        // record is recoverable, and an entry stamped with an id no keyring
+        // can hold pins the store at cannot-verify permanently (`ADR-0007`).
+        //
+        // Says only that the entry could not be signed, not why: two causes
+        // remain reachable and only one leaves the epoch unknown.
+        // `load_signing_key` has already printed the specific condition;
+        // naming a cause here would be guessing at which one.
         eprintln!(
             "omamori warning: this key rotation was not recorded in the audit log — the \
              entry could not be signed, and an unsigned one cannot be repaired later \
@@ -642,6 +702,12 @@ fn run_audit_hash_cwd(args: &[OsString]) -> Result<i32, AppError> {
             Ok(0)
         }
         None => {
+            // #484: `None` carries one bit and three causes reach it, so this
+            // line is wrong for one of them — an unlistable key directory,
+            // where both the path and the secret are fine. The true cause is
+            // printed above it by the keyring's anomaly report (#477), which
+            // is why this was left rather than fixed here: correcting it means
+            // widening a `pub use`d signature.
             eprintln!(
                 "omamori audit hash-cwd: no audit path or HMAC secret available — nothing to hash against"
             );

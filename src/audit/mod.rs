@@ -4464,7 +4464,10 @@ mod tests {
         assert_eq!(
             key.secret(),
             Some(&TEST_SECRET),
-            "the key still resolves; the lock is an optimisation, not a gate"
+            "the key still resolves: an unavailable lock degrades to unlocked here \
+             rather than blocking. Not because the exclusivity is optional — #477 \
+             warns when rotation loses it — but because a caller that can hold this \
+             lock forever must not be able to stall key resolution"
         );
 
         drop(holder);
@@ -4627,6 +4630,128 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #477 (V-A16): a listing that stops partway is not a shorter listing —
+    /// it is no listing at all.
+    ///
+    /// *Why* a partial listing is worse than a short one — what `std` does with
+    /// a per-entry `Err`, and the 300-file measurement behind it — is on
+    /// `fold_key_dir_entries`, next to the code it justifies. What this test
+    /// adds is that it drives that seam directly rather than the filesystem: no
+    /// condition producing a per-entry `Err` (removable volume, network
+    /// filesystem, failing disk) can be provisioned by this suite, so without
+    /// the seam the branch would ship untested.
+    #[test]
+    fn a_listing_that_stops_partway_is_unlistable_not_short() {
+        use std::ffi::OsString;
+
+        let dir = std::path::Path::new("/tmp/477-fold");
+        let names =
+            |v: Vec<std::io::Result<OsString>>| secret::fold_key_dir_entries(dir, v.into_iter());
+
+        // Control: the same names, all `Ok`, list normally.
+        let complete = names(vec![
+            Ok(OsString::from("audit-secret.1.retired")),
+            Ok(OsString::from("audit-secret.9.retired")),
+        ]);
+        let secret::KeyDirScan::Listed(retired) = &complete else {
+            panic!("a complete listing must list")
+        };
+        assert_eq!(
+            secret::max_retired_index(retired),
+            9,
+            "a complete listing must report the highest epoch present"
+        );
+
+        // The same listing truncated before `.9` by an error. Pre-#477 this
+        // reported 1, and rotation would have filed the current key into slot
+        // 2 — while `.9.retired` sat unread on disk.
+        let truncated = names(vec![
+            Ok(OsString::from("audit-secret.1.retired")),
+            Err(std::io::Error::from_raw_os_error(22)),
+            Ok(OsString::from("audit-secret.9.retired")),
+        ]);
+        // Destructured rather than compared against a "no index" value: the
+        // claim is that this is not a listing, and an assertion phrased as
+        // `max_index() == None` would also pass for a listing that merely has
+        // no retired keys in it.
+        let secret::KeyDirScan::Unlistable(reason) = &truncated else {
+            panic!("an interrupted listing must not be usable as a listing")
+        };
+        assert!(
+            reason.contains("stopped after 1 entries"),
+            "the reason must state where the listing stopped, not guess at why: {reason}"
+        );
+
+        // Failing on the first item is the same answer, not a special case:
+        // "no entries were read" must still be unlistable rather than an empty
+        // `Listed`, which is what a fresh install legitimately produces.
+        let immediate = names(vec![Err(std::io::Error::from_raw_os_error(22))]);
+        let secret::KeyDirScan::Unlistable(reason) = &immediate else {
+            panic!("an error on the first entry is no listing either")
+        };
+        assert!(
+            reason.contains("stopped after 0 entries"),
+            "and it must not be confused with the empty directory a fresh install has"
+        );
+        // The errno is reported, never interpreted: the reachable macOS case is
+        // EINVAL, not the EIO this was first predicted to be, and the two
+        // platforms take different `ReadDir::next` bodies.
+        assert!(
+            !reason.contains("permission") && !reason.contains("Permission"),
+            "the reason must not name a cause it did not observe: {reason}"
+        );
+    }
+
+    /// #477 (V-A17): an unlistable directory yields an **empty** keyring, not a
+    /// partial one.
+    ///
+    /// `verify` never observes this — `fatal_anomaly` stops it first — so
+    /// `hash_cwd_candidates` is the only surface where the difference shows.
+    /// Registering the active key here would mean naming it, and the only
+    /// number available to name it with is the one the failed scan could not
+    /// produce. An investigator would get candidates under a guessed epoch
+    /// label, which is the forensic form of the mislabelling #457 closed for
+    /// the writer.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_key_directory_registers_no_keys_at_all() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("477-empty-ring");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&secret_path, &TEST_SECRET);
+        write_key_file(&dir.join("audit-secret.1.retired"), &[0x11u8; 32]);
+
+        // Readable: both keys load, as a control for the assertion below.
+        let ring = secret::load_keyring(&secret_path);
+        assert!(!ring.is_empty(), "precondition: the ring loads normally");
+        assert!(
+            ring.fatal_anomaly().is_none(),
+            "precondition: nothing is wrong yet"
+        );
+
+        // `0o300`, not the `0o100` the older unlistable fixtures in this module
+        // use: write permission keeps `audit-secret.lock` creatable, so the
+        // listing is the only thing that fails. At `0o100` the lock also fails
+        // and there would be two conditions to tell apart.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let ring = secret::load_keyring(&secret_path);
+        let restored = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+
+        assert!(
+            ring.is_empty(),
+            "an unlistable directory must not yield keys under a guessed epoch"
+        );
+        assert!(
+            ring.fatal_anomaly().is_some(),
+            "and it must still say why the ring is empty — an empty ring with no \
+             anomaly is indistinguishable from a store with no keys"
+        );
+        restored.unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #457 P4-b (V-016). A gap in the retired indices must not hide the keys
     /// beyond it. The old loop probed 1, 2, 3, … and stopped at the first
     /// miss, so a missing `.2` made `.3` unreachable — permanently
@@ -4672,10 +4797,15 @@ mod tests {
     /// on disk to explain why.
     ///
     /// Index-based numbering picks `.4` — above the highest present, so by
-    /// construction free. The explicit refusal added to `rotate_key` is a
-    /// backstop for the case this arithmetic cannot cover: if the directory
-    /// scan itself fails (unreadable directory), the highest index reads as 0
-    /// and the next slot would be `.1`, which may well exist.
+    /// construction free. The explicit `AlreadyExists` refusal in `rotate_key`
+    /// remains as a backstop for a slot that becomes occupied between the scan
+    /// and the rename.
+    ///
+    /// It used to be described as covering the failed-scan case as well, on the
+    /// reasoning that a failed scan reads the highest index as 0 and reaches for
+    /// `.1`. It never did: on a store missing its low epochs, `.1` is *free*, so
+    /// the check passes and the guess lands. #477 closes that upstream instead —
+    /// an unlistable directory is refused before any slot is chosen.
     #[test]
     fn rotation_after_a_gap_does_not_destroy_the_occupied_slot() {
         let dir = test_dir("457-gap-rotation");
