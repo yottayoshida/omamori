@@ -346,8 +346,8 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
                 // which `verify`'s own `NeverProtected` arm then denies.
                 "omamori warning: {reason} — cannot determine which key epoch is active, so no \
                  entry written from here on can be HMAC-protected or labelled with a key epoch. \
-                 Entries written while this lasts carry no HMAC and stay unverifiable; clearing \
-                 the condition protects later ones, not those."
+                 {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the condition protects \
+                 later ones, not those."
             );
             return SigningKey {
                 id: UNRESOLVED_KEY_ID.to_string(),
@@ -360,11 +360,16 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     let max_retired = max_retired_index(&retired);
 
     // #457 P4-e: a rotation that crashed between `rename` and `create_secret`
-    // leaves retired keys with no active key. `load_or_create_secret` below
-    // will mint a fresh one — under the *same* `key-{N+1}` label the crashed
-    // rotation was heading for. Two different secrets then share one id, and
-    // no verifier-side repair can untangle that: the id resolves, the bytes
+    // leaves retired keys with nothing at the active path. `load_or_create_secret`
+    // below tries to mint one — under the *same* `key-{N+1}` label the crashed
+    // rotation was heading for. If it succeeds and that rotation had already
+    // handed out a key under that label, two different secrets share one id,
+    // and no verifier-side repair can untangle that: the id resolves, the bytes
     // just do not match, so the entries read as tampered forever.
+    //
+    // #478: "tries to". A directory that can be read and searched but not
+    // written denies the mint, and the branch below reports that case
+    // separately rather than describing a key that was never created.
     //
     // Detecting it here does not fix it (the complete fix needs the key file
     // itself to record its epoch — deferred, see ADR-0008), but a warning at
@@ -374,31 +379,88 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // Read once and reuse. The warning check and `load_or_create_secret` both
     // needed the active key, so the pre-`/simplify` form read the same file
     // twice on every command in a rotated store (measured: +9.4 µs).
-    let active = read_secret(secret_path).ok();
-    if max_retired > 0 && active.is_none() {
-        eprintln!(
-            "omamori warning: retired audit keys exist but the active key is missing \
-             or unreadable — a key rotation may have been interrupted. A new key will \
-             be created under id key-{next}, which entries from the interrupted \
-             rotation may also claim. To recover, copy audit-secret.{max_retired}.retired \
-             back to audit-secret before anything appends — the rotation never got as \
-             far as creating a new key, so the retired copy is the one those entries \
-             were signed with.",
-            next = max_retired + 1,
-            max_retired = max_retired
-        );
-    }
+    let active = read_secret(secret_path);
+
+    // #478: the condition is the error *kind*, not "produced no value".
+    // `read_secret` rejects thirteen different ways — permission, symlink,
+    // FIFO, directory, oversize, bad hex — and `.ok()` filed every one of them
+    // as "the active key is missing". Only `NotFound` means that, and it is
+    // only reachable with the directory searchable, which also makes it the
+    // only one that says anything about a rotation. Measured: a data directory
+    // at mode 0400 lists completely and denies every open inside it, so the old
+    // condition announced an interrupted rotation on a store whose active key
+    // was present, valid and untouched.
+    let interrupted =
+        max_retired > 0 && matches!(&active, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
 
     // `load_or_create_secret` is only reached when the active key could not be
     // read — normally because this is a fresh install and it has to be created.
     let secret = match active {
-        Some(secret) => Some(secret),
-        None => load_or_create_secret(secret_path),
+        Ok(secret) => Some(secret),
+        Err(_) => load_or_create_secret(secret_path),
     };
-    SigningKey {
-        id: key_id_for_index(max_retired),
-        secret,
+    let id = key_id_for_index(max_retired);
+
+    // #478: printed *after* the mint, and about the store as it stands now.
+    // The previous version ran before it and described what was about to
+    // happen: it promised a new key the mint does not always manage, gave the
+    // operator a window that this same call closes a few lines further down,
+    // and offered as its reason a fact the mint falsified before anyone could
+    // read it. The three withdrawn clauses are quoted verbatim in
+    // `RETRACTED_CLAUSES` (`tests/hook_integration.rs`), which is also what
+    // `check-invariants.sh` reads to keep them out of this file — quoting them
+    // here would put the strings back into the code they were removed from.
+    //
+    // Following the old instruction was worse than ignoring it: copying a
+    // retired key over `audit-secret` destroys the replacement's bytes while
+    // `max_retired` stays put, so `{id}` resolves to the older key and `verify`
+    // reports the product's strongest accusation — permanently, since ADR-0007
+    // forbids rewriting the entries. Under the same-user threat model that
+    // makes the instruction itself the payload.
+    //
+    // The first branch reports that an active key is present, not that a new
+    // one was created: `Some` here can also be a concurrent writer's mint that
+    // this call went on to read. The distinction does not change what the
+    // operator must not do, and only the weaker claim is something this code
+    // observed. Described rather than quoted — a paraphrase in quotation marks
+    // is what a literal `grep` for the printed string will miss, and this repo
+    // pins operator text with exactly that grep.
+    //
+    // "may carry" is the S1/S2 ambiguity, not hedging. A rotation that stopped
+    // before minting wrote no entry under `{id}`; a store whose distributed key
+    // was lost afterwards wrote several. The key store holds nothing that tells
+    // the two apart — the difference is only in `audit.jsonl` — so the sentence
+    // covers both. PR-C1's epoch record is what will separate them.
+    if interrupted {
+        if secret.is_some() {
+            eprintln!(
+                "omamori warning: retired audit keys are present and audit-secret was not \
+                 — a key rotation may have been interrupted. audit-secret now holds an \
+                 active key; entries from here on are signed with it and labelled {id}, \
+                 and entries written before this may carry {id} too, signed with \
+                 different bytes. Do not copy a .retired file over audit-secret: that \
+                 destroys the key the newer entries were signed with. See the audit \
+                 chapter of omamori's FAQ."
+            );
+        } else {
+            eprintln!(
+                // "while this lasts", not "from here on" — the same bound the
+                // unlistable-directory warning above uses, and for the same
+                // reason. The condition is a permissions or storage fault the
+                // operator can clear, after which later entries are protected
+                // again; the unbounded phrasing described a store that never
+                // recovers (Codex Round 1).
+                "omamori warning: retired audit keys are present, audit-secret was not, \
+                 and a replacement could not be created — a key rotation may have been \
+                 interrupted. {ENTRIES_CARRY_NO_HMAC} They are still labelled {id}, so once a \
+                 key exists under that label they will be checked against it, fail, and be \
+                 reported as tampering — clearing the condition does not make them verifiable. \
+                 See the audit chapter of omamori's FAQ."
+            );
+        }
     }
+
+    SigningKey { id, secret }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +484,80 @@ pub(super) const MAX_KEYRING_KEYS: usize = 256;
 /// before the length check could reject it.
 const MAX_SECRET_FILE_BYTES: u64 = 1024;
 
+/// The opening words of the symlink rejection, shared by the one place that
+/// builds it and the one place that classifies on it.
+///
+/// #478: `verify_chain` matched `"symlink"` *anywhere* in the message, and
+/// every `read_secret` rejection ends with the path — so a store under
+/// `~/symlink-tests/` made a FIFO at the secret path read as an attack.
+/// `ErrorKind` cannot separate the two, because `symlink_attack_error` and the
+/// "not a regular file" rejection are both `InvalidInput`; a prefix can,
+/// because the path is always last. `read_secret`'s pre-check comment already
+/// recorded this hazard — about a *test* that matched the same way — and the
+/// production classifier had the same bug the whole time.
+/// The one observation both no-HMAC warnings share.
+///
+/// **Only the observation.** An earlier version of this constant carried the
+/// consequence too — "…and stay unverifiable; clearing the condition protects
+/// later ones, not those" — and that half is a prognosis about a later `verify`
+/// run, which the two sites do not share.
+///
+/// The unlistable-directory site returns [`UNRESOLVED_KEY_ID`], an id no
+/// keyring can hold, so its entries do stay unverifiable. The failed-mint site
+/// returns `key_id_for_index(max_retired)` — a resolvable `key-{N+1}` — with no
+/// secret, so once the operator clears the fault and a key is minted under that
+/// same label, those entries resolve, their `NO_HMAC_SECRET` hash fails to
+/// match, and `verify` reports **tampering**, permanently (`ADR-0007`). The
+/// shared sentence told that operator the opposite of what happens.
+///
+/// This is the mistake #477's Phase 8 recorded and named: what two sites may
+/// share is the *observation*, never the *remedy or the prognosis*. It came
+/// back here through a Codex Round 1 fix that aligned the second site's wording
+/// with the first's, and a `/simplify` pass that then froze the alignment into
+/// a constant. Each site now states its own consequence from its own facts.
+const ENTRIES_CARRY_NO_HMAC: &str = "Entries written while this lasts carry no HMAC.";
+
+/// The opening words of the symlink rejection, shared by the one place that
+/// builds it and the one place that classifies on it.
+///
+/// #478: `verify_chain` matched `"symlink"` *anywhere* in the message, and
+/// every `read_secret` rejection ends with the path — so a store under
+/// `~/symlink-tests/` made a FIFO at the secret path read as an attack.
+/// `ErrorKind` cannot separate the two, because `symlink_attack_error` and the
+/// "not a regular file" rejection are both `InvalidInput`; a prefix can,
+/// because the path is always last. `read_secret`'s pre-check comment already
+/// recorded this hazard — about a *test* that matched the same way — and the
+/// production classifier had the same bug the whole time.
+const SYMLINK_ATTACK_PREFIX: &str = "audit path is a symlink";
+
+/// Whether a [`read_secret`] failure is the symlink rejection.
+///
+/// Next to the constructor rather than at the call site. `symlink_attack_error`
+/// below is documented as the one place that rejection is *built*; until #478
+/// the one place it was *recognised* sat in another module with the wording
+/// copied across the boundary, which is the arrangement that comment exists to
+/// prevent. Both halves now move together, and a later switch to a typed
+/// payload is a change to this function rather than to its callers.
+pub(super) fn is_symlink_attack(e: &std::io::Error) -> bool {
+    e.to_string().starts_with(SYMLINK_ATTACK_PREFIX)
+}
+
+/// How a failed [`read_secret`] is reported once the key directory itself has
+/// been listed successfully.
+///
+/// Shared by rotation and verification on purpose. #478 exists because the two
+/// gave contradictory accounts of one store, and letting each classify the same
+/// error independently is how that comes back: a future arm — a distinct
+/// verdict for `PermissionDenied`, say — then lands in one and not the other.
+/// `NotFound` is the only failure meaning the key is absent rather than
+/// unreachable, so it is the only one that keeps its own name.
+pub(super) fn classify_secret_failure(e: std::io::Error) -> AuditError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => AuditError::SecretUnavailable,
+        _ => AuditError::Io(e),
+    }
+}
+
 /// The one place the symlink rejection is constructed.
 ///
 /// #457 (`/simplify`): `verify_chain` classifies a symlinked secret path by
@@ -432,7 +568,7 @@ fn symlink_attack_error(path: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
-            "audit path is a symlink (possible attack): {}",
+            "{SYMLINK_ATTACK_PREFIX} (possible attack): {}",
             path.display()
         ),
     )
@@ -650,9 +786,39 @@ pub(super) fn expected_key_file(id: &str) -> Option<String> {
         );
     }
     let n: u32 = id.strip_prefix("key-")?.parse().ok()?;
-    let prev = n.checked_sub(1)?;
+    // #478: this branch said `.{n-1}.retired`. Epoch N retires into slot N —
+    // `rotate_key_locked` renames the key it is displacing into
+    // `audit-secret.{max_retired + 1}.retired` and labels it
+    // `key_id_for_index(max_retired)`, i.e. `key-{max_retired + 1}`, so the
+    // number in the id and the number in the filename are the same one. The
+    // paragraph above this function said so, and the `"default"` branch (epoch
+    // 1 → `.1.retired`) was already right; one line of code disagreed with all
+    // of them.
+    //
+    // Not a harmless off-by-one. This string is only printed when the named
+    // epoch is *below* the store's ceiling — the operator-tidying case — so on
+    // a store holding `.1` and `.3`, an entry naming `key-2` sent the operator
+    // to `audit-secret.1.retired`, a file that exists and holds a different
+    // epoch's key. Restoring it is a worse outcome than finding nothing.
+    //
+    // `key-0` and `key-1` return `None`, for the reason
+    // `is_writer_emitted_key_id` also rejects them: epoch 1 is `"default"`, and
+    // `.0.retired` is a slot the directory scan refuses as one no writer can
+    // produce. The old `checked_sub(1)` rejected only `key-0`, and by
+    // arithmetic accident rather than by agreeing with anything.
+    //
+    // Agreeing *for the same reason* is not the same as agreeing everywhere,
+    // and the two still part company on `key-02`: `is_writer_emitted_key_id`
+    // requires canonical decimal and rejects it, `parse` here accepts it. The
+    // one production caller (`classify_unavailable_key`) gates on the stricter
+    // of the two first, so the difference is unreachable — but it is latent,
+    // not absent, and a claim that they match would be the kind this change
+    // exists to remove.
+    if n < 2 {
+        return None;
+    }
     Some(format!(
-        "audit-secret.{prev}.retired, or audit-secret if epoch {n} is still the current key"
+        "audit-secret.{n}.retired, or audit-secret if epoch {n} is still the current key"
     ))
 }
 
@@ -881,7 +1047,21 @@ pub(super) fn load_or_create_secret(path: &Path) -> Option<[u8; 32]> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match read_secret(path) {
             Ok(secret) => Some(secret),
             Err(e) => {
-                eprintln!("omamori warning: audit secret race: {e}");
+                // #478: not "race". `O_CREAT|O_EXCL` returning `AlreadyExists`
+                // is a sound observation that something occupies the path —
+                // measured: a dangling symlink, a live symlink, a FIFO, a
+                // directory, a mode-000 file and a too-short key file all
+                // produce it — and this second read is what says why it is not
+                // usable. A concurrent writer is one way to arrive here and the
+                // least likely one; the ordinary cause is a file that has been
+                // there all along. Calling it a race filed a standing
+                // permissions fault as transient contention, which is the
+                // difference between an operator who runs `ls -l` and one who
+                // retries.
+                eprintln!(
+                    "omamori warning: something already occupies the audit secret path \
+                     and cannot be read as a key: {e}"
+                );
                 None
             }
         },
@@ -1142,10 +1322,7 @@ fn rotate_key_locked(
     // symlinked one ("possible attack") and from a non-regular file, and
     // `verify` classifies on that text. Rotation was erasing the distinction
     // and reporting all of them as "nothing to rotate".
-    read_secret(&secret_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => AuditError::SecretUnavailable,
-        _ => AuditError::Io(e),
-    })?;
+    read_secret(&secret_path).map_err(classify_secret_failure)?;
 
     // Determine retired key number from the highest index present, not from a
     // count of matching names (#457 P4-a): with a gap (`.1`, `.3`) the count
@@ -1225,8 +1402,21 @@ fn rotate_key_locked(
         let _ = fs::set_permissions(&retired_path, fs::Permissions::from_mode(0o600));
     }
 
-    // Generate new secret
-    create_secret(&secret_path).map_err(AuditError::Io)?;
+    // Generate new secret.
+    //
+    // #478: its own error, not the `Io` catch-all. Everything above this line
+    // refuses without touching the key directory; the `rename` on the line
+    // above did touch it, so a failure here is the one rotation outcome that
+    // leaves the store changed — and changed into exactly the interrupted state
+    // `load_signing_key` warns about, where the next append mints a second key
+    // under the id this rotation was heading for. The operator needs to know
+    // which file moved, and `key rotation failed: {e}` said neither.
+    if let Err(source) = create_secret(&secret_path) {
+        return Err(AuditError::RotationInterrupted {
+            retired_path,
+            source,
+        });
+    }
 
     // The pre-rotation max index names the epoch this rotation just ended.
     // `key_id_for_index` owns the `"default"`-vs-`key-N` rule; restating it

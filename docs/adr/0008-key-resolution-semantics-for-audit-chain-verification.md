@@ -194,7 +194,14 @@ tracked separately, out of scope here.
   before any key file is renamed or created when the key directory cannot be listed — so the scan-failure
   case never reaches the slot check at all.
 - An interrupted rotation (retired keys present, no active key) is reported when detected, and the
-  residual is pinned by a test rather than left to be rediscovered. Two ways to close it properly
+  residual is pinned by a test rather than left to be rediscovered. **#478 amends what "detected"
+  means here.** The report is now made after the *attempt* to mint a replacement rather than
+  before, and states which of the two outcomes it then observed; the earlier version predicted a
+  mint that does not always succeed and offered a recovery step that, once one has, destroys the
+  key the newest entries were signed with. The detection condition also narrowed from "the active
+  key could not be read" to "there is no `audit-secret`": the wider form fired on stores whose key
+  was present and intact behind a directory that merely denied `open`, and the recovery it printed
+  would have overwritten that live key. Two ways to close the window properly
   are recorded in Alternatives: reordering rotation so the window does not exist (cheaper, no
   format change), and having each key file record its own epoch (more general, adds an on-disk
   element 1.0 would freeze). Note the asymmetry in that second one: **if 1.0 freezes on-disk

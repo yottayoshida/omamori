@@ -8,6 +8,54 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **The recovery instruction printed for an interrupted key rotation no longer destroys the key it is meant to protect.** ([#478](https://github.com/yottayoshida/omamori/issues/478), [#472](https://github.com/yottayoshida/omamori/issues/472))
+
+  The warning said a new key "will be created", told the operator to act "before anything appends", and gave as its reason that the rotation "never got as far as creating a new key". All three described the future: the same call mints the replacement a few lines further down, which closes the window the second clause names and falsifies the third. Copying the retired key over `audit-secret` after that point overwrites the replacement's bytes while the retired count stays put, so the entries written in between resolve to the wrong key and `audit verify` reports the strongest thing it can say — permanently, since `ADR-0007` forbids rewriting them. Following the instruction was worse than ignoring it.
+
+  The warning is now printed after the attempt to mint, and reports which of two things it then observed. If an active key is present, it says so, names the label entries from that point will carry, and says that copying a `.retired` file over it destroys them. If no key could be created — a directory that can be read and searched but not written denies it — it says that instead, and states what that costs: entries written in that window carry no HMAC while still being labelled with the next epoch, so once the fault is cleared and a key is minted under that label, they are checked against it, fail, and are reported as tampering. That outcome is not new and this release does not fix it; what changed is that omamori no longer tells the operator the opposite.
+
+  **The condition also narrowed, which removes a false alarm on healthy stores.** It was "the active key could not be read", and `read_secret` fails thirteen ways — permission, symlink, non-regular file, oversize, bad hex. Only one of them, `NotFound`, means no key file is there. Measured on a store whose key was present, valid and untouched, with the data directory at mode `0400` (it lists completely and denies every `open` inside it): the previous release announced an interrupted rotation and named `audit-secret.1.retired` as the file to restore over the live key. A `chmod` that changed nothing about the keys produced an instruction that would have destroyed one.
+
+  A second false statement went with it. `O_CREAT|O_EXCL` reporting `AlreadyExists` was being announced as an `audit secret race`; measured, it is produced by a dangling symlink, a live symlink, a FIFO, a directory, a mode-`000` file and a too-short key file, none of which involve a concurrent writer. It now says what was observed — something occupies the path and cannot be read as a key — which points at `ls -l` rather than at retrying.
+
+  None of these strings was pinned by a test: each had exactly one occurrence in the repository, the line that printed it, so removing any of them left the suite green. They are pinned now, and `check-invariants.sh` reads the withdrawn wordings out of that test so they cannot return to `src/` unnoticed.
+
+- **The key file named in an exit-2 recovery message was off by one.** ([#478](https://github.com/yottayoshida/omamori/issues/478))
+
+  An entry naming `key-N` was reported as belonging to `audit-secret.{N-1}.retired`. Rotation renames the key it displaces into `audit-secret.{N}.retired` and reports it as `key-N`, so the two numbers are the same one; the function's own documentation said so, and its `"default"` branch (epoch 1 → `.1.retired`) was already right. One line disagreed with all of them, and a test pinned the disagreement.
+
+  This message is only printed when the named epoch is *below* the store's ceiling — the case where an operator has been tidying the directory — so the file it named usually exists and holds a different epoch's key. Restoring it is a worse outcome than finding nothing. `key-0` and `key-1` now return no filename at all, matching what `is_writer_emitted_key_id` already says about them: epoch 1 is `"default"`, and `.0.retired` is a slot the directory scan refuses to read.
+
+- **`audit verify` no longer decides "symlink attack" from the text of the path.** ([#478](https://github.com/yottayoshida/omamori/issues/478))
+
+  The classification looked for `symlink` anywhere in the error, and every rejection `read_secret` builds ends with the path — so a store under a directory whose name contains that word took the attack branch, which returns before the key directory is examined at all. Measured on one store with the data directory unlistable and a non-regular file at the secret path: under a name containing `symlink` the answer was `audit secret path is not a regular file`, under any other name it was `HMAC secret unavailable`, and neither mentioned the unlistable directory that was actually blocking verification. `ErrorKind` cannot separate the two cases (both are `InvalidInput`); the prefix can, because the path is always last.
+
+### Changed
+
+- **`audit verify` reports an unlistable key directory as the reason it cannot verify, rather than reporting the secret.** ([#478](https://github.com/yottayoshida/omamori/issues/478))
+
+  When the data directory can be neither listed nor searched, the active secret cannot be read either — and the previous release named the secret, which is the symptom. `audit key rotate` has named the directory since [#477](https://github.com/yottayoshida/omamori/issues/477), so the two commands gave contradictory accounts of one store. The read keeps its position rather than moving behind the scan: at mode `0300` the directory is searchable but not listable, so a symlink planted at the secret path is still observable there, and a scan-first order would answer "cannot list" and never mention the attack. Only the generic verdict waits for the listing.
+
+  Where the directory *is* listable, the secret's own failure is now reported with the reason `read_secret` produced instead of being flattened into "HMAC secret unavailable" — the same treatment `audit key rotate` has given it since #477.
+
+  `audit verify` exits 2 on every one of these paths, before and after. **What does move is `report --json`:** for an unlistable key directory, `chain_status` changes from `{"status":"unavailable"}` to `{"status":"keyring_unusable","kind":"directory_unreadable"}`, and `omamori doctor` gains a risk-signal line for the same store. No field is added or removed and no exit code changes. This is a store that was previously reported as healthy on both surfaces.
+
+  This does not let `verify` see an interrupted rotation — retired keys with no active key still verify as intact from the verifier's point of view. [#487](https://github.com/yottayoshida/omamori/issues/487) stays open.
+
+- **A rotation that fails after retiring the old key says so, instead of reporting a generic failure.** ([#478](https://github.com/yottayoshida/omamori/issues/478))
+
+  `key rotation failed: {e}` covered five situations. Four of them refuse before the key directory is touched; the fifth — the replacement key could not be created, after the rename — is the one that leaves the store changed, and changed into exactly the interrupted state described above. It now names the file the previous key was moved to and says that this rotation did not create its replacement. It stops there rather than describing the store: the failure can be `AlreadyExists`, which means some other writer has put a file at that path, and predicting what the next command will manage is the shape this release is removing everywhere else.
+
+  This is the one path in the change with no end-to-end test. `rename` and `create_secret` need the same directory permissions, so every state that stops the second stops the first; what remains — a concurrent writer taking the name, `/dev/urandom` failing, `ENOSPC`, `EMFILE` — cannot be scheduled from a test. The wording is pinned by a unit test against the rendering function instead, and the reason is recorded next to it.
+
+### Added
+
+- **`docs/FAQ.md` has an entry for a broken audit chain.** ([#472](https://github.com/yottayoshida/omamori/issues/472))
+
+  Its first instruction is not to delete `audit.jsonl`. It then separates the three messages that lead there, gives the diagnostic order — which entry, which `key_id`, which key files exist — and maps epoch numbers to filenames, which until now lived only in `ADR-0008`. `SECURITY.md` documents that deleting the only retired key file produces exit 1 and "may have been tampered with"; a recoverable mistake reached the product's strongest accusation with no written way back.
+
+### Fixed
+
 - **`omamori audit key rotate` no longer files the current key under a guessed epoch when it cannot read the key directory.** It refuses instead — before any key file is renamed or created — and exits 1 with the directory named and every key left where it was. (The best-effort `audit-secret.lock` may be created first; it holds no key material and is never read as a retired key.) ([#477](https://github.com/yottayoshida/omamori/issues/477), [#482](https://github.com/yottayoshida/omamori/issues/482))
 
   Measured before the fix, on a store at epoch 4 whose `.1`/`.2` retired keys had been tidied away and whose data directory was execute-but-not-read: rotation **succeeded**, moved the epoch-4 key into `audit-secret.1.retired`, and announced `New key ID: key-2` — an epoch `.3.retired` already covers. Neither warning it printed mentioned the key; both were about the record. Once the directory was readable again, entries signed by epoch 4 resolved to the wrong bytes and `verify` reported tampering — permanently, since `ADR-0007` forbids rewriting them, and with no attacker involved.

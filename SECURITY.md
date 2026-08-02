@@ -848,13 +848,28 @@ remove it, exactly as they can any other.
   the highest epochs sort — would otherwise be silently absent from a result that looks complete
 - The keyring loads at most 256 keys, keeping the highest indices. If more exist, `verify` reports
   the truncation rather than silently verifying against a partial set
-- A rotation interrupted between the rename and the new key's creation leaves retired keys with no
-  active key. omamori warns when it sees this: the next append would otherwise mint a second,
-  different secret under the same `key_id` the interrupted rotation was heading for. **The warning
-  is all that happens** — those entries do become permanently unverifiable, and the verifier
-  reports them as tampering rather than as cannot-verify, because the id resolves and only the
-  bytes differ. Distinguishing the two would require each key file to record its own epoch; see
-  ADR-0008
+- A rotation interrupted between the rename and the new key's creation leaves the retired key in
+  place and the replacement uncreated. `audit key rotate` says so when the failure happens under
+  it, naming the file the previous key was moved to, and stops there — it does not describe the
+  store afterwards, because the failure can be `AlreadyExists`, which means some other writer has
+  put a file at that path. Otherwise omamori reports the state the next time any command resolves a
+  key, **after** attempting a replacement, and reports which of two things it then observed:
+  - **An active key is present.** Entries from that point carry its label — the same label the
+    interrupted rotation was heading for. If the interrupted rotation had already handed out a key
+    under that label, two different secrets now share one `key_id`, those entries are permanently
+    unverifiable, and the verifier reports them as tampering rather than as cannot-verify, because
+    the id resolves and only the bytes differ. Whether that happened is not visible from the key
+    store; distinguishing it would require each key file to record its own epoch (see ADR-0008).
+    Copying a retired file over the active key at this point destroys it.
+  - **No active key could be created** — a directory that can be read and searched but not written
+    denies it. Entries written while that lasts carry no HMAC at all and stay unverifiable;
+    clearing the condition protects later ones, not those.
+
+  **The warning is all that happens** in either case: omamori records nothing durable about the
+  interruption and takes no repair action. The detection condition is "there is no `audit-secret`",
+  not "the active key could not be read" — a directory that denies `open` while holding an intact
+  key is a permissions fault, and treating it as an interrupted rotation used to print a recovery
+  step that would have overwritten that key
 - The data directory contains an `audit-secret.lock` file. It holds no data and is used only as an
   `flock` target, so that resolving the active key and rotating it cannot interleave. It is not a
   key and is never treated as one. It is recreated on demand, so losing it costs nothing beyond

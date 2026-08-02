@@ -10,6 +10,7 @@ Practical answers for the situations omamori users hit most often. Start here wh
 | "I need to get past a block right now" | [I need to bypass temporarily](#i-need-to-bypass-temporarily) |
 | "Why exactly was that command blocked?" | [Why was this command blocked?](#why-was-this-command-blocked) |
 | "What is this staging file / 'materialized' message?" | [What is a staging file?](#what-is-a-staging-file--what-does-materialized-mean) |
+| "`omamori audit verify` says the chain is broken" | [omamori audit verify says the chain is broken](#omamori-audit-verify-says-the-chain-is-broken) |
 | "Would omamori catch X?" | [Does omamori protect against X?](#does-omamori-protect-against-x) |
 | "Claude Code blocks *every* command with a hook error" | [README → Troubleshooting](../README.md#troubleshooting) (different problem class: a broken hook path, not a policy decision) |
 
@@ -127,6 +128,86 @@ action = "block"     # default: "materialize"
 ```
 
 Named-rule matches (`rm -rf` etc.) are unaffected by this setting — those always follow their rule's action. Details on the `[structural]` config section: [README.md → Rule configuration](../README.md#rule-configuration).
+
+---
+
+## "omamori audit verify says the chain is broken"
+
+**Do not delete `audit.jsonl`.** Copy it aside first:
+
+```bash
+cp ~/.local/share/omamori/audit.jsonl ~/audit.jsonl.backup
+```
+
+Deleting the log is the one step here that cannot be undone, and most of the states that produce this message are recoverable without it.
+
+Four different messages bring you here, and they mean different things:
+
+| Message | Exit | What it means |
+|---------|------|---------------|
+| `chain broken at entry #N` / `The audit log may have been tampered with.` | 1 | An entry's hash does not match the key it names. Either the log was altered, **or** the key that entry was signed with is no longer the one its `key_id` resolves to |
+| `cannot verify from entry #N — it names key "…", which is not in the keyring` | 2 | The key that entry names cannot be loaded. omamori is not accusing anything — it is saying it cannot check |
+| `cannot verify — audit keyring: cannot list …` | 2 | The key directory itself could not be read. This is a permissions or storage problem, not a log problem: fix the directory and re-run |
+| `cannot verify — <something about audit-secret>` | 2 | The active key file could not be read, and the message says why: it is a symlink, or not a regular file, or the wrong size, or not valid hex. The directory listed fine, so this is about that one file |
+
+### Work out which state you are in
+
+1. **Which entry.** The message names it as `#N`. For a break near the head:
+
+   ```bash
+   omamori audit show --all --json | head -20
+   ```
+
+   For one further in, `omamori audit show --last 10 --json`. Use `--json`: it carries the `seq` field, and the plain table has no seq column.
+
+2. **Which key that entry names.** Read `key_id` from that entry:
+
+   - `"default"` — epoch 1, written before this store ever rotated
+   - `"key-N"` — epoch N
+   - `"unresolved"` — omamori wrote this entry while it could not determine which key epoch was active, so it carries no HMAC and never did. No key file is missing, and restoring one will not help
+
+3. **Which key files exist.**
+
+   ```bash
+   ls -la ~/.local/share/omamori/
+   ```
+
+   An epoch's key sits in `audit-secret` while it is the current key, and moves to `audit-secret.{N}.retired` when the next rotation displaces it — **the number in the id and the number in the filename are the same one**:
+
+   | `key_id` | Look in |
+   |----------|---------|
+   | `"default"` (epoch 1) | `audit-secret`, or `audit-secret.1.retired` if this store has rotated |
+   | `"key-2"` | `audit-secret`, or `audit-secret.2.retired` |
+   | `"key-N"` | `audit-secret`, or `audit-secret.N.retired` |
+
+### Common causes
+
+**A retired key file was deleted or renamed.** Tidying `~/.local/share/omamori/` is the usual way to get here. If you still have the file — in a backup, in Trash — put it back under its original name and re-run `omamori audit verify`. Nothing about the log itself changed; this is fully recoverable.
+
+**A copy of a key was left in the directory.** A file named `audit-secret.<number>.retired` is read as that epoch's key, whatever it actually contains. Copying `.1.retired` to `.2.retired` gives epoch 2 the epoch-1 bytes, and every entry labelled `key-2` stops verifying. Keep spare copies **outside** this directory, or under a name that does not end in `.retired`.
+
+**A rotation was interrupted.** If `.retired` files are present and `audit-secret` is missing, a rotation stopped between retiring the old key and creating its replacement. What to do depends on one thing:
+
+- **Before any replacement exists** — `audit-secret` is still absent — *moving* (not copying) the highest-numbered `.retired` file back to `audit-secret` restores the state before the rotation. Use a form that refuses to overwrite, so a race or a misread does not cost you a key:
+
+  ```bash
+  cd ~/.local/share/omamori && mv -n audit-secret.2.retired audit-secret   # adjust the number
+  ```
+
+  If `audit-secret` still exists afterwards alongside the `.retired` file, `mv -n` declined and you are in the case below, not this one.
+- **Once a replacement exists** — omamori tries to create one the next time any command needs a key, and prints a warning saying whether it managed to — moving a `.retired` file over it **destroys** the key that entries written since were signed with, and those entries then read as tampering permanently. Existing entries are never rewritten to repair this ([ADR-0007](adr/0007-no-in-place-rewrite-of-existing-audit-entries.md)).
+
+  So check before you act, rather than assuming which side of that line you are on: `ls -l ~/.local/share/omamori/audit-secret`.
+
+  If you are past that point, leave `audit-secret` alone. Entries from before the rotation still verify against their retired keys.
+
+**A key could not be created while the store had none.** If omamori warned that `audit-secret` was absent *and* a replacement could not be created — a data directory that can be read and searched but not written does this — then everything written in that window carries no HMAC while still being labelled with the next epoch. Fixing the permissions creates a key under that same label, and those entries are then checked against it, fail, and are reported as tampering. They cannot be repaired ([ADR-0007](adr/0007-no-in-place-rewrite-of-existing-audit-entries.md)). The break is genuine in the sense that the hashes do not match; nothing was altered by anyone. Note the seq range from the warning's timestamp so you can tell those entries apart later.
+
+### If none of those apply
+
+An entry whose hash does not match, with every key file present and untouched and no warning of the kind above in your logs, is what tampering looks like. Note that `key_id` is an ordinary field of `audit.jsonl` — anyone who can write the file can edit it — so an entry that moved from exit 1 to exit 2 is not itself reassuring. Treat both wordings as reportable when you did not touch the key directory yourself.
+
+Entries before the break are still verified; the counts in the message say how many. Keep the copy you made at the top.
 
 ---
 

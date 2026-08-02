@@ -6443,3 +6443,298 @@ fn config_add_updates_baseline_so_doctor_stays_clean() {
     let _ = fs::remove_dir_all(&base_dir);
     let _ = fs::remove_dir_all(&home);
 }
+
+// --- #478 PR-B: `verify` diagnoses the key directory before the secret ---
+
+/// A store that has rotated once — `audit-secret` plus `audit-secret.1.retired`
+/// — with one audit entry, and the data directory left at `dir_mode`.
+///
+/// `secret` decides what sits at the `audit-secret` path: a normal key file, a
+/// symlink pointing outside the store, or a directory (any non-regular file
+/// takes the same branch in `read_secret`).
+#[cfg(unix)]
+fn seed_store_for_verify(name: &str, secret: &str, dir_mode: u32) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = unique_dir(name);
+    let data = home.join(".local").join("share").join("omamori");
+    fs::create_dir_all(&data).unwrap();
+
+    let retired = data.join("audit-secret.1.retired");
+    fs::write(&retired, "1".repeat(64)).unwrap();
+    fs::set_permissions(&retired, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let secret_path = data.join("audit-secret");
+    match secret {
+        "key" => {
+            fs::write(&secret_path, "2".repeat(64)).unwrap();
+            fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        "symlink" => {
+            let elsewhere = home.join("key-kept-elsewhere");
+            fs::write(&elsewhere, "9".repeat(64)).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &secret_path).unwrap();
+        }
+        "directory" => fs::create_dir(&secret_path).unwrap(),
+        other => panic!("unknown secret shape {other}"),
+    }
+
+    let log = data.join("audit.jsonl");
+    fs::write(
+        &log,
+        "{\"seq\":1,\"chain_version\":2,\"key_id\":\"key-2\",\
+         \"timestamp\":\"2026-08-02T00:00:00Z\",\"action\":\"block\"}\n",
+    )
+    .unwrap();
+
+    fs::set_permissions(&data, fs::Permissions::from_mode(dir_mode)).unwrap();
+    (home, data)
+}
+
+/// `remove_dir_all` cannot walk a directory it is not allowed to read, so the
+/// mode has to go back before the tree can be dropped. Without this the
+/// unreadable fixtures accumulate for the life of the machine.
+#[cfg(unix)]
+fn drop_store(home: &std::path::Path, data: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(data, fs::Permissions::from_mode(0o700));
+    let _ = fs::remove_dir_all(home);
+}
+
+/// stderr with the fixture's own data directory removed.
+///
+/// Half a defence, deliberately. `audit_verify_fails_closed_and_says_how_to_clear_an_unlistable_key_directory`
+/// records the other half and why the strip alone is not enough: stderr also
+/// carries the config path, and on macOS the printed form can be
+/// `/private/var/…` where the fixture holds `/var/…`. Every assertion in the
+/// tests below is therefore on a phrase that cannot occur inside a path —
+/// notably `"listable again"` rather than `"listable"`, since one of these
+/// fixtures is named `…-verify-unlistable-…`. This removes the easiest way for
+/// a path to creep back into a match when a fixture is renamed.
+#[cfg(unix)]
+fn stderr_without_store_path(output: &std::process::Output, data: &std::path::Path) -> String {
+    String::from_utf8_lossy(&output.stderr).replace(&data.display().to_string(), "<dir>")
+}
+
+/// #478. A data directory that cannot be listed used to be reported as
+/// "HMAC secret unavailable" — the symptom, on a store whose secret is fine and
+/// whose *directory* is the problem. `audit key rotate` has named the directory
+/// since #477, so one omamori command contradicted the other about one store.
+///
+/// The exit code is unchanged (2 on both sides); what moves is which of the two
+/// facts the operator is told.
+#[cfg(unix)]
+#[test]
+fn audit_verify_names_the_unlistable_directory_rather_than_the_secret() {
+    let (home, data) = seed_store_for_verify("478-verify-unlistable", "key", 0o000);
+
+    let output = verify_in(&home);
+    let stderr = stderr_without_store_path(&output, &data);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "still cannot-verify: {stderr}"
+    );
+    assert!(
+        stderr.contains("cannot list"),
+        "the directory is what failed and the message must say so: {stderr}"
+    );
+    assert!(
+        !stderr.contains("HMAC secret unavailable"),
+        "the secret is readable in principle — naming it is the misdiagnosis \
+         this closes: {stderr}"
+    );
+    assert!(
+        stderr.contains("listable again"),
+        "and the remedy has to name the property that failed: {stderr}"
+    );
+
+    drop_store(&home, &data);
+}
+
+/// #478, the property the reordering must not cost. At mode 0300 the directory
+/// is searchable but not listable, so a symlink planted at the secret path is
+/// still observable — and a scan-first order would answer "cannot list" and
+/// never mention it.
+///
+/// This is why the read keeps its position and only the generic verdict moves.
+/// The plan's first sketch was to swap the two calls; this test is the reason
+/// that sketch was dropped rather than a restatement of it.
+#[cfg(unix)]
+#[test]
+fn audit_verify_reports_a_symlinked_secret_even_when_the_directory_cannot_be_listed() {
+    let (home, data) = seed_store_for_verify("478-verify-symlink-0300", "symlink", 0o300);
+
+    let output = verify_in(&home);
+    let stderr = stderr_without_store_path(&output, &data);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("possible attack"),
+        "an unlistable directory must not swallow the symlink report: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot list"),
+        "and it must not be answered with the directory instead: {stderr}"
+    );
+
+    drop_store(&home, &data);
+}
+
+/// #478. `verify` decided "this is a symlink attack" by looking for the word
+/// `symlink` anywhere in the error, and every rejection `read_secret` builds
+/// ends with the path — so the verdict depended on what the operator had named
+/// their directory.
+///
+/// **The fixture's path contains `symlink` on purpose**, which is the one thing
+/// a test must never do by accident. Nothing below asserts on the name: the
+/// claim is that a store whose secret is a *directory* is diagnosed by its
+/// unlistable key directory, and that the non-regular-file wording — the text
+/// the old classifier short-circuited to, skipping the directory check
+/// entirely — does not appear.
+///
+/// Measured against `da54eb4` on this exact fixture: `audit secret path is not
+/// a regular file: …`, with the unlistable directory never looked at.
+#[cfg(unix)]
+#[test]
+fn audit_verify_does_not_take_the_word_symlink_from_the_path() {
+    let (home, data) = seed_store_for_verify("478-symlink-in-the-name", "directory", 0o300);
+
+    let output = verify_in(&home);
+    let stderr = stderr_without_store_path(&output, &data);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot list"),
+        "the unlistable directory is the blocker and must be reported: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not a regular file"),
+        "reaching that wording means the attack branch ran, which here can only \
+         have come from the path's own text: {stderr}"
+    );
+    assert!(
+        !stderr.contains("possible attack"),
+        "and nothing here is an attack: {stderr}"
+    );
+
+    // The control. Same store, same modes, a name with no `symlink` in it. The
+    // point is not that this one passes — it did before the fix too — but that
+    // the two now agree. Measured against `da54eb4`: this fixture answered
+    // `HMAC secret unavailable` while its twin above answered `not a regular
+    // file`, so one store had two diagnoses and the directory's name picked
+    // between them.
+    let (plain_home, plain_data) = seed_store_for_verify("478-ordinary-name", "directory", 0o300);
+    let plain = verify_in(&plain_home);
+    let plain_stderr = stderr_without_store_path(&plain, &plain_data);
+    assert!(
+        plain_stderr.contains("cannot list"),
+        "control: the same store under an ordinary name: {plain_stderr}"
+    );
+    assert!(
+        !plain_stderr.contains("HMAC secret unavailable"),
+        "control: which is also no longer answered with the secret: {plain_stderr}"
+    );
+
+    drop_store(&home, &data);
+    drop_store(&plain_home, &plain_data);
+}
+
+/// #478. With the directory listable, the secret's own failure is the whole
+/// story — and it is reported with the reason `read_secret` produced rather
+/// than flattened into "HMAC secret unavailable".
+///
+/// `rotate_key_locked` has kept the error body since #477 for the same reason;
+/// this is the verifier catching up. Both arms are exit 2, and
+/// `aggregate_report` maps either to `ChainStatus::Unavailable`, so no
+/// machine-readable surface moves.
+#[cfg(unix)]
+#[test]
+fn audit_verify_keeps_the_reason_a_listable_stores_secret_failed() {
+    let (home, data) = seed_store_for_verify("478-verify-nonregular", "directory", 0o700);
+
+    let output = verify_in(&home);
+    let stderr = stderr_without_store_path(&output, &data);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        stderr.contains("not a regular file"),
+        "the observed reason, not a category: {stderr}"
+    );
+    // The reason replaces the category, not the verdict. Keeping the error body
+    // routed four store shapes through the `Io` arm, which printed the errno
+    // alone — leaving the operator the one thing omamori had actually decided
+    // (Phase 8 QA).
+    assert!(
+        stderr.contains("cannot verify"),
+        "and the verdict still has to be said: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot list"),
+        "this directory lists fine; saying otherwise would be the mirror of the \
+         bug above: {stderr}"
+    );
+
+    drop_store(&home, &data);
+}
+
+/// #478 (Phase 6.5). The `verify` reordering moves two machine-readable
+/// surfaces, and this batch's own standard — set by #477's V-A09 — is that a
+/// reported change is pinned by a test as well as written in the CHANGELOG.
+/// The CHANGELOG entry existed; the test did not.
+///
+/// On a store whose key directory cannot be listed, `verify_chain` now returns
+/// `KeyringUnusable` where it used to return `SecretUnavailable`, and
+/// `aggregate_report` maps only the former to `ChainStatus::KeyringUnusable`.
+/// So `report --json`'s `chain_status` moves, `needs_attention()` flips from
+/// false to true, and `doctor` gains a risk-signal line for a store it used to
+/// pass over in silence.
+///
+/// Measured against `da54eb4` on this fixture: `{"status":"unavailable"}` and
+/// no `chain:` line under Risk signals.
+#[cfg(unix)]
+#[test]
+fn an_unlistable_key_directory_reaches_report_json_and_doctor() {
+    let (home, data) = seed_store_for_verify("478-report-surface", "key", 0o000);
+
+    let report = run_in(&home, &["report", "--json"]);
+    let stdout = String::from_utf8_lossy(&report.stdout);
+    assert!(
+        stdout.contains("\"status\": \"keyring_unusable\""),
+        "the status this store now carries: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"status\": \"unavailable\""),
+        "and not the one `needs_attention()` treats as healthy: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"kind\": \"directory_unreadable\""),
+        "with the reason-free kind consumers can act on: {stdout}"
+    );
+    // The reason string carries the operator's home directory, and `--json` is
+    // the form most likely to be pasted into an issue. `ChainStatus` keeps it
+    // out deliberately; assert that here rather than trusting the serde test,
+    // which builds the variant by hand instead of reaching it through a store.
+    assert!(
+        !stdout.contains(&data.display().to_string()),
+        "the directory path must not reach --json: {stdout}"
+    );
+
+    let doctor = run_in(&home, &["doctor"]);
+    let doctor_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        doctor_out.contains("chain: cannot verify"),
+        "doctor gains a risk signal for the same store: {doctor_out}"
+    );
+    assert!(
+        doctor_out.contains("cannot list"),
+        "and names the directory rather than the secret: {doctor_out}"
+    );
+
+    drop_store(&home, &data);
+}
