@@ -8,6 +8,12 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **CLI tests no longer pass on the name of their own fixture directory.** ([#488](https://github.com/yottayoshida/omamori/issues/488))
+
+  Four tests asserted that a message contained a word that also appeared in the sandbox directory they had just created. Every one of those commands quotes a path in its output, so the assertion was satisfied by the fixture's own name whatever the code printed — deleting the line under test left them green. Two could not be repaired by renaming the fixture at all: `contains("valid")` is equally satisfied by the failure verdict `invalid`, and `contains("move-to")` by the usage line every `config add` error carries. All four now assert on the diagnostic sentence itself, and each was confirmed to go red when that sentence is changed.
+
+  `scripts/check-invariants.sh` gained a check for the class. The previous instance was written forty minutes after the identical bug had been fixed in a neighbouring test, which is the argument for a mechanical check over a remembered rule. It reads only assertions that consume `stderr`/`stdout`, since that is the mechanism — restricting it removed six false positives — and it asserts the size of what it scanned, so an empty corpus or a broken extraction cannot pass as a clean result.
+
 - **The recovery instruction for an interrupted key rotation no longer sends the operator at a file that may be the only thing authenticating an epoch.** ([#487](https://github.com/yottayoshida/omamori/issues/487))
 
   Both the CLI message and `docs/FAQ.md` said, unconditionally, that while no `audit-secret` existed, moving the highest-numbered `.retired` file back restored the state from before the rotation — the FAQ with a `mv -n` command to run. That was written when creating the replacement was the last thing a rotation did. `write_epoch_record` now runs between the two renames, and two different failure points print this message: one leaves the record untouched, where the move really is a recovery, and one leaves it already advanced, where the same move takes away the only key that authenticates its own epoch's entries while the record keeps pointing past it. A single unconditional instruction is wrong on one of the two, and it was the destructive one.
