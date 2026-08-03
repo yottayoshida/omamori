@@ -263,17 +263,20 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
         // than allowed to masquerade as tampering — on a rotated store,
         // continuing would resolve every `"default"` to the active key and
         // fail the whole chain over a permissions problem.
-        Err(audit::AuditError::KeyringUnusable(reason)) => {
+        Err(audit::AuditError::KeyringUnusable { reason, remedy }) => {
+            // The remedy comes with the error rather than being written here.
+            //
+            // It used to be a literal on this line, on the argument that the
+            // cause was already stated above and only the property that failed
+            // needed naming. That held while an unusable keyring had exactly
+            // one cause. PR-C1 added a second — an epoch record that states no
+            // epoch — and the line then told an operator whose directory was
+            // perfectly readable to make it listable: the same mistake #477
+            // withdrew a caller-side remedy for, one variant later.
             eprintln!("omamori audit verify: cannot verify \u{2014} {reason}");
-            // "listable", not "check the permissions": the cause is already in
-            // `{reason}` above, in one wording, from one constructor
-            // (`secret::unlistable`). #477 first tried sharing this sentence
-            // across the four sites instead, which put a cause in each of them
-            // and made three wrong — rotation also needs the directory
-            // *writable*, and the per-entry arm below is only reached once it
-            // is readable again. Name the property that failed; let the reason
-            // say why.
-            eprintln!("  To fix: make that directory listable again, then re-run.");
+            if !remedy.is_empty() {
+                eprintln!("  {remedy}");
+            }
             Ok(2)
         }
         // #478: `verify_chain` does not produce this — only `rotate_key` does.
@@ -521,27 +524,29 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
                 // operator cannot act on is barely better than the silent
                 // mislabelling it replaces, and `audit verify` established the
                 // shape — say what was observed, then what to do about it.
-                Err(audit::AuditError::KeyringUnusable(reason)) => {
+                // The whole message comes from `{reason}`, which
+                // `rotate_key_locked` builds next to the condition that
+                // produced it.
+                //
+                // Three lines used to be added here: why an incomplete listing
+                // makes rotation unsafe, that nothing was renamed or created,
+                // and to make the directory listable and writable. All three
+                // were true of the one cause this arm had. PR-C1 gave it a
+                // second — an epoch record that states no epoch — where the
+                // directory is readable, writable and complete, and only a file
+                // is wrong. Two of the three lines then told the operator to
+                // fix something that was not broken.
+                //
+                // What the two causes still share ("no key file was renamed or
+                // created") each state for themselves. `with_key_store_lock`
+                // may have created `audit-secret.lock` by this point, which
+                // holds no key material and is recreated on demand — the
+                // refusal test allows exactly that one file.
+                Err(audit::AuditError::KeyringUnusable { reason, remedy }) => {
                     eprintln!("omamori: key rotation refused — {reason}");
-                    eprintln!(
-                        "  Rotating without a complete listing of the key directory would \
-                         retire the current key under the wrong epoch number, and entries \
-                         signed by it would later read as tampered."
-                    );
-                    // "No key file was renamed or created" rather than
-                    // "nothing was changed": `with_key_store_lock` may already
-                    // have created `audit-secret.lock`, which holds no key
-                    // material and is recreated on demand. The refusal test
-                    // allows exactly that one file, and this line is what the
-                    // operator reads instead of the test.
-                    // "listable **and writable**": rotation renames and
-                    // creates, so a directory made merely readable still fails
-                    // here — measured at mode 0500, where both the rename and
-                    // the create return EACCES.
-                    eprintln!(
-                        "  No key file was renamed or created. To fix: make that directory \
-                         listable and writable again, then re-run."
-                    );
+                    if !remedy.is_empty() {
+                        eprintln!("  {remedy}");
+                    }
                     Ok(1)
                 }
                 // #478: the one rotation failure that leaves the store changed.

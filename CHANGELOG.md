@@ -8,6 +8,18 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **Deleting a retired audit key no longer produces a permanent accusation of tampering.** ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
+  The key epoch was derived from the retired key files that happened to be present — `max_retired + 1` — so removing one walked the store's idea of the current epoch backwards. Three defects came out of that single inference, and all three close by recording the epoch instead of deducing it.
+
+  **Removing the last retired key** made the store indistinguishable from one that never rotated, so `"default"` resolved to the *active* key: an id that exists, holding bytes that never signed the entry. Those entries failed their hash and `verify` reported tampering — exit 1, the strongest thing omamori says — permanently, since `ADR-0007` forbids rewriting them. They now report as cannot verify (exit 2), which is what actually became of them: the key is gone.
+
+  **A rotation whose key was lost afterwards** had its number handed out a second time by the next append. Two different secrets then shared one `key_id`, and no verifier-side repair can untangle that — the id resolves and only the bytes are wrong — so those entries also read as tampering. The store now mints under the *next* number and records it, so no two keys can share a label. Epoch numbers may skip as a result; that costs nothing, and `u32` holds 4.29e9 of them against 104 for weekly rotation over two years.
+
+  **A rotation on a store missing its low retired slots** filed the current key into a slot an earlier epoch already owned. The retired slot is now chosen from the recorded epoch rather than from the highest slot present.
+
+  A fourth, found while writing the tests for the first three: deleting the *newest* retired key moved the active key's own label backwards, so entries written afterwards were labelled with an epoch whose slot the next rotation would then try to create.
+
 - **The recovery instruction printed for an interrupted key rotation no longer destroys the key it is meant to protect.** ([#478](https://github.com/yottayoshida/omamori/issues/478), [#472](https://github.com/yottayoshida/omamori/issues/472))
 
   The warning said a new key "will be created", told the operator to act "before anything appends", and gave as its reason that the rotation "never got as far as creating a new key". All three described the future: the same call mints the replacement a few lines further down, which closes the window the second clause names and falsifies the third. Copying the retired key over `audit-secret` after that point overwrites the replacement's bytes while the retired count stays put, so the entries written in between resolve to the wrong key and `audit verify` reports the strongest thing it can say — permanently, since `ADR-0007` forbids rewriting them. Following the instruction was worse than ignoring it.
@@ -32,6 +44,14 @@ The format is based on Keep a Changelog.
 
 ### Changed
 
+- **`audit verify` and `audit key rotate` refuse to proceed on an epoch record they cannot read.** ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
+  A file at `audit-secret.epoch` that does not hold a canonical decimal epoch stops verification with exit 2 and makes rotation refuse, instead of being ignored in favour of the derivation. The record is consulted exactly where the derivation is known to be wrong, so guessing past a broken one would reinstate the defect on the stores that needed the record most. Both messages name the file and say that removing it returns the store to deriving the epoch from the retired keys — an action `PROTECTED_FILE_PATTERNS` leaves to an operator and denies to an AI agent.
+
+  Stricter than the treatment of a corrupt `.retired` file, which stays a non-fatal anomaly, and deliberately so: one retired key covers one epoch, while the record decides which epoch *every* entry is labelled with. The cost is that a single unreadable file halts verification, and the whole of the mitigation is the message.
+
+  One consequence improved on the way past. When a fault blocks the record *and* the mint together — an unwritable data directory does both — entries written meanwhile now carry `unresolved` instead of a resolvable epoch label. Clearing the fault used to mint a key under that label and turn every one of them into a tampering report; they now stay cannot-verify, which is what they are.
+
 - **`audit verify` reports an unlistable key directory as the reason it cannot verify, rather than reporting the secret.** ([#478](https://github.com/yottayoshida/omamori/issues/478))
 
   When the data directory can be neither listed nor searched, the active secret cannot be read either — and the previous release named the secret, which is the symptom. `audit key rotate` has named the directory since [#477](https://github.com/yottayoshida/omamori/issues/477), so the two commands gave contradictory accounts of one store. The read keeps its position rather than moving behind the scan: at mode `0300` the directory is searchable but not listable, so a symlink planted at the secret path is still observable there, and a scan-first order would answer "cannot list" and never mention the attack. Only the generic verdict waits for the listing.
@@ -49,6 +69,14 @@ The format is based on Keep a Changelog.
   This is the one path in the change with no end-to-end test. `rename` and `create_secret` need the same directory permissions, so every state that stops the second stops the first; what remains — a concurrent writer taking the name, `/dev/urandom` failing, `ENOSPC`, `EMFILE` — cannot be scheduled from a test. The wording is pinned by a unit test against the rendering function instead, and the reason is recorded next to it.
 
 ### Added
+
+- **`audit-secret.epoch`** — one decimal integer beside the audit keys, recording the highest key epoch this store has handed out. ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
+  Written by `audit key rotate` between the rename and the new key's creation, and by the recovery path that skips a generation whose key is gone. The write is `fsync`ed before any key exists to carry the number, so a process crash cannot bring the old number back and hand it out twice; the parent directory's sync is best-effort, which bounds this at power loss rather than at a crash (`ADR-0008` records the residual). The value only ever moves up — it is re-read before each write, because the recovery path runs under a shared lock and a stale caller must not walk it back. Epochs are read as `max(recorded, max_retired + 1)`.
+
+  **A store without the file behaves exactly as it did before.** Only rotation writes one, so a fresh install has none and neither does a store that has not rotated since upgrading. Binaries that predate the record ignore it: the name does not end in `.retired`, so no version of omamori counts it as a key. One downgrade state is conditional and documented in `ADR-0008` — a store that skipped an epoch is mislabelled by v0.16.0, and entries written there can read as cannot-verify after upgrading again.
+
+  The record is advisory. Removing it returns the store to the previous derivation, which is the documented remedy when it cannot be read; `PROTECTED_FILE_PATTERNS` already covers the `audit-secret` prefix, so that is an operator's action and not an agent's.
 
 - **`docs/FAQ.md` has an entry for a broken audit chain.** ([#472](https://github.com/yottayoshida/omamori/issues/472))
 

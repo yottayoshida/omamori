@@ -283,6 +283,224 @@ fn with_key_store_lock<T>(
     out
 }
 
+/// What the store can say about an `audit-secret` that is not there.
+///
+/// #478 could only say "a rotation may have been interrupted" and had to cover
+/// two readings in one sentence, because the key store held nothing that told
+/// them apart. The epoch record does, for stores that have one — so each
+/// variant is a different sentence, about different entries and different
+/// keys, rather than one sentence hedged to cover both.
+///
+/// Reached only when `read_secret` returned `NotFound`. Every other failure
+/// means the key is unreachable rather than absent (#478), and none of these
+/// sentences would be true of it.
+enum MissingActiveKey {
+    /// No record, so the store cannot say whether the rotation that left this
+    /// state got as far as handing its number out. Every store looked like
+    /// this before the record existed, and one that has not rotated since
+    /// still does.
+    Ambiguous,
+    /// The record does not reach past the retired slots. The rotation that left
+    /// this state stopped before writing a new epoch, so — as far as the record
+    /// goes — the number about to be minted has never named a key.
+    BeforeHandout { recorded: u32 },
+    /// The record names an epoch above every retired slot and no key answers to
+    /// it.
+    ///
+    /// **Whether that epoch ever signed anything is not knowable here.** The
+    /// record is written before the key is minted, so a crash between the two
+    /// leaves this exact state with nothing handed out. What is certain is the
+    /// number must not be handed out again: a second key under an id some entry
+    /// already carries makes those entries read as tampered, permanently.
+    Unbacked(u32),
+}
+
+impl MissingActiveKey {
+    fn classify(recorded: u32, max_retired: u32) -> Option<Self> {
+        if recorded > max_retired {
+            // `recorded > max_retired >= 0`, so a record exists.
+            return Some(Self::Unbacked(recorded));
+        }
+        if max_retired == 0 {
+            // A fresh install: nothing retired, nothing recorded, no key yet.
+            // Not an interrupted anything, and warning about one here is what
+            // #478 measured as the false alarm on a healthy store.
+            return None;
+        }
+        Some(if recorded == 0 {
+            Self::Ambiguous
+        } else {
+            Self::BeforeHandout { recorded }
+        })
+    }
+
+    /// The observation, for the branch where a key is now present.
+    fn observed(&self, id: &str, max_retired: u32) -> String {
+        match self {
+            Self::Ambiguous => "retired audit keys are present and audit-secret was not — a key \
+                 rotation may have been interrupted."
+                .to_string(),
+            Self::BeforeHandout { recorded } => format!(
+                "retired audit keys are present and audit-secret was not — a key rotation may \
+                 have been interrupted. {EPOCH_RECORD_NAME} records epoch {recorded}, which the \
+                 retired keys already reach ({max_retired}), so that rotation stopped before \
+                 recording a new epoch and the record shows nothing signed under {id}."
+            ),
+            Self::Unbacked(lost) => format!(
+                "{EPOCH_RECORD_NAME} records epoch {lost} and no key answers to it — that \
+                 rotation may have handed the epoch out before its key was lost, or may have \
+                 stopped before creating one. Either way the number is not reused: entries \
+                 labelled {}, if any exist, stay unverifiable.",
+                key_id_for_epoch(*lost)
+            ),
+        }
+    }
+
+    /// The observation, for the branch where the replacement could not be
+    /// created. Stated separately rather than composed from [`Self::observed`]:
+    /// the two differ in the middle of the sentence, not at the end, and
+    /// splicing "and a replacement could not be created" into a string built
+    /// elsewhere is how the wording drifts apart.
+    fn observed_without_mint(&self, max_retired: u32) -> String {
+        match self {
+            Self::Ambiguous => "retired audit keys are present, audit-secret was not, and a \
+                 replacement could not be created — a key rotation may have been interrupted."
+                .to_string(),
+            Self::BeforeHandout { recorded } => format!(
+                "retired audit keys are present, audit-secret was not, and a replacement could \
+                 not be created — a key rotation may have been interrupted. \
+                 {EPOCH_RECORD_NAME} records epoch {recorded} and the retired keys reach \
+                 {max_retired}."
+            ),
+            Self::Unbacked(lost) => format!(
+                "{EPOCH_RECORD_NAME} records epoch {lost}, no key answers to it, and a \
+                 replacement could not be created."
+            ),
+        }
+    }
+
+    /// What becomes of the entries written while no key could be created.
+    ///
+    /// Two different fates, and the difference is whether the label can ever
+    /// resolve. `Ambiguous` and `BeforeHandout` hand out a number the record
+    /// does not hold, so clearing the fault mints a key under exactly that
+    /// label and every entry written meanwhile fails against it — the outcome
+    /// #478 documented. `Unbacked` cannot end that way: the record already
+    /// holds this epoch, so the next attempt allocates past it and nothing is
+    /// ever created under this id.
+    ///
+    /// **The `Unbacked` arm is not reachable from the test suite** (Codex Round
+    /// 1, P2). Getting here needs the record to be writable while
+    /// `create_secret` fails, and on every fixture that denies the mint — an
+    /// unwritable directory — the record is denied first and the caller returns
+    /// before this point. What is left is a missing `/dev/urandom` or `EMFILE`.
+    /// Stated rather than left to be inferred from the other arm, because a
+    /// sentence that is wrong only in an unreachable state is still a sentence
+    /// this repository has now shipped twice.
+    fn consequence_without_mint(&self, id: &str) -> String {
+        match self {
+            Self::Ambiguous | Self::BeforeHandout { .. } => format!(
+                "They are still labelled {id}, so once a key exists under that label they will \
+                 be checked against it, fail, and be reported as tampering — clearing the \
+                 condition does not make them verifiable."
+            ),
+            Self::Unbacked(_) => format!(
+                "They are still labelled {id}, and {EPOCH_RECORD_NAME} already holds that \
+                 epoch — the next attempt allocates past it, so no key is ever created under \
+                 {id} and these entries stay unverifiable rather than turning into a tampering \
+                 report."
+            ),
+        }
+    }
+
+    /// The clause warning that earlier entries may already carry this id.
+    ///
+    /// Only [`Self::Ambiguous`] can say it, and saying it is not hedging: a
+    /// store with no record genuinely cannot tell a rotation that stopped
+    /// before handing out its number from one whose key was lost afterwards.
+    /// The other two variants know which happened — `BeforeHandout` because the
+    /// record is below the slots, `Unbacked` because the mint moved past the
+    /// recorded number instead of reusing it — so for them the clause would
+    /// describe a collision this call has just made impossible.
+    fn overlap_clause(&self, id: &str) -> String {
+        match self {
+            Self::Ambiguous => format!(
+                ", and entries written before this may carry {id} too, signed with different \
+                 bytes"
+            ),
+            _ => String::new(),
+        }
+    }
+}
+
+/// Move the record past an epoch whose key is gone, returning the number the
+/// caller may hand out.
+///
+/// yotta 判断11: the danger is not minting, it is reusing a number. Entries
+/// signed under the lost epoch stay cannot-verify — exit 2, which is the honest
+/// verdict — while entries signed from here carry a number no earlier entry
+/// can hold.
+///
+/// **The record moves before the key exists, and never after.** Handing out
+/// `lost + 1` while the file still says `lost` would put the next run back on
+/// `lost`: the same bytes would answer to two ids, and everything written in
+/// between would name an epoch no keyring can produce. That is the
+/// key-and-label split #457 closed, reopened one generation wide.
+///
+/// `None` means the caller must not mint. A key created under a number the
+/// store has not written down is a key the next run names differently.
+///
+/// Residual, and deliberate: if the record can be written but the mint cannot
+/// run — a missing `/dev/urandom`, `EMFILE` — every later command repeats this
+/// and the number climbs. Both failures usually share a cause (an unwritable
+/// directory denies the record first, and then this returns `None` without
+/// touching anything), and the alternative is minting under a number the record
+/// does not hold. u32 gives 4.29e9 epochs; weekly rotation for two years
+/// reaches 104.
+fn claim_next_epoch(secret_path: &Path, lost: u32) -> Option<u32> {
+    let Some(next) = lost.checked_add(1) else {
+        eprintln!(
+            "omamori warning: audit key epoch {lost} is at the representable limit, so no \
+             successor can be allocated and no replacement key was created. \
+             {ENTRIES_CARRY_NO_HMAC}"
+        );
+        return None;
+    };
+    match write_epoch_record(secret_path, next) {
+        // Not necessarily `next`: another process may have claimed further
+        // while this one was deciding, and the number on disk is the one the
+        // mint below will be named by.
+        Ok(recorded) => Some(recorded),
+        Err(e) => {
+            eprintln!(
+                // "a replacement could not be created" is the wording #478 gave
+                // this outcome, and the outcome is the same one: no key exists at
+                // the active path when this returns. Kept verbatim so the operator
+                // reads one sentence for one state — the reason differs (the record
+                // stopped it before the mint was attempted) and the reason is what
+                // the rest of the sentence is for.
+                // "They stay unverifiable", not "they will be reported as
+                // tampering" — the consequence the *other* failed-mint branch has.
+                // The difference is the label: that branch returns a resolvable
+                // `key-{N}`, so clearing the fault mints a key under it and the
+                // entries written meanwhile fail against it. This one returns
+                // `UNRESOLVED_KEY_ID`, which no keyring can hold, so they stay in
+                // cannot-verify instead. Same words as the unlistable-directory
+                // site because the same thing happens there and for the same
+                // reason, checked rather than assumed (#478 Phase 8) — and written
+                // out rather than shared through a constant, so a third site
+                // cannot inherit a consequence nobody re-derived for it.
+                "omamori warning: the key for audit epoch {lost} is missing and a replacement could \
+             not be created — {EPOCH_RECORD_NAME} could not be advanced to {next}: {e}. \
+             Creating one under an epoch the store has not recorded is what puts two keys under \
+             a single id. {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the condition \
+             protects later ones, not those."
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the active signing key and its `key_id` together.
 ///
 /// #457: the secret and its id used to be resolved by two separate calls, each
@@ -336,7 +554,7 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // append on purpose. Asserting "this entry is recorded without HMAC
     // protection" told the operator, in both of those, that something was
     // written when nothing was.
-    let retired = match scan {
+    let (retired, record) = match scan {
         KeyDirScan::Unlistable(reason) => {
             eprintln!(
                 // Not "fix the condition and re-run to restore protection":
@@ -354,10 +572,34 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
                 secret: None,
             };
         }
-        KeyDirScan::Listed(retired) => retired,
+        KeyDirScan::Listed { retired, epoch } => (retired, epoch),
+    };
+
+    // PR-C1 (yotta 判断12): a record that does not state an epoch is refused
+    // here, in the verifier and in rotation alike. Falling back to the
+    // derivation is the softer option and the wrong one — the record is
+    // consulted precisely where the derivation is known to walk backwards, so
+    // ignoring an unreadable one reinstates the defect on exactly the stores
+    // that needed it. #479's rule, applied to a second file: one invariant,
+    // guarded at one depth.
+    let recorded = match record.recorded() {
+        Ok(recorded) => recorded,
+        Err(reason) => {
+            eprintln!(
+                "omamori warning: {reason} — cannot determine which key epoch is active, so no \
+                 entry written from here on can be HMAC-protected or labelled with a key epoch. \
+                 {ENTRIES_CARRY_NO_HMAC} They stay unverifiable. {}",
+                epoch_record_remedy()
+            );
+            return SigningKey {
+                id: UNRESOLVED_KEY_ID.to_string(),
+                secret: None,
+            };
+        }
     };
 
     let max_retired = max_retired_index(&retired);
+    let epoch = active_epoch(&retired, recorded);
 
     // #457 P4-e: a rotation that crashed between `rename` and `create_secret`
     // leaves retired keys with nothing at the active path. `load_or_create_secret`
@@ -390,8 +632,30 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // at mode 0400 lists completely and denies every open inside it, so the old
     // condition announced an interrupted rotation on a store whose active key
     // was present, valid and untouched.
-    let interrupted =
-        max_retired > 0 && matches!(&active, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    // PR-C1: the same `NotFound` condition, now handed to the record to be
+    // classified. `max_retired > 0` used to stand in for "a rotation happened
+    // here" — it is the only signal a store without a record has, and it misses
+    // the store whose retired keys were all removed.
+    let missing = matches!(&active, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        .then(|| MissingActiveKey::classify(recorded, max_retired))
+        .flatten();
+
+    // PR-C1: `Unbacked` is the one state that may not hand out the epoch the
+    // derivation produced, because that number is already written down. Moving
+    // the record first is what makes the mint below name a generation the next
+    // command will still name the same way.
+    let epoch = match missing {
+        Some(MissingActiveKey::Unbacked(lost)) => match claim_next_epoch(secret_path, lost) {
+            Some(next) => next,
+            None => {
+                return SigningKey {
+                    id: UNRESOLVED_KEY_ID.to_string(),
+                    secret: None,
+                };
+            }
+        },
+        _ => epoch,
+    };
 
     // `load_or_create_secret` is only reached when the active key could not be
     // read — normally because this is a fresh install and it has to be created.
@@ -399,7 +663,7 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
         Ok(secret) => Some(secret),
         Err(_) => load_or_create_secret(secret_path),
     };
-    let id = key_id_for_index(max_retired);
+    let id = key_id_for_epoch(epoch);
 
     // #478: printed *after* the mint, and about the store as it stands now.
     // The previous version ran before it and described what was about to
@@ -431,16 +695,16 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // was lost afterwards wrote several. The key store holds nothing that tells
     // the two apart — the difference is only in `audit.jsonl` — so the sentence
     // covers both. PR-C1's epoch record is what will separate them.
-    if interrupted {
+    if let Some(missing) = &missing {
         if secret.is_some() {
             eprintln!(
-                "omamori warning: retired audit keys are present and audit-secret was not \
-                 — a key rotation may have been interrupted. audit-secret now holds an \
-                 active key; entries from here on are signed with it and labelled {id}, \
-                 and entries written before this may carry {id} too, signed with \
-                 different bytes. Do not copy a .retired file over audit-secret: that \
+                "omamori warning: {} audit-secret now holds an \
+                 active key; entries from here on are signed with it and labelled {id}{}. \
+                 Do not copy a .retired file over audit-secret: that \
                  destroys the key the newer entries were signed with. See the audit \
-                 chapter of omamori's FAQ."
+                 chapter of omamori's FAQ.",
+                missing.observed(&id, max_retired),
+                missing.overlap_clause(&id)
             );
         } else {
             eprintln!(
@@ -450,12 +714,10 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
                 // operator can clear, after which later entries are protected
                 // again; the unbounded phrasing described a store that never
                 // recovers (Codex Round 1).
-                "omamori warning: retired audit keys are present, audit-secret was not, \
-                 and a replacement could not be created — a key rotation may have been \
-                 interrupted. {ENTRIES_CARRY_NO_HMAC} They are still labelled {id}, so once a \
-                 key exists under that label they will be checked against it, fail, and be \
-                 reported as tampering — clearing the condition does not make them verifiable. \
-                 See the audit chapter of omamori's FAQ."
+                "omamori warning: {} {ENTRIES_CARRY_NO_HMAC} {} See the audit chapter of \
+                 omamori's FAQ.",
+                missing.observed_without_mint(max_retired),
+                missing.consequence_without_mint(&id)
             );
         }
     }
@@ -516,6 +778,33 @@ const MAX_SECRET_FILE_BYTES: u64 = 1024;
 /// with the first's, and a `/simplify` pass that then froze the alignment into
 /// a constant. Each site now states its own consequence from its own facts.
 const ENTRIES_CARRY_NO_HMAC: &str = "Entries written while this lasts carry no HMAC.";
+
+/// What an operator can do about a record that does not state an epoch.
+///
+/// Shared by the writer, the verifier and rotation — and shared only after
+/// checking each, because #478's Phase 8 shared a recovery line across four
+/// sites and it was wrong at three of them. Here the action really is one
+/// action: the record is advisory, all three consumers fall back to the same
+/// derivation without it, and removing it is safe on every one. Each site
+/// still states its own consequence; only the action is common.
+///
+/// Reachable by a person and not by an agent: the file sits under the
+/// `audit-secret` prefix, so `PROTECTED_FILE_PATTERNS` blocks AI writes to it
+/// while leaving an operator's `rm` alone. An instruction omamori's own threat
+/// model lets the AI follow would be a payload, which is the mistake #478
+/// found in the interrupted-rotation text.
+///
+/// A function rather than a `const` so the filename comes from
+/// [`EPOCH_RECORD_NAME`]. A `const` cannot interpolate one, which would leave
+/// the name spelled twice — and this is the one sentence that tells an operator
+/// which file to delete, so a drift here sends them after a file that does not
+/// exist. Cheaper to make the mistake impossible than to add a check for it.
+fn epoch_record_remedy() -> String {
+    format!(
+        "Removing {EPOCH_RECORD_NAME} puts this store back on deriving the epoch from the \
+         retired key files, which is what omamori did before the record existed."
+    )
+}
 
 /// The opening words of the symlink rejection, shared by the one place that
 /// builds it and the one place that classifies on it.
@@ -597,12 +886,201 @@ fn symlink_attack_error(path: &Path) -> std::io::Error {
 /// #477 is the same hazard on the one consumer it missed, and the only one
 /// that *mutates* the store.
 pub(super) enum KeyDirScan {
-    /// Parsed retired-key index → path, ordered by index.
-    Listed(BTreeMap<u32, PathBuf>),
+    Listed {
+        /// Parsed retired-key index → path, ordered by index.
+        retired: BTreeMap<u32, PathBuf>,
+        /// What the store says about the highest epoch it has handed out,
+        /// read from this same listing.
+        epoch: EpochRecord,
+    },
     /// The listing could not be obtained, or could not be trusted to be whole.
     /// The string states what was observed, with no interpretation — callers
     /// wrap it in whatever their own context can actually claim.
     Unlistable(String),
+}
+
+/// The file recording the store's highest handed-out epoch.
+///
+/// Under the `audit-secret` prefix on purpose: `PROTECTED_FILE_PATTERNS`
+/// (`engine/hook.rs`) matches that prefix against the file name, so this file
+/// is covered by the AI write block from the moment it exists, with no second
+/// entry to keep in step. Equally on purpose it does **not** end in
+/// `.retired` — [`fold_key_dir_entries`] requires that suffix, so no version
+/// of omamori, including ones that predate this file, can mistake the record
+/// for a retired key and shift every epoch by one.
+pub(super) const EPOCH_RECORD_NAME: &str = "audit-secret.epoch";
+
+/// The record holds one decimal integer. 16 bytes is past `u32::MAX`'s ten
+/// digits with room for a trailing newline, and small enough that a hostile
+/// file cannot be read into memory in bulk.
+const MAX_EPOCH_FILE_BYTES: u64 = 16;
+
+pub(super) fn epoch_record_path(secret_path: &Path) -> PathBuf {
+    secret_path.with_file_name(EPOCH_RECORD_NAME)
+}
+
+/// What the key store records about the highest epoch it has ever handed out.
+///
+/// Every defect this record closes is one shape: **an epoch inferred from
+/// files that can be deleted**. `max_retired + 1` reads the current epoch off
+/// the retired slots, so an operator tidying up after a prune moves the store
+/// backwards, and the next rotation hands out a number that has already been
+/// used — under which entries were already signed. Their keys are gone either
+/// way; what the inference adds is that the store stops *knowing* they are
+/// gone and reports the resulting mismatch as tampering, permanently
+/// (`ADR-0007` forbids rewriting the entries).
+///
+/// A number the store wrote down cannot be lowered by deleting some other
+/// file. That is the whole mechanism.
+///
+/// Not a per-key tag. ADR-0008 proposed one — each key file naming its own
+/// epoch — and it cannot work: what has to be told apart is a *lost*
+/// generation, and a file that is gone carries no tag.
+pub(super) enum EpochRecord {
+    /// The store states its highest handed-out epoch. Always ≥ 1;
+    /// [`read_epoch_record`] rejects 0, which is not an epoch any writer emits.
+    Recorded(u32),
+    /// No record file. Epochs derive from the retired slots exactly as they did
+    /// before this file existed (see [`active_epoch`]). **Not a fault** — a
+    /// store that has not rotated since upgrading has nothing to record,
+    /// because rotation is the only thing that writes one.
+    Absent,
+    /// A file is there but does not state an epoch this program wrote. Carries
+    /// what was observed, with no interpretation — the rule
+    /// [`KeyDirScan::Unlistable`] follows.
+    Unreadable(String),
+}
+
+impl EpochRecord {
+    /// The recorded number, or the reason the store cannot be trusted to
+    /// answer.
+    ///
+    /// A `Result` rather than an `Option` with a default, because all three
+    /// consumers have to refuse an unreadable record (`#479`: one invariant is
+    /// not guarded at two depths) and none of them may fold it into "no
+    /// record". That fold is the `.ok()` collapse #478 took out of
+    /// `read_secret`, in a place where its consequence is not a wrong message
+    /// but a silently lowered epoch.
+    pub(super) fn recorded(&self) -> Result<u32, &str> {
+        match self {
+            Self::Recorded(n) => Ok(*n),
+            Self::Absent => Ok(0),
+            Self::Unreadable(reason) => Err(reason),
+        }
+    }
+}
+
+/// Read the record, classifying every way it can fail to state an epoch.
+///
+/// Fail-closed by construction: no arm returns [`EpochRecord::Absent`].
+/// Absence is decided by the directory listing and only there — a
+/// `PermissionDenied` on this path means the store *has* a record it cannot
+/// show, which is the opposite of not having one.
+fn read_epoch_record(path: &Path) -> EpochRecord {
+    let content = match crate::atomic_file::read_to_string_capped(path, MAX_EPOCH_FILE_BYTES) {
+        Ok(content) => content,
+        Err(e) => return EpochRecord::Unreadable(format!("cannot read {}: {e}", path.display())),
+    };
+    match parse_epoch(path, &content) {
+        Ok(n) => EpochRecord::Recorded(n),
+        Err(reason) => EpochRecord::Unreadable(reason),
+    }
+}
+
+/// Classify the *content* of a record.
+///
+/// Split from [`read_epoch_record`] because the two readers disagree about
+/// exactly one thing: what an absent file means. That reader has the directory
+/// listing behind it, so absence never reaches it and every error is a fault;
+/// [`write_epoch_record`] has no listing, and for it an absent file is the
+/// ordinary first write. Sharing the parse and not the open is what keeps the
+/// two from drifting on the part they *do* agree about.
+fn parse_epoch(path: &Path, content: &str) -> Result<u32, String> {
+    let trimmed = content.trim();
+    match trimmed.parse::<u32>() {
+        // Canonical decimal, and at least 1: the two conditions
+        // `fold_key_dir_entries` puts on a retired slot number, for the same
+        // reasons. `01` and `+1` are not numbers this program writes, and
+        // epoch 0 does not exist — epoch 1 is `"default"`.
+        Ok(n) if n >= 1 && n.to_string() == trimmed => Ok(n),
+        // The content is not quoted back. It is attacker-controlled bytes on a
+        // path any local process can write, and the operator gains nothing
+        // from it: the remedy is the same whatever it says.
+        _ => Err(format!("{} does not hold a key epoch", path.display())),
+    }
+}
+
+/// Record `epoch` as the highest this store has handed out, and return the
+/// number the record holds afterwards.
+///
+/// **Monotonic.** The value is re-read here rather than taken from whatever the
+/// caller scanned, because a caller can hold a stale observation: the recovery
+/// path runs under a *shared* lock, so two processes can both see epoch 2
+/// missing, and if one of them has meanwhile written 4 and minted a key for it,
+/// a blind write of 3 walks the record backwards. The next `create_secret`
+/// then fails `AlreadyExists`, reads the epoch-4 key, and labels it `key-3` —
+/// a key travelling under another epoch's name, which is the shape this whole
+/// change removes. Returning the number actually on disk is the other half:
+/// skipping the write while still naming the caller's number would leave the
+/// same mismatch (Codex Round 1, P1).
+///
+/// The read is still a TOCTOU against a concurrent writer. What it buys is a
+/// direction — every write moves the number up — which is the property the
+/// defect needs violated.
+///
+/// Durable before it returns for the write it does perform:
+/// `atomic_write_with_mode` writes to a temp file, `sync_all`s it, renames, and
+/// then asks the parent directory to sync. **The file sync is checked; the
+/// parent's is best-effort** (`atomic_file::fsync_parent` swallows its error,
+/// by a design decision that predates this file). So a record that has returned
+/// `Ok` is durable to a process crash, and to a power loss only as far as the
+/// directory entry made it — see ADR-0008's residual list.
+pub(super) fn write_epoch_record(secret_path: &Path, epoch: u32) -> Result<u32, std::io::Error> {
+    let path = epoch_record_path(secret_path);
+    // Not `read_epoch_record`: that one has a directory listing behind it and
+    // treats every failure as a fault, `NotFound` included. Here `NotFound` is
+    // the ordinary first write — rotation creates this file, it is not shipped.
+    match crate::atomic_file::read_to_string_capped(&path, MAX_EPOCH_FILE_BYTES) {
+        Ok(content) => match parse_epoch(&path, &content) {
+            // Already at or past this epoch: someone else claimed further, and
+            // their number is the one the store is on.
+            Ok(current) if current >= epoch => return Ok(current),
+            Ok(_) => {}
+            // Fail-closed, as the three readers do. Overwriting a record that
+            // cannot be parsed would destroy the bytes an operator still has to
+            // look at, and this is the only path that could do it silently.
+            Err(reason) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, reason));
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Present and unreadable — a permission fault, a FIFO, a directory.
+        // Refuse for the same reason as an unparseable one: what is there
+        // might be a higher number.
+        Err(e) => return Err(e),
+    }
+    crate::atomic_file::atomic_write_with_mode(&path, epoch.to_string().as_bytes(), 0o600)?;
+    Ok(epoch)
+}
+
+/// Which epoch the key at `audit-secret` belongs to.
+///
+/// `max(recorded, max_retired + 1)`, and each side covers what the other
+/// cannot:
+///
+/// - **`max_retired + 1`** is the derivation that predates the record, and it
+///   is still right whenever the retired slots are intact. A store that has
+///   never recorded an epoch passes `recorded` = 0 and gets exactly this
+///   number — which is what makes the record a pure addition rather than a
+///   migration.
+/// - **`recorded`** covers the cases where the slots are not intact: a retired
+///   key deleted, or a rotation that handed out a number and then lost the key
+///   to it. Both lower `max_retired`; neither lowers what the store wrote down.
+///
+/// Taking the larger never walks an epoch backwards, and walking backwards is
+/// what every defect here has in common.
+pub(super) fn active_epoch(retired: &BTreeMap<u32, PathBuf>, recorded: u32) -> u32 {
+    max_retired_index(retired).saturating_add(1).max(recorded)
 }
 
 /// Highest retired index present, or 0 when there are none. Replaces the old
@@ -665,7 +1143,10 @@ fn scan_key_dir(secret_path: &Path) -> KeyDirScan {
         // ever created, so a new install wrote entries with no HMAC at all.
         // Only an *existing* directory we cannot look into is a fault.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return KeyDirScan::Listed(BTreeMap::new());
+            return KeyDirScan::Listed {
+                retired: BTreeMap::new(),
+                epoch: EpochRecord::Absent,
+            };
         }
         Err(e) => return unlistable(parent, None, &e),
     };
@@ -695,6 +1176,13 @@ pub(super) fn fold_key_dir_entries(
     entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
 ) -> KeyDirScan {
     let mut retired = BTreeMap::new();
+    // Whether the record exists is answered by this listing, never by a
+    // separate `exists()` probe on a constructed path. `scan_key_dir`'s header
+    // records why: on a case-insensitive filesystem (APFS default) a probe
+    // succeeds for `AUDIT-SECRET.EPOCH`, a name the listing does not consider a
+    // record — so the two would disagree about which files are present, and a
+    // store could read its own epoch off a file `rotate` will never update.
+    let mut epoch_present = false;
 
     for (seen, entry) in entries.enumerate() {
         let file_name = match entry {
@@ -707,6 +1195,10 @@ pub(super) fn fold_key_dir_entries(
             Err(e) => return unlistable(parent, Some(seen), &e),
         };
         let name = file_name.to_string_lossy();
+        if name == EPOCH_RECORD_NAME {
+            epoch_present = true;
+            continue;
+        }
         let Some(middle) = name
             .strip_prefix("audit-secret.")
             .and_then(|rest| rest.strip_suffix(".retired"))
@@ -737,20 +1229,38 @@ pub(super) fn fold_key_dir_entries(
         }
     }
 
-    KeyDirScan::Listed(retired)
+    KeyDirScan::Listed {
+        retired,
+        // Read only when the listing saw it. An absent record and an
+        // unreadable one are different states and the difference is not
+        // recoverable from an error: `read_epoch_record` has no `Absent` arm
+        // precisely so that this decision is made here, from the listing, and
+        // nowhere else.
+        epoch: if epoch_present {
+            read_epoch_record(&parent.join(EPOCH_RECORD_NAME))
+        } else {
+            EpochRecord::Absent
+        },
+    }
 }
 
-/// The `key_id` for a store whose highest retired index is `max_retired`.
-/// `"default"` when nothing has been retired yet; `"key-N"` otherwise.
+/// The `key_id` naming `epoch`. `"default"` for epoch 1, `key-{N}` above it.
 ///
-/// Takes the index rather than a path so it cannot disagree with the scan the
-/// caller already performed — the previous path-taking form re-read the
-/// directory, which is how the writer's key and its label came apart.
-fn key_id_for_index(max_retired: u32) -> String {
-    if max_retired == 0 {
+/// Takes the epoch rather than the highest retired index, which is the whole
+/// of PR-C1 at this level: the previous form derived the epoch itself, by
+/// adding one to the single input that deleting a file can lower. Callers
+/// compute it once through [`active_epoch`], where the record gets a say, and
+/// name it here.
+///
+/// Every caller passes an [`active_epoch`] result, which is ≥ 1, so there is
+/// no epoch 0 to name — the `key-0` that would fall out of the `else` is a
+/// label [`is_writer_emitted_key_id`] rejects, and it stays unreachable
+/// because the epoch has one producer.
+fn key_id_for_epoch(epoch: u32) -> String {
+    if epoch == 1 {
         "default".to_string()
     } else {
-        format!("key-{}", max_retired + 1)
+        format!("key-{epoch}")
     }
 }
 
@@ -852,6 +1362,11 @@ pub(super) enum KeyringAnomaly {
     /// unknown. Every id resolution below is a guess; callers must treat this
     /// as "cannot verify" rather than as an empty key set.
     DirectoryUnreadable { reason: String },
+    /// The epoch record is there but does not state an epoch, so which id names
+    /// the active key is unknown. Fatal for the reason `DirectoryUnreadable` is
+    /// fatal: the fallback resolves `"default"` to the active key on a rotated
+    /// store, and every entry then reads as altered.
+    EpochRecordUnreadable { reason: String },
 }
 
 impl KeyringAnomaly {
@@ -874,6 +1389,39 @@ impl KeyringAnomaly {
                 "audit keyring: {reason} — which key epochs exist is unknown, so no entry can \
                  be authenticated against the key it names."
             ),
+            Self::EpochRecordUnreadable { reason } => format!(
+                "audit keyring: {reason} — which key epoch is active is unknown, so no entry \
+                 can be authenticated against the key it names."
+            ),
+        }
+    }
+
+    /// What to do about it, for the surfaces that carry a repair.
+    ///
+    /// Separate from [`Self::describe`] because the two travel to different
+    /// places. `describe` reaches `doctor`, whose whole job at that line is to
+    /// name the cause and point at `omamori audit verify` — its siblings are
+    /// one short clause each, and inlining a repair there took this branch's
+    /// wording past 250 characters (pinned by `cli.rs`, and measured again
+    /// when PR-C1 briefly put the remedy back into `describe`).
+    ///
+    /// Separate from the *caller*, too, for the reason #477 had to withdraw a
+    /// caller-side remedy: the CLI arm knows it has an unusable keyring and not
+    /// which of the two conditions produced one, so any sentence it adds is
+    /// right for one of them at best.
+    ///
+    /// `None` for the two non-fatal anomalies. A truncated ring or one
+    /// unreadable retired key still authenticates everything whose key did
+    /// load, and what to do about the gap depends on whether those keys exist
+    /// anywhere else — no single sentence covers it, and `fatal_anomaly` never
+    /// selects them.
+    pub(super) fn remedy(&self) -> Option<String> {
+        match self {
+            Self::DirectoryUnreadable { .. } => {
+                Some("To fix: make that directory listable again, then re-run.".to_string())
+            }
+            Self::EpochRecordUnreadable { .. } => Some(epoch_record_remedy()),
+            Self::Truncated { .. } | Self::Unreadable { .. } => None,
         }
     }
 }
@@ -913,10 +1461,11 @@ impl Keyring {
     ///
     /// Used to tell "your key file went missing" apart from "this epoch has
     /// never been on this machine". It is deliberately phrased as *currently
-    /// shows*: deleting retired key files lowers this number, because nothing
-    /// on disk records the store's epoch history (the same limitation
-    /// `deleting_the_last_retired_key_reads_as_tampering_known_limitation`
-    /// pins). So it grounds an observation, never an accusation.
+    /// shows*: deleting a retired key file still lowers this number for the
+    /// epoch that file held. What PR-C1 changed is the *active* epoch, which
+    /// the record pins even with every retired key gone
+    /// (`deleting_the_last_retired_key_reads_as_cannot_verify`). Either way
+    /// this grounds an observation, never an accusation.
     pub(super) fn highest_known_epoch(&self) -> u32 {
         self.keys
             .keys()
@@ -948,14 +1497,19 @@ impl Keyring {
 
     /// The first anomaly that makes verification untrustworthy, if any.
     ///
-    /// Only `DirectoryUnreadable` qualifies: `"default"` would resolve to the
-    /// active key on a rotated store and every entry would read as tampered.
-    /// A truncated ring or one unreadable file is bounded — the keys that did
-    /// load still authenticate their own entries, and the gap is reported.
+    /// `DirectoryUnreadable` and `EpochRecordUnreadable` qualify: under either,
+    /// `"default"` would resolve to the active key on a rotated store and every
+    /// entry would read as tampered. A truncated ring or one unreadable file is
+    /// bounded — the keys that did load still authenticate their own entries,
+    /// and the gap is reported.
     pub(super) fn fatal_anomaly(&self) -> Option<&KeyringAnomaly> {
-        self.anomalies
-            .iter()
-            .find(|a| matches!(a, KeyringAnomaly::DirectoryUnreadable { .. }))
+        self.anomalies.iter().find(|a| {
+            matches!(
+                a,
+                KeyringAnomaly::DirectoryUnreadable { .. }
+                    | KeyringAnomaly::EpochRecordUnreadable { .. }
+            )
+        })
     }
 }
 
@@ -979,22 +1533,45 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
     // it first — but `hash_cwd_candidates` does not consult that, and handing
     // an investigator a candidate list under a guessed epoch label is the
     // forensic version of the same mislabelling #457 closed for the writer.
-    let retired = match scan_key_dir(secret_path) {
+    let (retired, record) = match scan_key_dir(secret_path) {
         KeyDirScan::Unlistable(reason) => {
             anomalies.push(KeyringAnomaly::DirectoryUnreadable { reason });
             return Keyring { keys, anomalies };
         }
-        KeyDirScan::Listed(retired) => retired,
+        KeyDirScan::Listed { retired, epoch } => (retired, epoch),
     };
-    let max_retired = max_retired_index(&retired);
+    // PR-C1 (yotta 判断12): fatal for the same reason the arm above is. Every
+    // id resolved below would be resolved against an epoch the store did not
+    // confirm, and the ring is what `verify` authenticates the whole log
+    // against.
+    let recorded = match record.recorded() {
+        Ok(recorded) => recorded,
+        Err(reason) => {
+            anomalies.push(KeyringAnomaly::EpochRecordUnreadable {
+                reason: reason.to_string(),
+            });
+            return Keyring { keys, anomalies };
+        }
+    };
+    let epoch = active_epoch(&retired, recorded);
 
     // Active key → the id the writer is currently stamping.
     if let Ok(secret) = read_secret(secret_path) {
-        keys.insert(key_id_for_index(max_retired), secret);
+        keys.insert(key_id_for_epoch(epoch), secret);
         // Before any rotation the active key *is* epoch 1, which is what
         // `"default"` names. After a rotation `"default"` belongs to
         // `.1.retired` instead, registered below.
-        if max_retired == 0 {
+        //
+        // PR-C1 (Codex Round 3, Minor-1): the condition is the *epoch*, not
+        // `max_retired == 0`, and the difference is the whole of the
+        // deleted-retired-key defect. On a store that recorded epoch 2 and then
+        // had its only retired key removed, `max_retired` is 0 — so the old
+        // condition aliased `"default"` onto the epoch-2 key, and every epoch-1
+        // entry was checked against bytes that never signed it and reported as
+        // tampering. With the record consulted, `"default"` resolves to nothing
+        // and those entries land in cannot-verify, which is what actually
+        // became of them.
+        if epoch == 1 {
             keys.insert("default".to_string(), secret);
         }
     }
@@ -1312,9 +1889,55 @@ fn rotate_key_locked(
     // Ordered before `read_secret` deliberately: it makes the diagnosis right
     // when *both* are unreadable (mode 000). The other order reported "no audit
     // secret found — nothing to rotate", which is false — the secret is there.
-    let retired = match scan_key_dir(&secret_path) {
-        KeyDirScan::Unlistable(reason) => return Err(AuditError::KeyringUnusable(reason)),
-        KeyDirScan::Listed(retired) => retired,
+    let (retired, record) = match scan_key_dir(&secret_path) {
+        // The rotation-specific half of the message is built here, next to the
+        // condition, rather than by the CLI arm that prints it. That arm used
+        // to add "make that directory listable and writable again" to every
+        // `KeyringUnusable` — correct while an unusable keyring had one cause,
+        // and wrong the moment the arm below gave it a second one, where the
+        // directory is fine and a file is not. Same shape as the caller-side
+        // remedy #477 had to withdraw, and it was found the same way: by
+        // running the binary.
+        KeyDirScan::Unlistable(reason) => {
+            return Err(AuditError::KeyringUnusable {
+                reason: format!(
+                    "{reason} — rotating without a complete listing of the key directory would \
+                     retire the current key under the wrong epoch number, and entries signed by \
+                     it would later read as tampered."
+                ),
+                // "listable **and writable**": rotation renames and creates, so
+                // a directory made merely readable still fails here — measured
+                // at mode 0500, where both the rename and the create return
+                // EACCES. And "no key file was renamed or created" rather than
+                // "nothing changed": `with_key_store_lock` may have created
+                // `audit-secret.lock` by now, which holds no key material and
+                // is recreated on demand.
+                remedy: "No key file was renamed or created. To fix: make that directory \
+                         listable and writable again, then re-run."
+                    .to_string(),
+            });
+        }
+        KeyDirScan::Listed { retired, epoch } => (retired, epoch),
+    };
+
+    // PR-C1 (yotta 判断12): refuse before touching the store, on the same
+    // argument as the arm above. Rotation is the one consumer that mutates, and
+    // the number it allocates is precisely what the record answers — proceeding
+    // on a fallback here is how a number gets handed out twice.
+    let recorded = match record.recorded() {
+        Ok(recorded) => recorded,
+        Err(reason) => {
+            return Err(AuditError::KeyringUnusable {
+                reason: format!(
+                    "{reason} — which key epoch is active is unknown, so rotation cannot \
+                     allocate the next one."
+                ),
+                remedy: format!(
+                    "No key file was renamed or created. {}",
+                    epoch_record_remedy()
+                ),
+            });
+        }
     };
 
     // Verify current secret exists. The error body is kept rather than
@@ -1328,30 +1951,31 @@ fn rotate_key_locked(
     // count of matching names (#457 P4-a): with a gap (`.1`, `.3`) the count
     // said 2 and picked `.2`, while `key_id` derivation said `key-3` — the two
     // disagreed about which epoch was which.
-    let max_retired = max_retired_index(&retired);
-    // #457 (Codex Round 2): `scan_key_dir` rejects `u32::MAX` itself, but
-    // `u32::MAX - 1` is accepted — and the new key's id is `n + 1`, one past
-    // the retired slot, so the arithmetic has to survive two increments, not
-    // one. Unreachable in practice; refusing beats panicking.
-    let (n, next_id) = match max_retired
-        .checked_add(1)
-        .and_then(|n| n.checked_add(1).map(|next| (n, next)))
-    {
-        Some(pair) => pair,
-        None => {
-            return Err(AuditError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "audit key epoch {max_retired} is at the representable limit; \
-                     rotation cannot allocate a successor"
-                ),
-            )));
-        }
+    //
+    // PR-C1: and not from the highest index alone either. The key being
+    // displaced belongs to the *active epoch*, which the record can put above
+    // `max_retired + 1` — a store that recorded epoch 5 and holds only `.2`
+    // retires into `.5.retired`, because 5 is the epoch whose entries that key
+    // signed. Deriving the slot from the slots is what let a rotation on a
+    // tidied-up store name a key after an epoch that already existed.
+    let epoch = active_epoch(&retired, recorded);
+    // #457 (Codex Round 2): `scan_key_dir` rejects `u32::MAX` itself, so the
+    // derived side of `active_epoch` cannot reach it — but the recorded side
+    // is a number read off disk and can be anything. Unreachable in ordinary
+    // use; refusing beats panicking.
+    let Some(next_id) = epoch.checked_add(1) else {
+        return Err(AuditError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "audit key epoch {epoch} is at the representable limit; \
+                 rotation cannot allocate a successor"
+            ),
+        )));
     };
     let retired_path = secret_path
         .parent()
         .unwrap()
-        .join(format!("audit-secret.{n}.retired"));
+        .join(format!("audit-secret.{epoch}.retired"));
 
     // #457 P4-c: `fs::rename` silently replaces its destination. `create_secret`
     // is already guarded with `create_new(true)`; the rename side was not, so a
@@ -1402,15 +2026,52 @@ fn rotate_key_locked(
         let _ = fs::set_permissions(&retired_path, fs::Permissions::from_mode(0o600));
     }
 
+    // PR-C1 step 16: record the new epoch *before* a key exists to carry it.
+    //
+    // The order is the invariant, not an optimisation: a key minted under a
+    // number the store has not written down is a key the next command names
+    // differently. Recording first means the worst a crash can leave is a
+    // number nobody used — epochs are allowed to have gaps, and skipping one
+    // costs nothing, while reusing one puts two secrets under a single id and
+    // `ADR-0007` forbids repairing the entries afterwards.
+    //
+    // Durable before it returns (Codex Round 3, Major-1) — see
+    // `write_epoch_record`. A record that reached only the page cache would
+    // come back as the old number after a crash, and this whole ordering would
+    // buy nothing.
+    //
+    // yotta 判断16: a failure here stops the rotation rather than rolling the
+    // rename back. The store is left in the interrupted state
+    // `load_signing_key` already handles and recovers from on the next command;
+    // an undo would add a failure path whose own failure has no handler. The
+    // error names the record so the message does not read as if `create_secret`
+    // was the step that failed.
+    let next_id = match write_epoch_record(&secret_path, next_id) {
+        // The record is monotonic, so this can come back *higher* than asked
+        // for — a concurrent recovery under an unheld lock. Naming the number
+        // that is on disk keeps `new_key_id` equal to what the next scan will
+        // derive; naming the one this call wanted would not.
+        Ok(recorded) => recorded,
+        Err(e) => {
+            return Err(AuditError::RotationInterrupted {
+                retired_path,
+                source: std::io::Error::new(
+                    e.kind(),
+                    format!("{EPOCH_RECORD_NAME} could not be advanced to epoch {next_id}: {e}"),
+                ),
+            });
+        }
+    };
+
     // Generate new secret.
     //
-    // #478: its own error, not the `Io` catch-all. Everything above this line
-    // refuses without touching the key directory; the `rename` on the line
-    // above did touch it, so a failure here is the one rotation outcome that
-    // leaves the store changed — and changed into exactly the interrupted state
-    // `load_signing_key` warns about, where the next append mints a second key
-    // under the id this rotation was heading for. The operator needs to know
-    // which file moved, and `key rotation failed: {e}` said neither.
+    // #478: its own error, not the `Io` catch-all. Everything above the rename
+    // refuses without touching the key directory; the `rename` did touch it, so
+    // a failure here is the one rotation outcome that leaves the store changed
+    // — and changed into exactly the interrupted state `load_signing_key` warns
+    // about, where the next append mints a second key under the id this
+    // rotation was heading for. The operator needs to know which file moved,
+    // and `key rotation failed: {e}` said neither.
     if let Err(source) = create_secret(&secret_path) {
         return Err(AuditError::RotationInterrupted {
             retired_path,
@@ -1418,16 +2079,16 @@ fn rotate_key_locked(
         });
     }
 
-    // The pre-rotation max index names the epoch this rotation just ended.
-    // `key_id_for_index` owns the `"default"`-vs-`key-N` rule; restating it
+    // The active epoch names the one this rotation just ended.
+    // `key_id_for_epoch` owns the `"default"`-vs-`key-N` rule; restating it
     // here is what would let the two drift.
     //
-    // `new_key_id` keeps its own `format!` so that `next_id` — which exists to
-    // make the overflow check above cover *both* increments — still guards a
-    // value something reads.
+    // `new_key_id` keeps its own `format!` so that `next_id` — which the
+    // overflow check above exists to guard — still names a value something
+    // reads.
     Ok(RotationResult {
         new_key_id: format!("key-{next_id}"),
-        retired_key_id: key_id_for_index(max_retired),
+        retired_key_id: key_id_for_epoch(epoch),
         retired_path,
     })
 }

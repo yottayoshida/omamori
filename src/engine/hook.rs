@@ -2817,6 +2817,33 @@ mod tests {
         assert_eq!(kind, MatchKind::FilenamePrefix);
     }
 
+    /// PR-C1 (step 20). `audit-secret.epoch` decides which key epoch every
+    /// entry is labelled with, so an agent that can rewrite it can make the
+    /// writer name a key it is not signing with — the defect the record exists
+    /// to remove, handed back through the file that removes it.
+    ///
+    /// Nothing was added to `PROTECTED_FILE_PATTERNS` for this: the name was
+    /// chosen to fall under the existing `audit-secret` prefix. That is the
+    /// claim under test, and it is worth testing precisely because it holds by
+    /// naming convention rather than by an entry someone would notice deleting.
+    ///
+    /// The in-progress write is a separate question. `write_epoch_record` goes
+    /// through `atomic_file`, whose temp names are `.omamori-tmp-{pid}-{random}`
+    /// — covered by the `.local/share/omamori` Subpath entry in the default
+    /// location, and outside it on the same footing as every other
+    /// `atomic_file` caller. `write_hwm` needed its own `.jsonl.hwm.tmp` entry
+    /// only because it builds a fixed-name temp of its own.
+    #[test]
+    fn protected_file_path_epoch_record_matches_outside_data_dir_via_filename_kind_only() {
+        let (pattern, kind, _) = is_protected_file_path("/custom/audit-dir/audit-secret.epoch")
+            .expect(
+                "audit-secret.epoch (the key epoch record) under a custom (non-data-dir) audit \
+                 path must stay protected",
+            );
+        assert_eq!(pattern, "audit-secret");
+        assert_eq!(kind, MatchKind::FilenamePrefix);
+    }
+
     #[test]
     fn protected_file_path_audit_jsonl_md_outside_data_dir_no_longer_false_positive() {
         // The headline #320 false positive: a genuinely unrelated file

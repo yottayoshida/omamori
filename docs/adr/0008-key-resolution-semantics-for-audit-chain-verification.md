@@ -208,3 +208,63 @@ tracked separately, out of scope here.
   elements, adding one afterwards is harder, not easier** — so "defer past 1.0" is the wrong frame
   for it. It is deferred because #457 is about key *resolution*, not key *storage*, and the
   reordering option closes the same window without touching storage at all.
+
+**Update (PR-C1, 2026-08-03 — the deferred storage change landed, as neither of the two options
+above)**: `audit-secret.epoch` now records **the highest epoch this store has ever handed out**,
+as one decimal integer in a file next to the keys. Epochs are read as
+`max(recorded, max_retired + 1)`, so a store without the file behaves exactly as before. Three
+statements above did not hold; each is corrected here rather than edited away.
+
+1. **"adds an on-disk element 1.0 would freeze" is not a property `docs/CONTRACT.md` has.** The
+   breaking-change policy names three frozen surfaces — rule matching, the CLI, and audit-chain
+   verification — and the key store's layout is in none of them; the same section puts
+   `config.toml`'s format explicitly outside the contract. This cycle also added
+   `audit-secret.lock` to that directory without treating it as breaking. The asymmetry argued
+   above was right about the direction and wrong about the premise: there was no freeze to get
+   ahead of.
+2. **The `.pending` reordering does not close the same set.** Its reach is the
+   interrupted-rotation window, which the Alternatives row states accurately. What reading it as
+   "the cheaper of two equivalent fixes" adds — and the row does not claim — is the
+   deleted-retired-key defect, which it cannot touch: the `"default"` alias condition looks at how
+   many retired keys are *present*, not at how many epochs happened. `.pending` remains worth
+   doing and is scoped as PR-C2; it is not a substitute for the record.
+3. **"each key file records its own epoch" is the wrong shape.** What has to be told apart is a
+   generation that is *gone*, and a file that is gone carries no tag. Tagging also leaves the mint
+   stamping `max + 1`, so the numbering defects survive it. The record works precisely because it
+   lives outside the keys: deleting a key lowers `max_retired` and changes nothing the store said.
+
+The form is deliberately neither the key files nor the file *names*. A second line inside
+`audit-secret` is rejected by v0.16.0's `hex.len() != 64` check, so every entry written under a
+downgraded binary would carry `NO_HMAC_SECRET` beneath a real `key_id` — a permanent exit-1
+tampering verdict on re-upgrade, unrepairable under ADR-0007. Encoding the epoch in the file name
+hides `audit-secret` from older binaries entirely, and they then mint a second key in silence. A
+separate file that older versions never look at is simply ignored by them.
+
+Residual, recorded rather than closed:
+
+- **A record is only as accurate as the listing that produced it.** If retired keys were already
+  missing when the first record was written, the number it fixes is the low, derived one.
+- **Downgrade is safe in general and conditional in one state.** v0.16.0 ignores the file. But a
+  store that skipped an epoch — record above `max_retired + 1`, which happens when a generation is
+  lost — mislabels its active key under v0.16.0, and entries written there can read as
+  cannot-verify after upgrading again.
+- **Deleting the record returns the store to the derivation.** It adds protection; it does not
+  enforce it. `PROTECTED_FILE_PATTERNS` matches the `audit-secret` prefix, so this is an
+  operator's action and not an agent's.
+- **A record that cannot be parsed stops `verify` and refuses `rotate`.** One file can therefore
+  halt verification, where a corrupt `.retired` file is only a non-fatal anomaly. That asymmetry
+  is the accepted cost of not guessing; the mitigation is entirely in the message, which names the
+  file and states that removing it restores the derivation.
+- **Durability stops at the directory entry.** `atomic_write_with_mode` checks the temp file's own
+  `sync_all` and then asks the parent directory to sync, but that second call's error is swallowed
+  (`atomic_file::fsync_parent`, a decision that predates this record and is shared by every caller
+  of the helper). A record that returned `Ok` therefore survives a process crash; against power
+  loss it survives only as far as the rename reached the disk. Making the parent sync fallible
+  would change every `atomic_file` call site and is not part of this change.
+- **A store that can record but cannot mint climbs.** The recovery path writes the next epoch
+  before creating the key, so if the write keeps succeeding while `create_secret` keeps failing,
+  every later command advances the number again. The two failures normally share a cause — an
+  unwritable directory denies the record first, and the recovery then does nothing at all — which
+  leaves a missing `/dev/urandom` or `EMFILE`. The alternative is minting under a number the
+  record does not hold, which is the defect itself; `u32` gives 4.29e9 epochs against 104 for
+  weekly rotation over two years.
