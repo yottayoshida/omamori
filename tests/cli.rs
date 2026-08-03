@@ -261,7 +261,11 @@ fn init_force_overwrites_existing() {
 #[cfg(unix)]
 #[test]
 fn init_refuses_symlink_target() {
-    let dir = unique_dir("init-symlink");
+    // #488: named away from every word asserted below. `init` quotes the path
+    // it refused, so a fixture called `…-symlink-…` satisfied
+    // `contains("symlink")` on its own name and the assertion passed against
+    // any message at all.
+    let dir = unique_dir("init-planted-config");
     let config_dir = dir.join("omamori");
     fs::create_dir_all(&config_dir).unwrap();
 
@@ -280,9 +284,13 @@ fn init_refuses_symlink_target() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // #488: the diagnostic itself, not a word that also occurs in every path
+    // this command prints. Renaming the fixture is not enough on its own — the
+    // sandbox path is environment-supplied and could carry the word too.
     assert!(
-        stderr.contains("symlink"),
-        "should mention symlink: {stderr}"
+        stderr.contains("is a symlink; refusing to write for security"),
+        "the refusal must come from `reject_symlink`, not from a path that \
+         happens to contain the word: {stderr}"
     );
 
     // Real file should be unchanged
@@ -295,7 +303,8 @@ fn init_refuses_symlink_target() {
 #[cfg(unix)]
 #[test]
 fn init_refuses_symlinked_parent_directory() {
-    let dir = unique_dir("init-symlink-dir");
+    // #488: see `init_refuses_symlink_target` — same shape, same fix.
+    let dir = unique_dir("init-planted-parent");
     let real_dir = dir.join("real_omamori");
     fs::create_dir_all(&real_dir).unwrap();
 
@@ -312,9 +321,12 @@ fn init_refuses_symlinked_parent_directory() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // #488: the diagnostic, not the word. `reject_symlink` is called with the
+    // `config directory` label on this path, so the same sentence carries it.
     assert!(
-        stderr.contains("symlink"),
-        "should mention symlink: {stderr}"
+        stderr.contains("is a symlink; refusing to write for security"),
+        "the refusal must come from `reject_symlink`, not from a path that \
+         happens to contain the word: {stderr}"
     );
 
     // No config.toml should be created in real_dir
@@ -2375,7 +2387,10 @@ fn config_disable_core_rule_rejected() {
 
 #[test]
 fn config_validate_valid_exits_0() {
-    let dir = unique_dir("cfg-validate-ok");
+    // #488: `cfg-validate-ok` contains "validate", so it contains "valid", and
+    // the command prints the path it checked — the old assertion passed on the
+    // fixture's own name.
+    let dir = unique_dir("cfg-accepts-ok");
 
     let mut init_cmd = Command::new(binary());
     clean_ai_env(&mut init_cmd);
@@ -2400,7 +2415,16 @@ fn config_validate_valid_exits_0() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("valid"), "should say valid: {stderr}");
+    // The whole verdict, not the word. **Renaming the fixture is not enough
+    // here**: `valid` is a substring of `invalid`, so the old assertion could
+    // not tell the two verdicts apart on any fixture name at all — the failure
+    // message `omamori config validate: invalid` satisfies it. Literal em dash,
+    // like the message itself; an escaped codepoint would be invisible to
+    // `check-invariants.sh`, which pins operator text with `grep -F`.
+    assert!(
+        stderr.contains("omamori config validate: valid —"),
+        "the assertion must separate the verdict from its negation: {stderr}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -6235,7 +6259,11 @@ fn config_add_requires_command_action_and_match_token() {
 /// `--action move-to` requires `--destination`.
 #[test]
 fn config_add_destination_and_move_to_action_are_mutually_required() {
-    let dir = unique_dir("cfg-add-move-to-pair");
+    // #488: `cfg-add-move-to-pair` contains both asserted strings, and every
+    // `config add` error prints `CONFIG_ADD_USAGE`, which contains them too —
+    // so renaming the fixture alone would leave the assertions passing against
+    // any diagnostic whatsoever.
+    let dir = unique_dir("cfg-add-pair-required");
     config_add_init(&dir);
 
     let dest_without_move_to = config_add_cmd(&dir)
@@ -6256,8 +6284,10 @@ fn config_add_destination_and_move_to_action_are_mutually_required() {
         .unwrap();
     assert!(!dest_without_move_to.status.success());
     assert!(
-        String::from_utf8_lossy(&dest_without_move_to.stderr).contains("move-to"),
-        "stderr: {}",
+        String::from_utf8_lossy(&dest_without_move_to.stderr)
+            .contains("config add: --destination is only valid with --action move-to"),
+        "the diagnostic itself, not the usage line every `config add` error \
+         carries: {}",
         String::from_utf8_lossy(&dest_without_move_to.stderr)
     );
 
@@ -6277,8 +6307,10 @@ fn config_add_destination_and_move_to_action_are_mutually_required() {
         .unwrap();
     assert!(!move_to_without_dest.status.success());
     assert!(
-        String::from_utf8_lossy(&move_to_without_dest.stderr).contains("--destination"),
-        "stderr: {}",
+        String::from_utf8_lossy(&move_to_without_dest.stderr)
+            .contains("config add: --action move-to requires --destination"),
+        "the diagnostic itself, not the usage line every `config add` error \
+         carries: {}",
         String::from_utf8_lossy(&move_to_without_dest.stderr)
     );
 

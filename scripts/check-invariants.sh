@@ -1320,6 +1320,97 @@ else
     fail=1
 fi
 
+# ---------- Invariant: a fixture name must not satisfy its own assertion (#488) ----------
+# A test that asserts on a captured stream can be satisfied by the sandbox path
+# the command echoes back, when its fixture directory is named after a word the
+# assertion looks for. `…-verify-unlistable-…` satisfies
+# `stderr.contains("listable")` whatever the code printed, and deleting the line
+# under test leaves it green. On #477 a mutation run was the only thing that
+# caught it, and the same shape was written again forty minutes after being
+# fixed -- which is the argument for a mechanical check rather than a rule
+# people are expected to remember.
+#
+# Restricted to assertions that read `stderr`/`stdout`, because that is the
+# mechanism: an assertion on parsed config content or on a single selected
+# output line carries no path. Including them produced six false positives when
+# this was first measured. Comment lines are stripped for the same reason -- a
+# comment quoting the very assertion it warns against was the seventh.
+#
+# All three counts are asserted, so an empty corpus or an extraction that
+# stopped matching cannot pass as "no violations found". Falsified once by
+# re-injecting a known violation and confirming it is reported.
+#
+# **Remove this when** the fixture helpers stop putting the sandbox path into
+# operator output, or when assertions on captured streams leave the suite --
+# either makes the mechanism unreachable. Not for going quiet: this class is
+# silent by construction.
+fixture_fail=0
+if ! python3 - <<'PYEOF'
+import re, pathlib, sys
+
+FIXTURE_CALLS = (
+    r'seed_rotatable_home\(&?(?:format!\()?"([^"]+)"',
+    r'unique_dir\("([^"]+)"',
+)
+MIN_TESTS, MIN_FIXTURES, MIN_ASSERTS = 200, 80, 120
+
+paths = sorted(pathlib.Path("tests").glob("*.rs"))
+tests_scanned = fixtures_seen = asserts_checked = 0
+violations = []
+
+for path in paths:
+    src = path.read_text()
+    starts = [(m.start(), m.group(1)) for m in re.finditer(r'\nfn (\w+)\(', src)]
+    for i, (pos, name) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(src)
+        code = "\n".join(
+            l for l in src[pos:end].splitlines() if not l.strip().startswith("//")
+        )
+        tests_scanned += 1
+        fixtures = []
+        for pat in FIXTURE_CALLS:
+            fixtures += re.findall(pat, code)
+        if not fixtures:
+            continue
+        fixtures_seen += len(fixtures)
+        for m in re.finditer(r'assert!\((.*?)\);', code, re.S):
+            expr = m.group(1)
+            if 'stderr' not in expr and 'stdout' not in expr:
+                continue
+            asserts_checked += 1
+            for s in re.findall(r'contains\("([^"]+)"\)', expr):
+                for fx in fixtures:
+                    if s and s in fx:
+                        violations.append((path, name, fx, s))
+
+if (tests_scanned < MIN_TESTS or fixtures_seen < MIN_FIXTURES
+        or asserts_checked < MIN_ASSERTS):
+    print(f"FAIL [invariant fixture-name-assertions/#488]: scanned {tests_scanned} "
+          f"tests / {fixtures_seen} fixtures / {asserts_checked} stream assertions "
+          f"across {len(paths)} files, expected at least {MIN_TESTS}/{MIN_FIXTURES}/"
+          f"{MIN_ASSERTS} -- not run from the repo root, or the extraction stopped "
+          f"matching the source.")
+    sys.exit(1)
+
+for path, name, fx, s in violations:
+    print(f"FAIL [invariant fixture-name-assertions/#488]: {path}::{name} asserts "
+          f"{s!r} on a captured stream while its fixture is named {fx!r}, which "
+          f"contains it -- the command echoes that path, so the assertion passes "
+          f"whatever the code printed.")
+if violations:
+    sys.exit(1)
+
+print(f"fixture-name-assertions OK: no asserted substring occurs in its own fixture "
+      f"name ({tests_scanned} tests, {fixtures_seen} fixtures, {asserts_checked} "
+      f"stream assertions across {len(paths)} files)")
+PYEOF
+then
+    fixture_fail=1
+fi
+if [ "$fixture_fail" -ne 0 ]; then
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"
