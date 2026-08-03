@@ -261,10 +261,59 @@ Residual, recorded rather than closed:
   of the helper). A record that returned `Ok` therefore survives a process crash; against power
   loss it survives only as far as the rename reached the disk. Making the parent sync fallible
   would change every `atomic_file` call site and is not part of this change.
-- **A store that can record but cannot mint climbs.** The recovery path writes the next epoch
+- **A store that can record but cannot mint climbs.** ⚠️ *Narrowed by PR-C2 — see the update
+  below; the rotation path no longer reaches this, only the recovery path does.* The recovery
+  path writes the next epoch
   before creating the key, so if the write keeps succeeding while `create_secret` keeps failing,
   every later command advances the number again. The two failures normally share a cause — an
   unwritable directory denies the record first, and the recovery then does nothing at all — which
   leaves a missing `/dev/urandom` or `EMFILE`. The alternative is minting under a number the
   record does not hold, which is the defect itself; `u32` gives 4.29e9 epochs against 104 for
   weekly rotation over two years.
+
+**Update (PR-C2, 2026-08-03 — the `.pending` reordering, which this ADR deferred alongside the
+record)**: rotation now builds its replacement at `audit-secret.pending` before the active key
+moves, and renames it into place last. The order is: create `.pending` → rename active into its
+retired slot → record the new epoch → rename `.pending` into place → `fsync` the directory.
+
+Both halves of the Alternatives row above held. It needed no format element any reader can see —
+the two consumers destructure the scan with `..` and never resolve that path — and it closes a
+window the record does not. **The two are complementary, not substitutes**, which is the reading
+the update above corrects.
+
+What it buys is narrower than the record, and worth stating exactly: **the failures that come from
+producing a key move to where the store is untouched**. Minting can fail for entropy, for
+descriptors, or for room to write its 64 bytes, and until now all of those landed after the
+rename, leaving a store the next command had to recover from.
+
+Steps 2-4 are directory-entry changes, which is a smaller surface and not an exempt one:
+`rename` returns `ENOSPC` when the target directory cannot be extended (Codex Round 1, P2 — the
+first draft of this paragraph claimed a full disk could not reach them). A failure there is
+reported as an interrupted rotation, which is the state the epoch record already covers.
+
+`create_secret` became durable in the same change: `sync_all`, a parent `fsync`, and the file is
+removed if the write or the sync fails. A partial `audit-secret` was previously unrecoverable
+without manual deletion — too short for `read_secret`, and un-replaceable because `create_new`
+refuses an existing path.
+
+Residual specific to this half:
+
+- **A leftover `.pending` is deleted by the next rotation *that holds the key-store lock*.** Two
+  conditions, both load-bearing, and the first one alone is not enough. "No reader resolves that
+  path" is why the key it holds was never handed out and why no entry can name it — that is what
+  separates it from a `.retired` file, where the same latitude would destroy an epoch. It proves
+  nothing about *ownership*: the lock is best-effort, so a second rotation can reach the slot
+  while the first is still writing into it, and deleting there would strand the first at its final
+  rename — manufacturing the interrupted store this reordering exists to prevent. Removal
+  therefore requires the lock; without it the rotation refuses and says why. Anything at the path
+  that is not a regular file is refused rather than removed in either case, before the store
+  changes.
+
+  **Residual**: holding the lock does not prove the other side is not also proceeding without one.
+  What it buys is that an irreversible delete is confined to the caller that won the exclusion.
+  Refusing to rotate on an unheld lock outright is not available — `#477` established that it
+  would let any local process block rotation for good.
+- **The window is narrower, not closed.** A crash between the two renames still leaves the
+  interrupted state, and the epoch record is still what keeps the recovery from reusing the
+  number. Steps 2-4 cannot be made atomic without platform-specific primitives that this codebase
+  has already declined once (`renamex_np` / `renameat2`, see the P4-c note above).

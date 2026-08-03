@@ -4733,16 +4733,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// PR-C1 (V-C09). The record is not a retired key, on this version or any
-    /// other.
+    /// PR-C1 (V-C09) + PR-C2 (V-C24). Neither of the two files omamori keeps
+    /// beside the keys is a retired key, on this version or any other.
     ///
-    /// It sits under the `audit-secret` prefix so the AI write block covers it,
-    /// which puts it one `strip_suffix` away from being counted as a slot. If
-    /// it ever were, every epoch in the store would shift by one — and the
-    /// versions that predate the record apply the same suffix rule, so this
-    /// holds for them too.
+    /// Both sit under the `audit-secret` prefix so the AI write block covers
+    /// them, which puts each one `strip_suffix` away from being counted as a
+    /// slot. If either ever were, every epoch in the store would shift — and
+    /// the versions that predate them apply the same suffix rule, so this holds
+    /// for those too.
+    ///
+    /// The pending slot is also checked to be *reported*, not merely ignored.
+    /// Rotation needs to know it is there, and it must learn that from the
+    /// listing rather than from an `exists()` on a path it built itself: on a
+    /// case-insensitive filesystem those two disagree, and rotation deletes
+    /// what it is told about.
     #[test]
-    fn the_record_is_not_registered_as_a_retired_key() {
+    fn neither_the_record_nor_the_pending_slot_is_a_retired_key() {
         use std::ffi::OsString;
 
         let dir = test_dir("c9-record-is-not-a-slot");
@@ -4752,27 +4758,229 @@ mod tests {
             &dir,
             vec![
                 Ok(OsString::from("audit-secret.epoch")),
+                Ok(OsString::from("audit-secret.pending")),
                 Ok(OsString::from("audit-secret.1.retired")),
             ]
             .into_iter(),
         );
-        let secret::KeyDirScan::Listed { retired, epoch } = &scan else {
+        let secret::KeyDirScan::Listed {
+            retired,
+            epoch,
+            pending,
+        } = &scan
+        else {
             panic!("a complete listing must list")
         };
         assert_eq!(
             secret::max_retired_index(retired),
             1,
-            "the record must not count as a slot"
+            "neither file may count as a slot"
         );
         assert_eq!(
             retired.len(),
             1,
-            "and must not appear in the retired map under any index"
+            "and neither may appear in the retired map under any index"
         );
         assert_eq!(
             epoch.recorded().expect("the record reads"),
             3,
-            "it is read as the epoch record instead"
+            "the record is read as the epoch record instead"
+        );
+        assert_eq!(
+            pending.as_deref(),
+            Some(dir.join("audit-secret.pending").as_path()),
+            "and the pending slot is handed to rotation, from the listing"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C2 (V-C21, V-C23). What sits in the pending slot decides whether the
+    /// rotation starts — and the decision lands before anything has moved.
+    ///
+    /// **The order is the change.** A rotation that could not build its
+    /// replacement used to find that out *after* renaming the active key away,
+    /// leaving a store the next command had to recover from. So the assertion
+    /// worth making here is not "it failed" but "it failed and nothing moved":
+    /// the active key is byte-identical, no slot was filled, no epoch was
+    /// recorded, and re-running is the entire remedy.
+    ///
+    /// Three shapes omamori refuses to remove. The refusal is not the defence —
+    /// `create_new` + `O_NOFOLLOW` is — it is what stops a rotation from
+    /// deleting a file omamori did not write.
+    #[test]
+    #[cfg(unix)]
+    fn what_sits_in_the_pending_slot_decides_before_anything_moves() {
+        for shape in ["a-directory", "a-fifo", "a-symlink"] {
+            let dir = test_dir(&format!("c21-{shape}"));
+            let audit_path = dir.join("audit.jsonl");
+            let secret_path = dir.join("audit-secret");
+            let pending_path = dir.join("audit-secret.pending");
+            let config = AuditConfig {
+                enabled: true,
+                path: Some(audit_path.clone()),
+                retention_days: 0,
+                strict: false,
+            };
+
+            let logger = AuditLogger::from_config(&config).expect("logger constructs");
+            logger.append(make_event("epoch-1")).unwrap();
+            drop(logger);
+            let before = fs::read_to_string(&secret_path).expect("the active key exists");
+
+            match shape {
+                "a-directory" => fs::create_dir(&pending_path).unwrap(),
+                "a-fifo" => mkfifo_at(&pending_path),
+                "a-symlink" => std::os::unix::fs::symlink(&secret_path, &pending_path).unwrap(),
+                other => unreachable!("unhandled shape {other}"),
+            }
+
+            let Err(e) = super::rotate_key(&audit_path) else {
+                panic!("{shape}: rotation must refuse")
+            };
+            let msg = e.to_string();
+            assert!(
+                msg.contains("audit-secret.pending"),
+                "{shape}: the message names the path to inspect: {msg}"
+            );
+
+            assert_eq!(
+                fs::read_to_string(&secret_path).unwrap(),
+                before,
+                "{shape}: the active key did not move"
+            );
+            assert!(
+                !dir.join("audit-secret.1.retired").exists(),
+                "{shape}: nothing was retired — the refusal is ahead of the rename"
+            );
+            assert!(
+                !dir.join("audit-secret.epoch").exists(),
+                "{shape}: and no epoch was recorded"
+            );
+            assert!(
+                fs::symlink_metadata(&pending_path).is_ok(),
+                "{shape}: what was planted is left where the operator can see it"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// PR-C2 (V-C21). A leftover the rotation itself wrote is cleared, and the
+    /// rotation goes through.
+    ///
+    /// The control for the test above — same slot, different contents, opposite
+    /// outcome. Without it, "rotation refuses when the slot is occupied" would
+    /// also be satisfied by refusing unconditionally, which would make every
+    /// store that crashed mid-rotation permanently un-rotatable.
+    ///
+    /// The leftover key is discarded rather than adopted. It was written by a
+    /// rotation that never moved it into place, so no reader ever resolved it
+    /// and no entry can name it; adopting it would be inheriting bytes with no
+    /// record of where they came from.
+    #[test]
+    fn a_leftover_pending_key_is_cleared_and_the_rotation_goes_through() {
+        let dir = test_dir("c21-leftover-cleared");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let pending_path = dir.join("audit-secret.pending");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+
+        write_key_file(&pending_path, &[3u8; 32]);
+        let leftover = fs::read_to_string(&pending_path).unwrap();
+
+        let result = super::rotate_key(&audit_path).expect("rotation succeeds");
+        assert_eq!(result.new_key_id, "key-2", "the rotation completed");
+        assert!(
+            !pending_path.exists(),
+            "and the slot is empty again — the replacement was moved out of it"
+        );
+        assert_ne!(
+            fs::read_to_string(&secret_path).unwrap(),
+            leftover,
+            "the leftover was discarded, not adopted"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("audit-secret.epoch")).unwrap(),
+            "2",
+            "and the epoch advanced as it would have without any leftover"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C2 (Codex Round 1, P1). A leftover is cleared only by a rotation that
+    /// holds the key-store lock.
+    ///
+    /// "No reader resolves `.pending`" proves no *entry* can name the key it
+    /// holds. It does not prove the file is unowned — and the lock is
+    /// best-effort, so a second rotation reaches this point while the first is
+    /// still inside `create_secret`. Deleting there strands the first at its
+    /// final rename and leaves exactly the interrupted store this change exists
+    /// to prevent, manufactured by the cleanup for it.
+    ///
+    /// The lock is made unavailable here by putting a directory at its path,
+    /// which is one of the four ways `with_key_store_lock` reports `Unheld`.
+    #[test]
+    fn a_pending_slot_is_not_cleared_without_the_key_store_lock() {
+        let dir = test_dir("c21-no-lock-no-delete");
+        let audit_path = dir.join("audit.jsonl");
+        let pending_path = dir.join("audit-secret.pending");
+        let lock_path = dir.join("audit-secret.lock");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+
+        write_key_file(&pending_path, &[3u8; 32]);
+        let before = fs::read_to_string(&pending_path).unwrap();
+
+        // A directory at the lock path: `with_key_store_lock` cannot open it,
+        // so the rotation runs unlocked.
+        let _ = fs::remove_file(&lock_path);
+        fs::create_dir(&lock_path).unwrap();
+
+        let Err(e) = super::rotate_key(&audit_path) else {
+            panic!("an unlocked rotation must not decide a leftover is stale")
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("does not hold the key-store lock"),
+            "and it must say why it refused rather than blaming the file: {msg}"
+        );
+        assert_eq!(
+            fs::read_to_string(&pending_path).unwrap(),
+            before,
+            "the file another rotation may be writing is left alone"
+        );
+        assert!(
+            !dir.join("audit-secret.1.retired").exists(),
+            "and the refusal is ahead of the rename, so the store is untouched"
+        );
+
+        // The control: with the lock reachable, the same leftover is cleared
+        // and the rotation completes. Without this the assertions above would
+        // also hold for a build that never clears anything.
+        fs::remove_dir(&lock_path).unwrap();
+        super::rotate_key(&audit_path).expect("with the lock available it goes through");
+        assert!(
+            !pending_path.exists(),
+            "control: the leftover is gone once exclusion was actually obtained"
         );
 
         let _ = fs::remove_dir_all(&dir);

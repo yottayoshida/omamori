@@ -572,7 +572,7 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
                 secret: None,
             };
         }
-        KeyDirScan::Listed { retired, epoch } => (retired, epoch),
+        KeyDirScan::Listed { retired, epoch, .. } => (retired, epoch),
     };
 
     // PR-C1 (yotta 判断12): a record that does not state an epoch is refused
@@ -892,6 +892,15 @@ pub(super) enum KeyDirScan {
         /// What the store says about the highest epoch it has handed out,
         /// read from this same listing.
         epoch: EpochRecord,
+        /// Where [`PENDING_NAME`] sits, if the listing saw it.
+        ///
+        /// **Only rotation looks at this.** The two readers destructure with
+        /// `..`, and that is the whole reason a half-finished rotation does not
+        /// add a fourth state for them to classify: a key that has not been
+        /// renamed into place has not been handed out, so nothing they resolve
+        /// can name it. Which epoch is current is answered by the record, and
+        /// only by the record.
+        pending: Option<PathBuf>,
     },
     /// The listing could not be obtained, or could not be trusted to be whole.
     /// The string states what was observed, with no interpretation — callers
@@ -909,6 +918,22 @@ pub(super) enum KeyDirScan {
 /// of omamori, including ones that predate this file, can mistake the record
 /// for a retired key and shift every epoch by one.
 pub(super) const EPOCH_RECORD_NAME: &str = "audit-secret.epoch";
+
+/// Where a rotation builds the replacement key before anything else moves.
+///
+/// Under the `audit-secret` prefix so `PROTECTED_FILE_PATTERNS` covers it, and
+/// deliberately not ending in `.retired` so no version of omamori counts it as
+/// an epoch — the same two constraints [`EPOCH_RECORD_NAME`] is named under.
+///
+/// A file here is a key **nobody has been given**. The readers never look at
+/// this path, so no entry can name it, which is what makes a leftover safe to
+/// delete — the opposite of a `.retired` file, where deleting one destroys the
+/// only thing that can authenticate an epoch's entries.
+pub(super) const PENDING_NAME: &str = "audit-secret.pending";
+
+pub(super) fn pending_path_for(secret_path: &Path) -> PathBuf {
+    secret_path.with_file_name(PENDING_NAME)
+}
 
 /// The record holds one decimal integer. 16 bytes is past `u32::MAX`'s ten
 /// digits with room for a trailing newline, and small enough that a hostile
@@ -1146,6 +1171,7 @@ fn scan_key_dir(secret_path: &Path) -> KeyDirScan {
             return KeyDirScan::Listed {
                 retired: BTreeMap::new(),
                 epoch: EpochRecord::Absent,
+                pending: None,
             };
         }
         Err(e) => return unlistable(parent, None, &e),
@@ -1183,6 +1209,12 @@ pub(super) fn fold_key_dir_entries(
     // record — so the two would disagree about which files are present, and a
     // store could read its own epoch off a file `rotate` will never update.
     let mut epoch_present = false;
+    // Same rule as the record: the listing decides what exists, never a
+    // constructed-path `exists()`. A probe on a case-insensitive filesystem
+    // answers for `AUDIT-SECRET.PENDING` too, and rotation would then delete a
+    // file its own `create_new` is about to collide with under a different
+    // name.
+    let mut pending = None;
 
     for (seen, entry) in entries.enumerate() {
         let file_name = match entry {
@@ -1197,6 +1229,10 @@ pub(super) fn fold_key_dir_entries(
         let name = file_name.to_string_lossy();
         if name == EPOCH_RECORD_NAME {
             epoch_present = true;
+            continue;
+        }
+        if name == PENDING_NAME {
+            pending = Some(parent.join(&file_name));
             continue;
         }
         let Some(middle) = name
@@ -1241,6 +1277,7 @@ pub(super) fn fold_key_dir_entries(
         } else {
             EpochRecord::Absent
         },
+        pending,
     }
 }
 
@@ -1538,7 +1575,7 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
             anomalies.push(KeyringAnomaly::DirectoryUnreadable { reason });
             return Keyring { keys, anomalies };
         }
-        KeyDirScan::Listed { retired, epoch } => (retired, epoch),
+        KeyDirScan::Listed { retired, epoch, .. } => (retired, epoch),
     };
     // PR-C1 (yotta 判断12): fatal for the same reason the arm above is. Every
     // id resolved below would be resolved against an epoch the store did not
@@ -1740,7 +1777,30 @@ pub(super) fn create_secret(path: &Path) -> Result<[u8; 32], std::io::Error> {
         opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = opts.open(path).map_err(|e| eloop_message(e, path))?;
-    file.write_all(hex.as_bytes())?;
+    // C-F3: a `write_all` that dies partway — ENOSPC, EIO, a quota — used to
+    // leave a short `audit-secret` behind that nothing ever removed.
+    // `read_secret` then rejects it on its length and `create_secret` cannot
+    // replace it (`create_new`), so the store has no usable key until a person
+    // deletes the file by hand. Write and sync are one fallible step now, and
+    // the file goes away if either half of it fails.
+    //
+    // The removal is best-effort of necessity: if it fails there is nothing
+    // further to try, and the write error is the one worth reporting. What
+    // changes is that the ordinary failure — a full disk — no longer bricks
+    // the store.
+    if let Err(e) = file
+        .write_all(hex.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    drop(file);
+    // The sync above makes the bytes durable; this makes the *name* durable.
+    // Best-effort, like every other `fsync_parent` caller — see ADR-0008's
+    // residual list.
+    crate::atomic_file::fsync_parent(path);
 
     Ok(secret)
 }
@@ -1865,6 +1925,81 @@ pub fn rotate_key(path: &Path) -> Result<RotationResult, AuditError> {
     })
 }
 
+/// Clear the pending slot, or refuse if something omamori did not write is
+/// sitting in it.
+///
+/// A leftover here is a rotation that stopped after creating the replacement
+/// and before renaming it into place. **That key was never handed out** — the
+/// readers do not resolve this path, so no entry can name it — which is what
+/// makes removing it safe, and what separates it from a `.retired` file, where
+/// deleting one destroys the only thing that authenticates an epoch.
+///
+/// Anything that is not a regular file is refused rather than removed. The
+/// refusal happens before the rename, so the store is untouched: a symlink or
+/// FIFO planted here costs a rotation, not a key. `create_secret`'s
+/// `create_new` + `O_NOFOLLOW` is the enforcement — this is the message.
+///
+/// **Removal requires the key-store lock** (Codex Round 1, P1). "No reader
+/// resolves this path" proves no *entry* can name the key — it says nothing
+/// about whether another rotation is holding the file open right now. The lock
+/// is best-effort: acquisition gives up after [`LOCK_ATTEMPTS`] and rotation
+/// proceeds anyway, so a second rotation can reach this point while the first
+/// is still inside `create_secret`. Deleting there would strand the first one
+/// at its final rename and leave exactly the interrupted store this change
+/// exists to prevent — produced by the cleanup for it.
+///
+/// Holding the lock does not make concurrency impossible (the other side may
+/// also have given up on it), but it does confine an irreversible delete to the
+/// caller that won the exclusion. The residual is in ADR-0008.
+///
+/// Takes the path the *listing* produced. A constructed path re-introduces the
+/// probe `scan_key_dir` avoids: on a case-insensitive filesystem it answers for
+/// a name the listing did not report, and this function deletes what it is
+/// given.
+fn take_pending_slot(seen: Option<&Path>, lock: &KeyStoreLock) -> Result<(), AuditError> {
+    let Some(path) = seen else {
+        return Ok(());
+    };
+    if let KeyStoreLock::Unheld(reason) = lock {
+        return Err(AuditError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "{} already exists and this rotation does not hold the key-store lock \
+                 ({reason}), so it cannot tell a leftover from another rotation's replacement \
+                 being written right now. No key file was renamed or created; re-run once the \
+                 lock is available, or remove that file by hand if you know no rotation is in \
+                 progress.",
+                path.display()
+            ),
+        )));
+    }
+    match fs::symlink_metadata(path) {
+        // Gone between the listing and now. Nothing to clear, and
+        // `create_secret` below is the one that decides whether the slot is
+        // really free.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(AuditError::Io(e)),
+        Ok(meta) if meta.is_file() => {
+            fs::remove_file(path).map_err(AuditError::Io)?;
+            eprintln!(
+                "omamori warning: removed a leftover {PENDING_NAME} from an earlier rotation \
+                 that stopped before moving it into place. It held a key no entry was ever \
+                 signed with — nothing resolves that path."
+            );
+            Ok(())
+        }
+        Ok(_) => Err(AuditError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} exists and is not a regular file. A rotation builds its replacement key \
+                 there, and omamori will not remove something it did not write. No key file \
+                 was renamed or created; inspect that path and clear it by hand.",
+                path.display()
+            ),
+        ))),
+    }
+}
+
 fn rotate_key_locked(
     secret_path: &Path,
     lock: &KeyStoreLock,
@@ -1889,7 +2024,7 @@ fn rotate_key_locked(
     // Ordered before `read_secret` deliberately: it makes the diagnosis right
     // when *both* are unreadable (mode 000). The other order reported "no audit
     // secret found — nothing to rotate", which is false — the secret is there.
-    let (retired, record) = match scan_key_dir(&secret_path) {
+    let (retired, record, pending) = match scan_key_dir(&secret_path) {
         // The rotation-specific half of the message is built here, next to the
         // condition, rather than by the CLI arm that prints it. That arm used
         // to add "make that directory listable and writable again" to every
@@ -1917,7 +2052,11 @@ fn rotate_key_locked(
                     .to_string(),
             });
         }
-        KeyDirScan::Listed { retired, epoch } => (retired, epoch),
+        KeyDirScan::Listed {
+            retired,
+            epoch,
+            pending,
+        } => (retired, epoch, pending),
     };
 
     // PR-C1 (yotta 判断12): refuse before touching the store, on the same
@@ -2007,6 +2146,43 @@ fn rotate_key_locked(
     // file — are the file-type guards firing, and this is the only place they
     // can be heard; the previous wording named a concurrent reader, which is
     // one of the other two.
+    // PR-C2 step 22: build the replacement first, at a path no reader looks
+    // at, and move it into place last.
+    //
+    // The order is about **where the failures land**. Generating a key can fail
+    // — no `/dev/urandom`, ENOSPC, EMFILE — and until now those failures
+    // happened *after* the rename, leaving a store with retired keys and no
+    // active one, which the next command then had to recover from. They now
+    // happen before anything has moved, so the store is exactly as it was and
+    // re-running is the whole remedy.
+    //
+    // What is left inside the window is rename → record → rename. What moved
+    // out of it is every way *producing a key* can fail: no entropy source, no
+    // free descriptor, no room for the 64 bytes.
+    //
+    // Not "the window cannot fail". Directory-entry changes are a smaller
+    // surface, not an exempt one — `rename` returns `ENOSPC` when the target
+    // directory cannot be extended — and a failure in there is still reported
+    // as an interrupted rotation, naming the file that moved.
+    let pending_path = pending_path_for(&secret_path);
+    take_pending_slot(pending.as_deref(), lock)?;
+    // `AuditError::Io`, not `RotationInterrupted`: nothing is interrupted yet.
+    // This is still the refusal half of the function, where the store is
+    // untouched and the operator's action is "fix the cause and re-run".
+    create_secret(&pending_path).map_err(AuditError::Io)?;
+
+    // Placed here, past every refusal, rather than at the top: a rotation that
+    // is about to be declined has no window for anyone to observe, and warning
+    // about one would describe a risk this run never takes. PR-C2 moved it
+    // down again, because building the replacement became a refusal too —
+    // `take_pending_slot` and `create_secret` both leave the store untouched
+    // when they fail.
+    //
+    // The reason is quoted, not summarised. Two of the four ways to reach
+    // `Unheld` — the lock path is a symlink (`O_NOFOLLOW`) or is not a regular
+    // file — are the file-type guards firing, and this is the only place they
+    // can be heard; the previous wording named a concurrent reader, which is
+    // one of the other two.
     if let KeyStoreLock::Unheld(reason) = lock {
         eprintln!(
             "omamori warning: proceeding without the audit key-store lock — {reason}. \
@@ -2063,21 +2239,31 @@ fn rotate_key_locked(
         }
     };
 
-    // Generate new secret.
+    // Move the replacement into place — the last step that can fail, and now
+    // the narrowest: a same-directory rename of a file this call created
+    // moments ago, with its bytes already synced.
     //
-    // #478: its own error, not the `Io` catch-all. Everything above the rename
-    // refuses without touching the key directory; the `rename` did touch it, so
-    // a failure here is the one rotation outcome that leaves the store changed
-    // — and changed into exactly the interrupted state `load_signing_key` warns
-    // about, where the next append mints a second key under the id this
-    // rotation was heading for. The operator needs to know which file moved,
-    // and `key rotation failed: {e}` said neither.
-    if let Err(source) = create_secret(&secret_path) {
+    // #478: its own error, not the `Io` catch-all. Everything above the first
+    // rename refuses without touching the key directory; from there on the
+    // store is changed, and a failure leaves exactly the interrupted state
+    // `load_signing_key` warns about. The operator needs to know which file
+    // moved, and `key rotation failed: {e}` said neither.
+    //
+    // PR-C2 narrowed what can land here. It used to be `create_secret`, which
+    // fails for a full disk, a missing `/dev/urandom` or an exhausted
+    // descriptor table — all of them now happen before the first rename, with
+    // the store untouched.
+    if let Err(source) = fs::rename(&pending_path, &secret_path) {
         return Err(AuditError::RotationInterrupted {
             retired_path,
             source,
         });
     }
+    // Two renames and a record, all of them directory-entry changes. This is
+    // what makes them survive a power loss as a set rather than individually.
+    // Best-effort, like every other `fsync_parent` caller — ADR-0008's residual
+    // list says so.
+    crate::atomic_file::fsync_parent(&secret_path);
 
     // The active epoch names the one this rotation just ended.
     // `key_id_for_epoch` owns the `"default"`-vs-`key-N` rule; restating it
