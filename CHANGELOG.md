@@ -8,6 +8,24 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **The recovery instruction for an interrupted key rotation no longer sends the operator at a file that may be the only thing authenticating an epoch.** ([#487](https://github.com/yottayoshida/omamori/issues/487))
+
+  Both the CLI message and `docs/FAQ.md` said, unconditionally, that while no `audit-secret` existed, moving the highest-numbered `.retired` file back restored the state from before the rotation — the FAQ with a `mv -n` command to run. That was written when creating the replacement was the last thing a rotation did. `write_epoch_record` now runs between the two renames, and two different failure points print this message: one leaves the record untouched, where the move really is a recovery, and one leaves it already advanced, where the same move takes away the only key that authenticates its own epoch's entries while the record keeps pointing past it. A single unconditional instruction is wrong on one of the two, and it was the destructive one.
+
+  The store recovers without anybody touching a file — the next command that needs a signing key finds the handed-out epoch unbacked, claims a fresh number and creates a key under it, skipping the interrupted epoch. Both surfaces now say to leave the key files alone, state the cost of not doing so as possible rather than certain, and leave the distinction between the two shapes to the FAQ. Neither says what the next command will manage, which is the predictive shape [#478](https://github.com/yottayoshida/omamori/issues/478) removed.
+
+- **A rotation on a store whose replacement never landed is no longer reported as an empty store.** ([#487](https://github.com/yottayoshida/omamori/issues/487))
+
+  `audit key rotate` answered a missing active key with "no audit secret found — nothing to rotate". That is true of a fresh install and false here: retired key files, a recorded epoch, or a replacement waiting in `audit-secret.pending` each say a rotation reached at least its first rename. All three were already in hand — the directory scan runs before this check and returns them — and were being discarded in favour of the fixed wording. Read as "the store is empty", the message invites recreating it, which abandons the retired key.
+
+  The refusal now quotes whichever of the three it observed, so each can be checked against the directory in front of the operator.
+
+- **The guard against overwriting a retired key no longer misses a dangling symlink.** ([#486](https://github.com/yottayoshida/omamori/issues/486))
+
+  The check used `Path::exists()`, which follows the link: a dangling symlink at the destination read as a free slot, and `fs::rename` replaced it without a word. It asks `symlink_metadata` now — the way the pending slot was already being checked — and refuses when it cannot tell either way rather than letting the rename decide.
+
+  The message also says why the file it names may not be findable under that name. The destination epoch is `max(max_retired + 1, recorded)`, above every key the directory listing reported, so anything occupying it arrived under a spelling the listing rejects: a middle that is not a canonical decimal, or one differing only in case on a case-insensitive filesystem. Deciding this check from the listing instead would have made it vacuous — the listing can never hold the epoch being allocated.
+
 - **A rotation that cannot create its replacement key no longer leaves the store without one.** ([#457](https://github.com/yottayoshida/omamori/issues/457))
 
   The replacement was minted *after* the active key had been renamed into its retired slot, so every way that mint can fail — a full disk, a missing `/dev/urandom`, an exhausted descriptor table — left a store with retired keys and no active one for the next command to recover from. The key is now built at `audit-secret.pending` before anything moves, and renamed into place last. Those failures now happen with the store untouched, and re-running is the whole remedy.

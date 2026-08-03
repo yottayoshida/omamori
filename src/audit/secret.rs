@@ -2000,6 +2000,34 @@ fn take_pending_slot(seen: Option<&Path>, lock: &KeyStoreLock) -> Result<(), Aud
     }
 }
 
+/// Which of the scan's observations say this store has rotated before.
+///
+/// Quoted into the refusal rather than summarised as "has rotated": the three
+/// are left behind by different points in a rotation — the first rename, the
+/// record, the replacement — and an operator standing in the directory can
+/// check each one against what is actually there. A summary would be a claim
+/// they cannot audit.
+///
+/// Never called with all three false; the caller's condition is the disjunction
+/// of exactly these, so the joined string is never empty.
+fn rotated_store_evidence(
+    retired: &BTreeMap<u32, PathBuf>,
+    recorded: u32,
+    pending: bool,
+) -> String {
+    let mut seen = Vec::new();
+    if !retired.is_empty() {
+        seen.push(format!("{} retired key file(s) present", retired.len()));
+    }
+    if recorded >= 1 {
+        seen.push(format!("{EPOCH_RECORD_NAME} records epoch {recorded}"));
+    }
+    if pending {
+        seen.push(format!("a replacement is waiting in {PENDING_NAME}"));
+    }
+    seen.join("; ")
+}
+
 fn rotate_key_locked(
     secret_path: &Path,
     lock: &KeyStoreLock,
@@ -2084,7 +2112,47 @@ fn rotate_key_locked(
     // symlinked one ("possible attack") and from a non-regular file, and
     // `verify` classifies on that text. Rotation was erasing the distinction
     // and reporting all of them as "nothing to rotate".
-    read_secret(&secret_path).map_err(classify_secret_failure)?;
+    //
+    // #487: and `NotFound` itself is two states, not one. On a store that has
+    // rotated before it is the interrupted-rotation shape; the CLI arm for
+    // `SecretUnavailable` describes the other one ("no audit secret found —
+    // nothing to rotate"), which reads as an empty store and invites setting
+    // one up again. The three observations that tell them apart were all
+    // answered by the scan above and were being thrown away here.
+    //
+    // A fresh install has none of the three, so it keeps the old wording.
+    if let Err(e) = read_secret(&secret_path) {
+        if e.kind() == std::io::ErrorKind::NotFound
+            && (!retired.is_empty() || recorded >= 1 || pending.is_some())
+        {
+            return Err(AuditError::KeyringUnusable {
+                reason: format!(
+                    "the active audit key is missing and this store has rotated before \
+                     ({}) — a rotation that stopped between filing the old key and moving \
+                     its replacement into place leaves exactly this.",
+                    rotated_store_evidence(&retired, recorded, pending.is_some())
+                ),
+                // Written here rather than shared with
+                // `rotation_interrupted_lines`. A recovery instruction with two
+                // homes is one edit away from disagreeing with itself, and that
+                // is the defect this change exists to remove — the other copy
+                // went stale when `write_epoch_record` moved between the
+                // renames. Says nothing about what the next command will
+                // manage, for the reason #478 gives.
+                // Hedged for the same reason `rotation_interrupted_lines` is:
+                // this refusal is reached from both interrupted shapes, and
+                // only one of them has the record advanced past the retired
+                // slot. On the other, moving the file back really is a
+                // recovery. What holds on both is that waiting works.
+                remedy: "No key file was renamed or created. Leave the key files where they \
+                         are; moving a .retired file to the active path can destroy the key \
+                         its own epoch's entries were signed with, and waiting is safe either \
+                         way. See the audit chapter of omamori's FAQ."
+                    .to_string(),
+            });
+        }
+        return Err(classify_secret_failure(e));
+    }
 
     // Determine retired key number from the highest index present, not from a
     // count of matching names (#457 P4-a): with a gap (`.1`, `.3`) the count
@@ -2127,14 +2195,48 @@ fn rotate_key_locked(
     // human-initiated, AI-blocked operation, so the residual window is not
     // worth the platform-specific unsafe code; what matters is that the
     // ordinary case can no longer destroy a key.
-    if retired_path.exists() {
-        return Err(AuditError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!(
-                "refusing to overwrite an existing retired key: {}",
-                retired_path.display()
-            ),
-        )));
+    //
+    // #486: asked through `symlink_metadata`, not `exists()`. The question is
+    // whether the rename will replace something, and `exists()` answers a
+    // different one — it follows the link, so a dangling symlink at that path
+    // reads as free and the rename removes it. `take_pending_slot` already asks
+    // it this way; this was the last place that did not.
+    //
+    // **The listing cannot answer it at all**, which is why the probe stays.
+    // `active_epoch` returns `max(max_retired + 1, recorded)`, above every key
+    // the scan reported, so `retired` never holds this epoch — comparing
+    // against the listing would make the check vacuous rather than stricter.
+    // What can be sitting there is exactly what the listing refuses to name: a
+    // middle that is not a canonical decimal, or a spelling that differs only
+    // in case on a case-insensitive filesystem (APFS by default).
+    match fs::symlink_metadata(&retired_path) {
+        // Nothing there — the one outcome that lets the rename proceed.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(AuditError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to overwrite an existing retired key: {} — the key-directory \
+                     listing did not report this epoch, so whatever occupies that path was \
+                     not filed there by a rotation. A name the listing rejects can still \
+                     resolve to it: a spelling that is not a canonical decimal, or one that \
+                     differs only in case on a case-insensitive filesystem.",
+                    retired_path.display()
+                ),
+            )));
+        }
+        // Cannot tell. Refusing costs a rotation; proceeding lets `rename`
+        // replace whatever is there, and it does that without a word.
+        Err(e) => {
+            return Err(AuditError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot tell whether {} is free: {e} — refusing rather than letting the \
+                     rename replace what may be a retired key.",
+                    retired_path.display()
+                ),
+            )));
+        }
     }
 
     // Placed here, past every refusal, rather than at the top: a rotation that

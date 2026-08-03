@@ -197,20 +197,18 @@ The store then works the epoch out from the `.retired` files again, which is wha
 
 **A copy of a key was left in the directory.** A file named `audit-secret.<number>.retired` is read as that epoch's key, whatever it actually contains. Copying `.1.retired` to `.2.retired` gives epoch 2 the epoch-1 bytes, and every entry labelled `key-2` stops verifying. Keep spare copies **outside** this directory, or under a name that does not end in `.retired`.
 
-**A rotation was interrupted.** If `.retired` files are present and `audit-secret` is missing, a rotation stopped between retiring the old key and creating its replacement. What to do depends on one thing:
+**A rotation was interrupted.** If `.retired` files are present and `audit-secret` is missing, a rotation stopped partway. **Leave the key files where they are.**
 
-- **Before any replacement exists** — `audit-secret` is still absent — *moving* (not copying) the highest-numbered `.retired` file back to `audit-secret` restores the state before the rotation. Use a form that refuses to overwrite, so a race or a misread does not cost you a key:
+omamori recovers from this by itself. The next command that needs a signing key finds that nothing answers to the epoch the store has handed out, and creates one: under a fresh number if the interrupted rotation had already recorded its own, and under the number that rotation was heading for if it had not. Either way the store has a working key again, and every entry written before the rotation still verifies against its retired key. A skipped epoch number costs nothing — they are allowed to have gaps.
 
-  ```bash
-  cd ~/.local/share/omamori && mv -n audit-secret.2.retired audit-secret   # adjust the number
-  ```
+Moving a `.retired` file onto `audit-secret` by hand is the one action that can lose you entries, and whether it does depends on how far the rotation got:
 
-  If `audit-secret` still exists afterwards alongside the `.retired` file, `mv -n` declined and you are in the case below, not this one.
-- **Once a replacement exists** — omamori tries to create one the next time any command needs a key, and prints a warning saying whether it managed to — moving a `.retired` file over it **destroys** the key that entries written since were signed with, and those entries then read as tampering permanently. Existing entries are never rewritten to repair this ([ADR-0007](adr/0007-no-in-place-rewrite-of-existing-audit-entries.md)).
+- If it stopped **after** `audit-secret.epoch` was advanced, that `.retired` file is the only thing that authenticates its own epoch's entries. Moving it away leaves them unverifiable, and the record still points past it, so the next entries are labelled with an epoch whose key is the one you just moved.
+- If it stopped **before**, moving it back does put the store where it was.
 
-  So check before you act, rather than assuming which side of that line you are on: `ls -l ~/.local/share/omamori/audit-secret`.
+You cannot tell those apart by looking at whether `audit-secret` exists — and you do not need to, because waiting recovers both. Existing entries are never rewritten to repair a mistake here ([ADR-0007](adr/0007-no-in-place-rewrite-of-existing-audit-entries.md)), so the action that is safe in both cases is the one to take.
 
-  If you are past that point, leave `audit-secret` alone. Entries from before the rotation still verify against their retired keys.
+> Earlier versions of this page told you to move the highest-numbered `.retired` file back whenever `audit-secret` was absent. That was written when creating the replacement was the last thing a rotation did. It no longer is: the epoch record is written in between, and on that side following the old instruction costs you the epoch.
 
 **A key could not be created while the store had none.** If omamori warned that `audit-secret` was absent *and* a replacement could not be created — a data directory that can be read and searched but not written does this — then everything written in that window carries no HMAC while still being labelled with the next epoch. Fixing the permissions creates a key under that same label, and those entries are then checked against it, fail, and are reported as tampering. They cannot be repaired ([ADR-0007](adr/0007-no-in-place-rewrite-of-existing-audit-entries.md)). The break is genuine in the sense that the hashes do not match; nothing was altered by anyone. Note the seq range from the warning's timestamp so you can tell those entries apart later.
 

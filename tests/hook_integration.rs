@@ -3118,13 +3118,30 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// The three clauses #478 is named for, each of which was false by the time
-/// anybody could read it. Kept in one place so every test below rejects the
+/// Clauses withdrawn from operator-facing text because each was false by the
+/// time anybody could read it. Kept in one place so every test below rejects the
 /// same set — the wording of the replacement may change, these must not return.
-const RETRACTED_CLAUSES: [&str; 3] = [
+///
+/// The first three are the ones #478 is named for. The rest came from the
+/// interrupted-rotation *recovery* instruction — two spellings of it, one in the
+/// CLI and one in `docs/FAQ.md` — and were withdrawn one release later for the
+/// same reason: `write_epoch_record` now runs between the two renames
+/// (PR-C1/PR-C2), so on the final-rename failure path the recorded epoch has
+/// already advanced and moving the retired key back removes the file that
+/// authenticates its own epoch's entries while the record keeps pointing past
+/// it. The instruction was unconditional and that path is not the only one it
+/// reached.
+///
+/// The FAQ's spelling had no `from` in it, which is why the first four clauses
+/// did not catch it — a reviewer did. `grep -F` is exact by design; near-misses
+/// are why each wording is listed rather than a pattern.
+const RETRACTED_CLAUSES: [&str; 6] = [
     "A new key will be created",
     "before anything appends",
     "never got as far as creating a new key",
+    "restores the state from before the rotation",
+    "turns on whether an audit-secret exists",
+    "restores the state before the rotation",
 ];
 
 fn assert_no_retracted_clauses(stderr: &str) {
@@ -3204,6 +3221,63 @@ fn interrupted_rotation_warning_describes_the_store_after_the_mint() {
         stderr.contains("Do not copy a .retired file over audit-secret"),
         "the instruction is inverted, not merely reworded — the old one \
          destroyed the key it told the operator to protect: {stderr}"
+    );
+    assert_no_retracted_clauses(&stderr);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #487: what makes "leave the key files where they are" safe to say.
+///
+/// The recovery line used to branch on whether an `audit-secret` existed and,
+/// while none did, told the operator that moving the retired key back restored
+/// the state from before the rotation. PR-C1 put `write_epoch_record` between
+/// the two renames, so the failure path that prints this message has already
+/// advanced the record: there is no state to restore, and the move removes the
+/// only key that authenticates its own epoch's entries while the record keeps
+/// pointing past it.
+///
+/// The fixture is the shape a failed `rename(pending -> active)` leaves — the
+/// replacement built and sitting in `.pending`, the old key filed, the record
+/// advanced past it, nothing at the active path. Reached by moving the file
+/// rather than by failing the rename, which no test can schedule; the
+/// observable store is the same one the recovery line is about.
+///
+/// Pins the two facts the instruction rests on: the retired key survives, and
+/// the store puts a key back on its own without anybody touching a file.
+#[test]
+fn a_store_left_at_the_final_rename_recovers_without_moving_the_retired_key() {
+    let (base, stderr) = stderr_of_hook_after("487-final-rename-left-alone", |store| {
+        std::fs::rename(
+            store.join("audit-secret"),
+            store.join("audit-secret.pending"),
+        )
+        .unwrap();
+    });
+    let store = store_dir(&base);
+
+    assert!(
+        store.join("audit-secret.1.retired").exists(),
+        "the retired key must still be there — the whole claim of the recovery \
+         line is that moving it is what costs you those entries: {stderr}"
+    );
+    assert!(
+        store.join("audit-secret").exists(),
+        "and the store puts a key back on its own, which is what separates \
+         'leave them alone' from 'leave it broken': {stderr}"
+    );
+    assert!(
+        stderr.contains("labelled key-3"),
+        "under a generation no earlier entry can hold, not the epoch the \
+         interrupted rotation was heading for: {stderr}"
+    );
+    // `.pending` holds the previous rotation's replacement. Nothing on the
+    // append path resolves that name, so it stays until the next `key rotate`
+    // clears it under the lock — which is what keeps this recovery from
+    // deleting a file another rotation may still be writing.
+    assert!(
+        store.join("audit-secret.pending").exists(),
+        "the append path must not clear the pending slot: {stderr}"
     );
     assert_no_retracted_clauses(&stderr);
 
