@@ -2758,14 +2758,14 @@ fn report_and_doctor_agree_with_verify_across_a_rotation() {
     // V-028: an entry naming a key we no longer hold must read as *cannot
     // verify*, with wording that does not accuse anyone.
     //
-    // A second rotation first. Deleting the *only* retired key leaves a store
-    // indistinguishable from one that never rotated — `"default"` then
-    // resolves to the active key and the result is exit 1 with the tampering
-    // wording (pinned as a known limitation in
-    // `deleting_the_last_retired_key_reads_as_tampering_known_limitation`).
-    // An earlier version of this test did exactly that and accepted
-    // `code == 1 || code == 2`, which admitted the pre-fix outcome and left
-    // the exit-2 branch unreached by the whole suite.
+    // A second rotation first. Before PR-C1, deleting the *only* retired key
+    // left a store indistinguishable from one that never rotated —
+    // `"default"` resolved to the active key and the result was exit 1 with
+    // the tampering wording. `audit-secret.epoch` removed that reading
+    // (`deleting_the_last_retired_key_reads_as_cannot_verify`), but the second
+    // rotation stays: an earlier version of this test deleted the only retired
+    // key and accepted `code == 1 || code == 2`, which admitted the pre-fix
+    // outcome and left the exit-2 branch unreached by the whole suite.
     let (rot2, _, _) = run_audit(&base, &["key", "rotate"]);
     assert_eq!(rot2, 0);
     let retired1 = base.join(".local/share/omamori/audit-secret.1.retired");
@@ -3152,6 +3152,13 @@ fn assert_no_retracted_clauses(stderr: &str) {
 ///
 /// **No test asserted any of this before.** Each of the three clauses had
 /// exactly one occurrence in the repo — the line that printed it.
+///
+/// **PR-C1 changed what "the store as it stands" is able to say.** The fixture
+/// rotates and then removes the key, so the record names an epoch nothing
+/// answers to — a fact rather than a guess, and the warning states it. The
+/// hedge this test used to require ("… may carry key-2 too") is gone with it:
+/// the replacement is a generation no earlier entry can hold, so there is no
+/// collision left to warn about.
 #[test]
 fn interrupted_rotation_warning_describes_the_store_after_the_mint() {
     let (base, stderr) = stderr_of_hook_after("478-interrupted-after-mint", |store| {
@@ -3159,34 +3166,39 @@ fn interrupted_rotation_warning_describes_the_store_after_the_mint() {
     });
 
     assert!(
-        stderr.contains("a key rotation may have been interrupted"),
-        "the state is still reported: {stderr}"
+        stderr.contains("audit-secret.epoch records epoch 2 and no key answers to it"),
+        "the state is still reported, now from the record rather than from a \
+         guess: {stderr}"
     );
     assert!(
         stderr.contains("audit-secret now holds an active key"),
         "and described as it stands after the mint: {stderr}"
     );
     assert!(
-        stderr.contains("labelled key-2"),
-        "naming the label the entries written from here on will carry: {stderr}"
+        stderr.contains("labelled key-3"),
+        "naming the label the entries written from here on will carry — the \
+         next epoch, not the one the record already holds: {stderr}"
     );
-    // The S1/S2 ambiguity, asserted in its own right. It is the second half of
-    // the same sentence as the clause above, and asserting only the first half
-    // left it unmeasured — removing it kept the suite green (Phase 6.5).
+    // The S1/S2 ambiguity, gone. This assertion is the inverse of the one it
+    // replaces, and the comment there predicted exactly this: "PR-C1's epoch
+    // record is what will separate them, and this assertion is what should go
+    // red when it does."
     //
-    // "may", not "do": a rotation that stopped before handing out a key wrote
-    // no entry under this label, one whose key was lost afterwards wrote
-    // several, and the key store holds nothing that tells the two apart. The
-    // sibling unit tests `an_interrupted_rotation_that_handed_out_no_key_still_verifies`
-    // and `interrupted_rotation_leaves_two_secrets_under_one_id_known_residual`
-    // are the two halves. PR-C1's epoch record is what will separate them, and
-    // this assertion is what should go red when it does.
+    // The clause was honest while the key store held nothing that told a
+    // rotation which stopped before handing out a key from one whose key was
+    // lost afterwards. It is not honest now: the record made the replacement a
+    // *new* generation, so no entry written before this can carry that label.
+    // A warning that still hedged would be describing a collision this call has
+    // made impossible.
     assert!(
-        stderr.contains(
-            "entries written before this may carry key-2 too, signed with different bytes"
-        ),
-        "the store cannot tell an interrupted rotation that handed out a key \
-         from one that did not, and the message must not pick one: {stderr}"
+        !stderr.contains("may carry"),
+        "with the epoch recorded the replacement takes a label no earlier \
+         entry can hold, so there is nothing to hedge about: {stderr}"
+    );
+    assert!(
+        stderr.contains("entries labelled key-2, if any exist, stay unverifiable"),
+        "what is said instead is the part that stayed true: whatever the lost \
+         epoch signed, its key is gone: {stderr}"
     );
     assert!(
         stderr.contains("Do not copy a .retired file over audit-secret"),
@@ -3284,6 +3296,15 @@ fn a_healthy_rotated_store_reports_no_interrupted_rotation() {
 /// Added because a mutation that made that branch unconditional survived the
 /// suite — the failing side of the mint had no test at all, and the sentence it
 /// would have produced claims a key is present when none is.
+///
+/// **PR-C1 moved where this fails, and lowered what it costs.** The store
+/// writes the new epoch before minting, and on this fixture that write is the
+/// one denied — so the mint is never attempted rather than attempted and
+/// refused. What the test was built to pin is unchanged: no key exists, and
+/// nothing claims one does. What changed is the label. A generation the store
+/// could not record is one it will not name, so these entries carry
+/// `unresolved` rather than a resolvable `key-{N}`, and clearing the fault no
+/// longer converts them into a tampering report.
 #[cfg(unix)]
 #[test]
 fn an_interrupted_rotation_that_cannot_mint_does_not_claim_a_key_exists() {
@@ -3308,14 +3329,32 @@ fn an_interrupted_rotation_that_cannot_mint_does_not_claim_a_key_exists() {
     // with the unlistable-directory warning for one round, which told this
     // operator the opposite; nothing caught it until a mutation dropped the
     // sentence and the suite stayed green (Phase 8 UX).
+    // **Reversed by PR-C1, and the reversal is the point.** This used to have
+    // to say "reported as tampering": the branch returned a resolvable
+    // `key-{N}` with no secret behind it, so clearing the fault minted a key
+    // under that same label and every entry written meanwhile failed against
+    // it — permanently (ADR-0007).
+    //
+    // The epoch record removes the resolvable label from this path. A
+    // generation the store could not write down is one it will not name, so
+    // the id becomes `unresolved`, which no keyring can hold. The entries stay
+    // in cannot-verify, where they belong; the accusation never arrives.
     assert!(
-        stderr.contains("reported as tampering"),
-        "the operator has to be told what clearing the fault turns these \
-         entries into: {stderr}"
+        !stderr.contains("reported as tampering"),
+        "nothing here becomes tampering any more — the entries carry an id no \
+         keyring can resolve: {stderr}"
     );
     assert!(
-        !stderr.contains("They stay unverifiable"),
-        "that is the other warning's consequence, and it is false here: {stderr}"
+        stderr.contains("They stay unverifiable"),
+        "which is the consequence that is true of them: {stderr}"
+    );
+    // The reason the mint did not happen, which is new. It stopped at the
+    // record rather than at `create_secret`, and saying so is what keeps the
+    // sentence an observation: on this fixture the directory denies both, but
+    // the code only ever attempted the first.
+    assert!(
+        stderr.contains("audit-secret.epoch could not be advanced to 3"),
+        "and the operator is told which write failed: {stderr}"
     );
     // Bounded, not permanent: this is a permissions fault the operator clears,
     // after which later entries are protected again (Codex Round 1).
@@ -3327,8 +3366,8 @@ fn an_interrupted_rotation_that_cannot_mint_does_not_claim_a_key_exists() {
     // exists to pin the one that did.
     assert!(
         stderr.contains(
-            "a replacement could not be created — a key rotation may have been \
-             interrupted. Entries written while this lasts"
+            "a replacement could not be created — audit-secret.epoch could not be \
+             advanced to 3"
         ),
         "the claim has to stop at the condition, not run forever — and the bound \
          has to be on this warning: {stderr}"

@@ -222,7 +222,7 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
         }
         // #457: an unusable keyring is not the same as "no audit log" —
         // mapping it to `Unavailable` would hide it from doctor's risk signals.
-        Err(AuditError::KeyringUnusable(reason)) => ChainStatus::KeyringUnusable {
+        Err(AuditError::KeyringUnusable { reason, .. }) => ChainStatus::KeyringUnusable {
             reason,
             // Still one kind, but no longer one producer: #477 added
             // `rotate_key`, which returns the raw scan reason rather than a

@@ -30,7 +30,26 @@ pub enum AuditError {
     /// often readable in this state) and emphatically apart from a tampering
     /// verdict — resolving `"default"` to the active key on a rotated store
     /// would make every entry look altered.
-    KeyringUnusable(String),
+    ///
+    /// PR-C1 split the repair out of the reason. `Display` renders only
+    /// `reason`, because the surface that shows it most often — `doctor`'s
+    /// one-line risk signal — exists to name a cause and point at
+    /// `omamori audit verify`, and a repair inlined there runs past what sits
+    /// readably next to its one-clause siblings (pinned in `cli.rs`). The
+    /// surfaces that *do* carry a repair print `remedy` on its own line.
+    ///
+    /// The remedy travels with the error rather than being added by the CLI
+    /// arm, for the reason #477 had to withdraw a caller-side one: the arm
+    /// knows the keyring is unusable and not which condition made it so, and
+    /// the two conditions need different actions — one is a directory that
+    /// cannot be listed, the other a record file that states no epoch while
+    /// the directory is perfectly fine.
+    ///
+    /// Empty `remedy` is allowed and means "nothing beyond the reason".
+    KeyringUnusable {
+        reason: String,
+        remedy: String,
+    },
     /// #478: `rename` moved the key being replaced into its retired slot and
     /// this rotation did not create the replacement.
     ///
@@ -57,7 +76,7 @@ impl std::fmt::Display for AuditError {
         match self {
             Self::SecretUnavailable => write!(f, "HMAC secret unavailable"),
             Self::FileNotFound => write!(f, "audit log not found"),
-            Self::KeyringUnusable(reason) => write!(f, "{reason}"),
+            Self::KeyringUnusable { reason, .. } => write!(f, "{reason}"),
             Self::RotationInterrupted {
                 retired_path,
                 source,
@@ -386,7 +405,10 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // rotated store as tampered — a false accusation caused by a permissions
     // problem. Stop before reading a single line.
     if let Some(fatal) = keyring.fatal_anomaly() {
-        return Err(AuditError::KeyringUnusable(fatal.describe()));
+        return Err(AuditError::KeyringUnusable {
+            reason: fatal.describe(),
+            remedy: fatal.remedy().unwrap_or_default(),
+        });
     }
     // Reached only with a listing in hand, which is what makes the secret's own
     // failure the whole story rather than a consequence of not having one.

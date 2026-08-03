@@ -782,13 +782,41 @@ What happens when one is missing depends on whether *any* retired key remains:
 
 - **Some remain.** The entries signed by the deleted key report as **cannot verify** (exit 2),
   naming the key id that could not be resolved
-- **None remain.** The store becomes indistinguishable from one that never rotated. `"default"`
-  then resolves to the *active* key — an id that exists, holding the wrong bytes — so the affected
-  entries report as **tampering** (exit 1), not as cannot-verify
+- **None remain, and the store has an epoch record.** Same answer: **cannot verify** (exit 2). The
+  record holds the active epoch where it is, so `"default"` is not aliased onto the active key
+- **None remain, and the store has no epoch record.** The store is indistinguishable from one that
+  never rotated. `"default"` resolves to the *active* key — an id that exists, holding the wrong
+  bytes — so the affected entries report as **tampering** (exit 1)
 
-The second case is a known limitation, not a judgement about the log: telling "this key is gone"
-apart from "this entry was altered" would require each key file to record which epoch it belongs
-to. That is deferred (see ADR-0008) because it adds an on-disk element that 1.0 would freeze.
+The third case is what the second one used to be for every store. It was a known limitation, not a
+judgement about the log, and PR-C1 closed it for any store that has rotated since — see the epoch
+record below. ADR-0008's Update block records why the fix this paragraph originally proposed
+("each key file records which epoch it belongs to") would not have worked: what has to be told
+apart is a generation that is *gone*, and a file that is gone carries no tag.
+
+#### The epoch record (PR-C1)
+
+`audit-secret.epoch` holds one decimal integer — the highest epoch this store has ever handed out.
+Rotation writes it between the rename and the new key's creation, durably, so a number is on disk
+before any key can carry it. Epochs are then read as `max(recorded, max_retired + 1)`, which is
+the previous derivation whenever the retired slots are intact and higher than it when they are
+not.
+
+- **A store with no record behaves exactly as it did before.** Only rotation writes one, so a
+  store that has not rotated since upgrading never gains one, and a fresh install does not either.
+- **The record is advisory, not enforced.** Removing it returns the store to deriving the epoch
+  from the retired key files. `PROTECTED_FILE_PATTERNS` matches the `audit-secret` prefix, so an
+  AI agent cannot write to it; an operator can.
+- **A record that does not state an epoch fails closed**: `verify` exits 2 and `rotate` refuses,
+  both naming the file and saying that removing it restores the derivation. This is stricter than
+  the treatment of a corrupt `.retired` file, which is a non-fatal anomaly — the record decides
+  which key epoch *every* entry is labelled with, so guessing past it is the thing being avoided.
+- **A generation whose key is gone is not handed out again.** The store mints under the next
+  number and records that. Entries under the lost epoch stay cannot-verify — their key really is
+  gone — while entries written afterwards carry a label no earlier entry can hold.
+- **Older binaries ignore the file.** It does not end in `.retired`, so no version of omamori
+  counts it as a key. One state is conditional: a store that skipped an epoch is mislabelled by
+  v0.16.0, and entries written there can read as cannot-verify after upgrading again.
 
 #### What rotation guarantees
 
@@ -854,13 +882,16 @@ remove it, exactly as they can any other.
   store afterwards, because the failure can be `AlreadyExists`, which means some other writer has
   put a file at that path. Otherwise omamori reports the state the next time any command resolves a
   key, **after** attempting a replacement, and reports which of two things it then observed:
-  - **An active key is present.** Entries from that point carry its label — the same label the
-    interrupted rotation was heading for. If the interrupted rotation had already handed out a key
-    under that label, two different secrets now share one `key_id`, those entries are permanently
-    unverifiable, and the verifier reports them as tampering rather than as cannot-verify, because
-    the id resolves and only the bytes differ. Whether that happened is not visible from the key
-    store; distinguishing it would require each key file to record its own epoch (see ADR-0008).
-    Copying a retired file over the active key at this point destroys it.
+  - **An active key is present.** Entries from that point carry its label. On a store with an
+    epoch record that label names a *new* generation: the interrupted rotation's number was
+    recorded before its key existed, so it is not handed out a second time and no two secrets can
+    share one `key_id`. Whatever that generation did sign, if anything, reports as cannot verify —
+    its key is gone, which is the honest answer. On a store with no record the older behaviour
+    stands: the replacement takes the very label the interrupted rotation was heading for, and if
+    that rotation had already handed out a key under it, two secrets share one `key_id`, those
+    entries are permanently unverifiable, and the verifier reports them as tampering rather than
+    as cannot-verify, because the id resolves and only the bytes differ. Copying a retired file
+    over the active key destroys it in either case.
   - **No active key could be created** — a directory that can be read and searched but not written
     denies it. Entries written while that lasts carry no HMAC at all and stay unverifiable;
     clearing the condition protects later ones, not those.

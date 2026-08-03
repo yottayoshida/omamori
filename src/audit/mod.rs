@@ -3946,25 +3946,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// #457 (test review blind spot 2, shape D27) — this pins a **limitation**,
-    /// not a fix.
+    /// PR-C1 (V-C02) — the deliberate improvement the limitation this replaces
+    /// asked for by name.
     ///
-    /// Deleting the last retired key does *not* read as "cannot verify". With
-    /// no `.retired` files left, the store is indistinguishable from one that
-    /// never rotated, so `"default"` resolves to the **active** key: an id that
-    /// exists, holding the wrong bytes. `key_unavailable` cannot fire — the id
-    /// resolved — and the entry fails its hash, so it reports as tampering.
+    /// Deleting the last retired key used to read as **tampering**. With no
+    /// `.retired` files left the store was indistinguishable from one that
+    /// never rotated, so `"default"` resolved to the *active* key: an id that
+    /// exists, holding the wrong bytes. `key_unavailable` could not fire — the
+    /// id resolved — and the entry failed its hash, so `verify` produced the
+    /// product's strongest accusation, permanently (`ADR-0007` forbids
+    /// rewriting the entry), from an operator tidying up a directory.
     ///
-    /// A5 cannot reclassify this, for the same reason it cannot reclassify an
-    /// interrupted rotation: both produce a resolvable id paired with the wrong
-    /// key. Telling them apart requires each key file to record its own epoch,
-    /// which ADR-0008 defers because it adds an on-disk element frozen at 1.0.
+    /// `audit-secret.epoch` is what tells the two apart. The store recorded
+    /// epoch 2 when it rotated, so removing `.1.retired` no longer lowers the
+    /// active epoch to 1: `"default"` is not aliased onto the epoch-2 key, the
+    /// epoch-1 entry resolves to nothing, and it lands in cannot-verify —
+    /// which is what actually became of it.
     ///
-    /// The test exists so the deferral stays visible. If a later change makes
+    /// The old test's own closing note set this bar: "If a later change makes
     /// this report cannot-verify instead, that is an improvement — but it must
-    /// be a deliberate one, with this test updated to say so.
+    /// be a deliberate one, with this test updated to say so." Renamed rather
+    /// than edited in place, because the name was the part that stated the
+    /// verdict.
     #[test]
-    fn deleting_the_last_retired_key_reads_as_tampering_known_limitation() {
+    fn deleting_the_last_retired_key_reads_as_cannot_verify() {
         let dir = test_dir("457-deleted-retired");
         let audit_path = dir.join("audit.jsonl");
         let config = AuditConfig {
@@ -3991,15 +3996,30 @@ mod tests {
 
         let result = verify_chain(&config).unwrap();
         assert_eq!(
-            result.broken_at,
-            Some(0),
-            "documented limitation: with no retired keys left, \"default\" \
-             resolves to the active key and the epoch-1 head fails its hash"
+            result.broken_at, None,
+            "the record holds the active epoch at 2, so \"default\" is not \
+             aliased onto the epoch-2 key and no entry is checked against \
+             bytes that never signed it"
         );
-        assert!(
-            result.key_unavailable_at.is_none(),
-            "the id resolves — it just resolves to the wrong bytes — so the \
-             cannot-verify path cannot catch this"
+        assert_eq!(
+            result.key_unavailable_at,
+            Some(0),
+            "the epoch-1 entry names a key that is genuinely gone: cannot \
+             verify (exit 2), not tampering (exit 1)"
+        );
+
+        // The control, and the reason this test discriminates: take the record
+        // away and the epoch comes from the retired slots again, which is the
+        // pre-PR-C1 reading — accusation included. Without this the assertions
+        // above would also pass on a build that stopped aliasing `"default"`
+        // for some entirely unrelated reason.
+        fs::remove_file(dir.join("audit-secret.epoch")).unwrap();
+        let derived = verify_chain(&config).unwrap();
+        assert_eq!(
+            derived.broken_at,
+            Some(0),
+            "control: with no record the store derives epoch 1 for the active \
+             key, and the old misreading comes back"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -4236,28 +4256,32 @@ mod tests {
     /// #457 P4-e — pins the **residual**, which is what the plan asked for and
     /// what `SECURITY.md`'s "omamori warns when it sees this" needs behind it.
     ///
-    /// #478 (V-B01). The state the plan calls S1: a rotation that stopped after
-    /// the rename and before anything was written under the new label. The
-    /// replacement it mints is the *first* key to carry that label, so nothing
-    /// resolves to the wrong bytes and the chain still verifies.
+    /// #478 (V-B01) → PR-C1 (V-C05). A completed rotation that afterwards lost
+    /// its key — which is what this fixture builds, and no longer what #478
+    /// called S1.
     ///
-    /// **This is the evidence for minting at all.** The alternative weighed for
-    /// #478 — refuse and fail closed whenever retired keys exist with no active
-    /// key — was rejected on the grounds that it would break a store which
-    /// recovers on its own. That claim had no test, and this change moves the
-    /// warning that fires in exactly this state, so it is load-bearing here.
+    /// **The record changed which state this is.** `rotate_key` writes the new
+    /// epoch between the rename and the mint, so a store that rotated and then
+    /// lost `audit-secret` carries a record naming an epoch no key answers to.
+    /// Whether that epoch ever signed anything is not recoverable from the key
+    /// store — the record precedes the key — so the store stops guessing and
+    /// stops reusing the number. Handing out epoch 2 a second time is what put
+    /// two secrets under one id; handing out 3 costs a gap in the numbering,
+    /// which costs nothing.
     ///
-    /// The sibling below is S2, where a key *had* already been handed out under
-    /// that label. The two are indistinguishable from the key store — the
-    /// difference exists only in `audit.jsonl` — which is why both fixtures
-    /// have to exist. PR-C1's epoch record is what will tell them apart.
+    /// **This is still the evidence for minting at all.** The alternative
+    /// weighed for #478 — fail closed whenever retired keys exist with no
+    /// active key — was rejected because it breaks a store that recovers on its
+    /// own, and this shows the recovery still happens and still verifies.
     ///
-    /// `rotate_key` renames and mints but does not append; the rotation event
-    /// is the CLI's doing (`audit_cmd::append_key_rotation_event`). A
-    /// library-level rotation therefore leaves nothing labelled `key-2` behind,
-    /// which is what makes this the S1 window rather than S2.
+    /// The sibling below drives the same fixture with an entry written under
+    /// the lost epoch and gets a different verdict for it: that entry is
+    /// reported as unauthenticatable rather than as tampering.
+    /// `an_interrupted_rotation_before_the_record_uses_the_derived_epoch`
+    /// covers the window that is still genuinely S1 — rename done, record not
+    /// yet written — which only a hand-built store can reach.
     #[test]
-    fn an_interrupted_rotation_that_handed_out_no_key_still_verifies() {
+    fn an_interrupted_rotation_does_not_reuse_the_recorded_epoch() {
         let dir = test_dir("478-interrupted-before-handout");
         let audit_path = dir.join("audit.jsonl");
         let secret_path = dir.join("audit-secret");
@@ -4279,8 +4303,19 @@ mod tests {
         let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
         assert_eq!(
             logger.key_id(),
-            "key-2",
-            "the replacement takes the label the interrupted rotation was heading for"
+            "key-3",
+            "epoch 2 is recorded, so the replacement takes the next number \
+             instead of the one the rotation already claimed"
+        );
+        // The number and the record move together or not at all. Asserting the
+        // observable id alone would pass on an implementation that hands out 3
+        // and leaves the file saying 2 — after which the next command derives
+        // 2 again and the same bytes answer to two ids.
+        assert_eq!(
+            fs::read_to_string(dir.join("audit-secret.epoch"))
+                .expect("the record survives the mint"),
+            "3",
+            "the record states the epoch that was handed out, byte for byte"
         );
         logger.append(make_event("after-recovery")).unwrap();
         drop(logger);
@@ -4288,31 +4323,38 @@ mod tests {
         let result = verify_chain(&config).unwrap();
         assert_eq!(
             result.broken_at, None,
-            "no entry was signed under key-2 before the replacement, so none \
-             resolves to the wrong bytes"
+            "nothing was signed under key-2 and key-3 is a fresh label, so no \
+             entry resolves to the wrong bytes"
         );
         assert_eq!(
             result.key_unavailable_at, None,
-            "and every id in the log resolves: epoch 1 to .1.retired, key-2 to \
+            "and every id in the log resolves: epoch 1 to .1.retired, key-3 to \
              the replacement"
         );
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A rotation interrupted between the rename and the new key's creation
-    /// leaves retired keys with no active key. The next append mints a fresh
-    /// secret under the *same* `key-{N+1}` label the interrupted rotation was
-    /// heading for. Two different secrets then share one id, and no
-    /// verifier-side repair can untangle that: the id resolves, the bytes are
-    /// simply wrong, so A5's cannot-verify path cannot fire either.
+    /// PR-C1 (V-C05) — the residual this replaces, resolved.
     ///
-    /// Detection (a warning at the moment it happens) is all this PR does.
-    /// The complete fix needs each key file to record its own epoch, deferred
-    /// in ADR-0008 because it adds an on-disk element 1.0 would freeze. This
-    /// test exists so that deferral cannot quietly become "handled".
+    /// A rotation whose key is lost afterwards used to have its number handed
+    /// out a second time: the next append minted a fresh secret under the same
+    /// `key-{N+1}` label, two secrets shared one id, and no verifier-side
+    /// repair could untangle it — the id resolved, the bytes were simply wrong,
+    /// so even the cannot-verify path could not fire. `verify` reported
+    /// tampering, permanently.
+    ///
+    /// The old test's closing note set the terms: "If this starts passing, the
+    /// epoch-recording fix landed — update ADR-0008 and SECURITY.md rather than
+    /// just the assertion." Both are updated in this change.
+    ///
+    /// What the record buys is not detection but prevention: `key-3` is a label
+    /// no earlier entry can hold, so nothing is ever checked against bytes that
+    /// did not sign it. The epoch-2 entry is not rescued — its key is gone —
+    /// but it is now reported as unauthenticatable rather than as evidence of
+    /// an attack, and those are different exit codes and different actions.
     #[test]
-    fn interrupted_rotation_leaves_two_secrets_under_one_id_known_residual() {
+    fn an_interrupted_rotation_no_longer_puts_two_secrets_under_one_id() {
         let dir = test_dir("457-interrupted-rotation");
         let audit_path = dir.join("audit.jsonl");
         let secret_path = dir.join("audit-secret");
@@ -4346,9 +4388,9 @@ mod tests {
         // the same id the interrupted rotation had already used.
         let replacement = load_signing_key(&secret_path);
         assert_eq!(
-            replacement.id, "key-2",
-            "the new secret reuses the interrupted rotation's label — this is \
-             the residual"
+            replacement.id, "key-3",
+            "the record already holds epoch 2, so the replacement is a \
+             generation the log cannot already contain"
         );
         assert_ne!(
             replacement.secret(),
@@ -4356,18 +4398,482 @@ mod tests {
             "it is a different secret, not a recovery of the old one"
         );
 
-        // Consequence: the epoch-2 entry now names a key whose bytes changed.
+        // Consequence: the epoch-2 entry names a key that is gone, and says so.
         let result = verify_chain(&config).unwrap();
         assert_eq!(
-            result.broken_at,
+            result.broken_at, None,
+            "no entry is checked against bytes that did not sign it, because \
+             no two keys share an id any more"
+        );
+        assert_eq!(
+            result.key_unavailable_at,
             Some(1),
-            "known residual: two secrets under one id read as tampering. If \
-             this starts passing, the epoch-recording fix landed — update \
-             ADR-0008 and SECURITY.md rather than just the assertion"
+            "the epoch-2 entry is unauthenticatable — cannot verify (exit 2) — \
+             rather than evidence of an attack (exit 1)"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Create a FIFO, for the shapes that must not be read as a missing key.
+    #[cfg(unix)]
+    fn mkfifo_at(path: &Path) {
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// PR-C1 (V-C01). The window that is still genuinely S1: the rename
+    /// happened, the record did not.
+    ///
+    /// `rotate_key` writes the record between the rename and the mint, so in
+    /// production this window is a few instructions wide and only a hand-built
+    /// store can be parked in it. What it has to do here is *nothing new* — a
+    /// record at or below the retired slots leaves the derivation in charge,
+    /// which is what makes the record additive rather than a migration.
+    #[test]
+    fn an_interrupted_rotation_before_the_record_uses_the_derived_epoch() {
+        let dir = test_dir("c1-before-record");
+        let secret_path = dir.join("audit-secret");
+        let record_path = dir.join("audit-secret.epoch");
+        write_key_file(&dir.join("audit-secret.1.retired"), &[7u8; 32]);
+
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-2",
+            "with no record the epoch comes from the slots, exactly as before"
         );
         assert!(
-            result.key_unavailable_at.is_none(),
-            "A5 cannot reclassify this: the id resolves, only the bytes differ"
+            !record_path.exists(),
+            "and a mint does not create one — only rotation records an epoch \
+             (yotta 判断15), which is what keeps record-less stores in the \
+             population the BASE comparison draws from"
+        );
+
+        // The same answer from a record the slots have already caught up with,
+        // which is the state a crash between `rename` and `write_epoch_record`
+        // leaves behind.
+        fs::remove_file(&secret_path).unwrap();
+        fs::write(&record_path, "1").unwrap();
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-2",
+            "a record at or below the highest slot does not raise the epoch"
+        );
+        assert_eq!(
+            fs::read_to_string(&record_path).unwrap(),
+            "1",
+            "and this mint does not advance it either: the number handed out \
+             is the derived one, which the next command derives again"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C1 (V-C03) — the shape QA called mandatory, because nothing
+    /// observable distinguishes it.
+    ///
+    /// `read_secret` rejects an active key in more ways than one, and only
+    /// `NotFound` means the key is *gone*. #478 removed the same fold from the
+    /// interrupted-rotation warning, where its cost was a wrong sentence. Here
+    /// the cost is worse and silent: a store whose key is present but
+    /// unreachable — one `chmod` — would be read as having lost a generation,
+    /// the record would advance, and the advance is durable. The observable id
+    /// is identical either way (the mint fails under every shape below, since
+    /// `create_new` finds the path occupied), so only the record's bytes can
+    /// tell a correct build from a broken one.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_active_key_does_not_advance_the_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for shape in [
+            "unreadable-mode",
+            "bad-hex",
+            "too-short",
+            "a-directory",
+            "a-fifo",
+        ] {
+            let dir = test_dir(&format!("c3-{shape}"));
+            let secret_path = dir.join("audit-secret");
+            let record_path = dir.join("audit-secret.epoch");
+            write_key_file(&dir.join("audit-secret.1.retired"), &[7u8; 32]);
+            fs::write(&record_path, "5").unwrap();
+            match shape {
+                "unreadable-mode" => {
+                    write_key_file(&secret_path, &[1u8; 32]);
+                    fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                "bad-hex" => fs::write(&secret_path, "z".repeat(64)).unwrap(),
+                "too-short" => fs::write(&secret_path, "a".repeat(63)).unwrap(),
+                "a-directory" => fs::create_dir(&secret_path).unwrap(),
+                "a-fifo" => mkfifo_at(&secret_path),
+                other => unreachable!("unhandled shape {other}"),
+            }
+
+            let id = load_signing_key(&secret_path).id;
+            assert_eq!(
+                fs::read_to_string(&record_path).unwrap(),
+                "5",
+                "{shape}: the record must not move for a key that is present \
+                 and unreadable — only `NotFound` says a generation is gone"
+            );
+            assert_eq!(
+                id, "key-5",
+                "{shape}: and the label stays on the recorded epoch"
+            );
+
+            let _ = fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600));
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // The control. Without it every assertion above would also hold on a
+        // build that never advances the record at all, which is a different
+        // bug wearing the same green.
+        let dir = test_dir("c3-control-notfound");
+        let secret_path = dir.join("audit-secret");
+        let record_path = dir.join("audit-secret.epoch");
+        write_key_file(&dir.join("audit-secret.1.retired"), &[7u8; 32]);
+        fs::write(&record_path, "5").unwrap();
+
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-6",
+            "control: an absent active key is the one shape that does move the \
+             epoch on"
+        );
+        assert_eq!(
+            fs::read_to_string(&record_path).unwrap(),
+            "6",
+            "control: and the record moves with it"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C1 (Codex Round 1, P1). The record only ever moves up.
+    ///
+    /// The recovery path runs under a **shared** lock, so two processes can both
+    /// observe the same missing key. If one of them has since advanced the
+    /// record and minted a key for the new epoch, the other must not write its
+    /// own lower number back: the next `create_secret` fails `AlreadyExists`,
+    /// reads the newer key, and labels it with the older epoch — a key
+    /// travelling under another epoch's name, which is the shape this whole
+    /// change removes, reappearing through the fix for it.
+    ///
+    /// Returning the number actually on disk is the other half. Skipping the
+    /// write while still letting the caller name its own number leaves exactly
+    /// the same mismatch, just without the file to show for it.
+    #[test]
+    fn the_epoch_record_only_moves_up() {
+        let dir = test_dir("c1-monotonic");
+        let secret_path = dir.join("audit-secret");
+        let record_path = dir.join("audit-secret.epoch");
+
+        assert_eq!(
+            secret::write_epoch_record(&secret_path, 4).expect("first write"),
+            4,
+            "an absent record takes whatever it is given"
+        );
+        assert_eq!(
+            secret::write_epoch_record(&secret_path, 5).expect("higher write"),
+            5,
+            "and moves up"
+        );
+        assert_eq!(
+            secret::write_epoch_record(&secret_path, 3).expect("stale write"),
+            5,
+            "a stale caller is told the number the store is on, not the one it \
+             asked for — naming 3 while the key belongs to epoch 5 is the \
+             defect this guards"
+        );
+        assert_eq!(
+            fs::read_to_string(&record_path).unwrap(),
+            "5",
+            "and the file is not walked back"
+        );
+        assert_eq!(
+            secret::write_epoch_record(&secret_path, 5).expect("equal write"),
+            5,
+            "equal is not an advance either"
+        );
+
+        // A record that cannot be parsed is not overwritten. This is the one
+        // path that could destroy it silently, and an operator diagnosing a
+        // fail-closed store needs the bytes to still be there.
+        fs::write(&record_path, "not-an-epoch").unwrap();
+        let err = secret::write_epoch_record(&secret_path, 9)
+            .expect_err("an unreadable record fails closed here too");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read_to_string(&record_path).unwrap(),
+            "not-an-epoch",
+            "and the bytes survive for the operator to look at"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C1 (V-C04). A record above the slots is followed by all three
+    /// consumers, not only whichever one reads it first.
+    ///
+    /// #477 exists because one of the three took a number the other two would
+    /// have refused. The record adds a second input to the same computation, so
+    /// the same question has to be asked again of each: the writer that labels
+    /// entries, the keyring that resolves those labels, and rotation, which
+    /// picks the slot the current key is filed into.
+    #[test]
+    fn every_consumer_follows_a_record_above_the_retired_slots() {
+        let dir = test_dir("c4-all-consumers");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        write_key_file(&dir.join("audit-secret.1.retired"), &[7u8; 32]);
+        write_key_file(&secret_path, &[9u8; 32]);
+        fs::write(dir.join("audit-secret.epoch"), "5").unwrap();
+
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-5",
+            "the writer labels entries with the recorded epoch, not with \
+             max_retired + 1 (which would be key-2)"
+        );
+
+        let ring = load_keyring(&secret_path);
+        assert_eq!(
+            ring.get("key-5"),
+            Some(&[9u8; 32]),
+            "the keyring registers the active key under the same epoch"
+        );
+        assert!(
+            ring.get("key-2").is_none(),
+            "and not under the derived one, which nothing signed"
+        );
+        assert_eq!(
+            ring.get("default"),
+            Some(&[7u8; 32]),
+            "epoch 1 keeps its alias: the record moves the active epoch, not \
+             the meaning of the oldest one"
+        );
+
+        let result = super::rotate_key(&audit_path).expect("rotation succeeds");
+        assert_eq!(
+            result.retired_key_id, "key-5",
+            "rotation ends the epoch the record named"
+        );
+        assert_eq!(result.new_key_id, "key-6", "and allocates the next one");
+        assert!(
+            dir.join("audit-secret.5.retired").exists(),
+            "the slot follows the epoch too — filing epoch 5's key into \
+             .2.retired is what made a later rotation overwrite a live key"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("audit-secret.epoch")).unwrap(),
+            "6",
+            "and the record states the epoch that was just handed out"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C1 (V-C06). Removing the *newest* retired key must not walk the
+    /// active label backwards.
+    ///
+    /// Not in the plan's table of three defects — it is a fourth instance of
+    /// the same shape, found while writing these. Deleting `.2.retired` on a
+    /// store at epoch 3 drops `max_retired` to 1, and the derivation then calls
+    /// the *current* key epoch 2. Every entry written afterwards would be
+    /// labelled `key-2` while signed with epoch 3's bytes, and `.2.retired` is
+    /// exactly the file the next rotation would then try to create.
+    #[test]
+    fn deleting_the_newest_retired_key_does_not_walk_the_active_label_back() {
+        let dir = test_dir("c6-newest-retired-gone");
+        let audit_path = dir.join("audit.jsonl");
+        let secret_path = dir.join("audit-secret");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+        super::rotate_key(&audit_path).expect("first rotation");
+        super::rotate_key(&audit_path).expect("second rotation");
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-3",
+            "precondition: two rotations put the store at epoch 3"
+        );
+
+        fs::remove_file(dir.join("audit-secret.2.retired")).unwrap();
+
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-3",
+            "the active key did not change, so neither does its label — \
+             deriving from the slots would call it key-2 here"
+        );
+
+        // The control, and the reason this is a fourth defect rather than a
+        // restatement: without the record the same deletion moves the label.
+        fs::remove_file(dir.join("audit-secret.epoch")).unwrap();
+        assert_eq!(
+            load_signing_key(&secret_path).id,
+            "key-2",
+            "control: with the record gone the label walks back, which is the \
+             behaviour this test exists to rule out"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C1 (V-C09). The record is not a retired key, on this version or any
+    /// other.
+    ///
+    /// It sits under the `audit-secret` prefix so the AI write block covers it,
+    /// which puts it one `strip_suffix` away from being counted as a slot. If
+    /// it ever were, every epoch in the store would shift by one — and the
+    /// versions that predate the record apply the same suffix rule, so this
+    /// holds for them too.
+    #[test]
+    fn the_record_is_not_registered_as_a_retired_key() {
+        use std::ffi::OsString;
+
+        let dir = test_dir("c9-record-is-not-a-slot");
+        fs::write(dir.join("audit-secret.epoch"), "3").unwrap();
+
+        let scan = secret::fold_key_dir_entries(
+            &dir,
+            vec![
+                Ok(OsString::from("audit-secret.epoch")),
+                Ok(OsString::from("audit-secret.1.retired")),
+            ]
+            .into_iter(),
+        );
+        let secret::KeyDirScan::Listed { retired, epoch } = &scan else {
+            panic!("a complete listing must list")
+        };
+        assert_eq!(
+            secret::max_retired_index(retired),
+            1,
+            "the record must not count as a slot"
+        );
+        assert_eq!(
+            retired.len(),
+            1,
+            "and must not appear in the retired map under any index"
+        );
+        assert_eq!(
+            epoch.recorded().expect("the record reads"),
+            3,
+            "it is read as the epoch record instead"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR-C1 (V-C10, yotta 判断12). A record that states no epoch fails closed
+    /// — and removing it puts the store back on the derivation.
+    ///
+    /// Failing closed has a price: one file makes `verify` stop. The mitigation
+    /// is entirely in the message, so the recovery half of this test is the
+    /// only evidence that the mitigation works. Deletion is reachable by a
+    /// person and not by an agent — `PROTECTED_FILE_PATTERNS` covers the
+    /// `audit-secret` prefix — so this is a remedy the threat model allows.
+    #[test]
+    fn a_record_that_states_no_epoch_fails_closed_and_recovers_when_removed() {
+        let dir = test_dir("c10-bad-record");
+        let audit_path = dir.join("audit.jsonl");
+        let record_path = dir.join("audit-secret.epoch");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(audit_path.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        logger.append(make_event("epoch-1")).unwrap();
+        drop(logger);
+        super::rotate_key(&audit_path).expect("rotation succeeds");
+        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        logger.append(make_event("epoch-2")).unwrap();
+        drop(logger);
+        assert!(
+            verify_chain(&config).unwrap().broken_at.is_none(),
+            "precondition: the rotated store verifies"
+        );
+
+        // Eleven shapes. Every one is a number this program does not write, and
+        // the canonical-decimal pair (`01`, `+1`) is here for the reason
+        // `fold_key_dir_entries` rejects the same two in a slot name: they
+        // parse to an epoch that already has a spelling.
+        for bad in [
+            "0",
+            "01",
+            "+1",
+            "abc",
+            "",
+            "   ",
+            "-1",
+            "1 2",
+            "4294967296",
+            "9".repeat(17).as_str(),
+            "1\n2",
+        ] {
+            fs::write(&record_path, bad).unwrap();
+            let Err(err) = verify_chain(&config) else {
+                panic!(
+                    "a record reading {bad:?} must stop verification, not be \
+                     guessed past"
+                )
+            };
+            let reason = err.to_string();
+            assert!(
+                matches!(err, AuditError::KeyringUnusable { .. }),
+                "{bad:?}: cannot-verify, not tampering — got {reason}"
+            );
+            assert!(
+                reason.contains("audit-secret.epoch"),
+                "{bad:?}: the message must name the file to remove: {reason}"
+            );
+
+            let Err(refused) = super::rotate_key(&audit_path) else {
+                panic!("{bad:?}: rotation must refuse too")
+            };
+            assert!(
+                matches!(refused, AuditError::KeyringUnusable { .. }),
+                "{bad:?}: rotation refuses on the same footing as verification \
+                 — one invariant, one depth (#479). Got: {refused}"
+            );
+        }
+
+        // A record that cannot be read at all, rather than one that reads as
+        // the wrong thing. `Absent` is decided by the listing, so this must not
+        // collapse into it.
+        fs::remove_file(&record_path).unwrap();
+        fs::create_dir(&record_path).unwrap();
+        let Err(unreadable) = verify_chain(&config) else {
+            panic!("a directory at the record path is not an absent record")
+        };
+        assert!(
+            matches!(unreadable, AuditError::KeyringUnusable { .. }),
+            "an unreadable record is not an absent one: {unreadable}"
+        );
+        fs::remove_dir(&record_path).unwrap();
+
+        // Recovery: the derivation agrees with what the record said, so the
+        // store verifies again.
+        assert!(
+            verify_chain(&config).unwrap().broken_at.is_none(),
+            "removing the record restores verification — this is the whole of \
+             the mitigation for failing closed"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -4442,7 +4948,7 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         match outcome {
-            Err(AuditError::KeyringUnusable(reason)) => {
+            Err(AuditError::KeyringUnusable { reason, .. }) => {
                 assert!(
                     reason.contains("cannot list"),
                     "the error must name the real cause, got: {reason}"
@@ -4734,7 +5240,7 @@ mod tests {
             Ok(OsString::from("audit-secret.1.retired")),
             Ok(OsString::from("audit-secret.9.retired")),
         ]);
-        let secret::KeyDirScan::Listed(retired) = &complete else {
+        let secret::KeyDirScan::Listed { retired, .. } = &complete else {
             panic!("a complete listing must list")
         };
         assert_eq!(

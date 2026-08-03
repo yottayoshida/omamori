@@ -149,6 +149,7 @@ Four different messages bring you here, and they mean different things:
 | `cannot verify from entry #N — it names key "…", which is not in the keyring` | 2 | The key that entry names cannot be loaded. omamori is not accusing anything — it is saying it cannot check |
 | `cannot verify — audit keyring: cannot list …` | 2 | The key directory itself could not be read. This is a permissions or storage problem, not a log problem: fix the directory and re-run |
 | `cannot verify — <something about audit-secret>` | 2 | The active key file could not be read, and the message says why: it is a symlink, or not a regular file, or the wrong size, or not valid hex. The directory listed fine, so this is about that one file |
+| `cannot verify — audit keyring: … audit-secret.epoch …` | 2 | The file recording which key epoch is current does not hold a number omamori wrote. Neither the log nor the keys are at fault — see "The epoch record was edited or corrupted" below |
 
 ### Work out which state you are in
 
@@ -184,6 +185,16 @@ Four different messages bring you here, and they mean different things:
 
 **A retired key file was deleted or renamed.** Tidying `~/.local/share/omamori/` is the usual way to get here. If you still have the file — in a backup, in Trash — put it back under its original name and re-run `omamori audit verify`. Nothing about the log itself changed; this is fully recoverable.
 
+On a store that has rotated since omamori started recording key epochs, this reports as *cannot verify* (exit 2). On one that has not — no `audit-secret.epoch` file — deleting the **only** retired key still produces exit 1 and the tampering wording, because with nothing recorded and no `.retired` files left the store cannot tell itself apart from one that never rotated. The remedy is the same either way: put the file back.
+
+**The epoch record was edited or corrupted.** `audit-secret.epoch` holds one decimal number, the highest key epoch this store has handed out, and omamori refuses to guess past a file that says anything else — that number decides which key every entry is checked against. Deleting it is safe, and is the documented way out:
+
+```bash
+rm ~/.local/share/omamori/audit-secret.epoch
+```
+
+The store then works the epoch out from the `.retired` files again, which is what it did before the record existed. You lose what the record buys — a deleted retired key goes back to reading as tampering rather than as cannot-verify — so if you have a backup of the file, prefer restoring it.
+
 **A copy of a key was left in the directory.** A file named `audit-secret.<number>.retired` is read as that epoch's key, whatever it actually contains. Copying `.1.retired` to `.2.retired` gives epoch 2 the epoch-1 bytes, and every entry labelled `key-2` stops verifying. Keep spare copies **outside** this directory, or under a name that does not end in `.retired`.
 
 **A rotation was interrupted.** If `.retired` files are present and `audit-secret` is missing, a rotation stopped between retiring the old key and creating its replacement. What to do depends on one thing:
@@ -202,6 +213,8 @@ Four different messages bring you here, and they mean different things:
   If you are past that point, leave `audit-secret` alone. Entries from before the rotation still verify against their retired keys.
 
 **A key could not be created while the store had none.** If omamori warned that `audit-secret` was absent *and* a replacement could not be created — a data directory that can be read and searched but not written does this — then everything written in that window carries no HMAC while still being labelled with the next epoch. Fixing the permissions creates a key under that same label, and those entries are then checked against it, fail, and are reported as tampering. They cannot be repaired ([ADR-0007](adr/0007-no-in-place-rewrite-of-existing-audit-entries.md)). The break is genuine in the sense that the hashes do not match; nothing was altered by anyone. Note the seq range from the warning's timestamp so you can tell those entries apart later.
+
+One case is exempt, and the warning tells you which one you are in. If the same fault also stopped omamori from recording the new key epoch — the message names `audit-secret.epoch` and says it could not be advanced — then those entries are labelled `unresolved` rather than with an epoch, and no key can ever be created under that id. They stay cannot-verify. That reads worse and is better to have: nothing is accused of anything.
 
 ### If none of those apply
 
