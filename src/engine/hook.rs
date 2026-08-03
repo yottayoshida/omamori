@@ -2844,6 +2844,26 @@ mod tests {
         assert_eq!(kind, MatchKind::FilenamePrefix);
     }
 
+    /// PR-C2. `audit-secret.pending` holds a real 32-byte key for the length of
+    /// a rotation. An agent that can write it substitutes the key the store is
+    /// about to adopt — and the rename that adopts it does not re-read the
+    /// bytes, so nothing downstream would notice.
+    ///
+    /// Covered by the same `audit-secret` prefix as the record, for the same
+    /// reason: the name was chosen to fall under an entry that already exists.
+    /// Worth its own test because that holds by naming convention rather than
+    /// by an entry someone would notice deleting.
+    #[test]
+    fn protected_file_path_pending_key_matches_outside_data_dir_via_filename_kind_only() {
+        let (pattern, kind, _) = is_protected_file_path("/custom/audit-dir/audit-secret.pending")
+            .expect(
+                "audit-secret.pending (a rotation's replacement key) under a custom \
+                 (non-data-dir) audit path must stay protected",
+            );
+        assert_eq!(pattern, "audit-secret");
+        assert_eq!(kind, MatchKind::FilenamePrefix);
+    }
+
     #[test]
     fn protected_file_path_audit_jsonl_md_outside_data_dir_no_longer_false_positive() {
         // The headline #320 false positive: a genuinely unrelated file

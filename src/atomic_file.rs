@@ -306,7 +306,7 @@ pub(crate) fn random_hex_suffix() -> io::Result<String> {
 // next fsync), which no test in this suite simulates. Best-effort by design
 // (errors are swallowed) — a failure here can't turn a successful write into
 // a lost one on a live process, only into a slightly-less-durable one.
-fn fsync_parent(target: &Path) {
+pub(crate) fn fsync_parent(target: &Path) {
     if let Some(dir) = target.parent()
         && let Ok(dir_file) = std::fs::File::open(dir)
     {

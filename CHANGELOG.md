@@ -8,6 +8,16 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **A rotation that cannot create its replacement key no longer leaves the store without one.** ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
+  The replacement was minted *after* the active key had been renamed into its retired slot, so every way that mint can fail — a full disk, a missing `/dev/urandom`, an exhausted descriptor table — left a store with retired keys and no active one for the next command to recover from. The key is now built at `audit-secret.pending` before anything moves, and renamed into place last. Those failures now happen with the store untouched, and re-running is the whole remedy.
+
+  What is left inside the window is rename → record → rename. What moved out of it is every way producing a key can fail: no entropy source, no free descriptor, no room for the 64 bytes. Directory-entry changes are a smaller surface and not an exempt one — `rename` still returns `ENOSPC` when the target directory cannot be extended — and a failure there is reported as an interrupted rotation, naming the file that moved.
+
+- **A key file that could not be written completely no longer bricks the store.** ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
+  `create_secret` wrote its 64 hex characters and returned. If the write died partway — ENOSPC, EIO, a quota — a short `audit-secret` was left behind that nothing ever removed: `read_secret` rejects it on its length, and `create_secret` cannot replace it because it opens with `create_new`. The store had no usable key until a person deleted the file by hand. The write and its `fsync` are one step now, and the file is removed if either half of it fails.
+
 - **Deleting a retired audit key no longer produces a permanent accusation of tampering.** ([#457](https://github.com/yottayoshida/omamori/issues/457))
 
   The key epoch was derived from the retired key files that happened to be present — `max_retired + 1` — so removing one walked the store's idea of the current epoch backwards. Three defects came out of that single inference, and all three close by recording the epoch instead of deducing it.
@@ -69,6 +79,10 @@ The format is based on Keep a Changelog.
   This is the one path in the change with no end-to-end test. `rename` and `create_secret` need the same directory permissions, so every state that stops the second stops the first; what remains — a concurrent writer taking the name, `/dev/urandom` failing, `ENOSPC`, `EMFILE` — cannot be scheduled from a test. The wording is pinned by a unit test against the rendering function instead, and the reason is recorded next to it.
 
 ### Added
+
+- **`audit-secret.pending`** — where a rotation builds its replacement key before the active key moves. ([#457](https://github.com/yottayoshida/omamori/issues/457))
+
+  Present only for the length of a rotation. The readers never look at this path, so a leftover from a crash is a key nobody was ever given, and the next rotation clears it and says so. Anything there that is **not** a regular file is refused rather than removed — a rotation will not delete a file omamori did not write, and the refusal happens before the store is touched. Covered by the existing `audit-secret` prefix in `PROTECTED_FILE_PATTERNS`.
 
 - **`audit-secret.epoch`** — one decimal integer beside the audit keys, recording the highest key epoch this store has handed out. ([#457](https://github.com/yottayoshida/omamori/issues/457))
 

@@ -818,6 +818,27 @@ not.
   counts it as a key. One state is conditional: a store that skipped an epoch is mislabelled by
   v0.16.0, and entries written there can read as cannot-verify after upgrading again.
 
+#### How a rotation is ordered
+
+1. Build the replacement key at `audit-secret.pending` (`O_EXCL`, `O_NOFOLLOW`, `fsync`).
+2. Rename the active key into `audit-secret.{N}.retired`.
+3. Record the new epoch (`fsync`).
+4. Rename the replacement into `audit-secret`.
+5. `fsync` the directory.
+
+**Everything that can fail while producing a key fails at step 1**, where the store has not been
+touched: no entropy source, no free descriptors, no room for the 64 bytes. Steps 2-4 are
+directory-entry changes — a smaller surface, not an exempt one. `rename` can still return
+`ENOSPC` when the target directory cannot be extended, and a failure in that window is reported
+as an interrupted rotation, naming the file that moved.
+
+A crash between steps 2 and 4 leaves the interrupted state described above, and the epoch record
+is what makes the recovery skip that number instead of reusing it. A crash at step 1 leaves an
+`audit-secret.pending` holding a key **nobody was given** — the readers never resolve that path,
+so no entry can name it — and the next rotation removes it, saying so. Anything at that path that
+is *not* a regular file is refused instead: a rotation will not delete a file omamori did not
+write, and the refusal happens before the store changes, so it costs a rotation rather than a key.
+
 #### What rotation guarantees
 
 - Entries written before the rotation continue to verify, against the retired key, with no
