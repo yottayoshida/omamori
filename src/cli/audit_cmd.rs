@@ -600,6 +600,29 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
 /// Round 1). What this process observed is that it moved one file and did not
 /// create another; the rest is left to `docs/FAQ.md`, which the operator reads
 /// with the directory in front of them.
+///
+/// **And it no longer branches on what the operator will find.** The recovery
+/// line used to turn on whether an active key existed at the moment they acted,
+/// and said that while none did, moving the retired key back restored the state
+/// from before the rotation. Both halves are in `RETRACTED_CLAUSES`
+/// (`tests/hook_integration.rs`), which `check-invariants.sh` reads to keep them
+/// out of this file.
+///
+/// **Two failure points reach this message, and they do not agree on what the
+/// store holds.** `write_epoch_record` failing returns here with the record
+/// untouched — moving the retired key back really does put the store where it
+/// was. The final rename failing returns here with the record already advanced,
+/// and then the same move takes away the only key that authenticates its own
+/// epoch's entries while the record keeps pointing past it. A single sentence
+/// that asserted either outcome would be false on one of the two paths, which
+/// is why this one says *can* destroy and hands the distinction to `docs/FAQ.md`
+/// (Codex review, P1).
+///
+/// What holds on both paths is that waiting is safe, so that is what the line
+/// instructs. It deliberately does **not** say the next command will try to mint
+/// a key, though `load_signing_key` does exactly that: that is the same
+/// predictive shape as the withdrawn "will create one" — true of the code path,
+/// unknown as an outcome, and read by an operator as permission to act.
 fn rotation_interrupted_lines(
     retired_path: &std::path::Path,
     source: &std::io::Error,
@@ -614,10 +637,10 @@ fn rotation_interrupted_lines(
              create its replacement.",
             retired_path.display()
         ),
-        "  What to do next turns on whether an audit-secret exists when you act: while none \
-         does, moving that file back restores the state from before the rotation; once one \
-         does, moving it back destroys the key that anything written in between was signed \
-         with. See the audit chapter of omamori's FAQ."
+        "  Leave the key files where they are. Moving that .retired file onto the active path \
+         can destroy the key its own epoch's entries were signed with — whether it does depends \
+         on how far this rotation got, and waiting is safe either way. See the audit chapter of \
+         omamori's FAQ."
             .to_string(),
     ]
 }
@@ -848,6 +871,40 @@ mod tests {
             text.contains("omamori's FAQ"),
             "the procedure lives where the operator can follow it: {text}"
         );
+        // The recovery line, pinned positively. Without this the whole third
+        // line can be deleted and every assertion above still passes — they all
+        // read the first two.
+        assert!(
+            text.contains("Leave the key files where they are"),
+            "the one instruction that is right on every failure path: {text}"
+        );
+        assert!(
+            text.contains("waiting is safe either way"),
+            "and why it is right on every one of them — without this the \
+             instruction reads as an arbitrary prohibition: {text}"
+        );
+        // Hedged on purpose. `write_epoch_record` failing returns this error
+        // with the record untouched, and there the move is a real recovery;
+        // the final rename failing returns it with the record advanced, and
+        // there the move costs the epoch. An unhedged verb would be false on
+        // one of the two paths (Codex review, P1).
+        assert!(
+            text.contains("can destroy the key"),
+            "the cost is stated as possible, not certain: {text}"
+        );
+        assert!(
+            !text.contains("destroys the key"),
+            "the unhedged form is false on the record-write failure path: {text}"
+        );
+        // The two withdrawn halves of the old sentence are deliberately **not**
+        // asserted here. They live in `RETRACTED_CLAUSES`
+        // (`tests/hook_integration.rs`), and `check-invariants.sh` scans every
+        // tracked file outside `tests/` for them — this file included. It
+        // matches on bytes and cannot tell an assertion that forbids a phrase
+        // from a message that uses one, which is why the list lives under
+        // `tests/` in the first place. Writing the negative here fails that
+        // invariant rather than strengthening this test: measured, both
+        // assertions were reported as the clauses being back in operator text.
     }
 
     /// #177 B3 (Codex Phase 6-B): the mixed-version parenthetical had zero

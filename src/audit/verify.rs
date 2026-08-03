@@ -41,9 +41,26 @@ pub enum AuditError {
     /// The remedy travels with the error rather than being added by the CLI
     /// arm, for the reason #477 had to withdraw a caller-side one: the arm
     /// knows the keyring is unusable and not which condition made it so, and
-    /// the two conditions need different actions — one is a directory that
-    /// cannot be listed, the other a record file that states no epoch while
-    /// the directory is perfectly fine.
+    /// the conditions need different actions — one is a directory that cannot
+    /// be listed, another a record file that states no epoch while the
+    /// directory is perfectly fine.
+    ///
+    /// **#487 added a third**: the active key is missing on a store that has
+    /// rotated before. Same shape as the other two — the keyring cannot be
+    /// resolved, and the arm cannot tell which condition made it so — and the
+    /// action differs again. Here the operator is to leave the key files alone;
+    /// nothing is broken that they can repair, and the `.retired` file the
+    /// obvious repair reaches for is the only thing authenticating its own
+    /// epoch's entries.
+    ///
+    /// **The last two are produced by `rotate_key` only, and `report --json`
+    /// depends on it.** `aggregate_report` maps `verify_chain`'s result rather
+    /// than rotation's, and pins `kind: "directory_unreadable"` on the
+    /// `ChainStatus` it builds (`report.rs`). That value is honest exactly
+    /// while `verify_chain` has one way to produce this variant. Giving the
+    /// verifier a second one makes the field describe a condition that did not
+    /// occur — the `kind` would have to grow with it, and it exists to be
+    /// stable.
     ///
     /// Empty `remedy` is allowed and means "nothing beyond the reason".
     KeyringUnusable {

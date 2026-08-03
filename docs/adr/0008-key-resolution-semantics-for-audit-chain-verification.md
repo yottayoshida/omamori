@@ -187,7 +187,8 @@ tracked separately, out of scope here.
 
   **Corrected in #477.** The sentence above originally read "the explicit refusal remains for the
   case where the directory scan itself fails", which was not true of the code it described. The
-  refusal is `retired_path.exists()`, so it only fires when the guessed slot is *occupied* — and a
+  refusal was `retired_path.exists()` at the time, so it only fired when the guessed slot was
+  *occupied* — and a
   failed scan guesses slot 1, which on a store missing its low epochs is free. That is exactly the
   case the sentence claimed to cover, and the one where the guess does damage: the current key was
   filed under an epoch that already existed. #477 closes it upstream instead — rotation now refuses

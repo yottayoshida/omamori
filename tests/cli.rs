@@ -1864,6 +1864,181 @@ fn audit_key_rotate_reports_missing_secret_without_partial_files() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// #487: the same `NotFound` on a store that has rotated before is a different
+/// state, and the wording above must not be reused for it.
+///
+/// "no audit secret found — nothing to rotate" reads as an empty store and
+/// invites setting one up again. On the interrupted-rotation shape that is the
+/// one response that loses entries — a `.retired` file is the only thing that
+/// authenticates its own epoch, and recreating the store abandons it.
+///
+/// The fixture is what a failed `rename(pending -> active)` leaves behind.
+/// **The paired test is the one directly above**: it pins that a store with
+/// none of the three observations still gets the old wording. Without that
+/// pair, an implementation that refused unconditionally would satisfy this one.
+#[test]
+fn audit_key_rotate_on_an_interrupted_store_does_not_report_it_as_empty() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-halfway-store");
+    let first = rotate_in(&home);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "the fixture needs one completed rotation: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    fs::rename(
+        secret_dir.join("audit-secret"),
+        secret_dir.join("audit-secret.pending"),
+    )
+    .unwrap();
+
+    let output = rotate_in(&home);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "rotation must refuse on a store whose active key is gone: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no audit secret found"),
+        "the store is not empty — calling it empty invites the one repair that \
+         abandons the retired key: {stderr}"
+    );
+    assert!(
+        stderr.contains("this store has rotated before"),
+        "the refusal must say which state it found: {stderr}"
+    );
+    // All three observations, quoted. Each is left behind by a different point
+    // in a rotation, and an operator standing in the directory can check them.
+    // Asserted separately so dropping one from `rotated_store_evidence` fails
+    // here rather than silently narrowing the message.
+    assert!(
+        stderr.contains("retired key file(s) present"),
+        "the filed key is one of the three: {stderr}"
+    );
+    assert!(
+        stderr.contains("records epoch"),
+        "the recorded epoch is the second: {stderr}"
+    );
+    assert!(
+        stderr.contains("audit-secret.pending"),
+        "and the waiting replacement is the third: {stderr}"
+    );
+    assert!(
+        stderr.contains("Leave the key files where they are"),
+        "the remedy must not send the operator at the key files: {stderr}"
+    );
+    // Hedged, and pinned as hedged. This refusal is reached from both
+    // interrupted shapes and only one of them has the record advanced past the
+    // retired slot; on the other, moving the file back is a real recovery. The
+    // unhedged verb sat here until the printed line was read back from the
+    // binary — the suite and `check-invariants.sh` both passed with it in.
+    assert!(
+        stderr.contains("can destroy the key"),
+        "the cost must be stated as possible, not certain: {stderr}"
+    );
+    assert!(
+        !stderr.contains("path destroys the key"),
+        "the unhedged form is false on the record-write failure path: {stderr}"
+    );
+    // The refusal happens before anything moves, which is what makes "leave
+    // them where they are" something the operator can still do.
+    assert!(
+        secret_dir.join("audit-secret.1.retired").exists(),
+        "the retired key must be untouched by the refusal: {stderr}"
+    );
+    assert!(
+        secret_dir.join("audit-secret.pending").exists(),
+        "and so must the waiting replacement: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #486: the overwrite guard asks whether the *rename* will replace something,
+/// and the listing cannot answer that question.
+///
+/// `active_epoch` returns `max(max_retired + 1, recorded)`, which is above every
+/// key the scan reported — so the destination is never a name `retired` holds,
+/// and deciding from the listing (as the issue proposed) would make the check
+/// vacuous rather than stricter. What *can* occupy that path is exactly what
+/// the listing refuses to name: here, a spelling that differs only in case,
+/// which `fold_key_dir_entries` ignores and which resolves to the canonical
+/// name on a case-insensitive filesystem.
+///
+/// Dangling on purpose. `exists()` follows the link, reports the slot as free,
+/// and the rename then replaces it — `symlink_metadata` is what makes the entry
+/// visible, and the last assertion is the one that separates the two.
+#[cfg(target_os = "macos")]
+#[test]
+fn audit_key_rotate_refuses_when_a_name_the_listing_rejects_occupies_the_slot() {
+    let (home, secret_dir) = seed_rotatable_home("audit-rotate-occupied-slot");
+
+    // APFS is case-insensitive by default, but a volume can be formatted
+    // otherwise and then this fixture cannot be built at all. Probe rather than
+    // assume, and say so on the way out.
+    //
+    // **This is a real hole and it is accepted knowingly** (Codex review, P2):
+    // a skipped run is indistinguishable from a passing one in captured test
+    // output, so on a case-sensitive volume CI stays green having exercised
+    // nothing. It is accepted because the alternative — failing on volumes
+    // where the state under test cannot exist — trades a silent gap for a
+    // false alarm, and because the case distinction is the *only* way to
+    // occupy the destination: `active_epoch` puts it above every name the
+    // listing reported, so no canonically spelled file can be there. The
+    // GitHub macOS runners use case-insensitive APFS, which is where this is
+    // expected to run.
+    let probe = secret_dir.join("CaseProbe");
+    fs::write(&probe, "").unwrap();
+    let case_insensitive = secret_dir.join("caseprobe").exists();
+    fs::remove_file(&probe).unwrap();
+    if !case_insensitive {
+        eprintln!(
+            "skipped: {} is on a case-sensitive volume, where the canonical name \
+             cannot be reached by another spelling",
+            secret_dir.display()
+        );
+        let _ = fs::remove_dir_all(&home);
+        return;
+    }
+
+    std::os::unix::fs::symlink(
+        secret_dir.join("no-such-key"),
+        secret_dir.join("AUDIT-SECRET.1.RETIRED"),
+    )
+    .unwrap();
+
+    let output = rotate_in(&home);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "rotation must not rename onto a slot it cannot account for: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to overwrite an existing retired key"),
+        "the refusal must name what it declined to do: {stderr}"
+    );
+    assert!(
+        stderr.contains("the key-directory listing did not report this epoch"),
+        "and say why the file is not one the operator can find under the name \
+         printed above: {stderr}"
+    );
+    assert!(
+        fs::symlink_metadata(secret_dir.join("AUDIT-SECRET.1.RETIRED")).is_ok(),
+        "the occupying entry must survive — with `exists()` the rename removed \
+         it, which is the whole difference this change makes: {stderr}"
+    );
+    assert!(
+        secret_dir.join("audit-secret").exists(),
+        "and the active key must not have moved: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+}
+
 /// #371 Phase 6-B blind spot: the HOME-unset error message tells the user
 /// to "set audit.path explicitly in config.toml" as the recovery — but
 /// nothing proved that recovery path actually works end-to-end through the
