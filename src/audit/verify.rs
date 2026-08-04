@@ -464,7 +464,19 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // `chain_entries == 0` branch below, from the key the head entry names.
     // Only used from the second chain entry onward.
     let mut expected_prev = String::new();
-    let mut expected_seq: u64 = 0;
+    // #456: `None` means "no successor number exists" — the previous verified
+    // entry was numbered `u64::MAX`. Held as an `Option` rather than a `u64`
+    // so the advance below can be a checked increment: a `u64` would have to
+    // wrap (or panic under `overflow-checks`) at the top of the range, and
+    // saturating instead would let a second `u64::MAX` entry satisfy the
+    // continuity check.
+    let mut expected_seq: Option<u64> = Some(0);
+    // #456: the highest seq actually verified, kept instead of deriving it
+    // from `expected_seq - 1` for the high-water-mark below. The derivation
+    // needed a `saturating_sub` to be safe, and reported `u64::MAX - 1` after
+    // verifying an entry numbered `u64::MAX` — one short, which reads as tail
+    // truncation against a mark that is correct.
+    let mut last_verified_seq: Option<u64> = None;
     // #457 A4: the prune-bind was written with the key active at prune time,
     // so it has to be recomputed with *that* key — not with the key of the
     // first retained entry, which belongs to whatever epoch that entry was
@@ -489,6 +501,15 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             result.unverified_entries_after += 1;
             continue;
         }
+
+        // #456: the position to report for an entry that does not state its
+        // own `seq`. `expected_seq` is `None` only when the previous verified
+        // entry was numbered `u64::MAX` — which is also the position being
+        // reported — so that is what the fallback yields. Bound once per
+        // iteration rather than at each of the five sites below: `expected_seq`
+        // only changes at the end of the body, so this cannot drift from it,
+        // and the reasoning lives in one place.
+        let reported_position = expected_seq.unwrap_or(u64::MAX);
 
         let event: AuditEvent = match serde_json::from_str(trimmed) {
             Ok(e) => e,
@@ -521,7 +542,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                     && let Some(chain_version) = peek.chain_version
                     && !is_supported_chain_version(chain_version)
                 {
-                    let seq = peek.seq.unwrap_or(expected_seq);
+                    let seq = peek.seq.unwrap_or(reported_position);
                     mark_unverifiable_tail(&mut result, seq, chain_version);
                     continue;
                 }
@@ -541,7 +562,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // unaudited content into the middle of an otherwise-verified
             // chain without breaking the links around it.
             if result.chain_entries > 0 {
-                result.broken_at = Some(expected_seq);
+                result.broken_at = Some(reported_position);
                 break;
             }
             result.legacy_entries += 1;
@@ -568,7 +589,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         if let Some(version) = event.chain_version
             && !is_supported_chain_version(version)
         {
-            let reported_seq = event.seq.unwrap_or(expected_seq);
+            let reported_seq = event.seq.unwrap_or(reported_position);
             mark_unverifiable_tail(&mut result, reported_seq, version);
             continue;
         }
@@ -586,7 +607,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // whose authenticity is unknown.
             mark_key_unavailable_tail(
                 &mut result,
-                event.seq.unwrap_or(expected_seq),
+                event.seq.unwrap_or(reported_position),
                 entry_key_id,
                 keyring.highest_known_epoch(),
             );
@@ -611,7 +632,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // misleading "at entry #0" report for an unrecognized-
                 // version entry appearing deep in an otherwise-verified
                 // chain.
-                let reported_seq = event.seq.unwrap_or(expected_seq);
+                let reported_seq = event.seq.unwrap_or(reported_position);
                 mark_unverifiable_tail(&mut result, reported_seq, v);
                 continue;
             }
@@ -649,8 +670,12 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // But verify the prune-bind: target_hash must bind this entry's hash.
             // (entry_hash verification below will confirm this entry is authentic)
         } else {
-            // Normal chain link
-            if seq != expected_seq {
+            // Normal chain link. #456: comparing `Some(seq)` means a `None`
+            // expectation — the previous entry was numbered `u64::MAX`, so no
+            // successor is possible — rejects this entry whatever its seq is,
+            // including another `u64::MAX`. Saturating the advance instead
+            // would have let that second one through here.
+            if Some(seq) != expected_seq {
                 result.broken_at = Some(seq);
                 break;
             }
@@ -689,7 +714,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             key: *entry_secret,
         });
         expected_prev = recorded_hash.to_string();
-        expected_seq = seq + 1;
+        last_verified_seq = Some(seq);
+        // #456: a checked increment, and `None` is kept as a state rather than
+        // clamped. This entry verified, so the chain is intact up to here —
+        // panicking or reporting `broken_at` would both be false. What is true
+        // is that nothing can legitimately follow it, which is what the
+        // continuity check above then enforces.
+        expected_seq = seq.checked_add(1);
         result.chain_entries += 1;
         // #177 B3: `event.chain_version` is `Some` here — the `None`
         // (legacy) case already `continue`d above, and `compute_entry_hash`
@@ -721,9 +752,17 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // expected_seq stopped advancing before the real end of file, so
     // writing/comparing the HWM here would compare against a false "end"
     // and could silently lower the high-water-mark on a later re-verify.
-    if result.broken_at.is_none() && !result.halted() && result.chain_entries > 0 {
+    // #456: the mark comes from the last seq actually verified, not from
+    // `expected_seq - 1`. `chain_entries > 0` and `last_verified_seq.is_some()`
+    // are the same condition — both are set in the one block that completes an
+    // entry's verification — so binding it here replaces the counter check
+    // rather than adding to it, and there is no arithmetic left to get wrong at
+    // the top of the range.
+    if result.broken_at.is_none()
+        && !result.halted()
+        && let Some(max_verified_seq) = last_verified_seq
+    {
         let hwm_file = hwm_path_for(&path);
-        let max_verified_seq = expected_seq.saturating_sub(1);
         match read_hwm(&hwm_file) {
             HwmState::Valid(hwm) if max_verified_seq < hwm => {
                 result.tail_truncated = true;

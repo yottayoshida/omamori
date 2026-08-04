@@ -66,6 +66,23 @@ serial_test = "3"
 proptest = "1.11"
 criterion = "0.8.2"
 
+# #456: without this, release builds wrap on integer overflow while the test
+# suite — which runs on the dev profile, where the flag is on by default —
+# never sees it. That gap is what let `append()` ship an unchecked `+ 1` on a
+# sequence number read out of the audit log: every test exercising it panicked
+# in debug, so none of them was written to observe a wrap.
+#
+# A panic is the safe direction here. On the hook path the installed wrapper
+# maps any exit status other than 0 or 2 to exit 2 = Block plus a recovery
+# hint, and pins 101 explicitly (ADR-0003, `wrapper_exit_code_matrix_v003_v004`
+# in `installer.rs`). Directly-invoked subcommands have no such wrapper —
+# `main` only converts `Err` into exit 1 — so there a panic is a bare crash;
+# an arithmetic scan over production code (39 files, 21,294 lines) found no
+# site where this flag changes behaviour, and `audit verify` / `test` /
+# `config` / `break-glass` were run on a release build to confirm it.
+[profile.release]
+overflow-checks = true
+
 # Benchmarks live under `benches/` and are excluded from the crate tarball
 # via the `include` allowlist above (Invariant #4 / SECURITY.md). They run
 # locally with `cargo bench` and in CI as a compile-only check

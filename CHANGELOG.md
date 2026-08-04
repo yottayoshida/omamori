@@ -8,6 +8,16 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **Release builds now check integer overflow, and `audit verify` no longer mis-reports the high-water-mark at the top of the sequence range.** ([#456](https://github.com/yottayoshida/omamori/issues/456))
+
+  `[profile.release]` did not exist, so release builds wrapped on overflow while the test suite — which runs on the dev profile, where the check is on by default — never saw it. That gap is what let the append path ship an unchecked increment on a sequence number read out of the log: every test touching it panicked in debug, so none was written to observe a wrap. `overflow-checks = true` closes the gap for the arithmetic no one has looked at yet.
+
+  A panic is the safe direction on the hook path, where the installed wrapper maps any exit status other than 0 or 2 to exit 2 = Block with a recovery hint and pins 101 explicitly (ADR-0003). Directly-invoked subcommands have no wrapper — `main` only turns `Err` into exit 1 — so there a panic would be a bare crash. An arithmetic scan over production code (39 files, 21,294 lines) found no site where the flag changes behaviour: every subtraction is guarded, constant-folded, or range-bounded on a signed type, there are no `sum()`/`product()` calls, and `audit verify` / `test` / `config` / `break-glass` were exercised on a release build to confirm it. The whole suite also passes on the release profile.
+
+  `verify_chain` held one such increment (`expected_seq = seq + 1`). It is only reachable in a state that requires the HMAC key, but the flag would have turned it into a panic on a chain that had just proved itself authentic — which `verify.rs` already has a documented stance against. `expected_seq` is now an `Option`, advanced with a checked increment, and `None` records that no successor number exists: the continuity check compares `Some(seq)` against it, so an entry following one numbered `u64::MAX` is reported as broken rather than accepted. Saturating instead would have let a *second* entry carrying `u64::MAX` satisfy the check, which a test now pins.
+
+  The mark written after verification comes from the last seq actually verified rather than from `expected_seq - 1`. The derivation needed a `saturating_sub` to be safe and was short by one at the top of the range — and a mark one short is behind the chain, which is the shape `tail_truncated` looks for. Verifying a chain that ends at `u64::MAX` reported a truncated tail for a file nothing had been removed from.
+
 - **A tail entry numbered at the `u64` limit no longer makes the next audit entry restart at `seq: 0`.** ([#456](https://github.com/yottayoshida/omamori/issues/456))
 
   `append()` numbered each entry by adding one to the `seq` on the tail line. That value is read off disk and the append path never authenticates it — `read_chain_state` requires only that `entry_hash` be a non-empty string — so one hand-written line sets it to anything, no HMAC key involved. At `u64::MAX` the addition has no representable result: a release build without `overflow-checks` wrapped it to `0`.
