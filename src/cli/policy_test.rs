@@ -16,7 +16,10 @@ pub(crate) fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError
     let load_result = load_config(config_path.as_deref())?;
     emit_config_warnings(&load_result);
     // Captured once per invocation (#175) for the Context section below.
-    let base = context::process_base_or_root();
+    // `#460`: an `Option` — `context_rows` passes it through to
+    // `evaluate_context`, which decides whether an unresolvable base is safe to
+    // substitute for given this config's `protected_paths`.
+    let base = context::process_base();
 
     // Rules section
     let config = &load_result.config;
@@ -74,7 +77,7 @@ pub(crate) fn run_policy_test_command(args: &[OsString]) -> Result<i32, AppError
     // only prints them, so there is one place that decides and one that
     // displays.
     let context_result: Vec<ContextRow> = match config.context {
-        Some(ref ctx_config) => context_rows(config, ctx_config, &base),
+        Some(ref ctx_config) => context_rows(config, ctx_config, base.as_deref()),
         None => Vec::new(),
     };
     let context_failures = context_result
@@ -237,7 +240,7 @@ const UNKNOWN_PATH_SAMPLE: &str = "data/";
 pub(crate) fn context_rows(
     config: &Config,
     ctx_config: &ContextConfig,
-    base: &Path,
+    base: Option<&Path>,
 ) -> Vec<ContextRow> {
     let mut rows = Vec::new();
 
@@ -281,6 +284,34 @@ pub(crate) fn context_rows(
         let inv = CommandInvocation::new("rm".to_string(), vec!["-rf".into(), target.into()]);
         context::evaluate_context(&inv, rule, ctx_config, base)
     };
+
+    // `#460` + Codex review P1: when the working directory is unresolvable and
+    // this config has a `protected_paths` entry that needs one, every
+    // evaluation below comes back as the fail-closed escalation rather than as
+    // a verdict about the path it was given. Detected once, for all three rows,
+    // the same shape the missing-`rm`-rule case above uses — per row it would
+    // leave the protected row passing for the wrong reason and the
+    // unknown-path row *failing*, turning `omamori test` red on account of the
+    // machine's state. That is precisely what `#458` set out to make
+    // impossible, so `#460` must not reintroduce it one PR later.
+    if evaluate(UNKNOWN_PATH_SAMPLE).reason == context::BASE_UNRESOLVABLE_REASON {
+        for name in [
+            "regenerable-path-downgrade",
+            "protected-path-escalate",
+            "unknown-path-unchanged",
+        ] {
+            rows.push(ContextRow {
+                name,
+                verdict: ContextVerdict::NotChecked(
+                    "the working directory could not be resolved, so no row's target was \
+                     evaluated against the configured paths",
+                ),
+                detail: context::BASE_UNRESOLVABLE_REASON.to_string(),
+            });
+        }
+        rows.push(git_row());
+        return rows;
+    }
 
     // --- Row 1: a declared regenerable path. Observation only. ---
     match ctx_config.regenerable_paths.first() {
@@ -356,7 +387,11 @@ pub(crate) fn context_rows(
     }
 
     // --- Row 3: a path no list names. Decidable behind a gate. ---
-    let (resolved, _) = context::resolve_path(UNKNOWN_PATH_SAMPLE, base);
+    // `#460`: the gate asks whether *this config* names the sample path, which
+    // is a question about the lists rather than about the base. When there is
+    // no base the sample is resolved against the same `/` the evaluation would
+    // have used, so the gate and the evaluation agree on which row is checkable.
+    let (resolved, _) = context::resolve_path(UNKNOWN_PATH_SAMPLE, base.unwrap_or(Path::new("/")));
     let listed = ctx_config
         .protected_paths
         .iter()
@@ -606,8 +641,8 @@ mod tests {
     // unknown rows must reach their verdicts without consulting the filesystem,
     // and passing a real directory would hide it if they did.
 
-    fn absent_base() -> &'static Path {
-        Path::new("/nonexistent-omamori-458-fixture")
+    fn absent_base() -> Option<&'static Path> {
+        Some(Path::new("/nonexistent-omamori-458-fixture"))
     }
 
     fn row<'a>(rows: &'a [ContextRow], name: &str) -> &'a ContextRow {
@@ -756,6 +791,54 @@ mod tests {
                 ContextVerdict::NotChecked(_)
             ),
             "the git readout is independent of the rm rule and must still appear"
+        );
+    }
+
+    /// `#460` + Codex review P1: with no resolvable base and a config whose
+    /// `protected_paths` needs one, every evaluation returns the fail-closed
+    /// escalation. Reported as verdicts, the protected row would pass for the
+    /// wrong reason and the unknown-path row would fail — making `omamori test`
+    /// red because of the machine's state. `#458`'s whole point was that the
+    /// exit code does not depend on the environment, so `#460` must not undo it.
+    ///
+    /// The `exit == 0` half is weak alone (an implementation that always
+    /// returns 0 satisfies it). What makes the pair discriminating is
+    /// `omamori_test_exits_non_zero_when_a_context_row_fails` above, which pins
+    /// that a config-level defect *does* turn it red.
+    #[test]
+    fn context_rows_are_not_checked_when_the_base_is_unresolvable() {
+        let mut config = Config::default();
+        let mut ctx = config.context.clone().unwrap();
+        ctx.protected_paths = vec!["some/nested/dir".to_string()];
+        config.context = Some(ctx.clone());
+
+        let rows = context_rows(&config, &ctx, None);
+        for name in [
+            "regenerable-path-downgrade",
+            "protected-path-escalate",
+            "unknown-path-unchanged",
+        ] {
+            assert!(
+                matches!(row(&rows, name).verdict, ContextVerdict::NotChecked(_)),
+                "row {name} must state that nothing was evaluated, not report a verdict \
+                 produced by the fail-closed arm"
+            );
+        }
+        assert!(
+            matches!(
+                row(&rows, "git-aware-evaluation").verdict,
+                ContextVerdict::NotChecked(_)
+            ),
+            "the git readout is independent of the base and must still appear"
+        );
+
+        // The consequence that matters: no row can reach the exit code.
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.verdict == ContextVerdict::Fail)
+                .count(),
+            0,
+            "an unresolvable working directory must not be able to fail `omamori test`"
         );
     }
 

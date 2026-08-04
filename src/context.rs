@@ -118,33 +118,14 @@ pub(crate) fn process_base() -> Option<PathBuf> {
     env::current_dir().ok()
 }
 
-/// [`process_base`] with the historical `/` fallback, consolidated to this
-/// one call site so no caller re-invents its own default.
-///
-/// Safe for [`evaluate_context`] callers under the *default* `protected_paths`
-/// (single-component entries like `src/`, `.git/`): `path_matches_pattern`
-/// does a contiguous-component-window match, and a single-component pattern
-/// needs no components from `base` to complete its window, so the synthetic
-/// `/`-rooted path still matches it correctly. **This does not generalize**:
-/// a user-configured multi-component `protected_paths` entry (e.g.
-/// `"some/nested/dir"`) can rely on `base` supplying a leading portion of the
-/// window (the same boundary-spanning shape `is_protected_file_path`'s
-/// Subpath matching has, see its V-A15 test) — under the real CWD it
-/// matches, under the synthetic `/` fallback it silently does not, and
-/// Priority 1 escalation is skipped (fail-*open* for that one rule, not
-/// fail-closed). Exploitability is low (requires both an unresolvable CWD
-/// *and* a non-default multi-component `protected_paths` entry) but this
-/// fallback does not close it — tracked as a follow-up issue rather than
-/// fixed here. `regenerable_paths` downgrade is unaffected either way: it
-/// requires `fs::canonicalize` to succeed, which a synthetic `/`-rooted path
-/// generally will not, so an unresolvable CWD can only ever suppress a
-/// downgrade, never one that shouldn't happen. **Not** safe for exact-
-/// location checks like `is_protected_file_path`, which must fail-closed on
-/// [`process_base`]'s `None` directly instead of routing through this
-/// fallback.
-pub(crate) fn process_base_or_root() -> PathBuf {
-    process_base().unwrap_or_else(|| PathBuf::from("/"))
-}
+// `#460` removed `process_base_or_root`. It applied the `/` fallback
+// unconditionally, which is only sound for `protected_paths` patterns that need
+// no components from `base` — the gap `#175` documented here and did not close.
+// The fallback now lives inside `evaluate_context`, next to the check that
+// decides whether it is sound for the config in hand, so callers pass
+// `process_base()`'s `Option` through unchanged and no caller re-invents a
+// default. `is_protected_file_path` was never routed through it and is
+// unaffected: it fails closed on `None` directly (`engine::hook`).
 
 /// Lexical path normalization with an explicit base directory for relative-path
 /// resolution: expand `~`, resolve relative paths against `base`, remove `.` and
@@ -272,6 +253,62 @@ pub fn path_matches_pattern(normalized: &Path, pattern: &str) -> bool {
         .any(|window| window == pattern_components.as_slice())
 }
 
+/// The reason [`evaluate_context`] gives when it refuses to decide Priority 1
+/// without a base. Shared so the shim's block message, `explain` and
+/// `omamori test` all say the same thing — the three surfaces print
+/// `ContextEvaluation::reason` verbatim.
+pub const BASE_UNRESOLVABLE_REASON: &str = "the process working directory could not be resolved, and this config has a protected_paths \
+     pattern that needs it to match — escalating rather than deciding without it";
+
+/// `#460`: does matching this pattern require components from `base`?
+///
+/// [`path_matches_pattern`] matches a contiguous window of components. A
+/// single-component pattern completes its window out of the target's own
+/// components, so the synthetic `/` root that used to stand in for an
+/// unresolvable CWD gave the same verdict as the real one. A pattern of two or
+/// more components can need the leading part of that window to come from
+/// `base` — under the real CWD it matches, under `/` it silently does not, and
+/// Priority 1 escalation is skipped. That is the fail-*open* `#175` documented
+/// and did not close.
+///
+/// The rule is uniform: a pattern needs a base exactly when its window is wider
+/// than one component.
+///
+/// **An absolute pattern is not exempt** — a first draft excluded it on the
+/// grounds that `normalize_path` never joins `base` onto an already-absolute
+/// *target*, which is true and beside the point (Codex review, P1). The
+/// dependency runs through the target's resolution, not the pattern's shape:
+/// with `protected_paths = ["/tmp/proj/secret"]`, a real CWD of `/tmp/proj` and
+/// a relative target `secret`, the target resolves to `/tmp/proj/secret` and
+/// matches; against the synthetic root it resolves to `/secret`, which cannot
+/// contain a four-component window, and the escalation is skipped. Excluding
+/// absolute patterns re-opened, in the exclusion, the same hole this function
+/// exists to close. `RootDir` therefore counts like any other component, which
+/// leaves `/` alone at one component — every absolute path starts with it, so
+/// that pattern matches with or without a base.
+///
+/// Two shapes still contribute nothing:
+///
+/// - **`.`** — `CurDir` is dropped by `normalize_path`, so it never appears in
+///   a resolved path and cannot widen a window. That keeps
+///   `protected_paths = ["."]` at one component — the config `#458` pinned as
+///   writable-but-never-matching.
+/// - **`..`** — `normalize_path` pops `ParentDir` rather than emitting it, so a
+///   pattern carrying one can never window-match anything, with or without a
+///   base. Treating it as needing `base` would fail closed for a pattern that
+///   is inert either way.
+fn pattern_needs_base(pattern: &str) -> bool {
+    let mut significant = 0usize;
+    for component in Path::new(pattern).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => return false,
+            _ => significant += 1,
+        }
+    }
+    significant >= 2
+}
+
 /// Check if a path matches any pattern in a list.
 fn matches_any_pattern(path: &Path, patterns: &[String]) -> Option<String> {
     for pattern in patterns {
@@ -341,16 +378,44 @@ pub fn evaluate_context(
     invocation: &CommandInvocation,
     _rule: &RuleConfig,
     config: &ContextConfig,
-    base: &Path,
+    base: Option<&Path>,
 ) -> ContextEvaluation {
-    // Real `assert!`, not `debug_assert!` — see `normalize_path`'s doc for
-    // why (this also protects the empty-`targets` early return below, which
-    // never reaches `resolve_path`'s own transitive check).
-    assert!(
-        base.is_absolute(),
-        "evaluate_context: base must be absolute, got {base:?} — see module docs"
-    );
     let targets = invocation.target_args();
+
+    // `#460`: the `/` fallback for an unresolvable CWD used to live in
+    // `process_base_or_root` and applied unconditionally. It is only sound for
+    // patterns that need no components from `base` (see `pattern_needs_base`),
+    // so the decision moved in here — one place decides, instead of three
+    // callers each re-deriving the same condition.
+    let base = match base {
+        Some(base) => {
+            // Real `assert!`, not `debug_assert!` — see `normalize_path`'s doc
+            // for why (this also protects the empty-`targets` early return
+            // below, which never reaches `resolve_path`'s own transitive check).
+            assert!(
+                base.is_absolute(),
+                "evaluate_context: base must be absolute, got {base:?} — see module docs"
+            );
+            base
+        }
+        None => {
+            // Fail closed only where the gap actually is. A relative target is
+            // what would be resolved against `base`; an absolute one never
+            // consults it. Both conditions have to hold, so the default
+            // config — whose `protected_paths` entries are all single
+            // component — reaches the fallback below exactly as before.
+            let needs_base = config.protected_paths.iter().any(|p| pattern_needs_base(p));
+            let has_relative_target = targets.iter().any(|t| Path::new(t).is_relative());
+            if needs_base && has_relative_target {
+                return ContextEvaluation {
+                    action_override: Some(ActionKind::Block),
+                    reason: BASE_UNRESOLVABLE_REASON.to_string(),
+                };
+            }
+            Path::new("/")
+        }
+    };
+
     if targets.is_empty() {
         return ContextEvaluation {
             action_override: None,
@@ -622,7 +687,7 @@ mod tests {
         PathBuf::from("/omamori-normalize-test-base")
     }
 
-    // --- process_base / process_base_or_root (V-A09) ---
+    // --- process_base (V-A09) ---
 
     #[test]
     // Reads the real process CWD (via `process_base`) — shares the `cwd`
@@ -634,13 +699,13 @@ mod tests {
     #[serial_test::serial(cwd)]
     fn process_base_returns_some_for_a_normal_cwd() {
         assert!(process_base().is_some());
-        assert_eq!(process_base_or_root(), process_base().unwrap());
     }
 
     // #175/#373: `process_base` must fail-close (return `None`) rather than
     // silently substituting something else when the CWD is unresolvable —
-    // e.g. deleted out from under the running process. `process_base_or_root`
-    // then applies the one sanctioned `/` fallback on top of that `None`.
+    // e.g. deleted out from under the running process. `#460` moved what to do
+    // with that `None` into `evaluate_context`, where the config is in scope;
+    // this test covers only the fail-close itself.
     //
     // Verified (not assumed) on both CI legs: `getcwd(3)` after the CWD
     // directory has been unlinked returns `ENOENT` on both Linux and macOS
@@ -671,7 +736,6 @@ mod tests {
         fs::remove_dir(&dir).unwrap();
 
         let result = process_base();
-        let fallback = process_base_or_root();
 
         // reason: same real-CWD test as above — restores the process's
         // original CWD so this test doesn't leak state into siblings.
@@ -683,11 +747,6 @@ mod tests {
         assert_eq!(
             result, None,
             "process_base must return None (fail-close), not a stale/dangling path"
-        );
-        assert_eq!(
-            fallback,
-            PathBuf::from("/"),
-            "process_base_or_root must apply the one sanctioned `/` fallback on top of None"
         );
     }
 
@@ -806,7 +865,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "target/".to_string()],
         );
-        let _ = evaluate_context(&inv, &test_rule(), &test_config(), Path::new("rel"));
+        let _ = evaluate_context(&inv, &test_rule(), &test_config(), Some(Path::new("rel")));
     }
 
     // --- path_matches_pattern ---
@@ -910,12 +969,161 @@ mod tests {
     ///
     /// Example: `/tmp/omamori-ctx-test-12345/target/` is what a relative
     /// `target/` arg resolves to when evaluating via
-    /// `evaluate_context(&inv, &rule, &config, &test_base())`.
+    /// `evaluate_context(&inv, &rule, &config, Some(&test_base()))`.
     fn test_base() -> PathBuf {
         let base = PathBuf::from(format!("/tmp/omamori-ctx-test-{}", std::process::id()));
         std::fs::create_dir_all(base.join("target")).unwrap();
         std::fs::create_dir_all(base.join("node_modules")).unwrap();
         base
+    }
+
+    // --- #460: an unresolvable base ---
+
+    fn rm_rf(target: &str) -> CommandInvocation {
+        CommandInvocation::new(
+            "rm".to_string(),
+            vec!["-rf".to_string(), target.to_string()],
+        )
+    }
+
+    /// The table `#460`'s plan fixed before implementing. Each row is a claim
+    /// about whether matching the pattern can consume components from `base`,
+    /// and the fail-closed arm fires on exactly the `true` rows.
+    #[test]
+    fn pattern_needs_base_counts_only_components_that_widen_the_window() {
+        for (pattern, expected, why) in [
+            ("src/", false, "single component completes its own window"),
+            ("a/b", true, "two components can span the base boundary"),
+            (".", false, "CurDir contributes nothing to a window"),
+            (
+                "./foo",
+                false,
+                "CurDir plus one Normal is still one component",
+            ),
+            (
+                "/a/b",
+                true,
+                "an absolute pattern still needs base — the *target* is what gets resolved                  against it (Codex P1)",
+            ),
+            (
+                "/",
+                false,
+                "every absolute path starts with RootDir, so this always matches",
+            ),
+            (
+                "a/../b",
+                false,
+                "normalize_path strips ParentDir, so this pattern matches nothing either way",
+            ),
+        ] {
+            assert_eq!(
+                pattern_needs_base(pattern),
+                expected,
+                "pattern {pattern:?}: {why}"
+            );
+        }
+    }
+
+    /// The default config is all single-component, so an unresolvable base must
+    /// give the identical verdict it gave before `#460`. This is the half that
+    /// stops the fix from being "escalate whenever the CWD is missing".
+    #[test]
+    fn default_shaped_config_is_unchanged_by_an_unresolvable_base() {
+        let config = test_config(); // src/ and .git/ — both single component
+        for target in ["src/", "target/", "data/"] {
+            let with_base = evaluate_context(
+                &rm_rf(target),
+                &test_rule(),
+                &config,
+                Some(Path::new("/nonexistent-omamori-460")),
+            );
+            let without_base = evaluate_context(&rm_rf(target), &test_rule(), &config, None);
+            assert_eq!(
+                with_base.action_override, without_base.action_override,
+                "target {target:?}: the verdict must not depend on the base being resolvable \
+                 when no configured pattern needs it"
+            );
+            assert_eq!(
+                with_base.reason, without_base.reason,
+                "target {target:?}: the reason is printed by shim, explain and `omamori test`, \
+                 so it must not change either"
+            );
+        }
+    }
+
+    /// The gap `#175` documented: with a multi-component pattern the synthetic
+    /// root silently fails to match, so Priority 1 was skipped. It now escalates
+    /// instead of deciding without the information.
+    #[test]
+    fn multi_component_protected_path_escalates_when_the_base_is_unresolvable() {
+        let mut config = test_config();
+        config.protected_paths = vec!["some/nested/dir".to_string()];
+
+        let result = evaluate_context(&rm_rf("dir"), &test_rule(), &config, None);
+        assert_eq!(
+            result.action_override,
+            Some(ActionKind::Block),
+            "a config whose protected pattern needs the base must not silently not-match"
+        );
+        assert_eq!(result.reason, BASE_UNRESOLVABLE_REASON);
+    }
+
+    /// Codex review P1: the first draft exempted absolute patterns, which
+    /// re-opened the hole inside the exclusion. The target is what gets
+    /// resolved against `base`, so an absolute pattern deeper than `/` is
+    /// exactly as base-dependent as a relative one.
+    #[test]
+    fn an_absolute_multi_component_protected_path_still_escalates() {
+        let mut config = test_config();
+        config.protected_paths = vec!["/tmp/proj/secret".to_string()];
+
+        let result = evaluate_context(&rm_rf("secret"), &test_rule(), &config, None);
+        assert_eq!(
+            result.action_override,
+            Some(ActionKind::Block),
+            "an absolute pattern is not base-independent — `secret` resolves under the real              CWD and would match, but resolves to `/secret` against the synthetic root"
+        );
+        assert_eq!(result.reason, BASE_UNRESOLVABLE_REASON);
+    }
+
+    /// Control for the test above, on two axes at once: the same config with a
+    /// base resolves normally, and an absolute target needs no base even when
+    /// the config does. Without these, "escalate whenever `protected_paths` has
+    /// a multi-component entry" would pass.
+    #[test]
+    fn multi_component_config_does_not_escalate_when_the_base_is_not_needed() {
+        let mut config = test_config();
+        config.protected_paths = vec!["some/nested/dir".to_string()];
+
+        let with_base = evaluate_context(
+            &rm_rf("dir"),
+            &test_rule(),
+            &config,
+            Some(Path::new("/nonexistent-omamori-460")),
+        );
+        assert_ne!(
+            with_base.reason, BASE_UNRESOLVABLE_REASON,
+            "a resolvable base must never reach the fail-closed arm"
+        );
+
+        let absolute_target = evaluate_context(&rm_rf("/tmp/dir"), &test_rule(), &config, None);
+        assert_ne!(
+            absolute_target.reason, BASE_UNRESOLVABLE_REASON,
+            "an absolute target is not resolved against the base, so the gap does not apply"
+        );
+    }
+
+    /// `protected_paths = ["."]` is writable and never matches anything
+    /// (`#458` pinned that). It must not be read as multi-component and drag
+    /// every relative target into a block.
+    #[test]
+    fn a_curdir_protected_path_does_not_trigger_the_fail_closed_arm() {
+        let mut config = test_config();
+        config.protected_paths = vec![".".to_string()];
+
+        let result = evaluate_context(&rm_rf("anything"), &test_rule(), &config, None);
+        assert_ne!(result.reason, BASE_UNRESOLVABLE_REASON);
+        assert_eq!(result.action_override, None);
     }
 
     #[test]
@@ -925,7 +1133,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&test_base()));
         assert_eq!(result.action_override, Some(ActionKind::Block));
         assert!(result.reason.contains("protected path"));
     }
@@ -934,7 +1142,7 @@ mod tests {
     fn context_no_targets_returns_none() {
         let config = test_config();
         let inv = CommandInvocation::new("rm".to_string(), vec!["-rf".to_string()]);
-        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&test_base()));
         assert!(result.action_override.is_none());
     }
 
@@ -945,7 +1153,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "data/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&test_base()));
         assert!(result.action_override.is_none());
     }
 
@@ -961,7 +1169,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&test_base()));
         // src/ is in NEVER_REGENERABLE, so it should NOT be downgraded
         assert!(
             result.action_override.is_none(),
@@ -981,7 +1189,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "shared/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&test_base()));
         assert_eq!(result.action_override, Some(ActionKind::Block));
     }
 
@@ -996,7 +1204,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "target/../src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&test_base()));
         assert_eq!(
             result.action_override,
             Some(ActionKind::Block),
@@ -1012,7 +1220,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "target_dir/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &test_base());
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&test_base()));
         assert!(
             result.action_override.is_none(),
             "target_dir should not match target pattern"
@@ -1032,7 +1240,7 @@ mod tests {
             "rm".to_string(),
             vec!["-rf".to_string(), "target/".to_string(), "src/".to_string()],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &base);
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&base));
         assert_eq!(
             result.action_override,
             Some(ActionKind::Block),
@@ -1054,7 +1262,7 @@ mod tests {
                 "node_modules/".to_string(),
             ],
         );
-        let result = evaluate_context(&inv, &test_rule(), &config, &base);
+        let result = evaluate_context(&inv, &test_rule(), &config, Some(&base));
         assert_eq!(result.action_override, Some(ActionKind::LogOnly));
     }
 
