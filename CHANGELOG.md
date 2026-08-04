@@ -8,6 +8,18 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **A tail entry numbered at the `u64` limit no longer makes the next audit entry restart at `seq: 0`.** ([#456](https://github.com/yottayoshida/omamori/issues/456))
+
+  `append()` numbered each entry by adding one to the `seq` on the tail line. That value is read off disk and the append path never authenticates it — `read_chain_state` requires only that `entry_hash` be a non-empty string — so one hand-written line sets it to anything, no HMAC key involved. At `u64::MAX` the addition has no representable result: a release build without `overflow-checks` wrapped it to `0`.
+
+  Measured against a `47afb5d` release build with a byte-identical store: it wrote an entry numbered `0` after the planted tail and warned `audit log tail may have been truncated (seq 0 < high-water-mark 1)` — a truncation report for a file nothing had been removed from. Where the `.hwm` sidecar is itself unreadable or symlinked, the same wrapped value is written back as the new mark, lowering it to `0`.
+
+  `ChainTailState::Ready` now carries the seq the next append takes rather than the tail's own, so the increment happens beside the range check that makes it valid and no arithmetic is left at the call site. A tail that admits no successor is reported separately and refused, in the shape the unrecognized-`chain_version` refusal already uses: an error naming the number observed, `strict` blocking the command as it does for any other unrecordable event, and the default mode warning without touching the block decision. The message does not call the line tampered, because nothing on this path authenticated it, and does not say who wrote it — omamori will itself write a `u64::MAX` entry when handed a tail numbered one below.
+
+  Whether a successor exists is decided from `seq` alone and before `entry_hash`'s shape is checked. Review caught that the reverse order left a hole: a malformed entry is answered by restarting from genesis, which numbers the next entry `0`, so `seq: u64::MAX` paired with an empty `entry_hash` reached the same outcome without passing through the increment at all.
+
+  `retention.rs`'s post-prune high-water-mark recomputation trusts unauthenticated `seq` values the same way and is **not** fixed here — the mark should follow authenticated entries only, which is [#461](https://github.com/yottayoshida/omamori/issues/461). Auto-prune is off by default, so that path does not run in a default install.
+
 - **CLI tests no longer pass on the name of their own fixture directory.** ([#488](https://github.com/yottayoshida/omamori/issues/488))
 
   Four tests asserted that a message contained a word that also appeared in the sandbox directory they had just created. Every one of those commands quotes a path in its output, so the assertion was satisfied by the fixture's own name whatever the code printed — deleting the line under test left them green. Two could not be repaired by renaming the fixture at all: `contains("valid")` is equally satisfied by the failure verdict `invalid`, and `contains("move-to")` by the usage line every `config add` error carries. All four now assert on the diagnostic sentence itself, and each was confirmed to go red when that sentence is changed.

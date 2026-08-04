@@ -290,17 +290,36 @@ pub(super) fn hmac_bytes(secret: Option<&[u8; 32]>, data: &[u8]) -> String {
 /// doesn't recognize" (`UnsupportedVersion`) — the caller must refuse to
 /// append after the latter rather than silently resuming seq numbering
 /// past, or chaining `prev_hash` onto, an entry it never verified.
+///
+/// `#456`: `Ready` carries the seq the next append must *use*, not the
+/// tail's own seq. The increment happens here, beside the range check that
+/// makes it valid, so no caller is left holding a number it still has to
+/// add one to. The tail's seq is read off disk and is *unauthenticated* —
+/// this function never verifies `entry_hash`, so any value can be planted
+/// by writing one line — and `u64::MAX + 1` is not representable: without
+/// `overflow-checks` it wraps to 0, where the wrapped seq reads as (or
+/// masks) tail truncation against the high-water-mark; with
+/// `overflow-checks` it panics. A tail that admits no successor is
+/// reported as `SeqAtLimit` rather than incremented.
 #[derive(Debug, PartialEq)]
 pub(super) enum ChainTailState {
     /// No prior chain entries (empty file, or the tail is legacy/malformed)
     /// — safe to start a new chain from `genesis`.
     Fresh { genesis: String },
     /// Tail entry is a real, version-supported chain entry — safe to
-    /// append with `seq = last_seq + 1`, `prev_hash = last_hash`.
-    Ready { last_seq: u64, last_hash: String },
+    /// append with `seq = next_seq`, `prev_hash = last_hash`.
+    Ready { next_seq: u64, last_hash: String },
     /// Tail entry declares an unsupported `chain_version` — not safe to
     /// append after it.
     UnsupportedVersion { chain_version: u32 },
+    /// Tail entry's `seq` is the largest value a `u64` holds, so no
+    /// successor number exists — not safe to append after it. Reaching this
+    /// number by counting would take `u64::MAX` appends, so a chain that
+    /// arrives here was not produced by appending alone. Note that omamori
+    /// *will* write a `u64::MAX` entry itself if handed a tail numbered one
+    /// below (the point being that the tail below it is equally unreachable),
+    /// so this state does not identify who wrote the line.
+    SeqAtLimit { seq: u64 },
 }
 
 /// Extract `chain_version` from a raw JSON value as a plausible `u32`.
@@ -349,16 +368,35 @@ pub(super) fn read_chain_state(file: &mut fs::File, secret: Option<&[u8; 32]>) -
         Some(chain_version) if !is_supported_chain_version(chain_version) => {
             ChainTailState::UnsupportedVersion { chain_version }
         }
-        Some(_) => match (parsed.get("seq"), parsed.get("entry_hash")) {
-            (Some(seq_val), Some(hash_val)) => match (seq_val.as_u64(), hash_val.as_str()) {
-                (Some(seq), Some(hash)) if !hash.is_empty() => ChainTailState::Ready {
-                    last_seq: seq,
+        // #456: the successor is computed here, not by the caller, and it is
+        // computed from `seq` *before* the `entry_hash` shape check — the
+        // order carries weight. The malformed arm below answers a bad entry
+        // by restarting from genesis, which numbers the next entry 0 and
+        // forks a second chain in the same file (the failure
+        // `UnsupportedVersion` exists to avoid). Deciding the number second
+        // would send `{"seq": <no successor>, "entry_hash": ""}` down that
+        // path, so the refusal this function promises would not cover it —
+        // and the wrapped-to-0 consequences are reached through the fork just
+        // as well as through the increment (Codex review, R1 P1).
+        //
+        // `checked_add` stays the single arbiter of whether a successor
+        // exists. Special-casing `u64::MAX` and leaving a bare `seq + 1`
+        // behind it would make the arithmetic safe only by an argument about
+        // another branch, which stops holding the moment that branch moves.
+        Some(_) => match parsed.get("seq").and_then(|v| v.as_u64()) {
+            None => ChainTailState::Fresh { genesis },
+            Some(seq) => match (
+                seq.checked_add(1),
+                parsed.get("entry_hash").and_then(|v| v.as_str()),
+            ) {
+                (None, _) => ChainTailState::SeqAtLimit { seq },
+                (Some(next_seq), Some(hash)) if !hash.is_empty() => ChainTailState::Ready {
+                    next_seq,
                     last_hash: hash.to_string(),
                 },
                 // Malformed chain entry → treat as corruption, restart from genesis
-                _ => ChainTailState::Fresh { genesis },
+                (Some(_), _) => ChainTailState::Fresh { genesis },
             },
-            _ => ChainTailState::Fresh { genesis },
         },
     }
 }
