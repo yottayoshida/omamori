@@ -2841,6 +2841,120 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #456: the high-water-mark reported after verification is the seq that
+    /// was verified, not one derived from "the seq expected next". The
+    /// derivation (`expected_seq - 1`) is short by one at the top of the range,
+    /// and a mark one short is *behind* the chain — which is exactly the shape
+    /// `tail_truncated` looks for. The mark here is what an append would have
+    /// left, so the file and the mark agree and nothing was removed.
+    #[test]
+    fn verify_does_not_report_truncation_when_the_chain_ends_at_the_seq_limit() {
+        let dir = test_dir("verify-seq-limit-no-false-truncation");
+        let _ = test_logger(&dir); // secret file only
+        let path = dir.join("audit.jsonl");
+        write_chain_entries_at_seqs(
+            &path,
+            &TEST_SECRET,
+            &[(u64::MAX, "cmd-at-limit", "2026-01-01T00:00:00Z")],
+            CHAIN_VERSION,
+        );
+        write_hwm(&hwm_path_for(&path), u64::MAX).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_none(),
+            "the entry is authentic and anchors to genesis — nothing is broken"
+        );
+        assert_eq!(result.chain_entries, 1);
+        assert!(
+            !result.tail_truncated,
+            "the chain verified up to u64::MAX and the mark is u64::MAX, so the mark is not \
+             ahead of the chain — reporting truncation here is a false accusation about a \
+             file nothing was removed from"
+        );
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            u64::MAX,
+            "an unchanged mark must stay unchanged"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Companion to the test above, for the bootstrap arm: the first verify of
+    /// a chain that has no mark yet must write the seq it verified. Writing one
+    /// less would plant the false-truncation state rather than merely report
+    /// it, and it would persist.
+    #[test]
+    fn verify_bootstraps_the_mark_to_the_seq_it_verified_at_the_limit() {
+        let dir = test_dir("verify-seq-limit-bootstrap");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries_at_seqs(
+            &path,
+            &TEST_SECRET,
+            &[(u64::MAX, "cmd-at-limit", "2026-01-01T00:00:00Z")],
+            CHAIN_VERSION,
+        );
+        assert!(
+            matches!(read_hwm(&hwm_path_for(&path)), HwmState::Missing),
+            "sanity: no mark before the first verify"
+        );
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.hwm_missing, "the bootstrap arm must have run");
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            u64::MAX,
+            "the bootstrapped mark must be the verified seq"
+        );
+
+        // The persistence is the point: a mark one short makes the *next*
+        // verify of an unchanged file report a truncated tail.
+        let again = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            !again.tail_truncated,
+            "re-verifying an unchanged file must not report truncation"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #456: nothing can legitimately follow an entry numbered `u64::MAX`, and
+    /// the verifier says so. This is the case a saturating advance would have
+    /// admitted — `expected_seq` would have stayed at `u64::MAX`, so a second
+    /// entry carrying the same number satisfies the equality check. Both
+    /// entries here are genuinely signed, so nothing but the seq continuity is
+    /// available to reject the second one.
+    #[test]
+    fn verify_rejects_a_second_entry_numbered_at_the_seq_limit() {
+        let dir = test_dir("verify-seq-limit-no-successor");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries_at_seqs(
+            &path,
+            &TEST_SECRET,
+            &[
+                (u64::MAX, "cmd-at-limit", "2026-01-01T00:00:00Z"),
+                (u64::MAX, "cmd-after-limit", "2026-01-01T00:00:01Z"),
+            ],
+            CHAIN_VERSION,
+        );
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at,
+            Some(u64::MAX),
+            "the second entry has no valid position, so the chain breaks at it"
+        );
+        assert_eq!(
+            result.chain_entries, 1,
+            "only the head counts as verified — the break stops the scan"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn verify_chain_accepts_break_glass_expired_observed_action() {
         // #324: confirms the plan's "no CHAIN_VERSION bump needed" claim —
@@ -3278,25 +3392,44 @@ mod tests {
     /// helper's `debug_assert_eq!(chain_version, CHAIN_VERSION)` exists to
     /// catch production writer bugs, and would wrongly panic here whenever
     /// this fixture helper is asked for a non-current version on purpose.
-    fn write_chain_entries(path: &Path, secret: &[u8; 32], entries: &[(&str, &str)], version: u32) {
-        let genesis = genesis_hash(Some(secret));
-        let mut prev_hash = genesis;
+    /// #456: like `write_chain_entries`, but each entry's `seq` is stated by
+    /// the caller instead of taken from its index. The top of the `u64` range
+    /// is not reachable by counting, so it cannot be reached by indexing
+    /// either — and the entries still have to be genuinely signed, because the
+    /// behaviour under test happens *after* an entry verifies.
+    fn write_chain_entries_at_seqs(
+        path: &Path,
+        secret: &[u8; 32],
+        entries: &[(u64, &str, &str)],
+        version: u32,
+    ) {
+        let mut prev_hash = genesis_hash(Some(secret));
         let mut content = String::new();
 
-        for (seq, (command, timestamp)) in entries.iter().enumerate() {
+        for (seq, command, timestamp) in entries {
             let mut event = make_event_with_timestamp(command, timestamp);
             event.chain_version = Some(version);
-            event.seq = Some(seq as u64);
+            event.seq = Some(*seq);
             event.prev_hash = Some(prev_hash.clone());
             event.key_id = Some("default".to_string());
-            event.entry_hash =
-                Some(compute_entry_hash(Some(secret), &event).expect_hash("write_chain_entries"));
+            event.entry_hash = Some(
+                compute_entry_hash(Some(secret), &event).expect_hash("write_chain_entries_at_seqs"),
+            );
             prev_hash = event.entry_hash.clone().unwrap();
             content.push_str(&serde_json::to_string(&event).unwrap());
             content.push('\n');
         }
 
         fs::write(path, content).unwrap();
+    }
+
+    fn write_chain_entries(path: &Path, secret: &[u8; 32], entries: &[(&str, &str)], version: u32) {
+        let with_seqs: Vec<(u64, &str, &str)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (command, timestamp))| (i as u64, *command, *timestamp))
+            .collect();
+        write_chain_entries_at_seqs(path, secret, &with_seqs, version);
     }
 
     #[test]
