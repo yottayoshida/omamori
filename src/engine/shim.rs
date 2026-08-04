@@ -658,9 +658,13 @@ pub(crate) fn run_command(
         // 2, #177) and must keep reading `env::current_dir()` directly
         // rather than routing through this helper — see `audit::provenance`
         // module docs.
-        let base = context::process_base_or_root();
+        // `#460`: passed through as `Option`. `evaluate_context` decides
+        // whether an unresolvable base is safe to substitute for, because the
+        // answer depends on the configured `protected_paths` — which this call
+        // site does not otherwise look at.
+        let base = context::process_base();
         // Tier 1: path-based evaluation
-        let ctx = context::evaluate_context(&invocation, rule, ctx_config, &base);
+        let ctx = context::evaluate_context(&invocation, rule, ctx_config, base.as_deref());
         let tier1_override = if let Some(override_action) = ctx.action_override {
             eprintln!(
                 "omamori: {} {} → {} ({}, original: {})",

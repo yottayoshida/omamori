@@ -75,10 +75,13 @@ pub(crate) fn run_explain_command(args: &[OsString]) -> Result<i32, AppError> {
     // any relative target path is relative to *this* — surfaced below so a
     // user re-running `explain` from a different directory isn't surprised
     // by a different answer without knowing why.
-    let base = context::process_base_or_root();
+    // `#460`: `None` when the working directory is unresolvable. Threaded
+    // through as an `Option` so the report and the JSON can say so rather
+    // than printing a synthetic `/` that was never the real base.
+    let base = context::process_base();
 
     // --- Layer 1 evaluation (shim / PATH-level) ---
-    let layer1 = evaluate_layer1(&command_parts, config_path.as_deref(), &base);
+    let layer1 = evaluate_layer1(&command_parts, config_path.as_deref(), base.as_deref());
 
     // --- Layer 2 evaluation (hook / token-level) ---
     let layer2 = evaluate_layer2(&command_str);
@@ -88,9 +91,9 @@ pub(crate) fn run_explain_command(args: &[OsString]) -> Result<i32, AppError> {
     let exit_code = if blocked { 2 } else { 0 };
 
     if json {
-        print_json(&command_str, &layer1, &layer2, blocked, &base);
+        print_json(&command_str, &layer1, &layer2, blocked, base.as_deref());
     } else {
-        print_report(&command_str, &layer1, &layer2, blocked, &base);
+        print_report(&command_str, &layer1, &layer2, blocked, base.as_deref());
     }
 
     Ok(exit_code)
@@ -121,7 +124,7 @@ struct Layer2Result {
 fn evaluate_layer1(
     command_parts: &[String],
     config_path: Option<&std::path::Path>,
-    base: &std::path::Path,
+    base: Option<&std::path::Path>,
 ) -> Layer1Result {
     let load_result = match load_config(config_path) {
         Ok(r) => r,
@@ -269,7 +272,7 @@ fn print_report(
     layer1: &Layer1Result,
     layer2: &Layer2Result,
     blocked: bool,
-    base: &std::path::Path,
+    base: Option<&std::path::Path>,
 ) {
     let verdict = if blocked { "BLOCK" } else { "ALLOW" };
     println!("omamori explain: {command_str}\n");
@@ -277,7 +280,16 @@ fn print_report(
     // #175: relative target paths in the command are evaluated against
     // this directory (Layer 1 context evaluation) — surfaced so re-running
     // from elsewhere doesn't produce a silently different answer.
-    println!("  evaluated relative to: {}\n", base.display());
+    // `#460`: `None` is printed as such rather than as the `/` that used to
+    // stand in for it. The verdict above may itself be the escalation that
+    // absence caused, and a report naming `/` would send the reader looking
+    // for a rule about the root directory.
+    match base {
+        Some(base) => println!("  evaluated relative to: {}\n", base.display()),
+        None => {
+            println!("  evaluated relative to: (the working directory could not be resolved)\n")
+        }
+    }
 
     // Layer 1
     println!("  Layer 1 (PATH shim):");
@@ -317,12 +329,30 @@ fn print_json(
     layer1: &Layer1Result,
     layer2: &Layer2Result,
     blocked: bool,
-    base: &std::path::Path,
+    base: Option<&std::path::Path>,
 ) {
-    let output = serde_json::json!({
+    let output = explain_json(command_str, layer1, layer2, blocked, base);
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+}
+
+/// The body of `--json`, split from the printing so its shape can be asserted.
+/// `#460` made `evaluated_relative_to` nullable and the only test covering this
+/// output checked that printing did not panic — which a field of any shape
+/// satisfies (Codex review, P2).
+fn explain_json(
+    command_str: &str,
+    layer1: &Layer1Result,
+    layer2: &Layer2Result,
+    blocked: bool,
+    base: Option<&std::path::Path>,
+) -> serde_json::Value {
+    serde_json::json!({
         "command": command_str,
         "verdict": if blocked { "block" } else { "allow" },
-        "evaluated_relative_to": base.display().to_string(),
+        // `#460`: `null`, not `"/"`. A consumer that reads this field to
+        // reproduce the evaluation needs to be able to tell "resolved to the
+        // root" from "there was no base".
+        "evaluated_relative_to": base.map(|b| b.display().to_string()),
         "layer1": {
             "blocked": layer1.blocked,
             "matched_rule": layer1.matched_rule,
@@ -335,8 +365,7 @@ fn print_json(
             "phase": layer2.phase,
             "detail": layer2.detail,
         },
-    });
-    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +379,7 @@ mod tests {
     #[test]
     fn layer1_no_rule_match_is_allow() {
         let parts = vec!["ls".to_string(), "/tmp".to_string()];
-        let result = evaluate_layer1(&parts, None, std::path::Path::new("/test-base"));
+        let result = evaluate_layer1(&parts, None, Some(std::path::Path::new("/test-base")));
         assert!(!result.blocked);
         assert!(result.matched_rule.is_none());
         assert_eq!(result.action, "allow");
@@ -359,7 +388,7 @@ mod tests {
     #[test]
     fn layer1_rm_recursive_matches_rule() {
         let parts = vec!["rm".to_string(), "-rf".to_string(), "/tmp/test".to_string()];
-        let result = evaluate_layer1(&parts, None, std::path::Path::new("/test-base"));
+        let result = evaluate_layer1(&parts, None, Some(std::path::Path::new("/test-base")));
         assert!(result.matched_rule.is_some());
         // Whether blocked depends on context config — the rule exists
         assert!(result.matched_rule.unwrap().contains("rm"));
@@ -454,7 +483,53 @@ mod tests {
             &l1,
             &l2,
             false,
-            std::path::Path::new("/test-base"),
+            Some(std::path::Path::new("/test-base")),
+        );
+    }
+
+    /// `#460` made `evaluated_relative_to` nullable, and the test above — the
+    /// only coverage this output had — passes for a field of any shape. Both
+    /// arms are pinned here: a resolved base is the path as a string, an
+    /// unresolved one is JSON `null` rather than `"/"`, so a consumer can tell
+    /// "resolved to the root" from "there was no base" (Codex review, P2).
+    #[test]
+    fn explain_json_reports_an_unresolved_base_as_null_not_a_synthetic_root() {
+        let l1 = Layer1Result {
+            blocked: false,
+            matched_rule: None,
+            action: "allow".to_string(),
+            context_override: None,
+            detail: "no match".to_string(),
+        };
+        let l2 = Layer2Result {
+            blocked: false,
+            phase: "allow".to_string(),
+            detail: "ok".to_string(),
+        };
+
+        let resolved = explain_json(
+            "ls /tmp",
+            &l1,
+            &l2,
+            false,
+            Some(std::path::Path::new("/test-base")),
+        );
+        assert_eq!(
+            resolved["evaluated_relative_to"],
+            serde_json::json!("/test-base"),
+            "a resolved base must still be reported as the path"
+        );
+
+        let unresolved = explain_json("ls /tmp", &l1, &l2, false, None);
+        assert!(
+            unresolved["evaluated_relative_to"].is_null(),
+            "an unresolved base must be null — got {}",
+            unresolved["evaluated_relative_to"]
+        );
+        assert_ne!(
+            unresolved["evaluated_relative_to"],
+            serde_json::json!("/"),
+            "the synthetic root must not be reported as if it were the real base"
         );
     }
 }
