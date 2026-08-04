@@ -8,6 +8,18 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **`omamori test`'s Context section can now fail, and a failure reaches the exit code.** ([#458](https://github.com/yottayoshida/omamori/issues/458))
+
+  Both arms of the section's match printed the same status word, so the rows reported success whatever the evaluation returned. Nothing consumed the result either — the exit code was computed from the Detection section alone — so even a real verdict would have been display-only. The section is the one CONTRACT.md names for verifying G-1, and it had no test at all, which is the direct explanation for how a check that cannot fail survived there.
+
+  The three sample paths are not equally decidable, and the fix says so rather than forcing a verdict on each. A target naming a `protected_paths` entry escalates by component match, needing neither the filesystem nor the process directory, so that row is a real check — it now takes its target from the config's own first entry, making the assertion "the config declares this path, is it honoured". A path named by neither list is decidable from the lists, behind a gate for configs that do name it. But a `regenerable_paths` match only downgrades when the path *resolves* on the machine running the command, so that row reports what it observed and returns no verdict: forcing one would fail wherever the directory is simply absent, which is most places. The consequence worth stating is that **the exit code cannot flip on whether a directory happens to exist**.
+
+  Rows whose gate is unmet say why instead of vanishing — a config with no enabled `rm` rule used to make three of them disappear from the output entirely. The `git-aware-evaluation` line, which reported configuration under a `PASS`, now says that is what it is.
+
+  The `Fail` arm is not hypothetical: `protected_paths = ["."]` is a config a user can write and it can never match anything, because path normalisation removes `.` before the pattern is compared. That declaration now shows as `FAIL … expected block, got no override` and exits 1. Previously it printed `PASS`.
+
+  The issue also reported the section as CWD-dependent. That half was already fixed — #175 itself threaded the resolved base into it (`6166bad`), so only the hardcoded status word remained.
+
 - **Release builds now check integer overflow, and `audit verify` no longer mis-reports the high-water-mark at the top of the sequence range.** ([#456](https://github.com/yottayoshida/omamori/issues/456))
 
   `[profile.release]` did not exist, so release builds wrapped on overflow while the test suite — which runs on the dev profile, where the check is on by default — never saw it. That gap is what let the append path ship an unchecked increment on a sequence number read out of the log: every test touching it panicked in debug, so none was written to observe a wrap. `overflow-checks = true` closes the gap for the arithmetic no one has looked at yet.
