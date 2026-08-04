@@ -293,11 +293,30 @@ impl AuditLogger {
                      this binary predates a newer chain format)"
                 )));
             }
+            // #456: the same refusal shape as the arm above, for the same
+            // reason — the tail is something this build cannot number after.
+            // States only what was observed, the number on the line: nothing
+            // here authenticated it (`read_chain_state` does not check
+            // `entry_hash`), so it is not called tampering.
+            ChainTailState::SeqAtLimit { seq } => {
+                return Err(std::io::Error::other(format!(
+                    "audit log tail is numbered {seq}, the largest sequence number the \
+                     format can hold, so there is no number left to give the next entry \
+                     \u{2014} refusing to append (this event was not recorded; not \
+                     necessarily tampering \u{2014} counting a chain up to this number is \
+                     not physically reachable, so the tail line or something before it did \
+                     not come from omamori's own counting)"
+                )));
+            }
             ChainTailState::Fresh { genesis } => (0, genesis),
+            // #456: no arithmetic here. `next_seq` is already the number this
+            // entry takes — `read_chain_state` incremented it where the range
+            // check lives, so there is nothing left at this call site that
+            // could wrap.
             ChainTailState::Ready {
-                last_seq,
+                next_seq,
                 last_hash,
-            } => (last_seq + 1, last_hash),
+            } => (next_seq, last_hash),
         };
 
         // Set chain fields
@@ -1486,6 +1505,232 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #456: the tail's `seq` is read off disk and never authenticated
+    /// (`read_chain_state` accepts any non-empty `entry_hash`), so one
+    /// planted line can set it to `u64::MAX`. `append()` used to compute
+    /// `last_seq + 1` from it, which wraps to 0 in a release build without
+    /// `overflow-checks` — the next entry is numbered 0, and the
+    /// high-water-mark check reads that as tail truncation. Refusing is the
+    /// same answer this function already gives an unsupported
+    /// `chain_version` tail.
+    #[test]
+    fn append_refuses_when_the_tail_seq_admits_no_successor() {
+        let dir = test_dir("append-seq-at-limit-refuse");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_seq_at_limit_line(&logger.path);
+
+        let hwm_file = hwm_path_for(&logger.path);
+        let hwm_before = expect_hwm(&hwm_file);
+        let content = fs::read_to_string(&logger.path).unwrap();
+
+        let err = logger
+            .append(make_event("cmd1-should-not-be-recorded"))
+            .expect_err("append must return Err, not wrap the seq to 0 and record the entry");
+        let msg = err.to_string();
+
+        // Assert on the diagnostic sentence, not on a word the fixture also
+        // supplies (#488): the number below comes from the planted line, so a
+        // `contains`-on-the-number alone would be satisfied by any message
+        // that quotes the tail.
+        assert!(
+            msg.contains("the largest sequence number the format can hold"),
+            "the refusal must say why there is no successor — got: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to append") && msg.contains("was not recorded"),
+            "the refusal must reuse the existing shape (refused, nothing written) — got: {msg}"
+        );
+        assert!(
+            msg.contains("18446744073709551615"),
+            "the refusal must quote the number the operator can check against the file — \
+             got: {msg}"
+        );
+        // Nothing here authenticated the tail, so the message must not make
+        // the accusation `broken_at` makes.
+        assert!(
+            !msg.contains("may have been tampered with"),
+            "must not use the tamper-claim phrasing for a line nothing authenticated — \
+             got: {msg}"
+        );
+
+        let after = fs::read_to_string(&logger.path).unwrap();
+        // The legible assertion first, then the total one: a byte-equality
+        // failure prints the whole file, which is unreadable as a first
+        // signal (Codex review, R1 P3 asked for the byte comparison — the
+        // claim is "nothing was written", and a line count does not say that).
+        assert!(
+            !after.contains("cmd1-should-not-be-recorded"),
+            "the refused event must not appear anywhere in the file"
+        );
+        assert_eq!(
+            after, content,
+            "a refused append must leave the file byte-for-byte unchanged"
+        );
+        assert_eq!(
+            expect_hwm(&hwm_file),
+            hwm_before,
+            "a refused append must not move the high-water-mark — a wrapped seq of 0 \
+             would either raise a false truncation warning or (on a Tampered sidecar) \
+             rewrite the mark to 0 and hide later truncation"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex review R1 P1: the refusal has to be decided from `seq` before
+    /// `entry_hash`'s shape is looked at. A malformed entry is answered by
+    /// restarting from genesis — which numbers the next entry `0` — so this
+    /// shape reached the very outcome the refusal exists to prevent while
+    /// never passing through the increment. The wrap was not the only road to
+    /// `seq: 0`; the fork was the other.
+    #[test]
+    fn append_refuses_at_the_seq_limit_even_when_the_tail_entry_hash_is_malformed() {
+        let dir = test_dir("append-seq-at-limit-empty-hash");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+
+        // `entry_hash: ""` is what makes this distinct from
+        // `append_seq_at_limit_line`: an empty string fails the shape check,
+        // so before the fix this line took the genesis-restart arm.
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(
+            r#"{"timestamp":"2026-01-01T00:00:01Z","provider":"test","command":"planted-cmd","action":"passthrough","result":"passthrough","target_count":0,"target_hash":"irrelevant","chain_version":2,"seq":18446744073709551615,"prev_hash":"irrelevant","key_id":"default","entry_hash":""}"#,
+        );
+        content.push('\n');
+        fs::write(&logger.path, &content).unwrap();
+
+        let err = logger
+            .append(make_event("cmd1-should-not-be-recorded"))
+            .expect_err("a tail at the limit must be refused whatever shape entry_hash is in");
+        assert!(
+            err.to_string()
+                .contains("the largest sequence number the format can hold"),
+            "must give the seq-limit refusal, not fall through to a genesis restart — \
+             got: {err}"
+        );
+
+        let after = fs::read_to_string(&logger.path).unwrap();
+        assert!(
+            !after.contains("cmd1-should-not-be-recorded"),
+            "the refused event must not appear anywhere in the file"
+        );
+        assert_eq!(
+            after, content,
+            "a refused append must leave the file byte-for-byte unchanged"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Control for the test above: the same malformed `entry_hash` on a tail
+    /// that is *not* at the limit still restarts the chain from genesis. This
+    /// pins that the fix reordered one decision rather than turning every
+    /// malformed tail into a refusal — which would be a much larger behavior
+    /// change than #456 asks for, and would break the pre-existing
+    /// corruption-recovery path.
+    #[test]
+    fn a_malformed_tail_below_the_limit_still_restarts_from_genesis() {
+        let dir = test_dir("append-malformed-hash-below-limit");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+
+        let mut content = fs::read_to_string(&logger.path).unwrap();
+        content.push_str(
+            r#"{"timestamp":"2026-01-01T00:00:01Z","provider":"test","command":"planted-cmd","action":"passthrough","result":"passthrough","target_count":0,"target_hash":"irrelevant","chain_version":2,"seq":7,"prev_hash":"irrelevant","key_id":"default","entry_hash":""}"#,
+        );
+        content.push('\n');
+        fs::write(&logger.path, &content).unwrap();
+
+        logger
+            .append(make_event("cmd1-should-be-recorded"))
+            .expect("a malformed tail below the limit keeps the pre-existing behavior");
+
+        let events = read_events(&logger.path);
+        let last = events.last().unwrap();
+        assert_eq!(last["command"], "cmd1-should-be-recorded");
+        assert_eq!(
+            last["seq"].as_u64(),
+            Some(0),
+            "the pre-existing answer to a malformed tail is a fresh chain at seq 0"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Control for `append_refuses_when_the_tail_seq_admits_no_successor`:
+    /// one below the limit still appends, and takes `u64::MAX` as its own
+    /// seq. Without this, the refusal test passes for the wrong reasons — an
+    /// implementation that rejected every large seq, or every hand-planted
+    /// tail, would satisfy it just as well.
+    #[test]
+    fn append_still_succeeds_one_below_the_seq_limit() {
+        let dir = test_dir("append-seq-one-below-limit");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_chain_version_line(
+            &logger.path,
+            CHAIN_VERSION,
+            Some(u64::MAX - 1),
+            "planted-cmd",
+            "passthrough",
+            "passthrough",
+        );
+
+        logger
+            .append(make_event("cmd1-should-be-recorded"))
+            .expect("a tail one below the limit still has a successor");
+
+        let events = read_events(&logger.path);
+        let last = events.last().unwrap();
+        assert_eq!(
+            last["command"], "cmd1-should-be-recorded",
+            "the event must have been recorded"
+        );
+        assert_eq!(
+            last["seq"].as_u64(),
+            Some(u64::MAX),
+            "the successor of u64::MAX - 1 is u64::MAX, and it is representable"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #456, mirroring `try_audit_append_strict_blocks_on_unknown_chain_version_tail`:
+    /// the refusal must reach strict mode through the same seam as every
+    /// other append failure. `try_audit_append` only escalates on `Err`, so
+    /// a wrap that returned `Ok(())` left strict mode's "no receipt = don't
+    /// allow" contract silently inapplicable to this failure.
+    #[test]
+    fn try_audit_append_strict_blocks_when_tail_seq_admits_no_successor() {
+        let dir = test_dir("try-audit-append-strict-seq-at-limit");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_seq_at_limit_line(&logger.path);
+
+        let strict_logger = AuditLogger {
+            path: logger.path.clone(),
+            signing_key: SigningKey::for_test(logger.key_id(), logger.secret_ref().copied()),
+            retention_days: logger.retention_days,
+        };
+        let event = strict_logger.create_event(
+            &CommandInvocation::new("cmd1".to_string(), vec![]),
+            None,
+            &[],
+            &ActionOutcome::PassedThrough { exit_code: 0 },
+            None,
+        );
+        let result = crate::engine::shim::try_audit_append(&strict_logger, event, true);
+        assert_eq!(
+            result,
+            Some(1),
+            "strict mode must block when the audit tail admits no successor seq, \
+             the same as it blocks on any other append failure"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // --- Torn line handling ---
 
     #[test]
@@ -2290,6 +2535,25 @@ mod tests {
             999,
             Some(seq),
             "future-cmd",
+            "passthrough",
+            "passthrough",
+        );
+    }
+
+    /// #456: a tail on a *supported* `chain_version` whose `seq` leaves no
+    /// successor. The version is the current one on purpose — the refusal
+    /// under test is about the number, not the format.
+    ///
+    /// Note what `append_chain_version_line` writes for `entry_hash`:
+    /// `"irrelevant"`. That is the premise of #456 rather than a shortcut in
+    /// the fixture — `read_chain_state` only checks that the field is a
+    /// non-empty string, so planting this tail needs no HMAC key.
+    fn append_seq_at_limit_line(path: &Path) {
+        append_chain_version_line(
+            path,
+            CHAIN_VERSION,
+            Some(u64::MAX),
+            "planted-cmd",
             "passthrough",
             "passthrough",
         );
