@@ -9,8 +9,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use time::OffsetDateTime;
 
 use super::AuditEvent;
-use super::chain::{CHAIN_VERSION, compute_entry_hash_for_write, hmac_bytes, prune_genesis_hash};
-use super::secret::SigningKey;
+use super::chain::{
+    CHAIN_VERSION, RecomputedHash, compute_entry_hash, compute_entry_hash_for_write, hmac_bytes,
+    prune_genesis_hash,
+};
+use super::secret::{Keyring, SigningKey, load_keyring, secret_path_for};
 use super::{hwm_path_for, write_hwm};
 
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
@@ -46,6 +49,22 @@ pub(super) fn try_prune_at(
     now: OffsetDateTime,
 ) -> Result<u64, std::io::Error> {
     use time::format_description::well_known::Rfc3339;
+
+    // `#461`: without a secret there is nothing to prune *with*. `hmac_bytes`
+    // answers a `None` key with the fixed string `NO_HMAC_SECRET` (`chain.rs`),
+    // so the prune point this would write carries a `target_hash` and an
+    // `entry_hash` that any reader can reproduce — a prune-bind that binds
+    // nothing, standing where the pruned range used to be. Keeping the entries
+    // is the lesser loss: the condition that removed the key is usually
+    // recoverable, and a later prune with the key in hand does the same work.
+    if signing_key.secret().is_none() {
+        eprintln!(
+            "omamori warning: audit prune skipped — no HMAC secret is available, so the prune \
+             point that replaces the removed entries could not be protected. The entries were \
+             left in place; the log will keep growing until the key is readable again."
+        );
+        return Ok(0);
+    }
 
     file.seek(SeekFrom::Start(0))?;
     let mut content = String::new();
@@ -125,32 +144,118 @@ pub(super) fn try_prune_at(
     file.set_len(new_content.len() as u64)?;
     file.flush()?;
 
-    // Reset HWM to max retained non-prune-point seq
+    // Reset the high-water-mark from the retained entries.
+    //
+    // `#461`: the mark used to be the largest `seq` among them, read straight
+    // out of the JSON. That number is tamper-evidence *about* the log, and it
+    // was being taken from the log without checking whether the line it came
+    // from was written by omamori — so one planted line with a high `seq` put
+    // the mark wherever its author chose. No key is needed to write that line:
+    // this recomputation was the only thing that read the field back.
+    //
+    // What that buys an attacker is a false accusation, not concealment
+    // (Codex review, R2 — an earlier version of this comment had the direction
+    // backwards). `verify_chain` reports a truncated tail when the mark is
+    // *above* the chain, so a raised mark makes it say the log was cut when
+    // nothing was removed, and keeps saying it: prune is the only thing that
+    // recomputes the mark, and it runs once per 1000 appends. Lowering it —
+    // which is what would hide a removal — is not reachable this way, since the
+    // mark is a maximum. The defect is that tamper-evidence about the log was
+    // taken from the log, which is the same root `#456` closed on the append
+    // side and named this half as still open.
+    //
+    // The mark now comes from an entry that authenticates against the key it
+    // names. `#456` closed the append side of the same root — on-disk `seq`
+    // values trusted without verification — and named this half as still open.
     if let Some(audit_path) = audit_path {
-        let mut max_seq: Option<u64> = None;
-        for line in &lines[retain_from..] {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if val.get("command").and_then(|v| v.as_str()) == Some(PRUNE_COMMAND) {
-                    continue;
-                }
-                if let Some(s) = val.get("seq").and_then(|v| v.as_u64()) {
-                    max_seq = Some(max_seq.map_or(s, |m: u64| m.max(s)));
+        let keyring = load_keyring(&secret_path_for(audit_path));
+        match authenticated_max_seq(&lines[retain_from..], &keyring) {
+            Some(seq) => {
+                if let Err(e) = write_hwm(&hwm_path_for(audit_path), seq) {
+                    eprintln!(
+                        "omamori warning: failed to update audit high-water-mark after prune: {e}"
+                    );
                 }
             }
-        }
-        if let Some(s) = max_seq
-            && let Err(e) = write_hwm(&hwm_path_for(audit_path), s)
-        {
-            eprintln!("omamori warning: failed to update audit high-water-mark after prune: {e}");
+            None => {
+                // Left where it was, deliberately. A mark below the chain reads
+                // as nothing; a mark above it reads as truncation. Neither is a
+                // claim this function can make right now, and the previous mark
+                // was at least derived when a key was available.
+                //
+                // The two ways to get here are worth telling apart, because one
+                // is a key-store fault the operator can fix and the other is a
+                // statement about the entries themselves.
+                let reason = match keyring.fatal_anomaly() {
+                    Some(anomaly) => anomaly.describe(),
+                    None => "no retained entry could be authenticated against the key it names"
+                        .to_string(),
+                };
+                eprintln!(
+                    "omamori warning: audit high-water-mark left unchanged after prune — {reason}"
+                );
+            }
         }
     }
 
     eprintln!("omamori: pruned {prune_count} audit entries older than {retention_days}d");
     Ok(prune_count)
+}
+
+/// The highest `seq` among `retained` lines that authenticate against the key
+/// they name (`#461`).
+///
+/// Entries are tried in descending `seq` order and the first one that
+/// authenticates wins, so the ordinary case costs one HMAC rather than one per
+/// retained entry — and the answer is the same either way, since a lower `seq`
+/// cannot raise the maximum.
+///
+/// `None` covers both "the keyring holds nothing usable" and "nothing retained
+/// authenticated". They arrive here identically — an empty ring makes every
+/// `keyring.get` miss — and the caller reports which one it was from the ring's
+/// own anomalies. Kept as one path on purpose: a separate emptiness branch
+/// would be a second place to keep in step with what `get` actually returns.
+///
+/// Prune points are excluded by [`is_prune_point`], which checks all three
+/// fields, rather than by `command` alone as the code this replaced did. The
+/// first draft kept the looser check and argued that a real prune point carries
+/// `seq: 0`, so admitting one could only lower the mark. That argument holds
+/// for a real prune point and says nothing about an ordinary entry that merely
+/// *names* `_prune` — a user running a command by that name produces a signed
+/// entry with a real `seq`, and dropping it lowered the mark by one whenever it
+/// was the highest retained, leaving that one entry's removal undetectable
+/// (Codex review, P3). The stricter check is right on both: it still excludes
+/// the real prune point, whose `action`/`result` identify it.
+fn authenticated_max_seq(retained: &[&str], keyring: &Keyring) -> Option<u64> {
+    // `seq` is taken out here rather than checked in the loop, so the sort key
+    // is a plain `u64` and an entry without one is simply not a candidate — it
+    // could not anchor the mark in any case.
+    let mut candidates: Vec<(u64, AuditEvent)> = retained
+        .iter()
+        .filter_map(|line| serde_json::from_str::<AuditEvent>(line.trim()).ok())
+        .filter(|event| !is_prune_point(event))
+        .filter_map(|event| event.seq.map(|seq| (seq, event)))
+        .collect();
+    candidates.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+
+    for (seq, event) in &candidates {
+        // `unwrap_or("default")` for the same reason `verify_chain` uses it: a
+        // missing `key_id` is an entry from before the field existed, and
+        // `"default"` is the id that epoch always carried.
+        let key_id = event.key_id.as_deref().unwrap_or("default");
+        let Some(secret) = keyring.get(key_id) else {
+            continue;
+        };
+        let RecomputedHash::Hash(recomputed) = compute_entry_hash(Some(secret), event) else {
+            // Legacy (no `chain_version`) or a version this build cannot hash.
+            // Either way this entry is not something to anchor the mark on.
+            continue;
+        };
+        if event.entry_hash.as_deref() == Some(recomputed.as_str()) {
+            return Some(*seq);
+        }
+    }
+    None
 }
 
 /// Build the prune point that replaces the pruned range.

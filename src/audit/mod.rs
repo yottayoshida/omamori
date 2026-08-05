@@ -584,7 +584,7 @@ mod tests {
         HashableEvent, HashableEventV2, RecomputedHash, SUPPORTED_CHAIN_VERSIONS, genesis_hash,
         prune_genesis_hash,
     };
-    use retention::{MIN_RETENTION_DAYS, build_prune_point, try_prune_at};
+    use retention::{MIN_RETENTION_DAYS, PRUNE_COMMAND, build_prune_point, try_prune_at};
     use secret::{
         KeyringAnomaly, MAX_KEYRING_KEYS, UNRESOLVED_KEY_ID, create_secret, decode_hex_secret,
         expected_key_file, flock_exclusive, is_writer_emitted_key_id, load_keyring,
@@ -3543,6 +3543,227 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pruned, 0, "nothing should be pruned");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- #461: the post-prune high-water-mark ---
+    //
+    // The mark used to be the largest `seq` among the retained lines, read
+    // straight out of the JSON with nothing checking who wrote it. **No test
+    // covered the recomputation at all**: every prune test above passes
+    // `audit_path: None`, which skips the block entirely. So these are the
+    // first tests to enter it, and the reason a "never update the mark"
+    // implementation would have gone unnoticed.
+
+    /// A store a prune will act on: 100 entries old enough to remove, 1100
+    /// young enough to keep (`MIN_RETAIN_ENTRIES` is 1000). `seq` is the index,
+    /// so the highest retained one is [`PRUNE_HWM_TOP_SEQ`].
+    ///
+    /// `version` is the literal `2`, not `CHAIN_VERSION`, for the reason
+    /// `write_chain_entries`' own doc gives: these tests are not about which
+    /// version is current, and pinning it stops a future flip from silently
+    /// rewriting what they exercise.
+    fn prune_hwm_fixture(dir: &Path, secret: &[u8; 32]) -> PathBuf {
+        let path = dir.join("audit.jsonl");
+        let old_ts = "2025-09-18T00:00:00Z";
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..100 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..1100 {
+            entries.push(("new", new_ts));
+        }
+        write_chain_entries(&path, secret, &entries, 2);
+        path
+    }
+
+    const PRUNE_HWM_TOP_SEQ: u64 = 1199;
+
+    /// Appends a line nothing signed, timestamped inside the retained window.
+    /// `entry_hash` is a placeholder on purpose — that it does not authenticate
+    /// is the whole point, and writing it needs no key, since until `#461` this
+    /// function's output was the only thing that read the field back.
+    fn plant_unauthenticated_line(path: &Path, seq: u64) {
+        let event = serde_json::json!({
+            "timestamp": "2026-04-04T00:00:01Z",
+            "provider": "planted",
+            "command": "planted-cmd",
+            "action": "passthrough",
+            "result": "passthrough",
+            "target_count": 0,
+            "target_hash": "irrelevant",
+            "chain_version": 2,
+            "seq": seq,
+            "prev_hash": "irrelevant",
+            "key_id": "default",
+            "entry_hash": "irrelevant",
+        });
+        let mut content = fs::read_to_string(path).unwrap();
+        content.push_str(&serde_json::to_string(&event).unwrap());
+        content.push('\n');
+        fs::write(path, content).unwrap();
+    }
+
+    /// Runs the prune with `audit_path` supplied, so the high-water-mark block
+    /// actually executes.
+    fn prune_reaching_the_hwm(path: &Path, signing_key: &SigningKey) -> u64 {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned =
+            try_prune_at(&mut file, signing_key, 90, Some(path), retention_test_now()).unwrap();
+        drop(file);
+        pruned
+    }
+
+    /// #461: the planted line carries the highest `seq` in the file and no
+    /// valid `entry_hash`. The mark must not follow it — a mark above the chain
+    /// is what tail-truncation detection reads as a removal, so moving it up
+    /// hides the removal of everything below.
+    #[test]
+    fn prune_hwm_ignores_a_retained_entry_that_does_not_authenticate() {
+        let dir = test_dir("prune-hwm-unauthenticated");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        plant_unauthenticated_line(&path, 9_999_999);
+        write_hwm(&hwm_path_for(&path), 0).unwrap();
+
+        let pruned = prune_reaching_the_hwm(&path, &test_signing_key());
+        assert_eq!(pruned, 100, "sanity: the prune itself must have run");
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            PRUNE_HWM_TOP_SEQ,
+            "the mark must come from the highest authenticated seq, not from the planted line"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Control for the test above. Without it, an implementation that never
+    /// writes the mark satisfies that assertion too — the planted value would
+    /// simply never be reached. Here the mark starts at 0 and has to advance.
+    #[test]
+    fn prune_hwm_advances_to_the_highest_authenticated_seq() {
+        let dir = test_dir("prune-hwm-advances");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        write_hwm(&hwm_path_for(&path), 0).unwrap();
+
+        let pruned = prune_reaching_the_hwm(&path, &test_signing_key());
+        assert_eq!(pruned, 100);
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            PRUNE_HWM_TOP_SEQ,
+            "with nothing planted the mark must still reach the top retained seq — otherwise \
+             the test above passes for an implementation that never writes it"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Second control, on the axis the plan's first draft got wrong: the
+    /// retained entries here are signed with the key that rotation *retires*,
+    /// so authenticating against the active key alone would find nothing and
+    /// leave the mark at 0. The keyring holds both, which is why the entry
+    /// still authenticates. Uses production `rotate_key`, not a hand-built
+    /// store.
+    #[test]
+    fn prune_hwm_authenticates_a_retained_entry_signed_with_a_retired_key() {
+        let dir = test_dir("prune-hwm-retired-key");
+        let secret_path = dir.join("audit-secret");
+        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key is created");
+        let path = prune_hwm_fixture(&dir, &epoch1);
+
+        let rotation = super::rotate_key(&path).expect("rotation succeeds");
+        assert_eq!(rotation.new_key_id, "key-2");
+        let active = load_signing_key(&secret_path);
+        assert_eq!(
+            active.id, "key-2",
+            "the prune must run under the post-rotation key, or this fixture is not \
+             exercising the retired-key path"
+        );
+        write_hwm(&hwm_path_for(&path), 0).unwrap();
+
+        let pruned = prune_reaching_the_hwm(&path, &active);
+        assert_eq!(pruned, 100);
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            PRUNE_HWM_TOP_SEQ,
+            "an entry signed with a retired key must still authenticate — the keyring holds it, \
+             and only an active-key-only implementation would miss it"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Codex review P3: `_prune` is a command name a user can run, and such an
+    /// entry is signed and carries a real `seq` — it is not the prune point.
+    /// Excluding it by `command` alone dropped the highest retained entry from
+    /// the mark whenever it happened to have that name, leaving that entry's
+    /// removal undetectable. The three-field [`is_prune_point`] check keeps the
+    /// real prune point out and lets this one in.
+    #[test]
+    fn prune_hwm_counts_a_signed_entry_that_only_shares_the_prune_command_name() {
+        let dir = test_dir("prune-hwm-prune-named-entry");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        let old_ts = "2025-09-18T00:00:00Z";
+        let new_ts = "2026-04-04T00:00:00Z";
+        let mut entries: Vec<(&str, &str)> = Vec::new();
+        for _ in 0..100 {
+            entries.push(("old", old_ts));
+        }
+        for _ in 0..1099 {
+            entries.push(("new", new_ts));
+        }
+        // seq 1199, signed, `action`/`result` are the ordinary ones — so it
+        // shares only the name with a prune point.
+        entries.push((PRUNE_COMMAND, new_ts));
+        write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+        write_hwm(&hwm_path_for(&path), 0).unwrap();
+
+        let pruned = prune_reaching_the_hwm(&path, &test_signing_key());
+        assert_eq!(pruned, 100);
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            PRUNE_HWM_TOP_SEQ,
+            "an entry that merely names `_prune` is an ordinary signed entry — excluding it \
+             would put the mark one below the chain, and a mark below the chain cannot detect \
+             the removal of the entry above it"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #461: with no secret the prune does not run. `hmac_bytes(None, ..)`
+    /// returns the fixed string `NO_HMAC_SECRET`, so the prune point standing
+    /// where the removed entries used to be would carry a `target_hash` and an
+    /// `entry_hash` any reader can reproduce — a prune-bind binding nothing.
+    #[test]
+    fn prune_does_not_run_without_a_secret() {
+        let dir = test_dir("prune-no-secret");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let before = fs::read_to_string(&path).unwrap();
+        write_hwm(&hwm_path_for(&path), 7).unwrap();
+
+        let pruned = prune_reaching_the_hwm(&path, &SigningKey::for_test("default", None));
+        assert_eq!(pruned, 0, "the prune must not run at all");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "the log must be byte-for-byte unchanged"
+        );
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            7,
+            "and the mark must not move either"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

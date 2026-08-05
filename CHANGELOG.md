@@ -8,6 +8,22 @@ The format is based on Keep a Changelog.
 
 ### Fixed
 
+- **The post-prune high-water-mark no longer follows a `seq` nobody signed.** ([#461](https://github.com/yottayoshida/omamori/issues/461), the high-water-mark half)
+
+  After a prune rewrites the log, the mark has to be recomputed from what remains. It took the largest `seq` among the retained lines, read straight out of the JSON, with nothing checking whether that line came from omamori — so a planted line with a high `seq` put the mark wherever its author chose. No key was needed to write it: this recomputation was the only thing that read the field back.
+
+  What that buys is a false accusation rather than concealment. `omamori audit verify` reports a truncated tail when the mark sits *above* the chain, so a raised mark makes it say the log was cut when nothing was removed — and keeps saying it, since prune is the only thing that recomputes the mark and it runs once per 1000 appends. Lowering the mark, which is what would hide a removal, is not reachable this way because the mark is a maximum. The defect is that tamper-evidence about the log was being taken from the log.
+
+  The mark now comes from an entry that authenticates against the key its own `key_id` names, resolved through the same keyring `verify` uses — so an entry signed with a **retired** key still counts, which an active-key-only check would have missed. Entries are tried in descending `seq` order and the first one that authenticates wins, so the usual case costs one HMAC rather than one per retained entry.
+
+  Review caught a second, narrower case in the same function: prune points were being excluded by `command` name alone, carried over from the code this replaced. `_prune` is a name a user can run, and such an entry is signed with a real `seq` — dropping it put the mark one below the chain whenever it was the highest retained, which cannot detect that entry's removal. The exclusion now checks all three fields that identify a prune point, which keeps the real one out and lets the ordinary entry in.
+
+  Two states leave the mark alone rather than guessing. When nothing retained authenticates — including a keyring that holds nothing usable, which arrives the same way because every lookup misses — the previous mark stays and the warning says which of the two it was, since one is a key-store fault an operator can fix. And with no secret at all **the prune does not run**: `hmac_bytes(None, …)` returns the fixed string `NO_HMAC_SECRET`, so the prune point replacing the removed entries would carry a `target_hash` and an `entry_hash` any reader can reproduce. Keeping the entries is the lesser loss, and the log now says why it is growing.
+
+  Worth recording how thin the previous coverage was: **every prune test passed `audit_path: None`, which skips the recomputation entirely**, so no test had ever entered that block. An implementation that simply never wrote the mark would have been green. The four new tests are the first to reach it, and each was checked against a mutation that isolates it — reverting to the unauthenticated maximum moves the mark to the planted `9999999` instead of `1199`, and authenticating against the active key alone leaves it at `0` on a store whose retained entries predate a rotation.
+
+  **The other half of [#461](https://github.com/yottayoshida/omamori/issues/461) is not closed**: a prune that removes a range containing unverifiable entries still leaves no record of it, so a `verify` reporting exit 4 before the prune reports exit 0 after. That needs a field `AuditEvent` does not have, which makes it a `chain_version` question rather than a change to this recomputation. The issue stays open.
+
 - **A `protected_paths` entry of two or more components no longer stops applying when the working directory cannot be resolved.** ([#460](https://github.com/yottayoshida/omamori/issues/460))
 
   Relative targets are resolved against the process's working directory before `protected_paths` is matched, and matching walks a contiguous window of path components. A single-component entry — every entry in the default config — completes that window out of the target's own components, so the synthetic `/` root that stood in for an unresolvable directory gave the same verdict as the real one. Two or more components can need the leading part of the window to come from the base: with the real directory the pattern matches, against `/` it silently does not, and escalation to Block was skipped. #175 documented that limit in a doc comment and left the behaviour.
