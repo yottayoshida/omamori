@@ -99,10 +99,21 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
             println!("  {:<6} {:<36} disabled", "[info]", "Layer 3 (audit)");
         } else if let Some(ref err) = summary.path_error {
             println!("  {:<6} {:<36} {err}", "[warn]", "Layer 3 (audit)");
-        } else if !summary.secret_available {
+        } else if let Some(reason) = &summary.unprotected_reason {
+            // #471: this arm used to print `HMAC secret missing` for every
+            // reason `read_secret` could fail, and never fired at all for the
+            // state the writer actually refuses on — an unlistable key
+            // directory, where the secret is present and readable. Both halves
+            // were wrong in the same direction: at mode 0300 entries were being
+            // recorded without HMAC protection while this line said `[ok]`.
+            //
+            // The reason comes from `audit_summary` rather than being assembled
+            // here, so this surface cannot name a cause the writer would not.
             println!(
-                "  {:<6} {:<36} HMAC secret missing",
-                "[warn]", "Layer 3 (audit)"
+                "  {:<6} {:<36} {}",
+                "[warn]",
+                "Layer 3 (audit)",
+                reason.summary()
             );
         } else if summary.entry_count == 0 {
             println!(

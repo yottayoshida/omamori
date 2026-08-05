@@ -6,7 +6,23 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: `audit::AuditSummary` gains a public field, `unprotected_reason: Option<audit::UnprotectedReason>`, and is now marked `#[non_exhaustive]`. Same reverse-dependency check and same precedent as `AuditEvent` (#177 B2), `VerifyResult` (#177 B3), `ChainStatus`/`AuditError` (#457) and `RotationResult` (#457) — zero known reverse dependencies on crates.io. `#[non_exhaustive]` blocks cross-crate exhaustive struct-literal construction and exhaustive destructuring without `..`; it does not restrict field reads. `UnprotectedReason` is new and also `#[non_exhaustive]`: it names why an append made right now would not be HMAC-protected — an unlistable key directory, an epoch record stating no epoch, an absent active key, or one that cannot be read. Library-API only; `cargo install`/Homebrew binary users are unaffected. ([#471](https://github.com/yottayoshida/omamori/issues/471))
+
 ### Fixed
+
+- **`omamori status` no longer reports the audit layer healthy while entries are being written without HMAC protection.** ([#471](https://github.com/yottayoshida/omamori/issues/471), the `status` half)
+
+  `status` judged health with `read_secret(…).is_ok()`, which opens the key by name and therefore needs only *search* permission on the directory holding it. The writer goes through `scan_key_dir`, which needs to *list* it. At mode `0300` the first succeeds and the second does not, so the writer fell back to recording entries with no HMAC and no key epoch — while `status` printed `[ok] Layer 3 (audit)`. The two agreed before [#457](https://github.com/yottayoshida/omamori/issues/457), when both went through `read_secret`.
+
+  Both surfaces now ask the same question, through one shared predicate rather than two copies of a condition — the move `classify_secret_failure` already makes between rotation and verification, for the reason recorded there: two commands disagreeing about one store is the defect being closed, and a duplicated condition is one edit away from disagreeing again.
+
+  The predicate stops where a reader must: it decides from the directory listing, and `status` adds one further observation of its own — the same `read_secret` call the writer makes. Neither can see a key mint that is attempted and fails, because reaching that would mean creating a key file as a side effect of asking for status. **No key-store lock is taken**, deliberately: `status` reports an observation, not an atomic one, and a concurrent rotation can make it stale. What is restored is *which question is asked*, not that the answer is simultaneous with the writer's.
+
+  The warning also names its cause. `HMAC secret missing` was the only wording available, and at `0300` it is false in both halves — nothing is missing, and the cause is the directory. `status` now prints the reason the writer would give: an unlistable key directory, an epoch record that states no epoch, or an unusable active key.
+
+  The guarantee is one-directional and stays that way: `[ok]` implies the entry is protected, not the reverse. A store with no active key warns and then mints one on the next append, and a test pins that asymmetry so it reads as a decision rather than a defect. That case is also why the reason for a missing active key states only what was observed: an earlier draft shared one "entries are recorded without HMAC protection" clause across every reason, which review caught and a release build confirmed — with the key moved aside, the next append minted a replacement and the entry it wrote *did* carry an HMAC, so the line would have stated the opposite of what the very next command did.
 
 - **A verification halt no longer hides a deleted tail.** ([#470](https://github.com/yottayoshida/omamori/issues/470), the high-water-mark half)
 

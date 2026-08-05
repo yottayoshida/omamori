@@ -17,7 +17,7 @@ pub mod verify;
 // --- Public re-exports (maintain `omamori::audit::*` API paths) ---
 pub use provenance::hash_cwd_candidates;
 pub use report::{ChainStatus, ReportAggregate, aggregate_report};
-pub use secret::{RotationResult, rotate_key};
+pub use secret::{RotationResult, UnprotectedReason, rotate_key};
 pub use verify::{
     AuditError, AuditSummary, KeyUnavailableKind, ShowOptions, VerifyResult, audit_summary,
     count_unknown_tool_fail_opens_within, show_entries, verify_chain,
@@ -3671,6 +3671,161 @@ mod tests {
         assert!(summary.enabled);
         assert_eq!(summary.entry_count, 2);
         assert!(summary.secret_available);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #471: `status`'s judgement and the writer's must be the same judgement.
+    ///
+    /// Comparing `secret_available` against a second copy of the same condition
+    /// would pass on any implementation that keeps the two in step while both
+    /// are wrong — which is the state this fixes. So each cell appends through
+    /// the **real writer** (`AuditLogger::from_config`, so `load_signing_key`
+    /// runs) and then asks what that entry actually carries.
+    ///
+    /// `0o300`, not `0o100`: write permission keeps `audit-secret.lock`
+    /// creatable and the append itself possible, so the listing is the only
+    /// thing that fails — the same reason the keyring fixtures in this module
+    /// give. At `0o100` the append would fail too and there would be nothing
+    /// left to inspect.
+    #[test]
+    fn summary_agrees_with_the_writer_about_whether_an_append_is_protected() {
+        use crate::audit::chain::hmac_bytes;
+        use std::os::unix::fs::PermissionsExt;
+
+        // (case, expect `secret_available`, expect the entry to carry an HMAC)
+        for (case, expect_available, expect_protected) in [
+            ("healthy", true, true),
+            // The regression: readable by name, unlistable as a directory. The
+            // writer refuses; before #471 `status` said `[ok]`.
+            ("unlistable", false, false),
+            // Something is at the active path that cannot be read as a key, so
+            // the mint cannot replace it either.
+            ("bad-secret", false, false),
+            // The one direction that is deliberately *not* symmetric: a store
+            // with no active key yet warns, and the writer then mints one and
+            // protects the entry. Pinned so the asymmetry is a recorded
+            // decision rather than something rediscovered as a bug — the
+            // guarantee is one-directional (`[ok]` implies protected), and
+            // erring toward `[warn]` is the safe side of it.
+            ("no-active-key", false, true),
+        ] {
+            let dir = test_dir(&format!("summary-471-{case}"));
+            let logger = test_logger(&dir);
+            logger.append(make_event("seed")).unwrap();
+            let secret_file = dir.join("audit-secret");
+
+            match case {
+                "unlistable" => {
+                    fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+                }
+                "bad-secret" => fs::write(&secret_file, "not-hex").unwrap(),
+                "no-active-key" => {
+                    fs::rename(&secret_file, dir.join("audit-secret.moved")).unwrap()
+                }
+                _ => {}
+            }
+
+            let config = verify_config(&dir);
+            let summary = audit_summary(&config);
+            let writer = AuditLogger::from_config(&config).expect("audit is enabled");
+            let _ = writer.append(make_event("probe"));
+
+            let last = fs::read_to_string(dir.join("audit.jsonl"))
+                .unwrap()
+                .lines()
+                .rfind(|l| !l.trim().is_empty())
+                .expect("the probe append must have produced a line")
+                .to_string();
+            let probe: serde_json::Value = serde_json::from_str(&last).unwrap();
+            // Derived, not spelled out: `hmac_bytes` with no key *is* the
+            // sentinel, so this cannot drift from what the writer stamps.
+            let sentinel = hmac_bytes(None, b"whatever");
+            let protected = probe["entry_hash"] != serde_json::json!(sentinel);
+
+            // Restore before asserting: at 0o300 the directory cannot be
+            // removed, so a failing assertion would leave it behind.
+            let restored = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+
+            assert_eq!(
+                summary.secret_available, expect_available,
+                "{case}: secret_available"
+            );
+            // Scoped to this fixture: audit is enabled and the path resolves,
+            // so a reason must exist whenever protection does not. The two
+            // early returns in `audit_summary` report `false` with no reason
+            // and are covered by their own tests.
+            assert_eq!(
+                summary.unprotected_reason.is_none(),
+                summary.secret_available,
+                "{case}: a reason must be present exactly when protection is not"
+            );
+            assert_eq!(
+                protected, expect_protected,
+                "{case}: the entry the writer actually produced (line: {last})"
+            );
+            if summary.secret_available {
+                assert!(
+                    protected,
+                    "{case}: `[ok]` was printed for an entry with no HMAC — the direction \
+                     this test exists to forbid"
+                );
+            }
+            // The reason may not describe an outcome opposite to the one the
+            // writer produced. A shared "entries are recorded without HMAC
+            // protection" suffix did exactly that in the `no-active-key` cell,
+            // where the append mints a key and the entry is protected — caught
+            // by review and confirmed on a release build before this assertion
+            // existed.
+            if let Some(reason) = &summary.unprotected_reason
+                && protected
+            {
+                assert!(
+                    !reason.summary().contains("without HMAC protection"),
+                    "{case}: the reason claims entries go unprotected, but the entry this \
+                     writer just produced carries an HMAC — got: {}",
+                    reason.summary()
+                );
+            }
+
+            restored.unwrap();
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The reason is the one the *writer* would give, not a phrase assembled at
+    /// the display surface. `HMAC secret missing` was wrong at `0o300` in both
+    /// halves: nothing is missing, and the cause is the directory.
+    #[test]
+    fn summary_names_the_unlistable_directory_rather_than_a_missing_secret() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("summary-471-reason");
+        let logger = test_logger(&dir);
+        logger.append(make_event("seed")).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+
+        let summary = audit_summary(&verify_config(&dir));
+        let restored = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+
+        let reason = summary
+            .unprotected_reason
+            .expect("an unlistable key directory is not protected");
+        assert!(
+            matches!(reason, UnprotectedReason::KeyDirUnlistable(_)),
+            "got {reason:?}"
+        );
+        assert!(
+            !reason.summary().contains("missing"),
+            "the key is present and readable here — got: {}",
+            reason.summary()
+        );
+        assert!(
+            reason.summary().contains("without HMAC protection"),
+            "the consequence is what the operator needs — got: {}",
+            reason.summary()
+        );
+
+        restored.unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -515,9 +515,107 @@ pub(super) fn load_signing_key(secret_path: &Path) -> SigningKey {
     })
 }
 
-fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
-    let scan = scan_key_dir(secret_path);
+/// Why an append made right now could not be HMAC-protected.
+///
+/// #471: `status` and the writer were asking different questions about one
+/// store. `audit_summary` judged health with `read_secret(…).is_ok()`, which
+/// opens by name and therefore needs only *search* permission on the directory
+/// holding it; the writer goes through `scan_key_dir`, which needs to *list*
+/// it. At mode `0300` the first succeeds and the second does not, so the writer
+/// fell back to recording without HMAC protection while `status` printed
+/// `[ok] Layer 3 (audit)`.
+///
+/// Carried as a reason rather than a `bool` so the caller does not assemble the
+/// wording from a flag: at `0300` the key is present and readable, and the old
+/// single message — "HMAC secret missing" — is simply false there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnprotectedReason {
+    /// The key directory could not be listed, so which epoch is active is
+    /// unknown. Decidable from the listing alone.
+    KeyDirUnlistable(String),
+    /// The epoch record is present but states no epoch. Also from the listing.
+    EpochRecordUnreadable(String),
+    /// There is no active key at all. Held apart from the variant below
+    /// because the consequence differs and only this one is uncertain: the
+    /// writer's next append tries to *mint* a key here, and often succeeds.
+    ActiveKeyMissing,
+    /// Something is at the active key's path that cannot be read as a key —
+    /// symlinked, a FIFO, the wrong size, bad hex. Not part of the
+    /// listing-derived pair above, but the same `read_secret` call the writer
+    /// makes.
+    ActiveKeyUnusable(String),
+}
 
+impl UnprotectedReason {
+    /// One clause for `status`'s single-line layer row.
+    ///
+    /// Each variant owns its whole sentence rather than sharing a suffix. A
+    /// shared "entries are recorded without HMAC protection" was wrong for
+    /// [`Self::ActiveKeyMissing`] — measured on a release build: with the
+    /// active key moved aside, the next append minted a replacement and the
+    /// entry it wrote *did* carry an HMAC. The line would have stated the
+    /// opposite of what the very next command does. `[warn]` is still right
+    /// there (the store is in a state an operator has to look at, and this run
+    /// did not mint anything), but the reason may not predict a mint it has
+    /// not performed.
+    pub fn summary(&self) -> &'static str {
+        match self {
+            Self::KeyDirUnlistable(_) => {
+                "key directory cannot be listed — entries are recorded without HMAC protection"
+            }
+            Self::EpochRecordUnreadable(_) => {
+                "key epoch record states no epoch — entries are recorded without HMAC protection"
+            }
+            Self::ActiveKeyMissing => "no active HMAC key is present",
+            Self::ActiveKeyUnusable(_) => {
+                "HMAC secret cannot be read — entries are recorded without HMAC protection"
+            }
+        }
+    }
+}
+
+/// The part of `load_signing_key_locked`'s decision that a reader can make
+/// **without side effects**: the directory listing, and the two refusals
+/// reachable from it alone.
+///
+/// The decision does not end here. Past this point the writer reads the active
+/// key and, finding none, *creates* one — and a command that only reports state
+/// must not do that. So this is where the shared predicate stops, and
+/// `audit_summary` adds exactly one more observation of its own: the same
+/// `read_secret` call, whose failure it reports as [`UnprotectedReason::ActiveKeyUnusable`].
+/// What neither can see is a mint that fails after being attempted; that outcome
+/// exists only inside the writer.
+///
+/// Shared rather than copied, for the reason `classify_secret_failure` gives one
+/// file over: two commands disagreeing about one store is the defect being
+/// closed, and a duplicated condition is one edit away from disagreeing again.
+pub(super) enum KeyStoreOutlook {
+    /// No append from here can be HMAC-protected, whatever the active key holds.
+    Unprotected(UnprotectedReason),
+    /// Nothing in the listing refuses. Carries what the writer needs next.
+    Usable {
+        retired: BTreeMap<u32, PathBuf>,
+        recorded: u32,
+    },
+}
+
+pub(super) fn key_store_outlook(secret_path: &Path) -> KeyStoreOutlook {
+    let (retired, record) = match scan_key_dir(secret_path) {
+        KeyDirScan::Unlistable(reason) => {
+            return KeyStoreOutlook::Unprotected(UnprotectedReason::KeyDirUnlistable(reason));
+        }
+        KeyDirScan::Listed { retired, epoch, .. } => (retired, epoch),
+    };
+    match record.recorded() {
+        Ok(recorded) => KeyStoreOutlook::Usable { retired, recorded },
+        Err(reason) => KeyStoreOutlook::Unprotected(UnprotectedReason::EpochRecordUnreadable(
+            reason.to_string(),
+        )),
+    }
+}
+
+fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // #457 (Codex Round 2): the verifier was made fail-closed for an unlistable
     // key directory, but this side was not — and it is the side that writes.
     // With execute-but-not-read permissions the active secret is still
@@ -554,27 +652,7 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // append on purpose. Asserting "this entry is recorded without HMAC
     // protection" told the operator, in both of those, that something was
     // written when nothing was.
-    let (retired, record) = match scan {
-        KeyDirScan::Unlistable(reason) => {
-            eprintln!(
-                // Not "fix the condition and re-run to restore protection":
-                // the reason is inline in this same sentence rather than
-                // above it, nothing here is a command the operator ran, and
-                // "restore" reads as covering the entries written meanwhile —
-                // which `verify`'s own `NeverProtected` arm then denies.
-                "omamori warning: {reason} — cannot determine which key epoch is active, so no \
-                 entry written from here on can be HMAC-protected or labelled with a key epoch. \
-                 {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the condition protects \
-                 later ones, not those."
-            );
-            return SigningKey {
-                id: UNRESOLVED_KEY_ID.to_string(),
-                secret: None,
-            };
-        }
-        KeyDirScan::Listed { retired, epoch, .. } => (retired, epoch),
-    };
-
+    //
     // PR-C1 (yotta 判断12): a record that does not state an epoch is refused
     // here, in the verifier and in rotation alike. Falling back to the
     // derivation is the softer option and the wrong one — the record is
@@ -582,20 +660,55 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // ignoring an unreadable one reinstates the defect on exactly the stores
     // that needed it. #479's rule, applied to a second file: one invariant,
     // guarded at one depth.
-    let recorded = match record.recorded() {
-        Ok(recorded) => recorded,
-        Err(reason) => {
-            eprintln!(
-                "omamori warning: {reason} — cannot determine which key epoch is active, so no \
-                 entry written from here on can be HMAC-protected or labelled with a key epoch. \
-                 {ENTRIES_CARRY_NO_HMAC} They stay unverifiable. {}",
-                epoch_record_remedy()
-            );
+    //
+    // #471: both refusals now come from `key_store_outlook`, which `status`
+    // asks the same question of. Only the wording stays here — a reader of
+    // state has no business printing an operator warning, and the two refusals
+    // want different remedies.
+    let (retired, recorded) = match key_store_outlook(secret_path) {
+        KeyStoreOutlook::Unprotected(reason) => {
+            match &reason {
+                // Not "fix the condition and re-run to restore protection":
+                // the reason is inline in this same sentence rather than
+                // above it, nothing here is a command the operator ran, and
+                // "restore" reads as covering the entries written meanwhile —
+                // which `verify`'s own `NeverProtected` arm then denies.
+                UnprotectedReason::KeyDirUnlistable(r) => eprintln!(
+                    "omamori warning: {r} — cannot determine which key epoch is active, so no \
+                     entry written from here on can be HMAC-protected or labelled with a key \
+                     epoch. {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the \
+                     condition protects later ones, not those."
+                ),
+                UnprotectedReason::EpochRecordUnreadable(r) => eprintln!(
+                    "omamori warning: {r} — cannot determine which key epoch is active, so no \
+                     entry written from here on can be HMAC-protected or labelled with a key \
+                     epoch. {ENTRIES_CARRY_NO_HMAC} They stay unverifiable. {}",
+                    epoch_record_remedy()
+                ),
+                // `key_store_outlook` decides from the listing alone and never
+                // reads the active key, so it produces neither of these two.
+                // Listed rather than caught by `_` so that a future refusal
+                // added there has to be given wording here instead of silently
+                // inheriting somebody else's — which the compiler enforced the
+                // moment `ActiveKeyMissing` was split out.
+                //
+                // Reaching either would mean this function returned before the
+                // code below that decides whether to mint, so neither may
+                // promise one.
+                UnprotectedReason::ActiveKeyUnusable(r) => eprintln!(
+                    "omamori warning: {r} — {ENTRIES_CARRY_NO_HMAC} They stay unverifiable."
+                ),
+                UnprotectedReason::ActiveKeyMissing => eprintln!(
+                    "omamori warning: no active audit key is present. {ENTRIES_CARRY_NO_HMAC} \
+                     They stay unverifiable."
+                ),
+            }
             return SigningKey {
                 id: UNRESOLVED_KEY_ID.to_string(),
                 secret: None,
             };
         }
+        KeyStoreOutlook::Usable { retired, recorded } => (retired, recorded),
     };
 
     let max_retired = max_retired_index(&retired);
