@@ -597,22 +597,71 @@ pub(super) enum KeyStoreOutlook {
     Usable {
         retired: BTreeMap<u32, PathBuf>,
         recorded: u32,
+        /// #471 (review): carried so the three observations `rotate_key_locked`
+        /// makes about "has this store rotated?" are the same three every
+        /// reader makes. Dropping it left the shared predicate answering a
+        /// slightly different question than the command it was shared with —
+        /// the exact shape this extraction exists to remove.
+        pending: Option<PathBuf>,
     },
 }
 
 pub(super) fn key_store_outlook(secret_path: &Path) -> KeyStoreOutlook {
-    let (retired, record) = match scan_key_dir(secret_path) {
+    let (retired, record, pending) = match scan_key_dir(secret_path) {
         KeyDirScan::Unlistable(reason) => {
             return KeyStoreOutlook::Unprotected(UnprotectedReason::KeyDirUnlistable(reason));
         }
-        KeyDirScan::Listed { retired, epoch, .. } => (retired, epoch),
+        KeyDirScan::Listed {
+            retired,
+            epoch,
+            pending,
+        } => (retired, epoch, pending),
     };
     match record.recorded() {
-        Ok(recorded) => KeyStoreOutlook::Usable { retired, recorded },
+        Ok(recorded) => KeyStoreOutlook::Usable {
+            retired,
+            recorded,
+            pending,
+        },
         Err(reason) => KeyStoreOutlook::Unprotected(UnprotectedReason::EpochRecordUnreadable(
             reason.to_string(),
         )),
     }
+}
+
+/// Does the store look like a rotation that stopped between filing the old key
+/// and creating its replacement?
+///
+/// #487 B. **Observed under the key-store lock**, which is the whole reason this
+/// lives here rather than being assembled by the caller. Review caught that
+/// reading the active key and then listing the directory as two unsynchronised
+/// steps admits a rotation completing in between: the reader then sees "no
+/// active key" from before it and "retired keys exist" from after it, and
+/// reports an interrupted rotation on a store that is perfectly healthy. This
+/// change would have introduced that false alarm, since the state used to be
+/// quiet. The mirror case is worse — a directory becoming unlistable between
+/// the two steps would drop a `KeyringUnusable` verdict to a quiet one.
+///
+/// The three observations are `rotate_key_locked`'s three, not a subset:
+/// retired keys, a recorded epoch, or a pending replacement.
+pub(super) fn interrupted_rotation_evidence(secret_path: &Path) -> bool {
+    with_key_store_lock(secret_path, false, |_lock| {
+        // Re-read inside the lock. The caller's earlier read is what raised the
+        // question; this is the one the answer is based on.
+        if read_secret(secret_path).is_ok() {
+            return false;
+        }
+        match key_store_outlook(secret_path) {
+            KeyStoreOutlook::Usable {
+                retired,
+                recorded,
+                pending,
+            } => !retired.is_empty() || recorded >= 1 || pending.is_some(),
+            // The directory stopped being listable. Not this function's verdict
+            // to give — the caller's keyring check owns that one.
+            KeyStoreOutlook::Unprotected(_) => false,
+        }
+    })
 }
 
 fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
@@ -708,7 +757,9 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
                 secret: None,
             };
         }
-        KeyStoreOutlook::Usable { retired, recorded } => (retired, recorded),
+        KeyStoreOutlook::Usable {
+            retired, recorded, ..
+        } => (retired, recorded),
     };
 
     let max_retired = max_retired_index(&retired);
@@ -1741,11 +1792,13 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
                 }
                 keys.insert(format!("key-{index}"), secret);
             }
+            // #471: the full path, not just the file name. `DirectoryUnreadable`
+            // names the directory it failed on, and an operator reading the two
+            // together had one that said where and one that said only which.
+            // The file name alone is also ambiguous once more than one store
+            // exists on a machine, which is exactly when a diagnostic gets read.
             Err(e) => anomalies.push(KeyringAnomaly::Unreadable {
-                name: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                name: path.display().to_string(),
                 reason: e.to_string(),
             }),
         }

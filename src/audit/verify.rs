@@ -9,8 +9,9 @@ use super::chain::{
 use super::retention::is_prune_point;
 use super::secret::{
     KeyStoreOutlook, UNRESOLVED_KEY_ID, UnprotectedReason, classify_secret_failure,
-    expected_key_file, flock_shared, is_symlink_attack, is_writer_emitted_key_id,
-    key_store_outlook, load_keyring, open_read_nofollow, read_secret, secret_path_for,
+    expected_key_file, flock_shared, interrupted_rotation_evidence, is_symlink_attack,
+    is_writer_emitted_key_id, key_store_outlook, load_keyring, open_read_nofollow, read_secret,
+    secret_path_for,
 };
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
@@ -86,6 +87,25 @@ pub enum AuditError {
         retired_path: std::path::PathBuf,
         source: std::io::Error,
     },
+    /// #471/#487: the store could not be read, and **not** because there is
+    /// nothing in it yet.
+    ///
+    /// Every one of these used to arrive as `SecretUnavailable`, `FileNotFound`
+    /// or `Io`, all of which `aggregate_report` mapped to
+    /// `ChainStatus::Unavailable` — a status `needs_attention()` treats as
+    /// healthy, because it also means "auditing is off" and "there is no log
+    /// yet". So a symlink planted on `audit.jsonl`, an interrupted rotation,
+    /// and an unreadable key all left `doctor` silent.
+    ///
+    /// `kind` is classified **at the call site**, where which file was being
+    /// touched is still known — an `io::Error` on its own cannot say whether it
+    /// came from the log or the key. It is path-free, for the reason
+    /// `KeyringUnusable`'s is: `reason` carries the operator's home directory
+    /// and must stay out of `report --json`.
+    StoreInaccessible {
+        kind: &'static str,
+        reason: String,
+    },
     Io(std::io::Error),
 }
 
@@ -103,6 +123,7 @@ impl std::fmt::Display for AuditError {
                 "the previous key was moved to {} and its replacement could not be created: {source}",
                 retired_path.display()
             ),
+            Self::StoreInaccessible { reason, .. } => write!(f, "{reason}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -462,8 +483,34 @@ struct SeqPeek {
     seq: Option<u64>,
 }
 
+/// Is this a store nothing has ever been written to?
+///
+/// #471 (review): the two quiet errors were named "there is no log yet" and
+/// "the first key has not been minted", and neither checked. Measured on a
+/// release build: **deleting `audit.jsonl` outright left `doctor` saying
+/// `quiet`**, and so did deleting the active key of a store that already held
+/// entries. An audit tool has no business being silent about either, and
+/// `docs/CONTRACT.md` had already published the claim that only "nothing has
+/// been written" stays quiet.
+///
+/// The evidence is on disk and costs two stats. `audit.jsonl.hwm` is created by
+/// the first append and is not removed with the log, so a sidecar beside an
+/// absent log says the log existed. A log with bytes in it says the same more
+/// directly.
+fn nothing_written_yet(path: &std::path::Path) -> bool {
+    let log_has_content = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
+    !log_has_content && !hwm_path_for(path).exists()
+}
+
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
-    let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
+    // #471: not `FileNotFound`. That variant means "there is no log yet", which
+    // is a quiet state; this is a configuration that cannot name a log at all,
+    // and `status` has always reported it as a fault. The two shared one
+    // variant, so the louder of them inherited the quieter one's verdict.
+    let path = resolved_audit_path(config).ok_or_else(|| AuditError::StoreInaccessible {
+        kind: "path_unresolved",
+        reason: "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
+    })?;
     let secret_path = secret_path_for(&path);
 
     // #457: the active secret is no longer used as a hash key — the anchor and
@@ -491,7 +538,17 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // both are `InvalidInput`.
     let secret_error = match read_secret(&secret_path) {
         Ok(_) => None,
-        Err(e) if is_symlink_attack(&e) => return Err(AuditError::Io(e)),
+        // #471: classified rather than handed on as `Io`. `verify` already
+        // preserved the "possible attack" wording here, but every non-
+        // `KeyringUnusable` error reached `doctor` as `Unavailable`, so the one
+        // state in this function that is *evidence of an attack* was also the
+        // one `doctor` said nothing about.
+        Err(e) if is_symlink_attack(&e) => {
+            return Err(AuditError::StoreInaccessible {
+                kind: "secret_symlink",
+                reason: e.to_string(),
+            });
+        }
         Err(e) => Some(e),
     };
 
@@ -523,14 +580,86 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // Reaching `KeyringUnusable` instead of either does, and that is the
     // intended change on the branch above — the CHANGELOG records it.
     if let Some(e) = secret_error {
-        return Err(classify_secret_failure(e));
+        // #487 B: `SecretUnavailable` covers two states that could not be less
+        // alike — a fresh store whose key has simply not been minted yet
+        // (quiet), and a rotation that stopped between filing the old key and
+        // creating its replacement (one append away from a permanent
+        // cannot-verify). `rotate` has told them apart since #487's A/C half;
+        // the verifier had not, so `doctor` stayed silent on the second.
+        //
+        // The distinction is asked of `interrupted_rotation_evidence`, which
+        // makes it **under the key-store lock** and from the same three
+        // observations `rotate_key_locked` uses. An earlier draft did it here,
+        // reading the outlook directly and comparing two of the three: review
+        // caught that the absent key and the retired keys were then observed at
+        // different times, so a rotation completing in between produced
+        // `rotation_interrupted` on a perfectly healthy store — a false alarm
+        // this change would have introduced, since the state used to be quiet.
+        // It is a second listing of a directory this function already listed;
+        // `verify` is not a hot path, and the alternative is a copy of
+        // `rotate`'s condition that can drift from it.
+        if e.kind() == std::io::ErrorKind::NotFound && interrupted_rotation_evidence(&secret_path) {
+            return Err(AuditError::StoreInaccessible {
+                kind: "rotation_interrupted",
+                reason: "the active audit key is missing and this store has rotated before — \
+                         a rotation that stopped between filing the old key and moving its \
+                         replacement into place leaves exactly this"
+                    .to_string(),
+            });
+        }
+        return match classify_secret_failure(e) {
+            // #471 (review): quiet only while nothing has been written. A store
+            // that already holds entries and has lost its active key is not a
+            // fresh install — the next append mints a *different* secret under
+            // the same id, and every existing entry then reads as tampered
+            // (#457 P4-e). `status` warned about this already; `doctor` did not.
+            AuditError::SecretUnavailable if nothing_written_yet(&path) => {
+                Err(AuditError::SecretUnavailable)
+            }
+            AuditError::SecretUnavailable => Err(AuditError::StoreInaccessible {
+                kind: "active_key_missing",
+                reason: "the active audit key is missing on a store that already holds \
+                         entries — the next append mints a different key under the same id, \
+                         after which those entries cannot be verified"
+                    .to_string(),
+            }),
+            other => Err(AuditError::StoreInaccessible {
+                kind: "secret_unreadable",
+                reason: other.to_string(),
+            }),
+        };
     }
 
+    // #471: the log itself was the half the first draft of this change missed
+    // — review caught it. A symlink or a FIFO planted on `audit.jsonl` is the
+    // same class of evidence as one planted on the key, and it landed in the
+    // same quiet bucket. Only a genuinely absent log stays quiet.
+    // `open_read_nofollow` routes ELOOP through `symlink_attack_error`, so the
+    // attack shape is recognisable here without inspecting the message for
+    // anything but that one prefix.
     let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => AuditError::FileNotFound,
-        _ => AuditError::Io(e),
+        // Quiet only if nothing was ever written here. A missing log with a
+        // high-water-mark sidecar still beside it is a log that was removed.
+        std::io::ErrorKind::NotFound if nothing_written_yet(&path) => AuditError::FileNotFound,
+        std::io::ErrorKind::NotFound => AuditError::StoreInaccessible {
+            kind: "log_missing",
+            reason: "the audit log is gone, but this store has written one before \
+                     (its high-water-mark sidecar is still here)"
+                .to_string(),
+        },
+        _ if is_symlink_attack(&e) => AuditError::StoreInaccessible {
+            kind: "log_symlink",
+            reason: e.to_string(),
+        },
+        _ => AuditError::StoreInaccessible {
+            kind: "log_unreadable",
+            reason: e.to_string(),
+        },
     })?;
-    flock_shared(&file)?;
+    flock_shared(&file).map_err(|e| AuditError::StoreInaccessible {
+        kind: "log_lock",
+        reason: e.to_string(),
+    })?;
 
     let reader = std::io::BufReader::new(&file);
 
@@ -571,7 +700,12 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let mut prev_prune: Option<PruneBind> = None;
 
     for line in reader.lines() {
-        let line = line?;
+        // #471: a read that fails partway through is not "there is no log"
+        // either — the file exists and stopped being readable.
+        let line = line.map_err(|e| AuditError::StoreInaccessible {
+            kind: "log_read",
+            reason: e.to_string(),
+        })?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
