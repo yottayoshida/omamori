@@ -8,8 +8,9 @@ use super::chain::{
 };
 use super::retention::is_prune_point;
 use super::secret::{
-    UNRESOLVED_KEY_ID, classify_secret_failure, expected_key_file, flock_shared, is_symlink_attack,
-    is_writer_emitted_key_id, load_keyring, open_read_nofollow, read_secret, secret_path_for,
+    KeyStoreOutlook, UNRESOLVED_KEY_ID, UnprotectedReason, classify_secret_failure,
+    expected_key_file, flock_shared, is_symlink_attack, is_writer_emitted_key_id,
+    key_store_outlook, load_keyring, open_read_nofollow, read_secret, secret_path_for,
 };
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
@@ -285,10 +286,37 @@ pub struct ShowOptions {
     pub relaxed_only: bool,
 }
 
+/// #471: `#[non_exhaustive]`, matching `VerifyResult` and `ChainStatus`. This
+/// change adds a field, and a `pub` struct with `pub` fields and no such
+/// attribute cannot gain one without breaking every struct literal outside the
+/// crate. The other two took that one-time cost before 1.0 on the reasoning
+/// that a type which will keep gaining cases should close the door early; this
+/// one was simply missed. Within the crate the compiler still checks nothing
+/// away — `#[non_exhaustive]` constrains other crates only.
+#[non_exhaustive]
 pub struct AuditSummary {
     pub enabled: bool,
     pub entry_count: u64,
+    /// **One-directional**: `true` means an append made at this moment would
+    /// be HMAC-protected. `false` does not mean the opposite — a store with no
+    /// active key reports `false` and then mints one on the next append,
+    /// protecting that entry (measured; pinned by a test). Erring toward
+    /// "not protected" is the safe side, and closing the gap would mean
+    /// creating a key file as a side effect of asking for status.
+    ///
+    /// #471: this used to be `read_secret(…).is_ok()`, which asks a narrower
+    /// question than the writer does — see [`UnprotectedReason`]. It is now
+    /// false in every state the writer refuses to sign in.
     pub secret_available: bool,
+    /// Why not, so a caller never has to invent wording for a state it cannot
+    /// name.
+    ///
+    /// `Some` exactly when `secret_available` is false **and** the store was
+    /// far enough resolved to look: the two early returns — auditing disabled,
+    /// and an audit path that does not resolve — report `false` with `None`
+    /// here, because neither reached a key store to have an opinion about.
+    /// `path_error` covers the second.
+    pub unprotected_reason: Option<UnprotectedReason>,
     pub retention_days: u32,
     pub path_error: Option<String>,
 }
@@ -1069,6 +1097,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             enabled: false,
             entry_count: 0,
             secret_available: false,
+            unprotected_reason: None,
             retention_days: 0,
             path_error: None,
         };
@@ -1079,13 +1108,42 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             enabled: true,
             entry_count: 0,
             secret_available: false,
+            unprotected_reason: None,
             retention_days: config.retention_days,
             path_error: Some(
                 "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
             ),
         };
     };
-    let secret_available = read_secret(&secret_path_for(&path)).is_ok();
+    // #471: the writer's own question, asked the writer's way. `read_secret`
+    // alone opens by name and so needs only search permission on the directory;
+    // `key_store_outlook` needs to list it, which is the observation the writer
+    // refuses on. At mode 0300 the two disagree, and the writer is the one that
+    // decides whether the entry carries an HMAC.
+    //
+    // No key-store lock is taken here, deliberately. `status` reports an
+    // observation, not an atomic one: a rotation running concurrently can make
+    // this stale between the read and the print. The invariant this restores is
+    // **which question is asked**, not that the answer is simultaneous with the
+    // writer's — and taking the lock in a status command would let an unrelated
+    // writer block it.
+    let secret_path = secret_path_for(&path);
+    let unprotected_reason = match key_store_outlook(&secret_path) {
+        KeyStoreOutlook::Unprotected(reason) => Some(reason),
+        // The one observation past the shared predicate, made the same way the
+        // writer makes it. What neither can see is a mint that is attempted and
+        // fails; that outcome exists only inside `load_signing_key_locked`, and
+        // reaching it from here would mean creating a key file as a side effect
+        // of asking for status.
+        KeyStoreOutlook::Usable { .. } => read_secret(&secret_path).err().map(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                UnprotectedReason::ActiveKeyMissing
+            } else {
+                UnprotectedReason::ActiveKeyUnusable(e.to_string())
+            }
+        }),
+    };
+    let secret_available = unprotected_reason.is_none();
 
     let (entry_count, path_error) = match open_read_nofollow(&path) {
         Ok(f) => {
@@ -1103,6 +1161,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         enabled: true,
         entry_count,
         secret_available,
+        unprotected_reason,
         retention_days: config.retention_days,
         path_error,
     }
