@@ -199,8 +199,22 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
     result.chain_status = match verify_chain(config) {
         Ok(verify_result) => {
             result.hwm_tampered = verify_result.hwm_tampered;
+            // #470: `Truncated` is checked *above* the two halted states, not
+            // below them. It used to sit last, which was invisible while
+            // `verify_chain` suppressed the comparison during a halt — the two
+            // could not both be set — and became load-bearing the moment it
+            // stopped doing so. The order here has to match
+            // `run_audit_verify`'s exit branch and, through `chain_status`,
+            // what `doctor` prints: a verdict that changes with which surface
+            // you look at is worse than either verdict.
+            //
+            // Nothing moves for a log that did not halt. `Unverifiable` and
+            // `KeyUnavailable` are both `None` there, so `Truncated` was
+            // already the next arm reached.
             if let Some(at_seq) = verify_result.broken_at {
                 ChainStatus::Broken { at_seq }
+            } else if verify_result.tail_truncated {
+                ChainStatus::Truncated
             } else if let (Some(at_seq), Some(chain_version)) = (
                 verify_result.unknown_version_at,
                 verify_result.unknown_chain_version,
@@ -214,8 +228,6 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
                 verify_result.key_unavailable_id.clone(),
             ) {
                 ChainStatus::KeyUnavailable { at_seq, key_id }
-            } else if verify_result.tail_truncated {
-                ChainStatus::Truncated
             } else {
                 ChainStatus::Intact
             }

@@ -2550,6 +2550,85 @@ fn run_audit(base: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// #470 — the two-step attack, end to end through the shipped binary.
+///
+/// Step one relabels one entry's `key_id` so verification halts there. Step two
+/// deletes the tail. Measured on `73b76a7`: exit 2, "cannot verify from entry
+/// #1", and not one word about the removal — while deleting the same line
+/// *without* the relabel reported exit 3. One edited field, in a plain text
+/// field of the log, bought silence about the deletion.
+///
+/// Both halves of the verdict are pinned. The exit code, because turning exit 3
+/// into exit 2 was the whole point of provoking the halt, and any consumer
+/// branching on it would have been told the wrong thing. And the absence of
+/// "chain intact" on stdout, because the truncation warning used to be printed
+/// *after* the success line — reaching it from a halted run would have
+/// announced an intact chain and then contradicted itself two lines later,
+/// which is the half an operator remembers.
+#[test]
+fn audit_verify_reports_a_deleted_tail_even_when_a_planted_key_id_halts_it() {
+    let (base, hook_path, shim_dir) = setup_hook_env("470-halt-hides-truncation");
+    let json = pretooluse_bash_json("rm -rf /");
+    for _ in 0..3 {
+        let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+        assert_eq!(
+            decision_from_exit(exit),
+            Decision::Block,
+            "setup: each deny seeds one chain entry"
+        );
+    }
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 0,
+        "precondition: the seeded chain verifies, and the mark sits at its end (stderr={err})"
+    );
+
+    let audit_path = audit_path_for(&base);
+    let before = std::fs::read_to_string(&audit_path).expect("read audit.jsonl");
+    let mut lines: Vec<String> = before
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines.len() >= 3,
+        "setup must leave at least three entries, got {}",
+        lines.len()
+    );
+
+    // Step one: name a key epoch this store has no file for. No key is needed
+    // to write it and every hash on the line is left byte-for-byte intact.
+    let mut relabelled: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    relabelled["key_id"] = serde_json::Value::String("key-7".to_string());
+    lines[1] = serde_json::to_string(&relabelled).unwrap();
+    // Step two: drop the tail.
+    lines.pop();
+    std::fs::write(&audit_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (code, out, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 3,
+        "a removed tail must be reported as exit 3 even though authentication halted \
+         before reaching it (stdout={out}, stderr={err})"
+    );
+    assert!(
+        err.contains("may have been truncated"),
+        "stderr must name the truncation — got: {err}"
+    );
+    assert!(
+        !out.contains("chain intact"),
+        "a run that could not authenticate the chain must not open by calling it intact \
+         — got stdout: {out}"
+    );
+    assert!(
+        err.contains("key-7"),
+        "the halt is still worth reporting alongside the truncation — got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// #457 V-001 — the minimal reproduction, end to end through the shipped
 /// binary. **Rotating is enough; no further activity is required.**
 ///
@@ -2810,11 +2889,24 @@ fn report_and_doctor_agree_with_verify_across_a_rotation() {
         "V-028: an edited key_id produces this exact state, so the message \
          must leave that reading open (stderr={err})"
     );
+    // #470 reversed the sentence this pinned, not the property. V-028's point
+    // is parity — exit 2 must not be the quieter way into a halt than exit 4 —
+    // and both arms still say the same thing about the mark. What changed is
+    // that the thing they say is no longer "detection is suspended": the
+    // comparison needs no key, so it now runs, and claiming otherwise would
+    // have told an attacker exactly what one edited `key_id` bought. This store
+    // has a valid mark and a chain that reaches it, so the honest report is
+    // that the check ran and found nothing — with the caveat about what it
+    // compared, which is the part that is genuinely weaker than authentication.
     assert!(
-        err.contains("Tail-truncation detection is suspended"),
-        "V-028: this state suppresses the HWM check just as exit 4 does, and \
-         exit 4 says so. Silence here made exit 2 the quieter way in \
-         (stderr={err})"
+        err.contains("tail-truncation check needs no key"),
+        "V-028: exit 2 must still say what happened to the tail check, and say the \
+         same as exit 4 does (stderr={err})"
+    );
+    assert!(
+        !err.contains("detection is suspended"),
+        "V-028: the check is no longer suspended by a halt — a message still claiming \
+         it is would be advertising a gap that was closed (stderr={err})"
     );
 
     // The test is named for `doctor` too, and `doctor` has its own arm for

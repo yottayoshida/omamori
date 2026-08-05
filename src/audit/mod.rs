@@ -2828,9 +2828,19 @@ mod tests {
             !result.tail_truncated,
             "must not compare against an HWM bootstrap that never happened"
         );
+        // #470 reversed this assertion, deliberately. It used to read
+        // `!result.hwm_missing`, on the reasoning that the guard "skips the
+        // bootstrap entirely — it must not run it and then discard the result".
+        // The bootstrap is still skipped, which is what the file assertion
+        // below pins; what changed is that the *absence of a mark* is now
+        // reported rather than swallowed. An operator reading exit 4 needs to
+        // know that truncation was not merely un-detected but uncheckable —
+        // there was nothing to compare against — because otherwise a halted
+        // run that stays silent about the tail is indistinguishable from one
+        // that checked it and found it whole.
         assert!(
-            !result.hwm_missing,
-            "the guard skips the bootstrap entirely — it must not run it and then discard the result"
+            result.hwm_missing,
+            "the missing mark must be reported even though it is not created"
         );
 
         assert!(
@@ -2838,6 +2848,340 @@ mod tests {
             "HWM must remain Missing — bootstrapping it off an early stop would permanently \
              cap future truncation detection below the chain's true (unknown) length"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #470: a halt stops authentication. It must not take the tail-truncation
+    // comparison down with it — that comparison needs no key.
+    // -----------------------------------------------------------------------
+
+    /// Rewrites the `key_id` of the line at `index` to an epoch this store has
+    /// no key file for. This is the whole of #470's first step: `key_id` is an
+    /// ordinary field of the log, so planting it needs no key and leaves every
+    /// hash on the line byte-for-byte intact.
+    fn plant_unresolvable_key_id(path: &Path, index: usize) {
+        let content = fs::read_to_string(path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        let mut event: serde_json::Value = serde_json::from_str(&lines[index]).unwrap();
+        event["key_id"] = serde_json::Value::String("key-7".to_string());
+        lines[index] = serde_json::to_string(&event).unwrap();
+        fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    /// Drops the last `n` lines — #470's second step.
+    fn remove_tail_lines(path: &Path, n: usize) {
+        let content = fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        let kept = &lines[..lines.len() - n];
+        fs::write(path, format!("{}\n", kept.join("\n"))).unwrap();
+    }
+
+    /// Where the halt sits relative to the file that is finally verified.
+    #[derive(Clone, Copy, Debug)]
+    enum HaltAt {
+        Head,
+        Middle,
+        Tail,
+    }
+
+    /// Six genuine entries (seq 0..=5), a mark at the real end, optionally the
+    /// last two lines removed, and one surviving line's `key_id` made
+    /// unresolvable. Deleting before planting rather than after is the same
+    /// file either way — the index is computed against what remains, so the
+    /// planted line always survives.
+    fn halted_store(name: &str, halt_at: HaltAt, delete_tail: bool) -> PathBuf {
+        let dir = test_dir(name);
+        let _ = test_logger(&dir); // secret file only
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+                ("cmd2", "2026-01-01T00:00:02Z"),
+                ("cmd3", "2026-01-01T00:00:03Z"),
+                ("cmd4", "2026-01-01T00:00:04Z"),
+                ("cmd5", "2026-01-01T00:00:05Z"),
+            ],
+            CHAIN_VERSION,
+        );
+        // The mark an honest run of appends would have left behind.
+        write_hwm(&hwm_path_for(&path), 5).unwrap();
+        if delete_tail {
+            remove_tail_lines(&path, 2);
+        }
+        let surviving = if delete_tail { 4 } else { 6 };
+        let index = match halt_at {
+            HaltAt::Head => 0,
+            HaltAt::Middle => 2,
+            HaltAt::Tail => surviving - 1,
+        };
+        plant_unresolvable_key_id(&path, index);
+        dir
+    }
+
+    /// C-1: the grid. Six cells — halt at the head, the middle and the tail,
+    /// each with and without a deleted tail.
+    ///
+    /// Both halves are load-bearing and neither alone would do. The three
+    /// *deleted* cells are what the fix buys: on `73b76a7` all six report
+    /// nothing, so those three are the regression. The three *undeleted* cells
+    /// rule out the implementation that passes the first three for the wrong
+    /// reason — comparing against `last_verified_seq`, which stops at the halt
+    /// and is therefore behind the mark whenever the halt is not at the very
+    /// end. That is not a hypothetical: it is what #470's own text proposes.
+    ///
+    /// `key_unavailable_at` is asserted in every cell because without it the
+    /// deleted cells pass whether or not the planting worked — a store that
+    /// never halted also has a chain shorter than its mark.
+    #[test]
+    fn verify_reports_a_removed_tail_even_when_a_halt_stopped_authentication() {
+        for (halt_at, deleted, expect_truncated) in [
+            (HaltAt::Head, false, false),
+            (HaltAt::Head, true, true),
+            (HaltAt::Middle, false, false),
+            (HaltAt::Middle, true, true),
+            (HaltAt::Tail, false, false),
+            (HaltAt::Tail, true, true),
+        ] {
+            let name = format!("verify-470-{halt_at:?}-{deleted}").to_lowercase();
+            let dir = halted_store(&name, halt_at, deleted);
+            let result = verify_chain(&verify_config(&dir)).unwrap();
+
+            assert!(
+                result.key_unavailable_at.is_some(),
+                "{halt_at:?}/deleted={deleted}: the planted key_id must actually halt \
+                 verification, or this cell proves nothing"
+            );
+            assert!(
+                result.broken_at.is_none(),
+                "{halt_at:?}/deleted={deleted}: an unresolvable key_id is not a broken chain"
+            );
+            assert_eq!(
+                result.tail_truncated, expect_truncated,
+                "{halt_at:?}/deleted={deleted}: expected tail_truncated={expect_truncated}"
+            );
+            assert_eq!(
+                expect_hwm(&hwm_path_for(&dir.join("audit.jsonl"))),
+                5,
+                "{halt_at:?}/deleted={deleted}: a halted run may read the mark but never \
+                 move it"
+            );
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// C-1, third surface: the same store has to produce the same verdict
+    /// through `aggregate_report`, which is also what `doctor` renders. A fix
+    /// applied to the CLI's exit branch alone would leave `--json` consumers
+    /// reading `key_unavailable` for a store whose tail is gone.
+    #[test]
+    fn report_prefers_truncated_over_the_halt_that_was_planted_to_hide_it() {
+        let dir = halted_store("report-470-truncated", HaltAt::Middle, true);
+        let report = aggregate_report(&verify_config(&dir), 30);
+        assert_eq!(
+            report.chain_status,
+            report::ChainStatus::Truncated,
+            "the removed tail outranks the halt that was planted to conceal it"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+
+        // Control: without the deletion the same store must still report the
+        // halt. Hoisting `Truncated` above the halted arms must not turn into
+        // "report Truncated whenever a halt happened".
+        let intact = halted_store("report-470-halt-only", HaltAt::Middle, false);
+        let report = aggregate_report(&verify_config(&intact), 30);
+        assert!(
+            matches!(
+                report.chain_status,
+                report::ChainStatus::KeyUnavailable { .. }
+            ),
+            "nothing was removed — the verdict is still the unresolvable key, got {:?}",
+            report.chain_status
+        );
+
+        let _ = fs::remove_dir_all(&intact);
+    }
+
+    /// C-2: a halted run reads the mark's *state* and reports it, and writes
+    /// nothing. Both halves are required — reporting without the second half
+    /// would be #177 B1's silent-lowering bug back again, and the second half
+    /// without the first is the suppression #470 is about.
+    #[test]
+    fn a_halted_run_reports_a_tampered_mark_without_resetting_it() {
+        let dir = halted_store("verify-470-hwm-tampered", HaltAt::Middle, false);
+        let hwm_file = hwm_path_for(&dir.join("audit.jsonl"));
+        fs::write(&hwm_file, "not-a-number").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.key_unavailable_at.is_some(), "sanity: it halted");
+        assert!(
+            result.hwm_tampered,
+            "an unreadable sidecar is a fact about the sidecar — a halt in the log does \
+             not make it unknowable"
+        );
+        assert!(
+            !result.tail_truncated,
+            "a Tampered mark yields no comparison at all, so nothing may be claimed \
+             about the tail"
+        );
+        assert_eq!(
+            fs::read_to_string(&hwm_file).unwrap(),
+            "not-a-number",
+            "the re-bootstrap must stay withheld: this run could not authenticate the \
+             chain end, so it has no value it is entitled to write"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #470, Codex R1 P1 — **the fallback position is not an end.**
+    ///
+    /// `mark_*` reports a halting line that states no `seq` at the position it
+    /// *should* have occupied, which is one past the last verified entry. A
+    /// first draft fed that number into the comparison, and it is behind the
+    /// mark for every halt that is not at the very end of the file — so a log
+    /// written by a future omamori that renamed or dropped `seq` would be
+    /// reported as truncated with nothing removed. That is the "compare against
+    /// a false end" failure the pre-#470 `!halted()` gate existed to prevent,
+    /// re-entering by a different door.
+    ///
+    /// Nothing at or after the halt states a `seq` here, so there is no end to
+    /// compare and the comparison is skipped.
+    #[test]
+    fn a_halt_that_states_no_seq_yields_no_end_to_compare() {
+        let dir = test_dir("verify-470-no-stated-seq");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+            ],
+            CHAIN_VERSION,
+        );
+        // Four entries from a format this build cannot read, none stating a
+        // `seq`. The mark is where six honest appends would have left it.
+        for _ in 0..4 {
+            append_chain_version_line(&path, 999, None, "future-cmd", "passthrough", "passthrough");
+        }
+        write_hwm(&hwm_path_for(&path), 5).unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.unknown_version_at.is_some(), "sanity: it halted");
+        assert!(
+            !result.tail_truncated,
+            "no line at or after the halt states a seq, so the file's end is unknown — \
+             reporting truncation here accuses a log nothing was removed from"
+        );
+        assert_eq!(
+            expect_hwm(&hwm_path_for(&path)),
+            5,
+            "and the mark is still not written from a halted run"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #470, Codex R1 P1 — **the last stated `seq`, not the largest.**
+    ///
+    /// A max lets any single planted line stand in for the file's end, so
+    /// concealing a deletion would cost an insertion in the middle rather than
+    /// a rewrite of the surviving tail — weaker than what SECURITY.md claims.
+    /// Here the largest surviving `seq` reaches the mark and the last one does
+    /// not, which is exactly the gap between the two rules.
+    #[test]
+    fn the_end_is_the_last_stated_seq_not_the_largest() {
+        let dir = test_dir("verify-470-last-not-max");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+                ("cmd2", "2026-01-01T00:00:02Z"),
+            ],
+            CHAIN_VERSION,
+        );
+        write_hwm(&hwm_path_for(&path), 5).unwrap();
+        plant_unresolvable_key_id(&path, 2);
+        // Past the halt: one line claiming the mark's own number, then the
+        // file's real last lines, below it.
+        for seq in [5u64, 3, 4] {
+            append_chain_version_line(
+                &path,
+                999,
+                Some(seq),
+                "future-cmd",
+                "passthrough",
+                "passthrough",
+            );
+        }
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.key_unavailable_at.is_some(), "sanity: it halted");
+        assert!(
+            result.tail_truncated,
+            "the file ends on a line stating seq 4, below the mark of 5 — a planted 5 \
+             earlier in the remainder must not answer for the end"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The `broken_at` gate is deliberately kept. A broken chain `break`s out
+    /// of the loop, so the structural end sits at the break rather than at the
+    /// end of file — and exit 1 is already the strongest thing this command
+    /// says. Pinned because "let the comparison through a halt" reads like it
+    /// should apply here too.
+    #[test]
+    fn a_broken_chain_still_suppresses_the_truncation_comparison() {
+        let dir = test_dir("verify-470-broken-plus-tail");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+                ("cmd2", "2026-01-01T00:00:02Z"),
+                ("cmd3", "2026-01-01T00:00:03Z"),
+            ],
+            CHAIN_VERSION,
+        );
+        write_hwm(&hwm_path_for(&path), 3).unwrap();
+
+        // Edit an entry's payload without recomputing its hash, then remove the
+        // tail: both findings are available, and exit 1 must win.
+        let content = fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        let mut event: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        event["command"] = serde_json::Value::String("tampered".to_string());
+        lines[1] = serde_json::to_string(&event).unwrap();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        remove_tail_lines(&path, 1);
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at,
+            Some(1),
+            "the edited payload must break the chain"
+        );
+        assert!(
+            !result.tail_truncated,
+            "broken_at keeps its own gate — the loop broke early, so the end it would \
+             compare is the break, not the end of the file"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
