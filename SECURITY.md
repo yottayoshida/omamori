@@ -1088,6 +1088,35 @@ Auto-prune is off by default (`retention_days = 0`), so none of this path runs i
 
 **Still open in the same file.** A prune that removes a range containing unverifiable entries leaves no record that it did: `prune_point` carries an entry count and nothing about how many of those entries could not be verified, so a `verify` that reported exit 4 before the prune reports exit 0 after it. That is the remaining half of [#461](https://github.com/yottayoshida/omamori/issues/461); it needs a field the `AuditEvent` schema does not have today, which is a `chain_version` question rather than a change to this recomputation.
 
+### What "Unavailable" Means (#471, #487)
+
+`omamori report --json` reports the chain's state as `chain_status`, and `omamori doctor` decides from the same value whether to raise a risk signal. One of its values, `unavailable`, used to absorb every failure the reporting path did not name — and `doctor` treats it as quiet, correctly, because it also covers *auditing is switched off* and *there is no log yet*.
+
+Everything else that shared the bucket inherited that silence. A symlink planted on `audit.jsonl`, a symlink on the key, a key rotation that stopped between filing the old key and creating its replacement, an unreadable key, an unresolvable `HOME`: `omamori audit verify` reported each of them, and the two surfaces an operator watches habitually said nothing.
+
+**The default is now inverted rather than patched.** Every failure the verifier can return was enumerated and given a destination:
+
+| state | `chain_status` |
+|---|---|
+| auditing disabled | `unavailable` (quiet) |
+| nothing ever written — no log, no high-water-mark, no key | `unavailable` (quiet) |
+| `audit.jsonl` removed from a store that had one | `inaccessible` (`log_missing`) |
+| active key removed from a store that holds entries | `inaccessible` (`active_key_missing`) |
+| symlink or non-regular file at the audit log | `inaccessible` (`log_symlink` / `log_unreadable`) |
+| symlink or non-regular file at the key | `inaccessible` (`secret_symlink` / `secret_unreadable`) |
+| retired keys present, no active key (interrupted rotation) | `inaccessible` (`rotation_interrupted`) |
+| `HOME` unset, empty or relative | `inaccessible` (`path_unresolved`) |
+| log lock or mid-read I/O failure | `inaccessible` (`log_lock` / `log_read`) |
+| key directory cannot be listed | `keyring_unusable` (unchanged, already loud) |
+
+Only the first two are quiet, and they are the two where nothing has been prevented because nothing was there. **Quiet is decided by evidence, not by which errno arrived**: `audit.jsonl.hwm` is written by the first append and is not removed with the log, so a sidecar beside an absent log says the log existed. Without that check the two rows below it — a deleted log, and a deleted key on a store that already holds entries — sat in the quiet bucket, which is where an initial review found them. A failure introduced later inherits `inaccessible`, not silence.
+
+**Exit codes are unchanged.** `audit verify` already reported cannot-verify (exit 2) for all of these; what changes is that `doctor` and `report` stop disagreeing with it.
+
+`kind` is path-free and stable for machine consumers; `reason` carries the data directory and is not serialized, the same split `keyring_unusable` uses.
+
+**Non-fatal keyring problems now reach `doctor` too.** A retired key file that cannot be read leaves the chain genuinely intact when nothing in the remaining log was signed with it — so this travels beside `chain_status` rather than changing it. It was previously printed by `verify` alone, which is the surface an operator consults after they already suspect something.
+
 ### Truncation Detection Across a Halt (#470)
 
 `omamori audit verify` stops authenticating at an entry it cannot check — one declaring a `chain_version` this binary does not recognize (#177 B1), or naming a `key_id` the keyring does not hold (#457). From that point on the remaining lines are counted, not trusted, because the `prev_hash` chain runs through an entry whose authenticity is unknown.

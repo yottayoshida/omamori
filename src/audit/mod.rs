@@ -3674,6 +3674,221 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // -----------------------------------------------------------------------
+    // #471 / #487: `ChainStatus::Unavailable` means "there is nothing to check
+    // yet" and nothing else.
+    // -----------------------------------------------------------------------
+
+    /// The inventory, both halves.
+    ///
+    /// The loud half is the regression: on `23b882c` every one of these reached
+    /// `doctor` as `Unavailable`, which `needs_attention()` calls healthy. The
+    /// quiet half is what stops the fix being "make `Unavailable` loud" — that
+    /// implementation passes every loud cell and turns a store with auditing
+    /// switched off into a permanent warning. Neither half proves anything on
+    /// its own.
+    #[test]
+    fn only_a_store_with_nothing_to_check_yet_stays_quiet() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // (case, expect `needs_attention`, expect `as_str`, expect `kind`)
+        //
+        // `kind` is asserted per cell, not just `as_str`. Review caught that
+        // the version without it — plus a separate test that checked one kind —
+        // was satisfied by an implementation returning the same `kind` for
+        // every fault, which is exactly what the `--json` contract must not do.
+        for (case, expect_loud, expect_status, expect_kind) in [
+            ("disabled", false, "unavailable", ""),
+            ("no-log-yet", false, "unavailable", ""),
+            ("never-written-no-key", false, "unavailable", ""),
+            // The two the first draft of this change left quiet, both measured
+            // on a release build before they were closed.
+            (
+                "log-deleted-after-writes",
+                true,
+                "inaccessible",
+                "log_missing",
+            ),
+            (
+                "key-deleted-after-writes",
+                true,
+                "inaccessible",
+                "active_key_missing",
+            ),
+            ("secret-symlink", true, "inaccessible", "secret_symlink"),
+            ("log-symlink", true, "inaccessible", "log_symlink"),
+            (
+                "rotation-interrupted",
+                true,
+                "inaccessible",
+                "rotation_interrupted",
+            ),
+            (
+                "secret-unreadable",
+                true,
+                "inaccessible",
+                "secret_unreadable",
+            ),
+        ] {
+            let dir = test_dir(&format!("chain-status-471-{case}"));
+            let logger = test_logger(&dir);
+            let secret_file = dir.join("audit-secret");
+            let log = dir.join("audit.jsonl");
+            // `never-written-no-key` must mean exactly that. The first draft
+            // appended first and then removed the key, called it
+            // "fresh-store-no-key", and pinned the resulting silence as
+            // correct — a fixture whose name disagreed with its contents,
+            // certifying the very hole review then found.
+            if !matches!(case, "no-log-yet" | "never-written-no-key") {
+                logger.append(make_event("seed")).unwrap();
+            }
+
+            match case {
+                "never-written-no-key" => fs::remove_file(&secret_file).unwrap(),
+                "log-deleted-after-writes" => fs::remove_file(&log).unwrap(),
+                "key-deleted-after-writes" => fs::remove_file(&secret_file).unwrap(),
+                "secret-symlink" => {
+                    let real = dir.join("real-secret");
+                    fs::rename(&secret_file, &real).unwrap();
+                    std::os::unix::fs::symlink(&real, &secret_file).unwrap();
+                }
+                "log-symlink" => {
+                    let real = dir.join("real-audit.jsonl");
+                    fs::rename(&log, &real).unwrap();
+                    std::os::unix::fs::symlink(&real, &log).unwrap();
+                }
+                "rotation-interrupted" => {
+                    // The store this leaves: retired keys present, nothing at
+                    // the active path. `rotate` has named it since #487's A/C
+                    // half; the verifier had not.
+                    fs::rename(&secret_file, dir.join("audit-secret.1.retired")).unwrap();
+                }
+                "secret-unreadable" => {
+                    fs::write(&secret_file, "not-hex").unwrap();
+                    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                _ => {}
+            }
+
+            let mut config = verify_config(&dir);
+            if case == "disabled" {
+                config.enabled = false;
+            }
+            let report = aggregate_report(&config, 30);
+
+            assert_eq!(
+                report.chain_status.as_str(),
+                expect_status,
+                "{case}: chain_status (got {:?})",
+                report.chain_status
+            );
+            assert_eq!(
+                report.chain_status.needs_attention(),
+                expect_loud,
+                "{case}: needs_attention"
+            );
+            if !expect_kind.is_empty() {
+                match &report.chain_status {
+                    report::ChainStatus::Inaccessible { kind, .. } => {
+                        assert_eq!(*kind, expect_kind, "{case}: kind")
+                    }
+                    other => panic!("{case}: expected Inaccessible, got {other:?}"),
+                }
+            }
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// `reason` carries the data directory and must not reach the serialized
+    /// form — the line this repo draws is "machine-readable output stays
+    /// path-free". The grid above pins the `kind`s; this pins what travels
+    /// beside them.
+    #[test]
+    fn an_inaccessible_reason_never_reaches_the_json() {
+        let dir = test_dir("chain-status-471-kinds");
+        let logger = test_logger(&dir);
+        logger.append(make_event("seed")).unwrap();
+        let real = dir.join("real-audit.jsonl");
+        fs::rename(dir.join("audit.jsonl"), &real).unwrap();
+        std::os::unix::fs::symlink(&real, dir.join("audit.jsonl")).unwrap();
+
+        let report = aggregate_report(&verify_config(&dir), 30);
+        match report.chain_status {
+            report::ChainStatus::Inaccessible { kind, ref reason } => {
+                assert_eq!(kind, "log_symlink");
+                assert!(
+                    reason.contains("possible attack"),
+                    "a symlinked log is an attack shape, not a generic I/O error — got: {reason}"
+                );
+                assert!(
+                    reason.contains(&dir.display().to_string()),
+                    "precondition: the reason really does embed the store path"
+                );
+            }
+            ref other => panic!("expected Inaccessible, got {other:?}"),
+        }
+        let json = serde_json::to_string(&report.chain_status).unwrap();
+        assert!(
+            !json.contains(&dir.display().to_string()),
+            "the serialized form must stay path-free — got: {json}"
+        );
+        assert!(
+            json.contains("log_symlink"),
+            "and must still carry the kind a consumer branches on — got: {json}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #471 item 3: the chain can be `intact` while the keyring is damaged, so
+    /// this travels beside `chain_status` rather than inside it — and it has to
+    /// travel, because `verify` printed it and the two surfaces an operator
+    /// watches habitually did not.
+    #[test]
+    fn a_damaged_retired_key_reaches_the_report_without_moving_chain_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("chain-status-471-keyring-warning");
+        let _ = test_logger(&dir); // creates audit-secret
+        // Retire that key and make it unreadable **before** anything is
+        // written, so the epoch the entries name is the *next* one. This is the
+        // issue's own scenario — a damaged retired key whose entries are
+        // already gone — and getting it wrong is instructive: filing the damage
+        // under `.1.retired` *after* seeding makes the seeded entry's own
+        // `key_id: "default"` resolve to it (index 1 is the epoch `"default"`
+        // names), so the chain legitimately reports `key_unavailable` and the
+        // fixture proves the opposite of what it set out to.
+        let retired = dir.join("audit-secret.1.retired");
+        fs::rename(dir.join("audit-secret"), &retired).unwrap();
+        fs::set_permissions(&retired, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let config = verify_config(&dir);
+        let writer = AuditLogger::from_config(&config).expect("audit is enabled");
+        writer.append(make_event("seed")).unwrap();
+
+        let report = aggregate_report(&config, 30);
+        let restored = fs::set_permissions(&retired, fs::Permissions::from_mode(0o600));
+
+        assert!(
+            !report.keyring_warnings.is_empty(),
+            "the damaged key must reach the report"
+        );
+        assert!(
+            report.keyring_warnings[0].contains("audit-secret.1.retired"),
+            "and must name the file — got: {:?}",
+            report.keyring_warnings
+        );
+        assert_eq!(
+            report.chain_status.as_str(),
+            "intact",
+            "the chain really is intact; saying otherwise would be its own false statement"
+        );
+
+        restored.unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #471: `status`'s judgement and the writer's must be the same judgement.
     ///
     /// Comparing `secret_available` against a second copy of the same condition
@@ -6788,10 +7003,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            named,
-            vec!["audit-secret.1.retired"],
-            "the FIFO must be reported as an unreadable key file, by name"
+        // #471: the full path, not the bare file name — `DirectoryUnreadable`
+        // already named the directory it failed on, and the two read side by
+        // side. Asserted as "absolute and ending in the name" rather than as a
+        // literal, so the fixture's own temp path does not have to be spelled
+        // out here.
+        assert_eq!(named.len(), 1, "exactly one unreadable key file");
+        assert!(
+            named[0].starts_with('/') && named[0].ends_with("/audit-secret.1.retired"),
+            "the FIFO must be reported as an unreadable key file, by full path — got: {named:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -6838,8 +7058,16 @@ mod tests {
             })
             .collect();
         reported.sort_unstable();
+        // #471: full paths now (see the FIFO fixture above for why). Reduced to
+        // file names here so the four-shape assertion stays readable — what it
+        // pins is that none is dropped, and the path form is pinned once, over
+        // there.
+        let names: Vec<&str> = reported
+            .iter()
+            .map(|p| p.rsplit('/').next().unwrap_or(p))
+            .collect();
         assert_eq!(
-            reported,
+            names,
             vec![
                 "audit-secret.1.retired",
                 "audit-secret.2.retired",
@@ -6848,6 +7076,10 @@ mod tests {
             ],
             "all four unusable shapes must be named, not silently dropped"
         );
+        assert!(
+            reported.iter().all(|p| p.starts_with('/')),
+            "and each must be named by full path — got: {reported:?}"
+        );
 
         // The symlink specifically must carry the attack wording, not the
         // generic file-type rejection.
@@ -6855,7 +7087,11 @@ mod tests {
             .anomalies()
             .iter()
             .find_map(|a| match a {
-                KeyringAnomaly::Unreadable { name, reason } if name == "audit-secret.4.retired" => {
+                // #471: `name` is a full path now, so this selector matches on
+                // the trailing component instead of the whole string.
+                KeyringAnomaly::Unreadable { name, reason }
+                    if name.ends_with("/audit-secret.4.retired") =>
+                {
                     Some(reason.as_str())
                 }
                 _ => None,
@@ -7422,18 +7658,27 @@ mod tests {
         std::os::unix::fs::symlink(&real_path, &logger.path).unwrap();
 
         let config = verify_config(&dir);
+        // #471: this arrived as `AuditError::Io` before, which
+        // `aggregate_report` mapped to `ChainStatus::Unavailable` — so the one
+        // state here that is evidence of an attack was also the one `doctor`
+        // said nothing about. The wording assertion is unchanged; what is new
+        // is that the variant carries a `kind`, and that `kind` is what stops
+        // this landing in the quiet bucket.
         match verify_chain(&config) {
-            Err(AuditError::Io(e)) => assert!(
-                // "possible attack", not "symlink": these fixtures use
-                // `test_dir` names containing the word "symlink", and the error
-                // embeds the path — so `contains("symlink")` passes regardless
-                // of what the error says. Found by same-class scan after Codex
-                // Round 1 flagged the same defect in
-                // `read_secret_rejects_symlink` (#457).
-                e.to_string().contains("possible attack"),
-                "expected the symlink/possible-attack error, got: {e}"
-            ),
-            Err(other) => panic!("expected Io error, got: {other}"),
+            Err(AuditError::StoreInaccessible { kind, reason }) => {
+                assert_eq!(kind, "log_symlink");
+                assert!(
+                    // "possible attack", not "symlink": these fixtures use
+                    // `test_dir` names containing the word "symlink", and the
+                    // error embeds the path — so `contains("symlink")` passes
+                    // regardless of what the error says. Found by same-class
+                    // scan after Codex Round 1 flagged the same defect in
+                    // `read_secret_rejects_symlink` (#457).
+                    reason.contains("possible attack"),
+                    "expected the symlink/possible-attack error, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected StoreInaccessible, got: {other}"),
             Ok(_) => panic!("expected error for symlink path"),
         }
         let _ = fs::remove_dir_all(&dir);
@@ -7590,7 +7835,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn verify_chain_secret_symlink_returns_io_error() {
+    fn verify_chain_secret_symlink_is_reported_as_inaccessible() {
         let dir = test_dir("verify-secret-symlink");
         let logger = test_logger(&dir);
         logger.append(make_event("ls")).unwrap();
@@ -7601,18 +7846,27 @@ mod tests {
         std::os::unix::fs::symlink(&real_secret, &secret_path).unwrap();
 
         let config = verify_config(&dir);
+        // #471: this arrived as `AuditError::Io` before, which
+        // `aggregate_report` mapped to `ChainStatus::Unavailable` — so the one
+        // state here that is evidence of an attack was also the one `doctor`
+        // said nothing about. The wording assertion is unchanged; what is new
+        // is that the variant carries a `kind`, and that `kind` is what stops
+        // this landing in the quiet bucket.
         match verify_chain(&config) {
-            Err(AuditError::Io(e)) => assert!(
-                // "possible attack", not "symlink": these fixtures use
-                // `test_dir` names containing the word "symlink", and the error
-                // embeds the path — so `contains("symlink")` passes regardless
-                // of what the error says. Found by same-class scan after Codex
-                // Round 1 flagged the same defect in
-                // `read_secret_rejects_symlink` (#457).
-                e.to_string().contains("possible attack"),
-                "expected the symlink/possible-attack error, got: {e}"
-            ),
-            Err(other) => panic!("expected Io error, got: {other}"),
+            Err(AuditError::StoreInaccessible { kind, reason }) => {
+                assert_eq!(kind, "secret_symlink");
+                assert!(
+                    // "possible attack", not "symlink": these fixtures use
+                    // `test_dir` names containing the word "symlink", and the
+                    // error embeds the path — so `contains("symlink")` passes
+                    // regardless of what the error says. Found by same-class
+                    // scan after Codex Round 1 flagged the same defect in
+                    // `read_secret_rejects_symlink` (#457).
+                    reason.contains("possible attack"),
+                    "expected the symlink/possible-attack error, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected StoreInaccessible, got: {other}"),
             Ok(_) => panic!("expected error for symlink secret"),
         }
         let _ = fs::remove_dir_all(&dir);

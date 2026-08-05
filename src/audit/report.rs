@@ -85,6 +85,30 @@ pub enum ChainStatus {
         /// The path-free classification, for machine consumers.
         kind: &'static str,
     },
+    /// #471/#487: the store could not be read, and not because there is
+    /// nothing in it yet.
+    ///
+    /// `Unavailable` used to absorb every failure that was not
+    /// `KeyringUnusable` — a symlink on `audit.jsonl`, an interrupted key
+    /// rotation, an unresolvable `HOME` — and `needs_attention()` treats
+    /// `Unavailable` as healthy, correctly, because it also means "auditing is
+    /// off" and "there is no log yet". The quiet reading was right for those
+    /// two and wrong for everything else that shared the bucket.
+    ///
+    /// One variant rather than one per condition: `kind` carries the
+    /// distinction, so a consumer branching on `chain_status` learns one new
+    /// value instead of seven. Same split as `KeyringUnusable` — `reason` is
+    /// human-facing and embeds the data directory's path, so it stays out of
+    /// the JSON; `kind` is what `--json` consumers branch on.
+    Inaccessible {
+        #[serde(skip_serializing)]
+        reason: String,
+        kind: &'static str,
+    },
+    /// **There is nothing to check yet**, and nothing else. Reached from
+    /// exactly two errors since #471: auditing is switched off, and a store
+    /// whose log or first key has not been written. Anything that means
+    /// omamori tried and could not is [`Self::Inaccessible`].
     Unavailable,
 }
 
@@ -101,6 +125,7 @@ impl ChainStatus {
             // which is why this is the first place the two could disagree.
             Self::KeyUnavailable { .. } => "key_unavailable",
             Self::KeyringUnusable { .. } => "keyring_unusable",
+            Self::Inaccessible { .. } => "inaccessible",
             Self::Unavailable => "unavailable",
         }
     }
@@ -124,7 +149,8 @@ impl ChainStatus {
             | Self::Truncated
             | Self::Unverifiable { .. }
             | Self::KeyUnavailable { .. }
-            | Self::KeyringUnusable { .. } => true,
+            | Self::KeyringUnusable { .. }
+            | Self::Inaccessible { .. } => true,
         }
     }
 }
@@ -134,7 +160,14 @@ impl ChainStatus {
 /// JSON output has 8 fields per SEC-R2:
 /// period_days, actual_window_days, total_blocks, by_layer, by_provider,
 /// by_rule, chain_status, unknown_tool_fail_opens
+/// #471: `#[non_exhaustive]`, matching `VerifyResult`, `ChainStatus`,
+/// `AuditError`, `RotationResult` and (in the PR before this one)
+/// `AuditSummary`. This change adds a field, and a `pub` struct with `pub`
+/// fields cannot gain one without breaking every struct literal outside the
+/// crate. Zero known reverse dependencies on crates.io, re-measured for this
+/// change rather than inherited from the earlier ones.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ReportAggregate {
     pub period_days: u32,
     pub actual_window_days: u32,
@@ -151,6 +184,18 @@ pub struct ReportAggregate {
     /// below instead of re-reading the HWM file a second time.
     #[serde(skip)]
     pub hwm_tampered: bool,
+    /// #471 item 3: non-fatal keyring problems `verify_chain` reports and
+    /// nothing else used to read — a truncated ring, or a file shaped like a
+    /// retired key that could not be read. Verification still ran, so
+    /// `chain_status` may well be `Intact`; what is incomplete is the coverage,
+    /// and a shorter key set that verifies fewer entries looks identical to a
+    /// complete one unless it is said out loud.
+    ///
+    /// Not part of the JSON output (SEC-R2: exactly 8 fields), same as
+    /// `hwm_tampered` — and for a second reason here, since these strings carry
+    /// paths.
+    #[serde(skip)]
+    pub keyring_warnings: Vec<String>,
 }
 
 impl Default for ReportAggregate {
@@ -165,7 +210,54 @@ impl Default for ReportAggregate {
             chain_status: ChainStatus::Unavailable,
             unknown_tool_fail_opens: 0,
             hwm_tampered: false,
+            keyring_warnings: Vec::new(),
         }
+    }
+}
+
+/// How a `verify_chain` failure becomes a `ChainStatus`.
+///
+/// #471/#487: extracted so the mapping can be *tested*. The version inlined in
+/// `aggregate_report` could not be: every arm but the two quiet ones needs a
+/// store in a specific broken state to reach through `verify_chain`, and the
+/// catch-all needs a variant `verify_chain` no longer produces at all. A
+/// falsification probe that reverted the catch-all to `Unavailable` took down
+/// no test — the thesis of this change was the one part of it nothing measured.
+///
+/// **The catch-all is inverted.** It used to be `Err(_) => Unavailable`, so
+/// every failure this function did not name was reported as healthy — the
+/// default for a security tool pointing the wrong way. Only the two errors that
+/// genuinely mean "there is nothing to check yet" stay quiet, and they are
+/// named; anything else, including a variant added later, is loud.
+fn chain_status_for_error(e: AuditError) -> ChainStatus {
+    match e {
+        // Quiet, and the only two: a log that has not been written, and a store
+        // whose first key has not been minted.
+        AuditError::FileNotFound | AuditError::SecretUnavailable => ChainStatus::Unavailable,
+        AuditError::StoreInaccessible { kind, reason } => {
+            ChainStatus::Inaccessible { reason, kind }
+        }
+        // #457: an unusable keyring is not the same as "no audit log" —
+        // mapping it to `Unavailable` would hide it from doctor's risk signals.
+        AuditError::KeyringUnusable { reason, .. } => ChainStatus::KeyringUnusable {
+            reason,
+            // Still one kind, but no longer one producer: #477 added
+            // `rotate_key`, which returns the raw scan reason rather than a
+            // `KeyringAnomaly`. It does not reach here — `aggregate_report`
+            // maps only `verify_chain`'s result — and both producers describe
+            // the same condition, so a second kind would split a distinction
+            // `--json` consumers cannot act on. Said out loud because this
+            // field exists to be stable, and "one producer" was the reason
+            // given for it being safe.
+            kind: "directory_unreadable",
+        },
+        // `unclassified`, not `io`: this arm exists for variants that do not
+        // exist yet, and naming them after one cause would tell a `--json`
+        // consumer something specific and wrong (review).
+        other => ChainStatus::Inaccessible {
+            reason: other.to_string(),
+            kind: "unclassified",
+        },
     }
 }
 
@@ -196,9 +288,11 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
     let path = resolved_audit_path(config);
 
     // Chain status via existing verify_chain (SEC-R11: shared reader)
+    let mut keyring_warnings = Vec::new();
     result.chain_status = match verify_chain(config) {
         Ok(verify_result) => {
             result.hwm_tampered = verify_result.hwm_tampered;
+            keyring_warnings = verify_result.keyring_warnings.clone();
             // #470: `Truncated` is checked *above* the two halted states, not
             // below them. It used to sit last, which was invisible while
             // `verify_chain` suppressed the comparison during a halt — the two
@@ -232,22 +326,19 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
                 ChainStatus::Intact
             }
         }
-        // #457: an unusable keyring is not the same as "no audit log" —
-        // mapping it to `Unavailable` would hide it from doctor's risk signals.
-        Err(AuditError::KeyringUnusable { reason, .. }) => ChainStatus::KeyringUnusable {
-            reason,
-            // Still one kind, but no longer one producer: #477 added
-            // `rotate_key`, which returns the raw scan reason rather than a
-            // `KeyringAnomaly`. It does not reach here — `aggregate_report`
-            // maps only `verify_chain`'s result — and both producers describe
-            // the same condition, so a second kind would split a distinction
-            // `--json` consumers cannot act on. Said out loud because this
-            // field exists to be stable, and "one producer" was the reason
-            // given for it being safe.
-            kind: "directory_unreadable",
-        },
-        Err(_) => ChainStatus::Unavailable,
+        Err(e) => chain_status_for_error(e),
     };
+    // #471 item 3: `keyring_warnings` was built by `verify_chain` and read by
+    // nobody. On a store where one retired key is unreadable but the entries it
+    // signed are already pruned, `verify` printed a warning while `doctor` said
+    // `quiet` and `report` said `intact` — and the two surfaces an operator
+    // watches habitually are the ones that stayed silent. A damaged key file is
+    // most useful to know about *before* it is needed.
+    //
+    // `chain_status` is deliberately left alone: the chain really is intact
+    // there, and saying otherwise would be its own false statement. This
+    // travels beside it, the way `hwm_tampered` already does.
+    result.keyring_warnings = keyring_warnings;
 
     // Retention caveat: actual window may be smaller than requested
     if config.retention_days > 0 && config.retention_days < days {
@@ -399,6 +490,51 @@ mod tests {
         assert_eq!(classify_layer(Some("layer2evil")), "layer2evil");
         assert_eq!(classify_layer(Some("layer2/")), "layer2/");
         assert_eq!(classify_layer(Some("layer3")), "layer3");
+    }
+
+    /// #471/#487: the inversion itself, which nothing else measures.
+    ///
+    /// Every loud state reachable through `verify_chain` needs a store broken a
+    /// particular way, so the fixtures covering them all land on named arms.
+    /// The catch-all is reached only by a variant `verify_chain` does not
+    /// produce — and a falsification probe that reverted it to `Unavailable`
+    /// took no test down. Feeding the mapping directly is what makes the
+    /// default checkable.
+    #[test]
+    fn every_failure_but_the_two_quiet_ones_needs_attention() {
+        // Quiet, and exhaustively so: nothing has been written yet.
+        for quiet in [AuditError::FileNotFound, AuditError::SecretUnavailable] {
+            let status = chain_status_for_error(quiet);
+            assert_eq!(status, ChainStatus::Unavailable);
+            assert!(!status.needs_attention(), "got {status:?}");
+        }
+
+        // Loud, including the two the catch-all exists for.
+        // `RotationInterrupted` is produced by `rotate_key` today and `Io` by
+        // nothing in `verify_chain` since this change — which is the point: the
+        // default a future failure inherits has to be the loud one.
+        for loud in [
+            AuditError::StoreInaccessible {
+                kind: "log_symlink",
+                reason: "symlink (possible attack)".to_string(),
+            },
+            AuditError::KeyringUnusable {
+                reason: "cannot list".to_string(),
+                remedy: String::new(),
+            },
+            AuditError::RotationInterrupted {
+                retired_path: std::path::PathBuf::from("/tmp/audit-secret.1.retired"),
+                source: std::io::Error::other("no space"),
+            },
+            AuditError::Io(std::io::Error::other("read failed")),
+        ] {
+            let status = chain_status_for_error(loud);
+            assert!(
+                status.needs_attention(),
+                "a failure that is not one of the two quiet ones must reach the operator — \
+                 got {status:?}"
+            );
+        }
     }
 
     #[test]
@@ -810,6 +946,20 @@ mod tests {
         let report = crate::test_support::with_home(Some(""), || aggregate_report(&config, 7));
 
         assert_eq!(report.total_blocks, 0, "no path to read events from");
-        assert_eq!(report.chain_status, ChainStatus::Unavailable);
+        // #471: this used to assert `Unavailable`, i.e. quiet. An audit path
+        // that cannot be resolved is a configuration fault — `status` has
+        // always reported it as one — and it shared a variant with "there is no
+        // log yet", so the louder of the two inherited the quieter one's
+        // verdict. "Degrades gracefully" means it does not panic and reports
+        // zero blocks, which the assertion above still pins; it does not mean
+        // the operator hears nothing.
+        assert_eq!(
+            report.chain_status,
+            ChainStatus::Inaccessible {
+                reason: "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
+                kind: "path_unresolved",
+            }
+        );
+        assert!(report.chain_status.needs_attention());
     }
 }

@@ -116,6 +116,17 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
     // Chain integrity (always shown; verbose adds seq detail)
     match &report.chain_status {
         ChainStatus::Intact => println!("  Audit log: intact"),
+        // #471/#487: `reason` carries the data directory's path, so it is
+        // printed only under `--verbose`, matching how the sibling arms treat
+        // their own internals. The short form names `kind`, which is the same
+        // value `--json` consumers branch on.
+        ChainStatus::Inaccessible { reason, kind } => {
+            if verbose {
+                println!("  Audit log: cannot be read ({kind}) — {reason}");
+            } else {
+                println!("  Audit log: cannot be read ({kind})");
+            }
+        }
         ChainStatus::Broken { at_seq } => {
             if verbose {
                 println!("  Audit log: broken at seq {at_seq}");
@@ -157,12 +168,21 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
         ChainStatus::Unavailable => println!("  Audit log: unavailable"),
     }
 
+    // #471 item 3: `doctor` is not the only surface an operator watches, and
+    // the comment in `aggregate_report` that motivated this said so — "the two
+    // surfaces". Review caught that only one of them got the line, leaving
+    // `report` printing `Audit log: intact` beside a damaged key. The chain
+    // status is untouched, because it is genuinely intact.
+    for warning in &report.keyring_warnings {
+        println!("  {warning}");
+    }
+
     // Follow-ups
     let mut follow_ups = Vec::new();
     if report.unknown_tool_fail_opens > 0 {
         follow_ups.push("review unknown tools: omamori audit unknown");
     }
-    if report.chain_status.needs_attention() {
+    if report.chain_status.needs_attention() || !report.keyring_warnings.is_empty() {
         follow_ups.push("verify chain: omamori audit verify");
     }
     if !follow_ups.is_empty() {
@@ -239,6 +259,10 @@ mod tests {
             chain_status: ChainStatus::Intact,
             unknown_tool_fail_opens: 1,
             hwm_tampered: false,
+            // #471: non-empty on purpose. This test counts the JSON fields
+            // (SEC-R2: exactly 8), and a field that is `skip`ped only while it
+            // happens to be empty would pass here and leak in production.
+            keyring_warnings: vec!["audit keyring: cannot read /tmp/k (denied)".to_string()],
         };
         let json: serde_json::Value = serde_json::to_value(&report).unwrap();
         let obj = json.as_object().unwrap();

@@ -386,6 +386,18 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
             eprintln!("omamori audit verify: cannot verify \u{2014} {e}");
             Ok(2)
         }
+        // #471/#487: the states `aggregate_report` used to file under
+        // "nothing to check yet". The exit code does not move — cannot-verify
+        // was always the right verdict for `verify`, and still is — but the
+        // reason is now specific, and the same classification is what makes
+        // `doctor` and `report --json` stop calling these healthy.
+        //
+        // `kind` is not printed: it exists for machine consumers, and an
+        // operator reading stderr has the sentence.
+        Err(audit::AuditError::StoreInaccessible { reason, .. }) => {
+            eprintln!("omamori audit verify: cannot verify \u{2014} {reason}");
+            Ok(2)
+        }
         // No catch-all: `#[non_exhaustive]` constrains other crates, not this
         // one, so the compiler still requires every variant here — which is
         // what should happen. A new failure mode deserves its own wording, not

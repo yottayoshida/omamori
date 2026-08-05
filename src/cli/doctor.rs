@@ -292,7 +292,17 @@ fn print_risk_signals_section(ai_env: bool) {
             Some(false) | None
         );
 
-    if !has_blocks && !has_unknown && !chain_broken && !report.hwm_tampered && !audit_unwritable {
+    // #471 item 3: `keyring_warnings` belongs in this condition as well as in
+    // the printing below. Adding a signal to one and not the other is how a
+    // section prints its header and then nothing — or, here, the mirror of it:
+    // returns `quiet` and never reaches the line that had something to say.
+    if !has_blocks
+        && !has_unknown
+        && !chain_broken
+        && !report.hwm_tampered
+        && report.keyring_warnings.is_empty()
+        && !audit_unwritable
+    {
         println!("  [Risk signals] Last 30 days: quiet");
         return;
     }
@@ -379,6 +389,17 @@ fn print_risk_signals_section(ai_env: bool) {
                 println!("    chain: cannot verify — {reason} Run omamori audit verify.");
             }
         }
+        // #471/#487: the states that used to land in `Unavailable` and so
+        // printed nothing at all. `kind` is the classification, not a path —
+        // `reason` embeds the data directory and stays out of this line, like
+        // the `KeyringUnusable` arm above delegates rather than inlining.
+        ChainStatus::Inaccessible { kind, .. } => {
+            if ai_env {
+                println!("    chain: cannot be read ({kind})");
+            } else {
+                println!("    chain: cannot be read ({kind}) — run omamori audit verify");
+            }
+        }
         // Listed rather than caught by `_`. `needs_attention()` is exhaustive
         // and its doc comment claims that makes a silently-healthy new variant
         // impossible — but a `_` here reopens exactly that: the author sets
@@ -394,6 +415,30 @@ fn print_risk_signals_section(ai_env: bool) {
             println!(
                 "    audit high-water-mark: unreadable or tampered — run omamori audit verify"
             );
+        }
+    }
+    // #471 item 3: `verify` has printed these since #457 and no habitually
+    // watched surface repeated them. The chain can be `intact` while this
+    // fires — a damaged retired key whose entries are already pruned verifies
+    // fine — which is why it sits beside `chain_status` rather than inside it,
+    // the same shape `hwm_tampered` above already has.
+    //
+    // Counted, not enumerated, for AI sessions: the strings carry the data
+    // directory's path, and this section is reachable from one.
+    if !report.keyring_warnings.is_empty() {
+        if ai_env {
+            println!(
+                "    audit keyring: {} problem(s) — coverage is incomplete",
+                report.keyring_warnings.len()
+            );
+        } else {
+            for warning in &report.keyring_warnings {
+                // No prefix of our own: `KeyringAnomaly::describe()` already
+                // opens with "audit keyring: ", so adding one printed it twice
+                // (review). `verify` prints these under `omamori warning: `,
+                // which does not collide.
+                println!("    {warning}");
+            }
         }
     }
     if audit_unwritable {
