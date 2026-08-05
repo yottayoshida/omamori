@@ -225,14 +225,27 @@ impl VerifyResult {
     /// #457 (`/simplify`, three reviewers converged): the two terminal states
     /// were spelled out longhand in both places that gate on them — the read
     /// loop and the high-water-mark check. A third state would have to be
-    /// added to both, and neither is compiler-checked. The HWM gate is the
-    /// expensive one to miss: writing the mark from a run that stopped early
+    /// added to both, and neither is compiler-checked. The HWM *write* is the
+    /// expensive one to miss: recording the mark from a run that stopped early
     /// silently lowers it, which disables tail-truncation detection from then
     /// on, with no error and no failing test.
     ///
     /// `broken_at` is deliberately *not* included. A broken chain `break`s out
     /// of the loop entirely, and it must still reach the HWM check.
-    fn halted(&self) -> bool {
+    ///
+    /// #470: `pub(crate)`, because the three surfaces that render a verdict —
+    /// the `audit verify` exit branch, `aggregate_report`, and `doctor` through
+    /// it — have to distinguish "halted" from "halted *and* the tail is short",
+    /// and the alternative was each of them re-spelling
+    /// `unknown_version_at.is_some() || key_unavailable_at.is_some()`, which is
+    /// the duplication this method exists to have removed. Crate-visible rather
+    /// than `pub`: every caller is in this crate, and widening the library API
+    /// for them would also put a `halted` method in scope for any consumer
+    /// holding a `VerifyResult`, changing method resolution for one of their
+    /// own traits (Codex R1, P2). Also note what it no longer means: halting
+    /// stops *authentication*, not every check. The high-water-mark comparison
+    /// runs regardless.
+    pub(crate) fn halted(&self) -> bool {
         self.unknown_version_at.is_some() || self.key_unavailable_at.is_some()
     }
 }
@@ -297,10 +310,32 @@ pub struct AuditSummary {
 /// stop?", and each `mark_*` function owns the transition into one of them —
 /// including `unverified_entries_after = 1`, which is what makes the count
 /// mean "this entry plus everything after it".
-fn mark_unverifiable_tail(result: &mut VerifyResult, seq: u64, chain_version: u32) {
-    result.unknown_version_at = Some(seq);
+/// #470 adds `structural_end` and `stated_seq` for the same reason `mark_*`
+/// owns `unverified_entries_after`: the high-water-mark comparison now needs an
+/// end for the *file*, the halting line is part of it, and a third terminal
+/// state must not be able to forget that by construction.
+///
+/// **`stated_seq` is not `seq`.** `seq` carries a fallback — the position this
+/// entry should have occupied — for a line that does not state one. That
+/// fallback is one past the last verified entry, so using it as the file's end
+/// compares the mark against the halt point rather than against the file, and
+/// reports truncation on a log nothing was removed from. Exactly the "compare
+/// against a false end" failure the old `!halted()` gate existed to prevent,
+/// re-entering by a different door (Codex R1, P1). Only a stated `seq` counts;
+/// when nothing at or after the halt states one, the comparison is skipped.
+fn mark_unverifiable_tail(
+    result: &mut VerifyResult,
+    structural_end: &mut Option<u64>,
+    stated_seq: Option<u64>,
+    reported_position: u64,
+    chain_version: u32,
+) {
+    result.unknown_version_at = Some(stated_seq.unwrap_or(reported_position));
     result.unknown_chain_version = Some(chain_version);
     result.unverified_entries_after = 1;
+    if stated_seq.is_some() {
+        *structural_end = stated_seq;
+    }
 }
 
 /// The other terminal state (#457): an entry names a key the keyring does not
@@ -311,14 +346,20 @@ fn mark_unverifiable_tail(result: &mut VerifyResult, seq: u64, chain_version: u3
 /// the transition was open-coded.
 fn mark_key_unavailable_tail(
     result: &mut VerifyResult,
-    seq: u64,
+    structural_end: &mut Option<u64>,
+    stated_seq: Option<u64>,
+    reported_position: u64,
     key_id: &str,
     highest_known_epoch: u32,
 ) {
-    result.key_unavailable_at = Some(seq);
+    result.key_unavailable_at = Some(stated_seq.unwrap_or(reported_position));
     result.key_unavailable_id = Some(key_id.to_string());
     result.key_unavailable_kind = Some(classify_unavailable_key(key_id, highest_known_epoch));
     result.unverified_entries_after = 1;
+    // See `mark_unverifiable_tail` for why only a stated `seq` may count.
+    if stated_seq.is_some() {
+        *structural_end = stated_seq;
+    }
 }
 
 /// Decide what can honestly be said about an unresolvable `key_id`.
@@ -379,6 +420,17 @@ fn epoch_of(key_id: &str) -> Option<u32> {
 #[derive(serde::Deserialize)]
 struct ChainVersionSeqPeek {
     chain_version: Option<u32>,
+    seq: Option<u64>,
+}
+
+/// #470: `seq` alone, for lines past a halt, where nothing else about them is
+/// being decided. Sharing `ChainVersionSeqPeek` here would have thrown away a
+/// perfectly readable `seq` whenever the same line's `chain_version` had the
+/// wrong JSON type — that peek fails as a whole in that case, by design, and
+/// after a halt that would leave the file's end stuck at the halting line and
+/// report truncation on a log nothing was removed from (Codex R1, P2).
+#[derive(serde::Deserialize)]
+struct SeqPeek {
     seq: Option<u64>,
 }
 
@@ -477,6 +529,12 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // verifying an entry numbered `u64::MAX` — one short, which reads as tail
     // truncation against a mark that is correct.
     let mut last_verified_seq: Option<u64> = None;
+    // #470: the last seq *stated* by a line at or after the one verification
+    // halted on — that line included, written by `mark_*`. Unauthenticated by
+    // construction, which is the point. `None` means no such line stated one,
+    // and no end can be named. See the high-water-mark block after the loop for
+    // what it is and is not allowed to decide.
+    let mut last_structural_seq: Option<u64> = None;
     // #457 A4: the prune-bind was written with the key active at prune time,
     // so it has to be recomputed with *that* key — not with the key of the
     // first retained entry, which belongs to whatever epoch that entry was
@@ -499,6 +557,31 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         // same meaning — from here on, entries are tallied, not trusted.
         if result.halted() {
             result.unverified_entries_after += 1;
+            // #470: the high-water-mark comparison after the loop needs an end
+            // for the *file*, and `last_verified_seq` stopped advancing at the
+            // halt. Take what these lines state, unauthenticated, because that
+            // comparison needs no key — an attacker who halts verification by
+            // editing one `key_id` must not thereby also get the tail deleted
+            // unreported.
+            //
+            // A typed peek, like the torn-line path's: it names one field, so
+            // serde skips the rest of a hostile line without materializing it
+            // (the measured amplification a `serde_json::Value` peek would cost
+            // is spelled out at that call site). A line that states no seq —
+            // torn, legacy-shaped, or a future format that renamed the field —
+            // simply does not move the end.
+            //
+            // **The last stated seq, not the largest.** A max lets one planted
+            // line anywhere in the remainder stand in for the file's end, so
+            // hiding a deletion would cost an insertion in the middle rather
+            // than a rewrite of the surviving tail. Taking the last one keeps
+            // the claim the docs make: the attacker has to renumber the line
+            // the file actually ends on (Codex R1, P1).
+            if let Ok(peek) = serde_json::from_str::<SeqPeek>(trimmed)
+                && peek.seq.is_some()
+            {
+                last_structural_seq = peek.seq;
+            }
             continue;
         }
 
@@ -542,8 +625,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                     && let Some(chain_version) = peek.chain_version
                     && !is_supported_chain_version(chain_version)
                 {
-                    let seq = peek.seq.unwrap_or(reported_position);
-                    mark_unverifiable_tail(&mut result, seq, chain_version);
+                    mark_unverifiable_tail(
+                        &mut result,
+                        &mut last_structural_seq,
+                        peek.seq,
+                        reported_position,
+                        chain_version,
+                    );
                     continue;
                 }
                 result.torn_lines += 1;
@@ -589,8 +677,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         if let Some(version) = event.chain_version
             && !is_supported_chain_version(version)
         {
-            let reported_seq = event.seq.unwrap_or(reported_position);
-            mark_unverifiable_tail(&mut result, reported_seq, version);
+            mark_unverifiable_tail(
+                &mut result,
+                &mut last_structural_seq,
+                event.seq,
+                reported_position,
+                version,
+            );
             continue;
         }
 
@@ -607,7 +700,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // whose authenticity is unknown.
             mark_key_unavailable_tail(
                 &mut result,
-                event.seq.unwrap_or(reported_position),
+                &mut last_structural_seq,
+                event.seq,
+                reported_position,
                 entry_key_id,
                 keyring.highest_known_epoch(),
             );
@@ -632,8 +727,13 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // misleading "at entry #0" report for an unrecognized-
                 // version entry appearing deep in an otherwise-verified
                 // chain.
-                let reported_seq = event.seq.unwrap_or(reported_position);
-                mark_unverifiable_tail(&mut result, reported_seq, v);
+                mark_unverifiable_tail(
+                    &mut result,
+                    &mut last_structural_seq,
+                    event.seq,
+                    reported_position,
+                    v,
+                );
                 continue;
             }
             RecomputedHash::Legacy => {
@@ -747,38 +847,93 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         }
     }
 
-    // HWM check: detect tail truncation. Requires having actually reached
-    // EOF (#177 B1 step 2) — an early stop on unknown_version_at means
-    // expected_seq stopped advancing before the real end of file, so
-    // writing/comparing the HWM here would compare against a false "end"
-    // and could silently lower the high-water-mark on a later re-verify.
+    // HWM check: detect tail truncation.
+    //
+    // #470: this whole block used to be gated on `!halted()` as well. The
+    // reason behind that gate is real and still holds for half of it — a run
+    // that stopped early cannot say where the chain ends, so writing the mark
+    // from it silently lowers it and disables truncation detection from then
+    // on, with no error and no failing test. But the gate applied that reason
+    // to the *comparison* too, and the comparison needs no key. That made a
+    // two-step attack free: edit one entry's `key_id` so verification halts,
+    // then delete as much of the tail as you like. Measured on a release build
+    // before this change — exit 2, "cannot verify from entry #1", and not one
+    // word about the removal; deleting the same lines without the halt
+    // reported exit 3.
+    //
+    // The two halves are now split by what each can honestly use:
+    //
+    // * The **comparison** uses the last `seq` *stated* by a line at or after
+    //   the halt — the halting line itself, then anything past it. It is not
+    //   authenticated, so an attacker who renumbers the line the file ends on
+    //   can still hide the removal; that is strictly narrower than before,
+    //   where changing one character was enough.
+    // * The **write** still comes from `last_verified_seq`, and still only
+    //   when nothing halted. #177 B1's judgement there is unchanged: an
+    //   unauthenticated end must never become the mark, because the mark is
+    //   what every later run compares against.
+    //
+    // When nothing at or after the halt states a `seq` — a future format that
+    // renamed the field, say — there is no end to compare and the comparison
+    // is skipped, exactly as before. Substituting `last_verified_seq` there
+    // would compare the mark against the halt point instead of the file, which
+    // is the "compare against a false end" failure the old gate prevented.
+    //
+    // `broken_at` keeps its own gate: it `break`s out of the loop, so any end
+    // taken here would sit at the break rather than at the end of file, and
+    // exit 1 is already the strongest thing this command can say.
+    //
     // #456: the mark comes from the last seq actually verified, not from
-    // `expected_seq - 1`. `chain_entries > 0` and `last_verified_seq.is_some()`
-    // are the same condition — both are set in the one block that completes an
-    // entry's verification — so binding it here replaces the counter check
-    // rather than adding to it, and there is no arithmetic left to get wrong at
-    // the top of the range.
+    // `expected_seq - 1`. That derivation needed a `saturating_sub` to be safe
+    // and reported `u64::MAX - 1` after verifying an entry numbered
+    // `u64::MAX` — one short, which reads as tail truncation against a mark
+    // that is correct.
+    let structural_end = if result.halted() {
+        last_structural_seq
+    } else {
+        last_verified_seq
+    };
     if result.broken_at.is_none()
-        && !result.halted()
-        && let Some(max_verified_seq) = last_verified_seq
+        && let Some(structural_end) = structural_end
     {
         let hwm_file = hwm_path_for(&path);
+        // The only end this run is entitled to record. `None` while halted,
+        // and `None` when nothing verified — both mean "do not touch the
+        // mark", which is why the two arms below check it rather than the
+        // counter.
+        let writable_end = if result.halted() {
+            None
+        } else {
+            last_verified_seq
+        };
         match read_hwm(&hwm_file) {
-            HwmState::Valid(hwm) if max_verified_seq < hwm => {
+            HwmState::Valid(hwm) if structural_end < hwm => {
                 result.tail_truncated = true;
             }
             HwmState::Valid(_) => {}
             HwmState::Missing => {
                 // Bootstrap: first verify on a chain without HWM
                 result.hwm_missing = true;
-                let _ = write_hwm(&hwm_file, max_verified_seq);
+                if let Some(end) = writable_end {
+                    let _ = write_hwm(&hwm_file, end);
+                }
             }
             HwmState::Tampered => {
                 // The HWM itself is unreadable or symlinked — this is tamper
                 // evidence, not a fresh install. Surface it distinctly instead
                 // of silently re-bootstrapping as if nothing happened.
+                //
+                // #470: reported during a halt too. That the sidecar is
+                // unreadable is a fact about the sidecar, true or false
+                // independently of whether the log could be authenticated, and
+                // suppressing it handed an attacker a second thing one edited
+                // `key_id` bought for free. Only the re-bootstrap is withheld —
+                // so the operator-facing message must not claim the mark was
+                // reset when it was not.
                 result.hwm_tampered = true;
-                let _ = write_hwm(&hwm_file, max_verified_seq);
+                if let Some(end) = writable_end {
+                    let _ = write_hwm(&hwm_file, end);
+                }
             }
         }
     }

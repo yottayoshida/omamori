@@ -63,6 +63,47 @@ fn format_verify_success_message(result: &audit::VerifyResult) -> String {
     msg
 }
 
+/// What the high-water-mark machinery did while verification was stopped —
+/// printed by both halted arms, after each has explained its own reason.
+///
+/// #470: this replaces the line both arms used to end on, "Tail-truncation
+/// detection is suspended while this entry is present." Suspension was never a
+/// design goal; it fell out of one gate covering both the comparison and the
+/// write, and saying it out loud told an attacker exactly what one edited field
+/// bought. The comparison now runs, so each arm below states what actually
+/// happened rather than a policy that no longer exists.
+///
+/// The three cases are the three `HwmState`s, which are mutually exclusive:
+/// truncation is only reachable from `Valid` (and is handled by its own exit
+/// arm before either caller runs), so a run that gets here with neither flag
+/// set is one that compared and found the chain long enough.
+fn print_halted_hwm_notes(result: &audit::VerifyResult) {
+    if result.hwm_tampered {
+        eprintln!(
+            "  WARNING: the high-water-mark file is unreadable or has been tampered with \
+             (expected a plain integer, found a symlink or invalid content), so no \
+             tail-truncation check was possible."
+        );
+        eprintln!(
+            "  It has not been reset: this run could not authenticate the end of the \
+             chain, so it has no value it is entitled to write there. Treat this as a \
+             possible attempt to defeat tail-truncation detection."
+        );
+    } else if result.hwm_missing {
+        eprintln!(
+            "  Note: there is no high-water-mark file to compare against, and this run \
+             did not create one — it could not authenticate the end of the chain. \
+             Tail-truncation detection begins once a run verifies the log end to end."
+        );
+    } else {
+        eprintln!(
+            "  The tail-truncation check needs no key, so it did still run, and the chain \
+             does reach the high-water-mark. Note that the end it compared is what the \
+             remaining lines claim, not something this run could authenticate."
+        );
+    }
+}
+
 fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
     let config_path = parse_config_flag(&args[3..])?;
     let load_result = load_config(config_path.as_deref())?;
@@ -98,6 +139,65 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     eprintln!("  Inspect: omamori audit show --last 10 --json");
                 }
                 Ok(1)
+            } else if result.tail_truncated {
+                // #470: hoisted above the two halted arms. The comparison that
+                // sets `tail_truncated` needs no key, so it now runs during a
+                // halt — and provoking a halt was precisely how an attacker got
+                // a removed tail reported as exit 2 instead of exit 3. Fixing
+                // the check while leaving this arm underneath the halted ones
+                // would have kept that substitution working.
+                //
+                // A log that did not halt reaches this arm exactly as it did
+                // before, and prints exactly what it printed: `unknown_version_at`
+                // and `key_unavailable_at` are both `None` there, so this was
+                // already the next arm reached.
+                if result.halted() {
+                    // Deliberately not `format_verify_success_message`: that
+                    // sentence ends "chain intact.", which is the one thing a
+                    // run in this state cannot say. Printing it and then
+                    // contradicting it two lines later is how the operator
+                    // ends up believing the reassuring half.
+                    eprintln!(
+                        "omamori audit verify: audit log tail may have been truncated \
+                         (chain ends before high-water-mark)."
+                    );
+                    if let (Some(seq), Some(chain_version)) =
+                        (result.unknown_version_at, result.unknown_chain_version)
+                    {
+                        eprintln!(
+                            "  Verification also stopped at entry #{seq}, which declares \
+                             chain_version {chain_version} — unrecognized by this build."
+                        );
+                    } else if let (Some(seq), Some(key_id)) = (
+                        result.key_unavailable_at,
+                        result.key_unavailable_id.as_deref(),
+                    ) {
+                        eprintln!(
+                            "  Verification also stopped at entry #{seq}, which names key \
+                             \"{key_id}\" — not in the keyring."
+                        );
+                    }
+                    eprintln!(
+                        "  {} entries verified before that point; unable to verify {} \
+                         entries at or after it.",
+                        result.chain_entries, result.unverified_entries_after
+                    );
+                    eprintln!(
+                        "  Editing a single field is enough to stop verification, and the \
+                         chain end this warning compared against is what the remaining \
+                         lines claim rather than anything authenticated. Two findings on \
+                         one log is not a coincidence to explain away — treat it as \
+                         possible tampering."
+                    );
+                } else {
+                    println!("{}", format_verify_success_message(&result));
+                    eprintln!(
+                        "  WARNING: audit log tail may have been truncated \
+                         (chain ends before high-water-mark)."
+                    );
+                }
+                eprintln!("  Inspect: omamori audit show --last 20");
+                Ok(3)
             } else if let (Some(seq), Some(chain_version)) =
                 (result.unknown_version_at, result.unknown_chain_version)
             {
@@ -116,9 +216,9 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 );
                 eprintln!(
                     "  If you are already running the latest omamori, an unrecognized \
-                     chain_version is unexpected — treat this as possible tampering. \
-                     Tail-truncation detection is suspended while this entry is present."
+                     chain_version is unexpected — treat this as possible tampering."
                 );
+                print_halted_hwm_notes(&result);
                 Ok(4)
             } else if let (Some(seq), Some(key_id)) = (
                 result.key_unavailable_at,
@@ -210,10 +310,10 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     }
                     None => {}
                 }
-                // Parity with the exit-4 branch, which suppresses the same
-                // check for the same reason and says so. Omitting it here made
-                // exit 2 the quieter of the two states to arrive at.
-                eprintln!("  Tail-truncation detection is suspended while this entry is present.");
+                // Parity with the exit-4 branch, which reaches the same state
+                // for a different reason and prints the same notes. Omitting
+                // this made exit 2 the quieter of the two states to arrive at.
+                print_halted_hwm_notes(&result);
                 Ok(2)
             } else if result.chain_entries == 0 && result.legacy_entries > 0 {
                 eprintln!(
@@ -225,15 +325,13 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 println!("omamori audit verify: no entries to verify.");
                 Ok(0)
             } else {
+                // #470: the `tail_truncated` block that used to open this arm
+                // moved up, above the halted arms — it is unreachable from
+                // here now. `hwm_tampered` and `hwm_missing` stay: they are
+                // reached from `HwmState`s that cannot also produce truncation,
+                // and a run arriving here authenticated the chain end, so the
+                // repair each one describes is one it actually performed.
                 println!("{}", format_verify_success_message(&result));
-                if result.tail_truncated {
-                    eprintln!(
-                        "  WARNING: audit log tail may have been truncated \
-                         (chain ends before high-water-mark)."
-                    );
-                    eprintln!("  Inspect: omamori audit show --last 20");
-                    return Ok(3);
-                }
                 if result.hwm_tampered {
                     eprintln!(
                         "  WARNING: high-water-mark file was unreadable or tampered with \
