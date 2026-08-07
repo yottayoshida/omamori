@@ -438,53 +438,11 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
 // Audit append helper
 // ---------------------------------------------------------------------------
 
-/// Lives under the base dir (`~/.omamori`), not the audit data dir
-/// (`~/.local/share/omamori`) — the warning this throttles fires precisely
-/// when the audit data dir is unwritable, so co-locating the sentinel there
-/// would make the sentinel itself unwritable in the same failure and the
-/// warning would repeat on every shimmed command. Delegates to
-/// `installer::default_base_dir()`, which is now fail-closed (#373, #372) —
-/// bit-identical to the previous direct `context::home_dir()` resolution
-/// (`Some(home/.omamori/...)` when HOME is absolute, `None` otherwise), so
-/// this is a single-source-of-truth cleanup, not a behavior change.
-fn audit_warn_sentinel_path() -> Option<PathBuf> {
-    Some(installer::default_base_dir()?.join("audit-warn-throttle"))
-}
-
 fn should_emit_audit_warning() -> bool {
-    match audit_warn_sentinel_path() {
-        Some(p) => should_emit_audit_warning_at(&p),
+    match crate::warn_throttle::sentinel_path("audit-warn-throttle") {
+        Some(p) => crate::warn_throttle::should_emit_at(&p),
         None => true,
     }
-}
-
-fn should_emit_audit_warning_at(path: &Path) -> bool {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if !meta.file_type().is_file() {
-            return true;
-        }
-        if let Ok(mtime) = meta.modified()
-            && let Ok(elapsed) = mtime.elapsed()
-            && elapsed.as_secs() < 300
-        {
-            return false;
-        }
-    }
-
-    touch_audit_warn_sentinel(path);
-    true
-}
-
-/// Writes via `atomic_file::atomic_write_with_mode` (#322-class: this sentinel
-/// had the same predictable-temp-name + `create(true)` race as the heartbeat
-/// writer before #307). Content is empty — only the mtime matters
-/// (`should_emit_audit_warning_at` reads it, never the bytes).
-fn touch_audit_warn_sentinel(path: &Path) {
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(parent);
-    let _ = crate::atomic_file::atomic_write_with_mode(path, b"", 0o600);
 }
 
 /// Attempt to append an audit event. On failure:
@@ -573,7 +531,7 @@ pub(crate) fn run_command(
         for warning in &detection.warnings {
             eprintln!("omamori warning: {warning}");
         }
-        if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
+        if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
             let event = logger.create_event(
                 &invocation,
                 None,
@@ -599,7 +557,7 @@ pub(crate) fn run_command(
         for warning in &detection.warnings {
             eprintln!("omamori warning: {warning}");
         }
-        if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
+        if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
             let event = logger.create_event(
                 &invocation,
                 None,
@@ -617,6 +575,17 @@ pub(crate) fn run_command(
     // --- Protected path: AI environment detected. Full evaluation. ---
 
     // Strict mode: block if audit HMAC secret is unavailable
+    //
+    // #473: **not** the throttled constructor, and for the same reason
+    // `audit key rotate` was left off it. The message printed below is generic
+    // ("re-create the secret or set audit.strict = false"); which condition
+    // actually holds — an unlistable directory, an epoch record stating no
+    // epoch, an unreadable key — comes from the warning `load_signing_key`
+    // prints. Throttle that and the second blocked command in the window says
+    // only that it was blocked, while the surviving hint is wrong for a
+    // permissions fault and its other suggestion is to switch the enforcement
+    // off. A blocked command is not repetition to be damped down; it is the
+    // event, and the operator is being asked to act on it.
     if load_result.config.audit.strict && load_result.config.audit.enabled {
         match AuditLogger::from_config(&load_result.config.audit) {
             Some(logger) if !logger.secret_available() => {
@@ -742,7 +711,7 @@ pub(crate) fn run_command(
                 rule.name
             );
             // Audit the bypass
-            if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
+            if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
                 let provider = detection
                     .matched_detectors
                     .first()
@@ -790,7 +759,7 @@ pub(crate) fn run_command(
         eprintln!("omamori warning: {warning}");
     }
 
-    if let Some(logger) = AuditLogger::from_config(&load_result.config.audit) {
+    if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
         let event = logger.create_event(
             &invocation,
             effective_rule,
@@ -1291,7 +1260,7 @@ mod tests {
         let sentinel = dir.join("audit-warn-throttle");
 
         assert!(
-            should_emit_audit_warning_at(&sentinel),
+            crate::warn_throttle::should_emit_at(&sentinel),
             "first call should return true (no sentinel)"
         );
         assert!(
@@ -1310,10 +1279,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sentinel = dir.join("audit-warn-throttle");
 
-        let first = should_emit_audit_warning_at(&sentinel);
+        let first = crate::warn_throttle::should_emit_at(&sentinel);
         assert!(first, "first call should emit");
 
-        let second = should_emit_audit_warning_at(&sentinel);
+        let second = crate::warn_throttle::should_emit_at(&sentinel);
         assert!(
             !second,
             "second call within 5min window should be suppressed"
@@ -1335,7 +1304,7 @@ mod tests {
         {
             std::os::unix::fs::symlink(&target, &sentinel).unwrap();
             assert!(
-                should_emit_audit_warning_at(&sentinel),
+                crate::warn_throttle::should_emit_at(&sentinel),
                 "symlink sentinel must degrade-open (return true = emit warning)"
             );
             assert!(
@@ -1351,11 +1320,15 @@ mod tests {
     #[serial_test::serial(home_env)]
     fn audit_warn_sentinel_path_none_when_home_unusable() {
         assert_eq!(
-            crate::test_support::with_home(Some(""), audit_warn_sentinel_path),
+            crate::test_support::with_home(Some(""), || crate::warn_throttle::sentinel_path(
+                "audit-warn-throttle"
+            )),
             None
         );
         assert_eq!(
-            crate::test_support::with_home(Some("relative/path"), audit_warn_sentinel_path),
+            crate::test_support::with_home(Some("relative/path"), || {
+                crate::warn_throttle::sentinel_path("audit-warn-throttle")
+            }),
             None
         );
     }
@@ -1363,11 +1336,11 @@ mod tests {
     #[test]
     #[serial_test::serial(home_env)]
     fn audit_warn_sentinel_path_lives_under_base_dir_not_data_dir() {
-        let path = crate::test_support::with_home(
-            Some("/tmp/omamori-sentinel-base-dir-test"),
-            audit_warn_sentinel_path,
-        )
-        .expect("absolute HOME must resolve");
+        let path =
+            crate::test_support::with_home(Some("/tmp/omamori-sentinel-base-dir-test"), || {
+                crate::warn_throttle::sentinel_path("audit-warn-throttle")
+            })
+            .expect("absolute HOME must resolve");
         assert_eq!(
             path,
             PathBuf::from("/tmp/omamori-sentinel-base-dir-test/.omamori/audit-warn-throttle")

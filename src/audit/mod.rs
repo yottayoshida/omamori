@@ -28,7 +28,8 @@ use chain::{CHAIN_VERSION, ChainTailState, compute_entry_hash_for_write, read_ch
 use provenance::ProcessProvenance;
 use retention::{PRUNE_CHECK_INTERVAL, try_prune};
 use secret::{
-    SigningKey, flock_exclusive, hmac_targets, load_signing_key, open_audit_rw, secret_path_for,
+    SigningKey, flock_exclusive, hmac_targets, load_signing_key_with, open_audit_rw,
+    secret_path_for,
 };
 
 use std::fs;
@@ -211,12 +212,33 @@ impl AuditLogger {
     }
 
     pub fn from_config(config: &AuditConfig) -> Option<Self> {
+        Self::build(config, secret::KeyWarnPolicy::Always)
+    }
+
+    /// `from_config` for callers that run on every command rather than because
+    /// someone typed one (#473).
+    ///
+    /// The key-store warnings are printed while building the logger, so a shim
+    /// invocation repeats them on every guarded command for as long as the
+    /// condition lasts. This form throttles them; `from_config` does not, and
+    /// is what every interactive command keeps using.
+    ///
+    /// A separate constructor rather than a parameter on `from_config`, so the
+    /// default stays loud: a call site added later inherits "say it" and has to
+    /// opt into silence. That is the direction `#510` established for the audit
+    /// status catch-all, for the same reason — the failure that costs something
+    /// is the quiet one.
+    pub(crate) fn from_config_throttled(config: &AuditConfig) -> Option<Self> {
+        Self::build(config, secret::KeyWarnPolicy::Throttled)
+    }
+
+    fn build(config: &AuditConfig, policy: secret::KeyWarnPolicy) -> Option<Self> {
         if !config.enabled {
             return None;
         }
         let (validated, _warnings) = config.validate();
         let path = resolved_audit_path(&validated)?;
-        let signing_key = load_signing_key(&secret_path_for(&path));
+        let signing_key = load_signing_key_with(&secret_path_for(&path), policy);
         Some(Self {
             path,
             signing_key,
@@ -7761,6 +7783,87 @@ mod tests {
             summary.path_error
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // #473: key-store warnings pass through the throttle and the SEC-R5
+    // disclosure gate. Both mechanisms already existed; neither reached here,
+    // and this block runs on every guarded command.
+    // -----------------------------------------------------------------
+
+    /// The gate removes the repair and nothing else.
+    ///
+    /// Suppressing the observation would hide a degraded key store from the
+    /// reader — the opposite of what SEC-R5 is for. What it withholds is the
+    /// sentence that names a file and says what to do to it, from the reader
+    /// most likely to act on it unsupervised.
+    #[test]
+    fn ai_gate_drops_the_repair_and_keeps_the_condition() {
+        let reason = secret::UnprotectedReason::EpochRecordUnreadable(
+            "audit-secret.epoch states no epoch".to_string(),
+        );
+
+        let human = secret::keystore_warning(&reason, true);
+        let ai = secret::keystore_warning(&reason, false);
+
+        assert!(
+            human.contains("Removing"),
+            "the repair is what a human terminal gets: {human}"
+        );
+        assert!(
+            !ai.contains("Removing"),
+            "and it is the only thing withheld: {ai}"
+        );
+        assert!(
+            ai.contains("states no epoch") && ai.contains("stay unverifiable"),
+            "the condition and its consequence must survive the gate: {ai}"
+        );
+    }
+
+    /// No two warnings with different content may share a throttle sentinel.
+    ///
+    /// This is the invariant, not a naming preference. The two rotation
+    /// warnings shared one until review found it, and only one of them carries
+    /// the "do not copy a `.retired` file over `audit-secret`" prohibition — so
+    /// the ordinary fix-and-retry sequence (mint fails, permissions repaired,
+    /// mint succeeds) suppressed the prohibition for the rest of the window.
+    ///
+    /// Weak on purpose: it cannot see which constant each call site passes.
+    /// What it does catch is the shape the defect actually took — two sites
+    /// given the same string — which neither the compiler nor any other test
+    /// here reports.
+    #[test]
+    fn throttle_kinds_are_distinct() {
+        let kinds = [
+            secret::WARN_KIND_KEYSTORE,
+            secret::WARN_KIND_ROTATION_MINTED,
+            secret::WARN_KIND_ROTATION_UNMINTED,
+        ];
+        let unique: std::collections::HashSet<_> = kinds.iter().collect();
+        assert_eq!(
+            unique.len(),
+            kinds.len(),
+            "two warning kinds share a sentinel, so one silences the other: {kinds:?}"
+        );
+    }
+
+    /// Only one of the four reasons carries a repair, so the gate must be a
+    /// no-op on the other three. If a future reason gains one without gaining
+    /// the flag, this stops holding — which is the point of asserting it across
+    /// all four rather than only the interesting one.
+    #[test]
+    fn ai_gate_changes_nothing_for_reasons_without_a_repair() {
+        for reason in [
+            secret::UnprotectedReason::KeyDirUnlistable("cannot list /x".to_string()),
+            secret::UnprotectedReason::ActiveKeyUnusable("bad hex".to_string()),
+            secret::UnprotectedReason::ActiveKeyMissing,
+        ] {
+            assert_eq!(
+                secret::keystore_warning(&reason, true),
+                secret::keystore_warning(&reason, false),
+                "{reason:?} has no repair to withhold, so the gate must not alter it"
+            );
+        }
     }
 
     #[test]

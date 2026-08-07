@@ -509,10 +509,135 @@ fn claim_next_epoch(secret_path: &Path, lost: u32) -> Option<u32> {
 /// permanently unverifiable entry that no amount of verifier-side repair can
 /// reclassify, because the id is present and only the bytes are wrong. The two
 /// reads are now one value *and* one locked observation.
+/// Throttle sentinel kinds. Named rather than inline so the invariant that
+/// binds them — **no two messages with different content may share one** — has
+/// something a test can hold onto. The bug this prevents does not fail to
+/// compile: passing the same string at two sites is valid Rust that silently
+/// lets one branch suppress the other (#473 review found exactly that between
+/// the two rotation warnings, only one of which carries the prohibition).
+pub(super) const WARN_KIND_KEYSTORE: &str = "keystore";
+pub(super) const WARN_KIND_ROTATION_MINTED: &str = "rotation-minted";
+pub(super) const WARN_KIND_ROTATION_UNMINTED: &str = "rotation-unminted";
+
+/// How loudly `load_signing_key` may talk about a degraded key store (#473).
+///
+/// The warnings below are produced where the key store is read, which is on
+/// **every** guarded command via `AuditLogger::from_config`. Two existing
+/// mechanisms exist for exactly that situation and neither reached here: the
+/// 300-second stderr throttle (`#359`) and the SEC-R5 rule against printing
+/// literal repair commands into an AI session.
+///
+/// The policy travels from the caller rather than being decided at the print
+/// site, because the print site cannot tell an operator who typed a command
+/// from a shim that fired because one was typed. Throttling at the print site
+/// would let a background shim invocation silence the answer to a question a
+/// person just asked — and `audit_cmd`'s rotation failure explicitly points at
+/// "the condition reported above", which is this warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyWarnPolicy {
+    /// Say it every time. The default, and what every interactive command uses.
+    Always,
+    /// At most once per throttle window, per warning kind, per store. Used by
+    /// the PATH shim, matching the Layer 1 / Layer 2 asymmetry SECURITY.md
+    /// already records for audit-append warnings.
+    Throttled,
+}
+
+/// `load_signing_key_with(.., Always)`, kept for the tests that predate the
+/// policy parameter (#473). Every production caller now states its policy.
+#[cfg(test)]
 pub(super) fn load_signing_key(secret_path: &Path) -> SigningKey {
+    load_signing_key_with(secret_path, KeyWarnPolicy::Always)
+}
+
+pub(super) fn load_signing_key_with(secret_path: &Path, policy: KeyWarnPolicy) -> SigningKey {
     with_key_store_lock(secret_path, false, |_lock| {
-        load_signing_key_locked(secret_path)
+        load_signing_key_locked(secret_path, policy)
     })
+}
+
+/// Whether a warning of `kind` about `store` may be printed under `policy`.
+fn may_warn(policy: KeyWarnPolicy, kind: &str, store: &Path) -> bool {
+    match policy {
+        KeyWarnPolicy::Always => true,
+        KeyWarnPolicy::Throttled => {
+            let name = crate::warn_throttle::sentinel_name_for_store(kind, store);
+            match crate::warn_throttle::sentinel_path(&name) {
+                Some(p) => crate::warn_throttle::should_emit_at(&p),
+                // No resolvable base dir is not a reason to withhold.
+                None => true,
+            }
+        }
+    }
+}
+
+/// The warning for a key store that cannot say which epoch is active.
+///
+/// `with_repair` is SEC-R5's answer, not a formatting choice: exactly one of
+/// the four reasons carries a repair, and that is the only text this flag can
+/// remove. The condition itself is stated in every case — withholding the
+/// observation would hide a degraded store from the reader, which inverts what
+/// the gate is for.
+pub(super) fn keystore_warning(reason: &UnprotectedReason, with_repair: bool) -> String {
+    match reason {
+        // Not "fix the condition and re-run to restore protection": the reason
+        // is inline in this same sentence rather than above it, nothing here is
+        // a command the operator ran, and "restore" reads as covering the
+        // entries written meanwhile — which `verify`'s own `NeverProtected` arm
+        // then denies.
+        UnprotectedReason::KeyDirUnlistable(r) => format!(
+            "omamori warning: {r} — cannot determine which key epoch is active, so no entry \
+             written from here on can be HMAC-protected or labelled with a key epoch. \
+             {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the condition protects \
+             later ones, not those."
+        ),
+        UnprotectedReason::EpochRecordUnreadable(r) => format!(
+            "omamori warning: {r} — cannot determine which key epoch is active, so no entry \
+             written from here on can be HMAC-protected or labelled with a key epoch. \
+             {ENTRIES_CARRY_NO_HMAC} They stay unverifiable.{}",
+            if with_repair {
+                format!(" {}", epoch_record_remedy())
+            } else {
+                // A route, not a deletion. Every other SEC-R5 site in this
+                // codebase substitutes "run it yourself, directly in your
+                // terminal" rather than ending on the condition — `doctor`,
+                // `explain`, `guard` and `break-glass` all do, and `cli.rs`
+                // pins the wording for `doctor`. Leaving an agent with a
+                // degraded key store and no sanctioned next step is what makes
+                // it improvise one inside the audit directory, which is the
+                // outcome the gate exists to prevent.
+                " To see how to clear it, run 'omamori doctor' directly in your terminal \
+                 (not via AI)."
+                    .to_string()
+            }
+        ),
+        // `key_store_outlook` decides from the listing alone and never reads the
+        // active key, so it produces neither of these two. Listed rather than
+        // caught by `_` so that a future refusal added there has to be given
+        // wording here instead of silently inheriting somebody else's — which
+        // the compiler enforced the moment `ActiveKeyMissing` was split out.
+        //
+        // Reaching either would mean this function returned before the code
+        // below that decides whether to mint, so neither may promise one.
+        UnprotectedReason::ActiveKeyUnusable(r) => {
+            format!("omamori warning: {r} — {ENTRIES_CARRY_NO_HMAC} They stay unverifiable.")
+        }
+        UnprotectedReason::ActiveKeyMissing => format!(
+            "omamori warning: no active audit key is present. {ENTRIES_CARRY_NO_HMAC} They stay \
+             unverifiable."
+        ),
+    }
+}
+
+/// Whether literal repair instructions may be printed (SEC-R5).
+///
+/// The condition itself is always reported — suppressing the observation would
+/// hide a degraded store, which is the opposite of the point. What is withheld
+/// in an AI session is the part that names a key file and says what to do to
+/// it, which is a recipe handed to the reader most likely to act on it
+/// unsupervised.
+fn may_print_repair() -> bool {
+    !crate::cli::doctor::is_ai_environment()
 }
 
 /// Why an append made right now could not be HMAC-protected.
@@ -664,7 +789,7 @@ pub(super) fn interrupted_rotation_evidence(secret_path: &Path) -> bool {
     })
 }
 
-fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
+fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> SigningKey {
     // #457 (Codex Round 2): the verifier was made fail-closed for an unlistable
     // key directory, but this side was not — and it is the side that writes.
     // With execute-but-not-read permissions the active secret is still
@@ -716,41 +841,14 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // want different remedies.
     let (retired, recorded) = match key_store_outlook(secret_path) {
         KeyStoreOutlook::Unprotected(reason) => {
-            match &reason {
-                // Not "fix the condition and re-run to restore protection":
-                // the reason is inline in this same sentence rather than
-                // above it, nothing here is a command the operator ran, and
-                // "restore" reads as covering the entries written meanwhile —
-                // which `verify`'s own `NeverProtected` arm then denies.
-                UnprotectedReason::KeyDirUnlistable(r) => eprintln!(
-                    "omamori warning: {r} — cannot determine which key epoch is active, so no \
-                     entry written from here on can be HMAC-protected or labelled with a key \
-                     epoch. {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the \
-                     condition protects later ones, not those."
-                ),
-                UnprotectedReason::EpochRecordUnreadable(r) => eprintln!(
-                    "omamori warning: {r} — cannot determine which key epoch is active, so no \
-                     entry written from here on can be HMAC-protected or labelled with a key \
-                     epoch. {ENTRIES_CARRY_NO_HMAC} They stay unverifiable. {}",
-                    epoch_record_remedy()
-                ),
-                // `key_store_outlook` decides from the listing alone and never
-                // reads the active key, so it produces neither of these two.
-                // Listed rather than caught by `_` so that a future refusal
-                // added there has to be given wording here instead of silently
-                // inheriting somebody else's — which the compiler enforced the
-                // moment `ActiveKeyMissing` was split out.
-                //
-                // Reaching either would mean this function returned before the
-                // code below that decides whether to mint, so neither may
-                // promise one.
-                UnprotectedReason::ActiveKeyUnusable(r) => eprintln!(
-                    "omamori warning: {r} — {ENTRIES_CARRY_NO_HMAC} They stay unverifiable."
-                ),
-                UnprotectedReason::ActiveKeyMissing => eprintln!(
-                    "omamori warning: no active audit key is present. {ENTRIES_CARRY_NO_HMAC} \
-                     They stay unverifiable."
-                ),
+            // #473: this block runs from `AuditLogger::from_config`, i.e. on
+            // every guarded command, and printed unconditionally. One sentinel
+            // for the whole block: these four are one condition seen four ways
+            // (the key store cannot answer), so reporting one and suppressing
+            // the others for the window would be the sharing this change exists
+            // to remove — between *kinds*, not within one.
+            if may_warn(policy, WARN_KIND_KEYSTORE, secret_path) {
+                eprintln!("{}", keystore_warning(&reason, may_print_repair()));
             }
             return SigningKey {
                 id: UNRESOLVED_KEY_ID.to_string(),
@@ -859,18 +957,48 @@ fn load_signing_key_locked(secret_path: &Path) -> SigningKey {
     // was lost afterwards wrote several. The key store holds nothing that tells
     // the two apart — the difference is only in `audit.jsonl` — so the sentence
     // covers both. PR-C1's epoch record is what will separate them.
+    // #473: throttled, but **not** withheld in an AI session, and the issue's
+    // own description of this warning is why the distinction had to be checked
+    // rather than assumed. It called this "a recovery procedure"; reading the
+    // whole of what the three shapes produce, there is no procedure in it. The
+    // parts are an observation, a consequence for the entries already written,
+    // and one prohibition — do not copy a `.retired` file over `audit-secret`.
+    //
+    // SEC-R5 withholds recipes from the reader most likely to run them
+    // unsupervised. A prohibition is the opposite artefact: suppressing it in
+    // an AI session removes the sentence from the one reader it was written
+    // for, and the action it forbids destroys the key its own newer entries
+    // were signed with. Separate sentinel from the key-store block above,
+    // because a store can be in both states and they need different remedies.
+    //
+    // The two branches take **separate** sentinels. Only the first carries the
+    // prohibition, and the sequence that reaches the second and then the first
+    // is the ordinary fix-and-retry: the directory is unwritable so the mint
+    // fails (branch B, no prohibition, sentinel touched), the operator repairs
+    // the permissions, the next command mints successfully — and branch A, the
+    // one that says not to copy a `.retired` file over `audit-secret`, would be
+    // suppressed for the rest of the window. That is the sharing this change
+    // exists to remove, reached through the likely path rather than a contrived
+    // one.
     if let Some(missing) = &missing {
+        // The throttle check is nested inside each arm rather than folded into
+        // the arm's own condition: `secret.is_some() && may_warn(..)` would send
+        // a *suppressed* first branch into the `else`, printing the other
+        // branch's message — which describes a store that failed to mint, on a
+        // store that just did.
         if secret.is_some() {
-            eprintln!(
-                "omamori warning: {} audit-secret now holds an \
-                 active key; entries from here on are signed with it and labelled {id}{}. \
-                 Do not copy a .retired file over audit-secret: that \
-                 destroys the key the newer entries were signed with. See the audit \
-                 chapter of omamori's FAQ.",
-                missing.observed(&id, max_retired),
-                missing.overlap_clause(&id)
-            );
-        } else {
+            if may_warn(policy, WARN_KIND_ROTATION_MINTED, secret_path) {
+                eprintln!(
+                    "omamori warning: {} audit-secret now holds an \
+                     active key; entries from here on are signed with it and labelled {id}{}. \
+                     Do not copy a .retired file over audit-secret: that \
+                     destroys the key the newer entries were signed with. See the audit \
+                     chapter of omamori's FAQ.",
+                    missing.observed(&id, max_retired),
+                    missing.overlap_clause(&id)
+                );
+            }
+        } else if may_warn(policy, WARN_KIND_ROTATION_UNMINTED, secret_path) {
             eprintln!(
                 // "while this lasts", not "from here on" — the same bound the
                 // unlistable-directory warning above uses, and for the same

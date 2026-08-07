@@ -12,6 +12,7 @@ pub mod integrity;
 pub mod rules;
 pub mod unwrap;
 mod util;
+pub(crate) mod warn_throttle;
 
 use std::ffi::OsString;
 
