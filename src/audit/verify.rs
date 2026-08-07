@@ -317,6 +317,17 @@ pub struct ShowOptions {
 #[non_exhaustive]
 pub struct AuditSummary {
     pub enabled: bool,
+    /// Whether an append would be attempted at all — `AuditLogger::from_config`'s
+    /// own predicate, mirrored here (#492).
+    ///
+    /// `enabled` alone does not answer it: `from_config` also returns `None`
+    /// when the audit path does not resolve, and there `enabled` is `true`.
+    /// Nor does `path_error`, which is `Some` in **two** unrelated states —
+    /// that one, and a resolved path whose log file cannot be read. The second
+    /// has a logger: appends are attempted and fail, which `[audit] strict`
+    /// turns into a refused command rather than an unrecorded one. Telling
+    /// "nothing will be written" from "the write will fail" needs this field.
+    pub logger_available: bool,
     pub entry_count: u64,
     /// **One-directional**: `true` means an append made at this moment would
     /// be HMAC-protected. `false` does not mean the opposite — a store with no
@@ -1229,6 +1240,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
     if !config.enabled {
         return AuditSummary {
             enabled: false,
+            logger_available: false,
             entry_count: 0,
             secret_available: false,
             unprotected_reason: None,
@@ -1240,6 +1252,10 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
     let Some(path) = resolved_audit_path(config) else {
         return AuditSummary {
             enabled: true,
+            // #492: the other state `AuditLogger::from_config` returns `None`
+            // for. `enabled` is `true` here, so a caller reading only that flag
+            // concludes appends are happening when no log location exists.
+            logger_available: false,
             entry_count: 0,
             secret_available: false,
             unprotected_reason: None,
@@ -1288,11 +1304,28 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             (count, None)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
-        Err(e) => (0, Some(e.to_string())),
+        // #492: sanitized here rather than at each display site. Every message
+        // this arm can produce ends with the audit path, and an **absolute**
+        // `audit.path` reaches this point verbatim — `AuditConfig::validate`
+        // strips control characters only on the relative branch, where it
+        // rejects the override anyway. So `config.toml`, which that same
+        // function's comment calls attacker-controlled, can put ESC sequences
+        // into a string that `status` prints and that `break-glass` now prints
+        // two lines above its consent prompt. Cursor-up plus erase-line is
+        // enough to overwrite the warning the operator is answering.
+        //
+        // Same treatment `provenance::sanitize` gives `parent_process`, minus
+        // its length cap — that cap sizes a field written into every audit
+        // entry, and truncating a filesystem error would cut the path the
+        // operator needs.
+        Err(e) => (0, Some(super::strip_control_chars(&e.to_string()))),
     };
 
     AuditSummary {
         enabled: true,
+        // Reached only past the two early returns above, which are exactly the
+        // two states `AuditLogger::from_config` refuses on.
+        logger_available: true,
         entry_count,
         secret_available,
         unprotected_reason,

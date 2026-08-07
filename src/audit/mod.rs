@@ -46,6 +46,26 @@ use crate::rules::{CommandInvocation, RuleConfig};
 // Config
 // ---------------------------------------------------------------------------
 
+/// Replace control characters so an attacker-influenced string cannot drive the
+/// terminal it is printed on.
+///
+/// Shared rather than repeated, for the reason `#468` recorded about
+/// `atomic_file::open_read_regular`: this substitution lived inline in
+/// `AuditConfig::validate` below, on the relative-path branch only, and the
+/// absolute-path route that reaches `AuditSummary::path_error` shipped without
+/// it (#492). A sanitizer written per call site does not reach the next call
+/// site.
+///
+/// `provenance::sanitize` keeps its own copy deliberately — it caps length for
+/// a field written into every audit entry, and truncating a filesystem error
+/// would cut the path an operator needs.
+pub(crate) fn strip_control_chars(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditConfig {
     #[serde(default = "default_true")]
@@ -109,11 +129,7 @@ impl AuditConfig {
             let shown = if path.as_os_str().is_empty() {
                 "<empty>".to_string()
             } else {
-                path.display()
-                    .to_string()
-                    .chars()
-                    .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
-                    .collect()
+                strip_control_chars(&path.display().to_string())
             };
             warnings.push(format!(
                 "audit.path `{shown}` is not an absolute path; ignoring the override — set an absolute path to use a custom audit log location"
@@ -7754,6 +7770,57 @@ mod tests {
         let summary = audit_summary(&config);
         assert_eq!(summary.entry_count, 0);
         assert!(summary.path_error.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `audit_summary` must not mint a key (#492).
+    ///
+    /// Its doc already says so — "closing the gap would mean creating a key
+    /// file as a side effect of asking for status" — but nothing measured it,
+    /// and the difference is invisible to every other assertion here: a
+    /// summary computed *after* minting reports the same fields, just more
+    /// optimistically. `break-glass` now calls this before its confirmation
+    /// prompt, so the side effect would be a write performed while asking a
+    /// question, before the operator has agreed to anything.
+    ///
+    /// The contrast is the point: `load_signing_key` on the same empty
+    /// directory *does* create the file. Without that half, a version of
+    /// `audit_summary` that no longer touches the key store at all would also
+    /// pass, and this test would stop discriminating.
+    #[test]
+    fn audit_summary_does_not_mint_a_key() {
+        let dir = test_dir("summary-no-mint");
+        fs::create_dir_all(&dir).unwrap();
+        let config = verify_config(&dir);
+        let secret = secret_path_for(&resolved_audit_path(&config).unwrap());
+
+        assert!(!secret.exists(), "fixture must start with no key file");
+        let summary = audit_summary(&config);
+        // The whole listing, not just the key's own name. `with_key_store_lock`
+        // creates a `0600` lock file, so a version of this that took the lock
+        // would leave a trace the narrower assertion cannot see — and the claim
+        // being made is "mints nothing", not "does not mint that one path".
+        let leftovers: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "asking for status wrote {leftovers:?} into the store"
+        );
+        assert!(
+            !summary.secret_available,
+            "and it must report the store as it found it"
+        );
+
+        // Control: the writer's path on the identical directory does mint one.
+        let _ = load_signing_key(&secret);
+        assert!(
+            secret.exists(),
+            "control failed — if the writer no longer mints here either, the \
+             assertion above proves nothing"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

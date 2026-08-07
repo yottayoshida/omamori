@@ -4,8 +4,8 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 
 use crate::AppError;
-use crate::audit::AuditLogger;
 use crate::audit::provenance::ProcessProvenance;
+use crate::audit::{self, AuditLogger, AuditSummary, UnprotectedReason};
 use crate::break_glass::{
     self, ActivationError, DEFAULT_DURATION_SECS, format_duration_human, format_remaining,
 };
@@ -73,13 +73,36 @@ fn run_activate(
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
 
+    // #492: the sentence below used to promise audit logging unconditionally,
+    // printed here — fifteen lines before the first `load_config`, and so
+    // before anything had checked whether auditing runs at all. With
+    // `[audit] enabled = false` nothing was logged and the sentence that
+    // obtained consent was simply untrue. It is an inducement, not a status
+    // line: it is the reassurance that makes granting a bypass feel safe, so
+    // it has to be answerable at the moment it is read.
+    //
+    // Asked through `audit_summary` rather than `AuditLogger::from_config`,
+    // deliberately. The latter runs `load_signing_key`, which **mints a key
+    // file** when none is there — a write, performed while asking a question,
+    // before the operator has agreed to anything. `audit_summary` is the
+    // read-only form of the same question and says so in its own doc.
+    let audit = config::load_config(None)
+        .map(|r| (audit::audit_summary(&r.config.audit), r.config.audit.strict))
+        .ok();
+
     eprintln!();
     eprintln!("  Break-glass bypass for: {rule_id}");
     eprintln!("  Duration: {duration_human} (expires {expires_str})");
     eprintln!();
     eprintln!("  WARNING: Protection action (trash/stash/block) will be disabled.");
     eprintln!("  The original command executes WITHOUT safety measures.");
-    eprintln!("  All bypassed executions will be logged to the audit chain.");
+    eprintln!(
+        "{}",
+        format_audit_expectation(audit.as_ref().map(|(summary, strict)| AuditOutlook {
+            summary,
+            strict: *strict,
+        }))
+    );
     eprintln!();
 
     eprint!("  Activate? [y/N] ");
@@ -115,6 +138,115 @@ fn run_activate(
         Err(e) => {
             eprintln!("omamori: break-glass activation failed — {e}");
             Ok(1)
+        }
+    }
+}
+
+/// What `break-glass` knows about auditing at the moment it asks for consent.
+///
+/// `strict` travels beside the summary because it changes the *consequence* of
+/// a failed append rather than its likelihood, and `AuditSummary` describes the
+/// store rather than the policy applied to it.
+struct AuditOutlook<'a> {
+    summary: &'a AuditSummary,
+    strict: bool,
+}
+
+/// Say what the audit chain will actually do with the bypasses this prompt is
+/// about to authorise (#492).
+///
+/// Six outcomes. "Recorded", "verifiable afterwards" and "allowed to run at
+/// all" are three separate promises and the operator is consenting to all of
+/// them, so a state that differs in any one needs its own sentence — merging
+/// two puts one of them under wording it does not deserve.
+///
+/// `None` means the config could not be read. That is not "auditing is off" —
+/// it is "this command cannot tell", and saying either of the other answers
+/// would be a guess presented as a fact.
+fn format_audit_expectation(outlook: Option<AuditOutlook<'_>>) -> String {
+    let Some(AuditOutlook { summary, strict }) = outlook else {
+        return "  Audit logging: cannot tell — this command could not read the config."
+            .to_string();
+    };
+
+    // No logger will be built, so nothing is attempted and nothing is refused.
+    // `logger_available` rather than `enabled` because an audit path that does
+    // not resolve lands here too with `enabled: true`, and rather than
+    // `path_error` because that is also `Some` in the very different state
+    // handled next.
+    if !summary.logger_available {
+        let mut out =
+            "  Bypassed executions will NOT be logged — auditing is not running.".to_string();
+        if let Some(err) = &summary.path_error {
+            out.push_str(&format!("\n  ({err})"));
+        }
+        return out;
+    }
+
+    // A logger exists and the log cannot be read. Checked before the key,
+    // because a write that cannot happen makes the signing story irrelevant —
+    // and because these states co-occur: a symlinked or directory-shaped
+    // `audit.jsonl` also reports `ActiveKeyMissing`, so the key arms below
+    // would otherwise answer for it.
+    //
+    // Under `[audit] strict = true` the outcome is not "unrecorded" but
+    // "refused": the failed append returns exit 2 from the hook
+    // (`engine::hook`), so the bypass the operator is authorising will not run.
+    // Saying "will not be logged" there would be a second false promise of the
+    // exact kind #492 exists to remove.
+    if let Some(err) = &summary.path_error {
+        let consequence = if strict {
+            "`[audit] strict = true` is set, so the bypass will be REFUSED rather than\n    \
+             run unrecorded."
+        } else {
+            "the bypass will still run, unrecorded."
+        };
+        return format!(
+            "  Bypassed executions will NOT be recorded — the audit log cannot be read:\n    \
+             {err}\n    {consequence}"
+        );
+    }
+
+    if summary.secret_available {
+        return "  All bypassed executions will be logged to the audit chain.".to_string();
+    }
+
+    // Recorded, but the signature is in doubt. Which sentence is honest here
+    // depends on the reason, and the difference is not cosmetic:
+    // `ActiveKeyMissing` is the one state where the *next* append often mints a
+    // key and protects the very entry being asked about — measured, and
+    // recorded in `UnprotectedReason::summary`'s own doc. Promising "cannot be
+    // verified later" there would state the opposite of what usually happens.
+    // `secret_available` is one-directional for exactly this reason (see
+    // `AuditSummary`), so a single degraded sentence cannot be written.
+    match &summary.unprotected_reason {
+        Some(UnprotectedReason::ActiveKeyMissing) => {
+            "  Bypassed executions will be logged, but the audit key is not in place:\n    \
+             omamori will try to create one on the next write. If that succeeds these\n    \
+             entries are signed as usual; if it fails they are recorded without a\n    \
+             signature and cannot be verified afterwards."
+                .to_string()
+        }
+        // ADR-0007 forbids rewriting an entry once written, so restoring the
+        // key does not repair rows that were stamped without one.
+        //
+        // `None` is attached to *this* arm deliberately. It is unreachable
+        // today — `audit_summary` derives `secret_available` from
+        // `unprotected_reason.is_none()`, so within this branch a reason always
+        // exists — but `AuditSummary` is `#[non_exhaustive]`, and a state added
+        // later that reports "not protected" with no reason this build can name
+        // should inherit the cautious sentence, not the reassuring one.
+        Some(_) | None => {
+            let reason = summary
+                .unprotected_reason
+                .as_ref()
+                .map(|r| format!("\n    Reason: {}", r.summary()))
+                .unwrap_or_default();
+            format!(
+                "  Bypassed executions will be logged, but NOT tamper-evident:\n    \
+                 they are recorded without a signature, and restoring the key\n    \
+                 afterwards does not make them verifiable.{reason}"
+            )
         }
     }
 }
@@ -414,6 +546,353 @@ mod tests {
             expires_at: expires_at.to_string(),
             reason: None,
         }
+    }
+
+    // -----------------------------------------------------------------
+    // format_audit_expectation (#492)
+    //
+    // The sentence this builds is an inducement: it is what makes granting a
+    // bypass feel safe, and it used to be printed before anything had checked
+    // whether auditing runs. Each state below is one the old unconditional
+    // sentence got wrong.
+    // -----------------------------------------------------------------
+
+    fn summary(enabled: bool, secret_available: bool) -> AuditSummary {
+        AuditSummary {
+            enabled,
+            // Every fixture here is past `from_config`'s two refusals unless it
+            // says otherwise, which is what `enabled` used to imply on its own.
+            logger_available: enabled,
+            entry_count: 0,
+            secret_available,
+            unprotected_reason: None,
+            retention_days: 90,
+            path_error: None,
+        }
+    }
+
+    /// Default policy: `strict` off. The one test that needs it on says so.
+    fn outlook(summary: &AuditSummary) -> Option<AuditOutlook<'_>> {
+        Some(AuditOutlook {
+            summary,
+            strict: false,
+        })
+    }
+
+    #[test]
+    fn audit_disabled_does_not_promise_logging() {
+        let text = format_audit_expectation(outlook(&summary(false, false)));
+        assert!(
+            text.contains("NOT be logged"),
+            "with `[audit] enabled = false` nothing is recorded, and this sentence \
+             is what obtains consent: {text}"
+        );
+        assert!(
+            !text.contains("will be logged to the audit chain"),
+            "the reassuring sentence must not survive here: {text}"
+        );
+    }
+
+    #[test]
+    fn unresolvable_audit_path_does_not_promise_logging() {
+        // `AuditLogger::from_config` returns `None` for this exactly as it does
+        // for `enabled = false`, so no bypass is recorded — but `enabled` is
+        // `true`, so a predicate that only read that flag would have printed
+        // the reassuring sentence on a store that logs nothing.
+        //
+        // `logger_available: false` is the whole fixture. An earlier version of
+        // this test set only `path_error` and left it `true`, which is not a
+        // state `audit_summary` can produce — that combination is the *other*
+        // `path_error` source (a resolved path whose log cannot be read), where
+        // a logger does exist. The test passed anyway, because the code then
+        // keyed on `path_error` and could not tell them apart either.
+        let mut s = summary(true, false);
+        s.logger_available = false;
+        s.path_error = Some("HOME is unset, empty, or relative".to_string());
+        let text = format_audit_expectation(outlook(&s));
+        assert!(
+            text.contains("NOT be logged"),
+            "an unresolvable audit path records nothing: {text}"
+        );
+        assert!(
+            text.contains("HOME is unset"),
+            "the reason belongs in the prompt — the operator can act on it: {text}"
+        );
+    }
+
+    /// `path_error` is `Some` in two unrelated states and only one of them
+    /// means "nothing is written".
+    ///
+    /// Here the path resolved, auditing is on, and it is the **log file** that
+    /// cannot be read — `AuditLogger::from_config` still returns a logger, so
+    /// the append is attempted and fails. Answering this with "auditing is not
+    /// running" names a cause the operator cannot act on, and the remedy is
+    /// nothing like the other state's (`remove whatever was planted on your
+    /// audit log`, not `turn auditing on`). This is the state `#471` was about,
+    /// so it is not hypothetical.
+    #[test]
+    fn unreadable_log_is_not_reported_as_auditing_switched_off() {
+        let mut s = summary(true, true);
+        s.path_error =
+            Some("audit path is a symlink (possible attack): /x/audit.jsonl".to_string());
+        let text = format_audit_expectation(outlook(&s));
+        assert!(
+            !text.contains("auditing is not running"),
+            "auditing IS running here — a logger exists and will attempt the append: {text}"
+        );
+        assert!(
+            text.contains("cannot be read"),
+            "the honest statement is about the log, not the switch: {text}"
+        );
+        assert!(
+            text.contains("possible attack"),
+            "and the reason has to survive — it is the actionable half: {text}"
+        );
+    }
+
+    /// Under `[audit] strict = true` a failed append is not an unrecorded
+    /// bypass, it is a **refused** one: the hook returns exit 2. Telling the
+    /// operator the command will "still run, unrecorded" would be a second
+    /// false promise of exactly the kind #492 exists to remove.
+    #[test]
+    fn strict_mode_says_the_bypass_is_refused_not_merely_unrecorded() {
+        let mut s = summary(true, true);
+        s.path_error = Some("is a directory, not a regular file".to_string());
+
+        let lenient = format_audit_expectation(outlook(&s));
+        assert!(
+            lenient.contains("will still run"),
+            "without strict the command does run: {lenient}"
+        );
+
+        let strict = format_audit_expectation(Some(AuditOutlook {
+            summary: &s,
+            strict: true,
+        }));
+        assert!(
+            strict.contains("REFUSED"),
+            "with strict the append failure blocks the command (exit 2): {strict}"
+        );
+        assert!(
+            !strict.contains("will still run"),
+            "and the lenient claim must not survive alongside it: {strict}"
+        );
+    }
+
+    #[test]
+    fn healthy_store_keeps_the_original_promise() {
+        let text = format_audit_expectation(outlook(&summary(true, true)));
+        assert_eq!(
+            text.trim(),
+            "All bypassed executions will be logged to the audit chain.",
+            "the state the old unconditional sentence was written for must be \
+             unchanged, or this change would be a regression for every healthy store"
+        );
+    }
+
+    #[test]
+    fn degraded_key_store_separates_logged_from_verifiable() {
+        let mut s = summary(true, false);
+        s.unprotected_reason = Some(UnprotectedReason::KeyDirUnlistable(
+            "cannot list /x: Permission denied".to_string(),
+        ));
+        let text = format_audit_expectation(outlook(&s));
+        assert!(
+            text.contains("will be logged"),
+            "entries ARE written in this state — claiming otherwise inverts what a \
+             missing row means (SECURITY.md: absence implies Allow): {text}"
+        );
+        assert!(
+            text.contains("NOT tamper-evident"),
+            "and they carry no HMAC, which is the half the old sentence hid: {text}"
+        );
+        assert!(
+            text.contains("key directory cannot be listed"),
+            "the specific reason comes from `UnprotectedReason::summary`: {text}"
+        );
+    }
+
+    #[test]
+    fn missing_active_key_does_not_claim_the_entries_are_unverifiable() {
+        // The one degraded state whose outcome is genuinely uncertain: the next
+        // append tries to mint a key and often succeeds, protecting the very
+        // entry being asked about (measured — see `UnprotectedReason::summary`).
+        // A single "cannot be verified later" sentence would state the opposite
+        // of what usually happens.
+        let mut s = summary(true, false);
+        s.unprotected_reason = Some(UnprotectedReason::ActiveKeyMissing);
+        let text = format_audit_expectation(outlook(&s));
+        assert!(
+            text.contains("try to create one"),
+            "the mint attempt is the whole difference from the other degraded \
+             states and must be stated: {text}"
+        );
+        assert!(
+            !text.contains("NOT tamper-evident"),
+            "that verdict is not established here — the next write may well sign \
+             these entries: {text}"
+        );
+    }
+
+    /// The five tests above hand-build `AuditSummary`, so each one proves what
+    /// the *formatter* does with a shape — not that `audit_summary` ever
+    /// produces that shape. A branch keyed on a field combination the real
+    /// function never returns would pass all five and be dead in production.
+    ///
+    /// This one runs the wiring: a real config, through the real
+    /// `audit_summary`, into the formatter. The degraded arm is the one worth
+    /// wiring — `mode 0o300` leaves the directory searchable but not listable,
+    /// which is the permission state `key_store_outlook` refuses on while
+    /// `read_secret` alone would still succeed. If the two ever stopped
+    /// disagreeing there, the `KeyDirUnlistable` arm would become unreachable
+    /// and only this test would notice.
+    #[cfg(unix)]
+    #[test]
+    fn unlistable_key_dir_reaches_the_degraded_arm_through_audit_summary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("omamori-bg-cmd-unlistable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+
+        // Seed a real key so the store is healthy first — that establishes the
+        // control: the reassuring sentence is reachable here, so the assertion
+        // below is about the permission change and nothing else.
+        let logger = crate::audit::AuditLogger::from_config(&audit_config).unwrap();
+        logger
+            .append(create_activation_event(
+                "rm-recursive-to-trash",
+                "2030-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        let healthy =
+            format_audit_expectation(outlook(&crate::audit::audit_summary(&audit_config)));
+        assert!(
+            healthy.contains("will be logged to the audit chain"),
+            "control failed — the healthy arm is not reachable in this fixture, so \
+             the assertion below would not be measuring the permission change: {healthy}"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let degraded =
+            format_audit_expectation(outlook(&crate::audit::audit_summary(&audit_config)));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            degraded.contains("NOT tamper-evident"),
+            "an unlistable key directory must reach the degraded arm through the \
+             real `audit_summary`, not just through a hand-built struct: {degraded}"
+        );
+        assert!(
+            degraded.contains("key directory cannot be listed"),
+            "and it must carry the reason `UnprotectedReason` actually returned: {degraded}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two `path_error` sources, told apart through the real
+    /// `audit_summary` rather than by hand.
+    ///
+    /// A directory at the audit path is the reachable form of "the log cannot be
+    /// read": the path resolves, so `logger_available` is true, and
+    /// `open_read_nofollow` then fails with something other than `NotFound`.
+    /// The hand-built tests above cannot prove this shape exists — only that the
+    /// formatter would handle it if it did.
+    #[test]
+    fn directory_at_audit_path_reaches_the_unreadable_log_arm() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-bg-cmd-dirlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("audit.jsonl")).unwrap();
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let summary = crate::audit::audit_summary(&audit_config);
+        assert!(
+            summary.logger_available,
+            "the path resolved, so a logger exists — this is the half that \
+             distinguishes this state from an unresolvable path"
+        );
+        assert!(
+            summary.path_error.is_some(),
+            "and the log itself could not be opened"
+        );
+
+        let text = format_audit_expectation(outlook(&summary));
+        assert!(
+            text.contains("cannot be read") && !text.contains("auditing is not running"),
+            "so the message must be about the log, not the switch: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An absolute `audit.path` carrying control characters reaches the consent
+    /// prompt (#492).
+    ///
+    /// `AuditConfig::validate` strips them only on the relative branch, where it
+    /// discards the override anyway, so an absolute path goes through verbatim
+    /// and lands in `path_error`. `ESC[2A` + `ESC[K` is cursor-up-two plus
+    /// erase-line — enough to overwrite the two warning lines the operator is
+    /// answering, on the one prompt whose honesty this change exists to
+    /// establish. Sanitized in `audit_summary` so `status` is covered too.
+    #[test]
+    fn control_characters_in_the_audit_path_cannot_drive_the_terminal() {
+        let dir = std::env::temp_dir().join(format!("omamori-bg-cmd-ansi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let planted = dir.join("\u{1b}[2A\u{1b}[Kaudit.jsonl");
+        std::fs::create_dir_all(&planted).unwrap(); // a directory, so the read fails
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(planted),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let summary = crate::audit::audit_summary(&audit_config);
+        let err = summary
+            .path_error
+            .as_deref()
+            .expect("a directory at the audit path must produce a path_error");
+        assert!(
+            !err.chars().any(char::is_control),
+            "the escape sequence survived into path_error: {err:?}"
+        );
+
+        let text = format_audit_expectation(outlook(&summary));
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "and it must not reach the prompt: {text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_config_says_so_rather_than_guessing() {
+        let text = format_audit_expectation(None);
+        assert!(
+            text.contains("cannot tell"),
+            "`None` means the config could not be read, which is neither of the \
+             other two answers — printing one of them would be a guess presented \
+             as a fact: {text}"
+        );
+        assert!(
+            !text.contains("will be logged to the audit chain") && !text.contains("NOT be logged"),
+            "and it must not borrow either verdict: {text}"
+        );
     }
 
     // -----------------------------------------------------------------
