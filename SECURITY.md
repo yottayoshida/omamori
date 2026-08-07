@@ -336,6 +336,55 @@ it is deferred rather than patched — the ones that would need it are enumerate
 - Non-existent `destination` paths skip `canonicalize()` validation at config load time (caught at runtime via fail-close).
 - macOS resolves `/etc` to `/private/etc` — the blocked prefix list includes `/private` to cover this.
 
+## Operator Warnings: Throttling and AI Disclosure
+
+Two rules govern what omamori prints to stderr from code paths the PATH shim runs on
+every guarded command.
+
+**Throttling.** A warning that repeats once per command stops being information and
+starts training the operator to skip it, so the audit-append warning (#359) and, since
+[#473](https://github.com/yottayoshida/omamori/issues/473), the key-store warnings are
+gated by an mtime sentinel under `~/.omamori` — at most one per 300 seconds, per warning
+kind, per store. The sentinel is deliberately **not** in the audit data directory: every
+warning it gates fires when something about that directory is unreadable, so a sentinel
+beside them would be unwritable in the same failure and the warning would repeat anyway.
+Throttling applies to the shim's constructor only; the strict-mode gate, the Layer 2 hook
+path, and every interactive command stay loud. A blocked command is not repetition to be
+damped down, and a command someone typed is not background noise.
+
+**AI disclosure (SEC-R5).** In a session an AI agent is reading, omamori withholds
+literal repair commands — the sentence that names a file and says what to do to it — and
+substitutes "run it yourself, directly in your terminal". The condition itself is always
+stated; suppressing the observation would hide a degraded store from its reader, which is
+the opposite of the intent. A **prohibition** is not withheld: `#473` established that
+"do not copy a `.retired` file over `audit-secret`" must reach the reader most likely to
+perform the action it forbids, since that action destroys the key the store's newer
+entries were signed with.
+
+**Residual risks in these two mechanisms**, all found by review while closing `#473` and
+all recorded rather than fixed:
+
+- **Four more printers on the same path are still unconditional**
+  ([#518](https://github.com/yottayoshida/omamori/issues/518)). An occupied secret path and
+  an epoch that cannot be advanced on a read-only mount are both persistent states nothing
+  on disk resolves, so those messages still repeat per command.
+- **The disclosure gate consults the built-in detector list, not the operator's**
+  ([#519](https://github.com/yottayoshida/omamori/issues/519)). A detector added in
+  `config.toml` for a tool omamori does not ship with puts the shim on its protected path
+  while the gate answers "not an AI session", and the repair is printed into exactly the
+  session it exists to withhold from. Pre-existing at every SEC-R5 call site.
+- **The throttle sentinel is outside `PROTECTED_FILE_PATTERNS`**
+  ([#520](https://github.com/yottayoshida/omamori/issues/520)). `~/.omamori` is covered only
+  as two named files, so a guarded agent can create or refresh the sentinel — its name is a
+  truncated digest of the secret path, which follows from the config — and keep the warning
+  suppressed. This hides a notification, not the evidence: entries are still stamped
+  `UNRESOLVED_KEY_ID`, and `verify`, `status` and `doctor` still report the state from the
+  store itself. Pre-existing for `#359`'s sentinel; `#473` widened which warnings depend on it.
+- **Two key-store reasons share one sentinel**
+  ([#521](https://github.com/yottayoshida/omamori/issues/521)), and only one of them carries a
+  repair — so a fix-and-retry sequence can suppress the repair for the rest of the window.
+  Bounded: the message returns once the window expires.
+
 ## Environment Variable Detection
 
 Detection uses **exact value matching**:
