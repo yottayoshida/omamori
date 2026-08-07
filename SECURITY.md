@@ -265,7 +265,7 @@ Canary checks point-in-time state. Tampering between checks is not detected unti
 
 ## Core Policy Immutability (v0.5.0+)
 
-The 7 built-in safety rules are structurally enforced in the binary. Config.toml cannot disable or weaken them.
+The built-in rules are structurally enforced in the binary. Config.toml cannot disable or weaken them. Two groups carry the `is_builtin` flag and both are covered here: the destructive-command rules listed under [What It Protects](#what-it-protects-v090), and the `omamori-*-block` self-protection rules described under [Hook Coverage](#recursive-unwrap-stack-v060). The second group arrived later (DI-13, v0.10.3+) than this section did.
 
 ### Immutability Scope
 
@@ -289,6 +289,39 @@ For legitimate use cases (CI environments, solo developers), `omamori override d
 ### Design Decision: Structural > Detection
 
 Core immutability uses structural enforcement (binary ignores config overrides for core rules) rather than detection-based approaches (HMAC signing of config). "Tampering is meaningless" is stronger than "tampering is detected."
+
+### The Verb Position Is Not Pinned (#395)
+
+A separate axis from immutability: this is about which commands the self-protection rules
+*match*, not about whether they can be turned off.
+
+Each `omamori-*-block` rule declares a subcommand, and DI-13 requires the first argument to
+equal it — that is what stops `omamori exec -- echo disable config` from matching a rule
+whose `match_any` contains `disable`. The gate constrains that first position and nothing
+after it. `match_any` is then tested against every argument, so a protected verb is matched
+wherever it appears rather than at the verb position specifically: for the rule guarding
+config mutation, `omamori config <anything> add` matches on the same grounds that
+`omamori config add` does.
+
+`match_all` has the same property, and there the gap is **already reachable**: the rule
+guarding `audit key rotate` requires both `key` and `rotate` among the arguments in any
+order, so `omamori audit show --rule key --action rotate` — a read-only command carrying
+both words as flag *values* — matches it and is blocked (#387). That case is pinned by a
+test as accepted current behaviour rather than left as a comment. No `match_any` rule has a
+reachable collision today: no subcommand under `config`, or under any other guarded
+subcommand, takes a protected verb as a non-verb argument.
+
+The failure mode in both directions is an **over-block**, never a bypass — a legitimate
+command refused, not a destructive one allowed — which is why this is recorded rather than
+treated as urgent. What makes it worth stating is that nothing in a rule's own definition
+says the match is position-independent, so a collision looks arbitrary from the outside: a
+subcommand added later that happens to take one of these words as an argument would be
+blocked for a reason the rule does not explain.
+
+Closing it means giving rules a way to say "this verb belongs at argument N", which changes
+the matching engine every rule goes through, not only the self-protection ones. That is why
+it is deferred rather than patched — the ones that would need it are enumerated under
+[Hook Coverage](#recursive-unwrap-stack-v060).
 
 ## Structural Limits
 
@@ -749,6 +782,8 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 
 **Fundamental constraint**: AI agent and omamori run as the same OS user. Unix file permissions do not provide isolation. `PROTECTED_FILE_PATTERNS` and Phase 2 rules operate at the hook layer only (`check_command_for_hook()`). Complete filesystem isolation requires OS-level sandboxing — use your AI tool's sandbox (Codex CLI sandbox (on by default), Claude Code `/sandbox`, Cursor agent sandbox) or a dedicated tool like [nono](https://github.com/always-further/nono).
 
+**Key bytes in memory are not zeroized** ([#475](https://github.com/yottayoshida/omamori/issues/475)): the `zeroize` crate is not a dependency, so key bytes sit in several buffers that are dropped without being cleared — among them the keyring held across a whole `verify_chain`, the signing key an `AuditLogger` carries for its lifetime, the copy a prune point keeps alive while verifying, and the hex strings `read_secret` and `create_secret` build (a `String` reallocates as it grows, so partial copies can be left behind in freed heap). Reading any of them requires reading another process's memory as the same OS user, and anything that can do that can read `audit-secret` off the disk instead — the row above already records that as **Not protected**. So this does not move the boundary, and it is recorded here rather than fixed before 1.0 for that reason alone; it remains worth doing as hardening, not as a repair. Checked and clean on the disclosure side: neither the key type nor the keyring derives `Debug`, and no path was found by which key bytes reach a log line or an error message.
+
 **`audit.path` and `HOME` are trust roots, not further validated** (#439): a relative or empty `audit.path` in config.toml is ignored (`AuditConfig::validate()` normalizes it away, closing the #210-class CWD-scatter hazard where the audit log and its HMAC secret land in the process's working directory). An *absolute* `audit.path`, and `HOME` itself, are trusted verbatim — a same-user attacker who can write config.toml or set `HOME` can still redirect where the log and secret are written (e.g. into their own writable directory to co-locate the secret). This is the same same-user structural limitation as the rest of this section, not a new gap.
 
 ### Audit Log Read Access (v0.9.7+)
@@ -895,7 +930,8 @@ remove it, exactly as they can any other.
   false tampering verdict, produced with no attacker. Keep spare copies **outside** the data
   directory
 - The next retired slot is chosen from the highest index present, and rotation refuses to
-  overwrite an existing retired key
+  overwrite an existing retired key. What that refusal asks, and why the listing cannot answer
+  it, is in [Directories Are Not Covered By The Table Above](#directories-are-not-covered-by-the-table-above-486)
 - **Rotation requires a complete listing of the key directory, and refuses without one** (#477).
   Every other reader of that listing already failed closed; rotation is the only one that *changes*
   the store, and it was taking the highest index from a scan it never asked about. On a store whose
@@ -1009,9 +1045,45 @@ The table below enumerates the **audit-file** operations specifically, because t
 
 | Limitation | Reason | Mitigation |
 |------------|--------|------------|
-| Parent directory symlinks not detected | `O_NOFOLLOW` only applies to the final path component | `create_dir_all` is called by omamori itself; `PROTECTED_FILE_PATTERNS` protects `.local/share/omamori` |
+| Parent directory symlinks not detected | `O_NOFOLLOW` only applies to the final path component | Partial, and narrower than it reads — see [Directories Are Not Covered By The Table Above](#directories-are-not-covered-by-the-table-above-486) ([#486](https://github.com/yottayoshida/omamori/issues/486)). `PROTECTED_FILE_PATTERNS` covers `.local/share/omamori` **at the hook layer only**, so it stops an AI agent's tool call and not a direct OS operation. omamori chooses the path it passes to `create_dir_all` itself, so it cannot be redirected to an attacker-named location — but that is a different question from whether a symlink is already sitting at its own path |
 | Hardlink attacks not detected | `O_NOFOLLOW` does not affect hardlinks | Same-user structural limitation. Hardlinks require same-partition + same-user |
 | Non-Unix platforms have no symlink protection | `O_NOFOLLOW` is Unix-specific (`#[cfg(unix)]`) | On non-Unix, audit operates without symlink protection. Document as known limitation |
+
+#### Directories Are Not Covered By The Table Above (#486)
+
+Every row of the operation table above names a **file**. The data directory holding them is
+not in it, and the asymmetry is the point: `create_secret` writes the key with
+`create_new` + `O_NOFOLLOW` + mode `0600`, and earlier in the same function creates the
+directory it will live in with a plain `create_dir_all`, which asks for no such refusal.
+
+What that costs is narrower than it first looks, and worth stating exactly. A **dangling**
+symlink at the data-directory path is not a silent redirect: `create_dir_all` returns
+`AlreadyExists` and the target is never created (measured, not assumed). The case that
+passes quietly is a symlink pointing at a directory that **already exists** — it resolves,
+`create_dir_all` returns `Ok`, and every subsequent key read and write lands wherever the
+link points, with nothing said. Enumeration has the same shape from the other side:
+`read_dir` takes no flags, so there is no `O_NOFOLLOW` to ask for. `read_secret` rejects a
+symlinked *key* and says "possible attack"; a symlinked *directory* redirects every key read
+without reaching that check.
+
+**This is not a new hole.** Placing a symlink where the data directory belongs requires
+write access to its **parent** (`~/.local/share`) as the invoking user — replacing a
+directory is an operation on the entry above it, not on the directory itself — and the
+[Defense Boundary](#defense-boundary) already records direct OS operations by that user as
+**Not protected**. What the row above overstated was the mitigation, not the boundary.
+
+**Deliberately left open.** The fix is not a bug fix: refusing to run against a symlinked
+data directory changes what omamori will accept as an environment, and people do legitimately
+symlink `~/.local/share`. Warning instead trades that for a message on every guarded command.
+Which of the two omamori should do is a decision about the operator's setup, and it is being
+made separately rather than absorbed into a correctness patch.
+
+A third finding filed under the same issue — a retired-key slot whose spelling the listing
+rejects but a path probe accepts — **was closed** by [#498](https://github.com/yottayoshida/omamori/pull/498),
+which moved the overwrite check from `Path::exists()` (which follows a link, so a dangling
+symlink read as a free slot) to `symlink_metadata`. Deciding that check from the listing
+instead would have deleted the guard rather than tightened it: the chosen epoch is always
+above every key the scan reported, so the refusal would be structurally unreachable.
 
 ### Audit Retention (v0.7.2+)
 
@@ -1238,4 +1310,4 @@ The `.github/dependabot.yml` `github-actions` ecosystem is narrowed to monthly p
 - Confirm that at least one Dependabot security PR arrived during the window for any pinned action that received an advisory. If zero security PRs arrived despite known advisories existing on pinned actions, the narrow config may have over-filtered — revert or relax.
 - Re-read the GitHub docs page above to confirm the `ignore` / `update-types` semantics have not changed.
 
-This audit is operational (not enforced in CI) and is scheduled annually from the v0.9.4 release date.
+This audit is operational (not enforced in CI) and is scheduled annually from the v0.9.4 release date. It is tracked in [#385](https://github.com/yottayoshida/omamori/issues/385), which stays open for as long as the schedule does — the recurrence is the deliverable, so there is no state in which it is finished.
