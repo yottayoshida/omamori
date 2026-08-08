@@ -13,6 +13,8 @@ omamori is not a sandbox or a permission classifier. It is a local deterministic
 
 **macOS only** — terminal commands are passed through unless an AI tool environment is detected. See [Tool Compatibility](#tool-compatibility) for supported AI tools and coverage.
 
+**1.0** — three surfaces are frozen from this release: which command classes are blocked or redirected, the CLI's subcommands and the meaning of its documented exit codes, and the audit chain's verifiability across upgrades. Breaking any of them takes a major version. Two things are deliberately **not** frozen and are named as such: the `config.toml` schema, and the Rust library API (this release changes several `audit::*` types — see the CHANGELOG). The full statement, including what is *not* guaranteed, is [docs/CONTRACT.md](docs/CONTRACT.md).
+
 ![omamori demo](demo.svg)
 
 ## Quick Start
@@ -30,8 +32,6 @@ That's it. `setup` installs shims and hooks, appends `$HOME/.omamori/shim` to yo
 > **Already installed?** `omamori setup` is idempotent — safe to re-run after upgrades.
 > For non-interactive environments (CI, scripts): `omamori setup --non-interactive`.
 > Preview without changes: `omamori setup --dry-run`.
-
-> `report` and the trust-dashboard `doctor` output require omamori >= 0.10.0.
 
 ## Verifiable Claims
 
@@ -64,7 +64,7 @@ Reproduce the machine-checkable rows locally with one command: `./scripts/verify
 
 Three claims carry an honest limitation instead of an unqualified "CI-enforced":
 
-- **Claim 2** covers **Claude Code / Codex `hook-check` Layer 2 deny events only**. Cursor's Layer 2 denies are stderr-only and do not reach the audit chain — see [SECURITY.md → Forensic semantics](SECURITY.md#forensic-semantics-v098). `omamori audit verify` on an empty log exits `0`; that is "nothing to verify," not "nothing was missed" — the write-side coverage (that the audit chain actually gets appended to, on every path that reaches it) is pinned by one cargo test per `HookCheckResult` variant that reaches the audit chain.
+- **Claim 2** covers **Claude Code / Codex `hook-check` Layer 2 deny events only**. Cursor's Layer 2 denies are stderr-only and do not reach the audit chain — see [SECURITY.md → Forensic semantics](SECURITY.md#forensic-semantics-v098). `omamori audit verify` on an empty log exits `0`; that is "nothing to verify," not "nothing was missed" — the write-side coverage (that the audit chain actually gets appended to, on every path that reaches it) is pinned by one cargo test per `HookCheckResult` variant that reaches the audit chain. A log that is *not* empty but whose entries were written while the key store could not be read is a different case and exits `2`: those entries carry no HMAC, so they are recorded but uncheckable, and the exit code says so rather than counting them as verified.
 
   <details>
   <summary>Which cargo tests back claim 2</summary>
@@ -107,7 +107,7 @@ Layer 2 hooks defend against evasion patterns via builtin rules. Structural patt
 
 Environment-variable tampering, PATH override attempts, and self-modification commands (`config disable`, `uninstall`, etc.) are always blocked. See [SECURITY.md](SECURITY.md) for the full structural pattern taxonomy.
 
-> **v0.11.2+**: Extractable structural patterns are now allowed by default (with audit trail). To restore hard-block behavior for all structural patterns, set `[structural] action = "block"` in config.toml.
+> Extractable structural patterns are allowed by default, with an audit trail. To hard-block all structural patterns instead, set `[structural] action = "block"` in config.toml.
 
 All rules are customizable via TOML config. See [Configuration](#configuration) below.
 
@@ -163,7 +163,7 @@ Terminal → rm -rf src/
 | **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, Claude Code settings.json | Hook integration tests |
 | **Auto-sync** | Detects version mismatch after `brew upgrade` and auto-regenerates hook files | Smoke test |
 
-Core policy: built-in rules (15 as of v0.13.x, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
+Core policy: built-in rules (15 at 1.0, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
 
 **Performance**: hook check completes in well under 0.1ms in the benchmark harness — typically ~1 µs to block and ~57 µs to allow. Subprocess startup by the AI tool dominates total cost. See `benches/` and [#124](https://github.com/yottayoshida/omamori/issues/124) for methodology.
 
@@ -217,7 +217,7 @@ omamori can adjust actions based on what the command targets:
 | `rm -rf src/` | trash | **block** (protected) |
 | `git reset --hard` (no changes) | stash-then-exec | **log-only** (git-aware) |
 
-**Enabled by default** (v0.10.9+). Built-in lists for regenerable (`target/`, `node_modules/`, etc.) and protected (`src/`, `.git/`, `.env`, etc.) paths are active out of the box. To customize, add a `[context]` section to `~/.config/omamori/config.toml`:
+**Enabled by default.** Built-in lists for regenerable (`target/`, `node_modules/`, etc.) and protected (`src/`, `.git/`, `.env`, etc.) paths are active out of the box. To customize, add a `[context]` section to `~/.config/omamori/config.toml`:
 
 ```toml
 [context]
@@ -392,7 +392,7 @@ These are inherent to the PATH shim approach:
 - **Full-path execution** (`/bin/rm`) bypasses the shim — mitigated by Layer 2 hooks.
 - **`sudo`** changes PATH — omamori blocks when it detects elevated execution.
 - **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected. [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools.
-- **Obfuscated commands** (base64, runtime variable indirection) — runtime-evaluated forms cannot be detected by static analysis. Static shell expansion at command verb position (`$'rm'`, `{rm,-rf,/}`) is caught since v0.10.2.
+- **Obfuscated commands** (base64, runtime variable indirection) — runtime-evaluated forms cannot be detected by static analysis. Static shell expansion at command verb position (`$'rm'`, `{rm,-rf,/}`) is caught.
 - **AI self-bypass** — `config disable` / `uninstall` / `break-glass` are blocked; direct file editing blocked by hooks (Claude Code only). For human-initiated false positive recovery, use `omamori break-glass --rule <id>` (time-limited, audit-logged).
 
 For what omamori **does not** catch — by design or by structural limit — and for the full security model and bypass corpus, see [SECURITY.md](SECURITY.md).
