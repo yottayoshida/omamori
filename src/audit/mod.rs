@@ -19,8 +19,8 @@ pub use provenance::hash_cwd_candidates;
 pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, UnprotectedReason, rotate_key};
 pub use verify::{
-    AuditError, AuditSummary, KeyUnavailableKind, ShowOptions, VerifyResult, audit_summary,
-    count_unknown_tool_fail_opens_within, show_entries, verify_chain,
+    AuditError, AuditSummary, KeyStoreFailure, KeyUnavailableKind, ShowOptions, VerifyResult,
+    audit_summary, count_unknown_tool_fail_opens_within, show_entries, verify_chain,
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
@@ -628,7 +628,7 @@ mod tests {
         expected_key_file, flock_exclusive, is_writer_emitted_key_id, load_keyring,
         load_or_create_secret, load_signing_key, open_read_nofollow, read_secret,
     };
-    use verify::{AuditError, KeyUnavailableKind, display_timestamp};
+    use verify::{AuditError, display_timestamp};
 
     /// Run `f` on a worker thread and fail the test if it has not finished
     /// within `limit`.
@@ -6406,20 +6406,37 @@ mod tests {
             "1\n2",
         ] {
             fs::write(&record_path, bad).unwrap();
-            let Err(err) = verify_chain(&config) else {
-                panic!(
-                    "a record reading {bad:?} must stop verification, not be \
-                     guessed past"
-                )
-            };
-            let reason = err.to_string();
-            assert!(
-                matches!(err, AuditError::KeyringUnusable { .. }),
-                "{bad:?}: cannot-verify, not tampering — got {reason}"
+            // #506 moved where this is reported, not whether it is. The walk no
+            // longer returns before reading the log — it records the failure and
+            // keeps going, so that the checks needing no key still run — and the
+            // property being pinned is unchanged: an unreadable record stops
+            // *verification* and is never guessed past. What it must not become
+            // is a verdict about the chain.
+            let result = verify_chain(&config).unwrap_or_else(|e| {
+                panic!("{bad:?}: the walk records this, it does not fail: {e}")
+            });
+            let failure = result.key_store_failure.as_ref().unwrap_or_else(|| {
+                panic!("a record reading {bad:?} must stop verification, not be guessed past")
+            });
+            assert_eq!(
+                failure.kind, "epoch_record_unreadable",
+                "{bad:?}: named as the record, not folded into the unlistable-directory \
+                 label the error used to carry: {}",
+                failure.reason
             );
             assert!(
-                reason.contains("audit-secret.epoch"),
-                "{bad:?}: the message must name the file to remove: {reason}"
+                result.halted(),
+                "{bad:?}: recording the failure has to be terminal — a log walked past it \
+                 with entries counted as verified would be the guess this test forbids"
+            );
+            assert!(
+                result.broken_at.is_none() && result.chain_entries == 0,
+                "{bad:?}: cannot-verify, not tampering, and nothing authenticated"
+            );
+            assert!(
+                failure.reason.contains("audit-secret.epoch"),
+                "{bad:?}: the message must name the file to remove: {}",
+                failure.reason
             );
 
             let Err(refused) = super::rotate_key(&audit_path) else {
@@ -6437,12 +6454,11 @@ mod tests {
         // collapse into it.
         fs::remove_file(&record_path).unwrap();
         fs::create_dir(&record_path).unwrap();
-        let Err(unreadable) = verify_chain(&config) else {
-            panic!("a directory at the record path is not an absent record")
-        };
-        assert!(
-            matches!(unreadable, AuditError::KeyringUnusable { .. }),
-            "an unreadable record is not an absent one: {unreadable}"
+        let unreadable = verify_chain(&config).expect("#506: recorded, not returned");
+        assert_eq!(
+            unreadable.key_store_failure.map(|f| f.kind),
+            Some("epoch_record_unreadable"),
+            "an unreadable record is not an absent one"
         );
         fs::remove_dir(&record_path).unwrap();
 
@@ -6525,20 +6541,50 @@ mod tests {
         let outcome = verify_chain(&config);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
-        match outcome {
-            Err(AuditError::KeyringUnusable { reason, .. }) => {
-                assert!(
-                    reason.contains("cannot list"),
-                    "the error must name the real cause, got: {reason}"
-                );
-            }
-            Err(other) => panic!("expected KeyringUnusable, got {other:?}"),
-            Ok(result) => panic!(
-                "an unlistable key directory must not produce a verdict; \
-                 broken_at = {:?}",
-                result.broken_at
-            ),
-        }
+        // #506 **withdraws** the judgement the `Ok` arm used to assert, and this
+        // note is the record of that rather than a test being brought into line.
+        //
+        // "An unlistable key directory must not produce a verdict" was written
+        // when the only way to keep walking was to keep *authenticating*, and it
+        // was right about that: resolving ids against a directory that could not
+        // be listed is exactly what made a rotated store read as tampered. What
+        // it ruled out without meaning to was the high-water-mark comparison,
+        // which needs no key — so removing read permission from one directory
+        // switched off tail-truncation detection, and a deleted tail came back
+        // as exit 2 with a message about keys.
+        //
+        // The walk now produces a result, and the result is not a verdict about
+        // the chain. Every assertion below is the old property restated over the
+        // value instead of over the error.
+        let result = outcome.expect("#506: the failure is recorded and the walk continues");
+        let failure = result
+            .key_store_failure
+            .as_ref()
+            .expect("an unlistable key directory must be recorded as a store-level failure");
+        assert_eq!(failure.kind, "directory_unreadable");
+        assert!(
+            failure.reason.contains("cannot list"),
+            "the failure must name the real cause, got: {}",
+            failure.reason
+        );
+        assert!(
+            result.halted(),
+            "nothing may be authenticated against a keyring that could not be assembled"
+        );
+        assert!(
+            result.broken_at.is_none() && result.chain_entries == 0,
+            "and a permissions problem must not come out as tampering: broken_at = {:?}, \
+             {} entries claimed as verified",
+            result.broken_at,
+            result.chain_entries
+        );
+        assert!(
+            result.key_unavailable_at.is_none(),
+            "nor as an entry-level key problem. With the store unreadable, both inputs \
+             `classify_unavailable_key` reasons from are spoiled by the same fault — \
+             `highest_known_epoch()` is 0 on an empty ring — and its answer would be \
+             \"this entry's key_id has been altered\" about a store nobody touched"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6738,8 +6784,14 @@ mod tests {
     /// `chain intact`: a regression, produced by the branch whose comment
     /// claimed it was avoiding exactly that outcome.
     ///
-    /// `UNRESOLVED_KEY_ID` cannot be in any keyring, so the entry now lands in
-    /// the cannot-verify terminal state with its real reason.
+    /// `UNRESOLVED_KEY_ID` cannot be in any keyring, so the entry is never
+    /// checked against a key that did not sign it.
+    ///
+    /// #483 changes what happens after that, and this test is where the defect
+    /// it closes was visible: the entry used to *halt* verification, and
+    /// ADR-0007 forbids rewriting it — so one line written during a permissions
+    /// blip pinned the store at cannot-verify for good, including after the
+    /// permissions were fixed.
     #[test]
     #[cfg(unix)]
     fn an_unlistable_key_directory_does_not_make_the_writer_manufacture_tampering() {
@@ -6781,15 +6833,27 @@ mod tests {
              broken_at = {:?}",
             result.broken_at
         );
-        assert_eq!(
-            result.key_unavailable_id.as_deref(),
-            Some(UNRESOLVED_KEY_ID),
-            "the entry must be reported under the id that says why it is unverifiable"
+        // #483: the entry is walked past rather than halted on, on two pieces of
+        // evidence that have to agree — the id no keyring can hold, and the
+        // no-key sentinel in the hash field. Halting on the id alone is what
+        // made this permanent.
+        assert!(
+            !result.halted(),
+            "fixing the permissions has to be able to clear this; a halt here is the state \
+             ADR-0007 makes irreversible"
         );
         assert_eq!(
-            result.key_unavailable_kind,
-            Some(KeyUnavailableKind::NeverProtected),
-            "and classified as never-protected, not as a key file the operator lost"
+            result.key_unavailable_id, None,
+            "an entry whose two key fields agree is not an unresolvable key"
+        );
+        assert_eq!(
+            result.never_protected_entries, 1,
+            "it is counted instead — the count is what holds `audit verify` at exit 2 and \
+             stops a log made only of these from reporting `no entries to verify`"
+        );
+        assert_eq!(
+            result.chain_entries, 1,
+            "and it is not counted as verified: the entry before it was, this one was not"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -8022,23 +8086,33 @@ mod tests {
         // said nothing about. The wording assertion is unchanged; what is new
         // is that the variant carries a `kind`, and that `kind` is what stops
         // this landing in the quiet bucket.
-        match verify_chain(&config) {
-            Err(AuditError::StoreInaccessible { kind, reason }) => {
-                assert_eq!(kind, "secret_symlink");
-                assert!(
-                    // "possible attack", not "symlink": these fixtures use
-                    // `test_dir` names containing the word "symlink", and the
-                    // error embeds the path — so `contains("symlink")` passes
-                    // regardless of what the error says. Found by same-class
-                    // scan after Codex Round 1 flagged the same defect in
-                    // `read_secret_rejects_symlink` (#457).
-                    reason.contains("possible attack"),
-                    "expected the symlink/possible-attack error, got: {reason}"
-                );
-            }
-            Err(other) => panic!("expected StoreInaccessible, got: {other}"),
-            Ok(_) => panic!("expected error for symlink secret"),
-        }
+        //
+        // #506: recorded rather than returned, and this is the state the issue's
+        // threat model cares about most — a symlink planted on the secret path
+        // *and* a deleted tail. It was also the early return the first draft of
+        // the fix overlooked, because it sits inside the `match` that builds
+        // `secret_error` rather than beside the other two.
+        let result = verify_chain(&config).expect("#506: the failure is recorded, not returned");
+        let failure = result
+            .key_store_failure
+            .as_ref()
+            .expect("a symlinked secret path must be recorded as a store-level failure");
+        assert_eq!(failure.kind, "secret_symlink");
+        assert!(
+            // "possible attack", not "symlink": these fixtures use
+            // `test_dir` names containing the word "symlink", and the
+            // reason embeds the path — so `contains("symlink")` passes
+            // regardless of what it says. Found by same-class
+            // scan after Codex Round 1 flagged the same defect in
+            // `read_secret_rejects_symlink` (#457).
+            failure.reason.contains("possible attack"),
+            "expected the symlink/possible-attack reason, got: {}",
+            failure.reason
+        );
+        assert!(
+            result.halted() && result.chain_entries == 0,
+            "the secret could not be read, so nothing may be reported as authenticated"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

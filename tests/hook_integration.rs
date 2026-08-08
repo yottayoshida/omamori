@@ -2531,23 +2531,34 @@ fn clean_ai_env(cmd: &mut Command) -> &mut Command {
         .env_remove("AI_GUARD")
 }
 
-/// Run an `omamori audit …` subcommand against a sandbox HOME and return
+/// Run any `omamori` subcommand against a sandbox HOME and return
 /// (exit code, stdout, stderr).
-fn run_audit(base: &Path, args: &[&str]) -> (i32, String, String) {
+///
+/// #506 needed `doctor` and `report` beside `audit verify`: the three render the
+/// same store and the defect being closed is one of them saying less than the
+/// others. `run_audit` stays as the sugar every earlier caller uses.
+fn run_omamori(base: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.arg("audit")
-        .args(args)
+    cmd.args(args)
         .env("HOME", base)
         .env("XDG_DATA_HOME", base.join(".local/share"))
         .env("XDG_CONFIG_HOME", base.join(".config"));
     let out = clean_ai_env(&mut cmd)
         .output()
-        .expect("failed to run omamori audit");
+        .expect("failed to run omamori");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Run an `omamori audit …` subcommand against a sandbox HOME and return
+/// (exit code, stdout, stderr).
+fn run_audit(base: &Path, args: &[&str]) -> (i32, String, String) {
+    let mut full = vec!["audit"];
+    full.extend_from_slice(args);
+    run_omamori(base, &full)
 }
 
 /// #470 — the two-step attack, end to end through the shipped binary.
@@ -2626,6 +2637,696 @@ fn audit_verify_reports_a_deleted_tail_even_when_a_planted_key_id_halts_it() {
         "the halt is still worth reporting alongside the truncation — got: {err}"
     );
 
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ---------------------------------------------------------------------------
+// #506: an unusable key store must not suppress the checks that need no key
+// ---------------------------------------------------------------------------
+
+/// What was done to a seeded store's key material.
+///
+/// Every variant leaves `audit.jsonl` byte-for-byte alone, and that is the
+/// whole design of the table below: the log is what the tail-truncation
+/// comparison reads, so a verifier that reports a deleted tail without the
+/// damage has no honest reason to go quiet with it.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq)]
+enum KeyDamage {
+    /// Control: nothing is wrong with the keys.
+    None,
+    /// The active key moved aside — a store that already holds entries and has
+    /// lost the key that signed them.
+    SecretMovedAside,
+    /// Mode 0300: writable and searchable, not listable. The only mode that
+    /// measures the unlistable-directory path. At 0000 the traverse bit goes
+    /// too, the log itself becomes unopenable, and a different arm answers.
+    DirectoryUnlistable,
+    /// A symlink planted at the secret path. The shape the issue's threat model
+    /// cares about most, and the early return that sits *inside* the match
+    /// building `secret_error` rather than beside the other two — which is how
+    /// the first draft of this change missed it.
+    SecretPlanted,
+}
+
+#[cfg(unix)]
+fn damage_key_material(secret_dir: &Path, damage: KeyDamage) {
+    use std::os::unix::fs::PermissionsExt;
+    let secret = secret_dir.join("audit-secret");
+    match damage {
+        KeyDamage::None => {}
+        KeyDamage::SecretMovedAside => {
+            std::fs::rename(&secret, secret_dir.join("moved-aside")).unwrap();
+        }
+        KeyDamage::DirectoryUnlistable => {
+            std::fs::set_permissions(secret_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        }
+        KeyDamage::SecretPlanted => {
+            let elsewhere = secret_dir.join("stored-away");
+            std::fs::rename(&secret, &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &secret).unwrap();
+        }
+    }
+}
+
+/// Give the directory its read bit back, so the sandbox can be removed.
+#[cfg(unix)]
+fn restore_key_directory(secret_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(secret_dir, std::fs::Permissions::from_mode(0o700));
+}
+
+/// Three chain entries and a high-water-mark sitting at their end.
+///
+/// Returns the sandbox HOME, the log path, and the hook pair — #483 needs to
+/// append *more* entries to a seeded store, through the same live hook, which is
+/// the only writer that produces an unprotected entry.
+#[cfg(unix)]
+fn seed_three_entry_store(case: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (base, hook_path, shim_dir) = setup_hook_env(case);
+    let json = pretooluse_bash_json("rm -rf /");
+    for _ in 0..3 {
+        let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+        assert_eq!(
+            decision_from_exit(exit),
+            Decision::Block,
+            "setup ({case}): each deny seeds one chain entry"
+        );
+    }
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 0,
+        "precondition ({case}): the seeded chain verifies and the mark sits at its end \
+         (stderr={err})"
+    );
+    let audit_path = audit_path_for(&base);
+    (base, audit_path, hook_path, shim_dir)
+}
+
+/// Append one entry through the live hook while the key directory cannot be
+/// listed, so omamori writes it with no HMAC.
+///
+/// Mode 0300: writable and traversable, **not** listable. Two bits matter and
+/// each was got wrong once:
+///
+/// * The execute bit has to stay, because the log lives in this directory too —
+///   without it the append never reaches the file and the fixture measures a
+///   failed write rather than an unprotected one.
+/// * The write bit has to stay as well, and this is the one that made the first
+///   version of these tests non-discriminating. `write_hwm` writes a temp file
+///   and renames it, which needs the directory writable, so at mode 0100 the
+///   high-water-mark silently stops advancing — hiding the exact interaction
+///   review found (the mark moves with the append while `last_verified_seq`
+///   does not, so comparing the two reports a truncation that never happened).
+#[cfg(unix)]
+fn append_unprotected_entry(hook_path: &Path, shim_dir: &Path, secret_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(secret_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let (_, _, exit) = run_hook_script(hook_path, shim_dir, &pretooluse_bash_json("rm -rf /"));
+    std::fs::set_permissions(secret_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "the deny still happens while the keys are unreadable; only its protection is missing \
+         — that is why the entry exists to be argued about"
+    );
+}
+
+/// Every non-empty line of the log, as parsed JSON.
+#[cfg(unix)]
+fn log_entries(audit_path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(audit_path)
+        .expect("read audit.jsonl")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect()
+}
+
+/// Write a set of entries back out as the whole log.
+#[cfg(unix)]
+fn rewrite_log(audit_path: &Path, entries: &[serde_json::Value]) {
+    let body: Vec<String> = entries
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect();
+    std::fs::write(audit_path, format!("{}\n", body.join("\n"))).unwrap();
+}
+
+/// Drop the last chain entry, leaving the mark where it was.
+#[cfg(unix)]
+fn delete_tail(audit_path: &Path) {
+    let before = std::fs::read_to_string(audit_path).expect("read audit.jsonl");
+    let mut lines: Vec<String> = before
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines.len() >= 3,
+        "setup must leave at least three entries, got {}",
+        lines.len()
+    );
+    lines.pop();
+    std::fs::write(audit_path, format!("{}\n", lines.join("\n"))).unwrap();
+}
+
+/// #506, falsification check 1 — **only** a truncated store reports exit 3, and
+/// it does so however the key material was damaged.
+///
+/// The gap: `verify_chain` returned before the high-water-mark comparison
+/// whenever the key material could not be read, and that comparison needs no
+/// key. Measured on `78b27ff`, one store seeded and its tail deleted: exit 3
+/// with the keys intact, exit 2 with the active key renamed, exit 2 with the
+/// key directory at mode 0300 — and neither of the last two said one word about
+/// the deletion. Making the keys unreadable *was* the way to delete a tail
+/// quietly.
+///
+/// The two untruncated rows are what make the table discriminating. "Halted ⇒
+/// exit 3" passes every truncated row and fails both of them; "never report
+/// truncation during a halt" — the behaviour being replaced — passes those two
+/// and fails the four above. No implementation that ignores the `truncate`
+/// column can pass, which is the property a single-row test would not have.
+#[cfg(unix)]
+#[test]
+fn only_a_truncated_store_exits_3_however_the_key_material_was_damaged() {
+    for (case, damage, truncate, expect) in [
+        // The tail is gone. Every one of these must report it.
+        ("intact-keys", KeyDamage::None, true, 3),
+        ("moved-secret", KeyDamage::SecretMovedAside, true, 3),
+        ("unlistable-dir", KeyDamage::DirectoryUnlistable, true, 3),
+        ("planted-secret", KeyDamage::SecretPlanted, true, 3),
+        // The tail is intact. Damaged keys are still cannot-verify, and
+        // must not acquire a truncation finding they have no evidence for.
+        (
+            "whole-unlistable-dir",
+            KeyDamage::DirectoryUnlistable,
+            false,
+            2,
+        ),
+        ("whole-moved-secret", KeyDamage::SecretMovedAside, false, 2),
+    ] {
+        let (base, audit_path, ..) = seed_three_entry_store(&format!("506-exit3-{case}"));
+        let secret_dir = audit_path
+            .parent()
+            .expect("the log has a parent")
+            .to_path_buf();
+        if truncate {
+            delete_tail(&audit_path);
+        }
+        damage_key_material(&secret_dir, damage);
+
+        let (code, out, err) = run_audit(&base, &["verify"]);
+        restore_key_directory(&secret_dir);
+
+        assert_eq!(
+            code, expect,
+            "{case}: expected exit {expect} (stdout={out}, stderr={err})"
+        );
+        assert_eq!(
+            err.contains("may have been truncated"),
+            truncate,
+            "{case}: the truncation finding must follow the log, not the key material \
+             (stderr={err})"
+        );
+        if damage == KeyDamage::None {
+            // The control row authenticates the entries it still has, so it is
+            // entitled to the success line — #470 settled that, and the
+            // truncation warning follows it. Asserting the halted wording here
+            // would pin the control to the behaviour of the rows it exists to
+            // be different from.
+            assert!(
+                out.contains("chain intact"),
+                "{case}: with the keys intact the surviving entries really were verified \
+                 (stdout={out})"
+            );
+        } else {
+            assert!(
+                !out.contains("chain intact"),
+                "{case}: a run that authenticated nothing must not open by calling the \
+                 chain intact (stdout={out})"
+            );
+            assert!(
+                err.contains("cannot verify") || err.contains("Verification could not start"),
+                "{case}: and the damaged key material must still be reported alongside \
+                 (stderr={err})"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// #506, falsification check 2 — a permissions fault is never dressed up as
+/// tampering, and never disappears either.
+///
+/// Both halves are load-bearing and they fail to opposite implementations. The
+/// accusation half fails the obvious version of this change: with the early
+/// return gone, every entry reaches `classify_unavailable_key`, whose two
+/// inputs are then spoiled by the same fault — `highest_known_epoch()` returns
+/// 0 on an empty ring — so `key-2` lands in `beyond_known_epochs` and the
+/// operator is told "**Either this entry's key_id has been altered, or retired
+/// key files were deleted**" about a store where nobody touched anything.
+///
+/// The silence half fails the cheap fix for that (drop the reporting): an empty
+/// log plus an unlistable key directory walks zero lines, halts at no entry and
+/// breaks nowhere, so `chain_status` lands on `Intact` and `doctor` — which
+/// prints nothing for `Intact` — goes completely quiet on a store it describes
+/// today. Loud → silent is the worst regression this tool can ship.
+#[cfg(unix)]
+#[test]
+fn an_unlistable_key_directory_is_neither_called_tampering_nor_passed_over() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Half one: a seeded store, keys made unlistable, nothing else touched.
+    let (base, audit_path, ..) = seed_three_entry_store("506-not-tampering");
+    let secret_dir = audit_path
+        .parent()
+        .expect("the log has a parent")
+        .to_path_buf();
+    std::fs::set_permissions(&secret_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let (verify_code, verify_out, verify_err) = run_audit(&base, &["verify"]);
+    let (_, doctor_out, doctor_err) = run_omamori(&base, &["doctor"]);
+    let (_, report_out, _) = run_omamori(&base, &["report", "--json"]);
+    restore_key_directory(&secret_dir);
+
+    let strip = |s: String| s.replace(&secret_dir.display().to_string(), "<dir>");
+    let verify_said = strip(format!("{verify_out}{verify_err}"));
+    // `doctor` renders far more than this store — PATH shims, hook installs, the
+    // integrity baseline — and those sections use "tampered" about their own
+    // subject. Narrowed to the lines describing the audit chain, with the
+    // narrowing itself pinned below: a filter that selected nothing would
+    // satisfy every "must not say" assertion here without measuring anything.
+    let doctor_said = strip(format!("{doctor_out}{doctor_err}"))
+        .lines()
+        .filter(|l| l.contains("chain:") || l.contains("audit "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !doctor_said.is_empty(),
+        "control: doctor must say something about the audit chain for the filter below \
+         to be measuring it: {doctor_out}{doctor_err}"
+    );
+
+    assert_eq!(
+        verify_code, 2,
+        "an unusable keyring is cannot-verify: {verify_said}"
+    );
+    for accusation in ["has been altered", "were deleted", "tampering", "tampered"] {
+        for (surface, said) in [("verify", &verify_said), ("doctor", &doctor_said)] {
+            assert!(
+                !said.contains(accusation),
+                "{surface}: a directory whose read bit is off is not evidence of \
+                 {accusation:?}: {said}"
+            );
+        }
+    }
+    assert!(
+        verify_said.contains("cannot list") && doctor_said.contains("cannot list"),
+        "and the cause has to be named on both surfaces: {verify_said} / {doctor_said}"
+    );
+    assert!(
+        doctor_said.contains("chain: cannot verify"),
+        "doctor must carry the risk signal: {doctor_said}"
+    );
+    assert!(
+        report_out.contains("\"status\": \"keyring_unusable\""),
+        "and `report --json` the machine-readable form: {report_out}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Half two: nothing in the log at all. The store `verify_chain` now walks
+    // zero lines of, where every terminal signal it could land on is unset.
+    let (empty_base, _, _) = setup_hook_env("506-empty-log-unlistable");
+    let empty_log = audit_path_for(&empty_base);
+    std::fs::create_dir_all(empty_log.parent().unwrap()).unwrap();
+    std::fs::write(&empty_log, "").unwrap();
+    let empty_dir = empty_log
+        .parent()
+        .expect("the log has a parent")
+        .to_path_buf();
+    std::fs::set_permissions(&empty_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let (empty_code, _, empty_err) = run_audit(&empty_base, &["verify"]);
+    let (_, empty_doctor, _) = run_omamori(&empty_base, &["doctor"]);
+    restore_key_directory(&empty_dir);
+
+    assert_eq!(
+        empty_code, 2,
+        "an empty log does not make an unusable keyring succeed: {empty_err}"
+    );
+    assert!(
+        empty_doctor.contains("chain: cannot verify") && empty_doctor.contains("cannot list"),
+        "doctor says this today and must keep saying it — an empty log walks zero lines, \
+         which is exactly where a status of `intact` would come from: {empty_doctor}"
+    );
+    assert!(
+        !empty_doctor.contains("Last 30 days: quiet"),
+        "and the section must not report the store as quiet: {empty_doctor}"
+    );
+    let _ = std::fs::remove_dir_all(&empty_base);
+}
+
+// ---------------------------------------------------------------------------
+// #483: an entry omamori wrote unprotected must not pin the store forever
+// ---------------------------------------------------------------------------
+
+/// #483, falsification check 3 — the four outcomes an unresolved `key_id` can
+/// lead to, and why no shortcut passes all four.
+///
+/// The defect: an entry omamori itself wrote while it could not resolve a key
+/// halted verification, and `ADR-0007` forbids rewriting entries — so one line
+/// written during a permissions blip held the store at exit 2 permanently,
+/// including long after the permissions were fixed.
+///
+/// Believing such an entry takes **two** fields that agree, and each row here
+/// fails a different shortcut:
+///
+/// * (a) fails "keep halting" — the store never recovers.
+/// * (b) fails "stop halting on `key_id`" — one edited field, no key material
+///   needed, and an authenticated entry slides out of `broken` into a state that
+///   no longer halts. That is the exit-2 exploit #457 closed, re-entered by a
+///   new door.
+/// * (b′) fails any version that skips the `expected_prev` update: forge both
+///   fields and the *next* line's `prev_hash` has to stop matching.
+/// * (c) fails one that does not count them — a log made only of these reaches
+///   `no entries to verify` and exits **0**.
+#[cfg(unix)]
+#[test]
+fn an_unresolved_key_id_is_believed_only_when_the_hash_field_agrees() {
+    // (a) A real unprotected entry, with authenticated ones on both sides.
+    let (base, audit_path, hook_path, shim_dir) = seed_three_entry_store("483-genuine");
+    let secret_dir = audit_path
+        .parent()
+        .expect("the log has a parent")
+        .to_path_buf();
+    append_unprotected_entry(&hook_path, &shim_dir, &secret_dir);
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &pretooluse_bash_json("rm -rf /"));
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "setup: one more entry, this time with the keys readable"
+    );
+
+    // Counted from the log rather than assumed: the hook is free to write more
+    // than one entry per invocation, and an assertion built on a guessed total
+    // would pass or fail for reasons that have nothing to do with #483.
+    let entries = log_entries(&audit_path);
+    let unprotected = entries
+        .iter()
+        .filter(|e| e["key_id"] == "unresolved")
+        .count();
+    let protected = entries.len() - unprotected;
+    assert_eq!(unprotected, 1, "setup: exactly one unprotected entry");
+
+    let (code, out, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 2,
+        "(a) an unprotected entry is cannot-verify, not clean (stdout={out}, stderr={err})"
+    );
+    assert!(
+        err.contains(&format!("{unprotected} entries carry no HMAC")),
+        "(a) it has to be counted and named: {err}"
+    );
+    assert!(
+        err.contains(&format!("{protected} entries verified")),
+        "(a) and everything around it authenticated — halting on it is exactly what used \
+         to stop that, permanently: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+
+    // (b) One authenticated entry relabelled, and nothing else touched. The
+    // hash field still holds a real HMAC, so the pair disagrees.
+    let (base, audit_path, ..) = seed_three_entry_store("483-relabelled");
+    let mut entries = log_entries(&audit_path);
+    entries[1]["key_id"] = serde_json::Value::String("unresolved".to_string());
+    rewrite_log(&audit_path, &entries);
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(code, 2, "(b) still cannot-verify: {err}");
+    assert!(
+        err.contains("cannot verify from entry #1"),
+        "(b) the halt is kept: this entry carries a real hash, so it was not one omamori \
+         wrote unprotected: {err}"
+    );
+    assert!(
+        !err.contains("carry no HMAC"),
+        "(b) and it must not be counted as one either — that count is what would clear \
+         the store: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+
+    // (b′) Both fields forged, so the pair agrees and the entry is walked past.
+    // The forgery lands on the line after it.
+    let (base, audit_path, ..) = seed_three_entry_store("483-forged-pair");
+    let mut entries = log_entries(&audit_path);
+    entries[1]["key_id"] = serde_json::Value::String("unresolved".to_string());
+    entries[1]["entry_hash"] = serde_json::Value::String("NO_HMAC_SECRET".to_string());
+    rewrite_log(&audit_path, &entries);
+
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 1,
+        "(b′) the next entry's prev_hash names the hash this forgery destroyed, so the \
+         chain breaks: {err}"
+    );
+    assert!(
+        err.contains("chain broken at entry #2"),
+        "(b′) at the line after the forged one — which is what the expected_prev update \
+         buys: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+
+    // (c) A log made only of unprotected entries: the #506 + #483 composite, and
+    // the hole that exists in neither half alone. #506 removes the early return
+    // that used to stop this store, #483 removes the halt, and what is left has
+    // no entry to break on, no key to fail against and nothing verified — the
+    // `chain_entries == 0` arm, which exits 0.
+    //
+    // Born that way rather than edited into shape: the store's very first append
+    // happens with the data directory already unlistable. An earlier version of
+    // this fixture kept the unprotected entry from a seeded store and deleted
+    // the rest, which leaves a head stating `seq: 3` and pointing at a hash that
+    // is no longer there — a *different* store, and one the head check added by
+    // review correctly calls broken. What the writer actually produces here is
+    // asserted below rather than assumed, since the head check now depends on
+    // it.
+    let (base, hook_path, shim_dir) = setup_hook_env("483-born-unprotected");
+    // One ordinary deny first, so the key file and the data directory exist —
+    // this store's keys are fine, they merely cannot be *listed* at the moment
+    // the entry below is written. Without it the store has no key at all, and
+    // `verify` answers with the store-level failure instead, which is #506's
+    // subject rather than this one's.
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &pretooluse_bash_json("rm -rf /"));
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "(c) setup: an ordinary deny, to mint the key"
+    );
+    let audit_path = audit_path_for(&base);
+    let data_dir = audit_path
+        .parent()
+        .expect("the log has a parent")
+        .to_path_buf();
+    // Reset the log so the unprotected entry is the head. The mark goes with it:
+    // it belongs to entries that no longer exist.
+    std::fs::write(&audit_path, "").unwrap();
+    let _ = std::fs::remove_file(data_dir.join("audit.jsonl.hwm"));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    }
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &pretooluse_bash_json("rm -rf /"));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "(c) setup: the deny happens even while the keys cannot be listed"
+    );
+
+    let entries = log_entries(&audit_path);
+    assert!(
+        entries.iter().all(|e| e["key_id"] == "unresolved"),
+        "(c) setup: every entry in this log was written unprotected: {entries:?}"
+    );
+    // The head check reads these two fields, so what the writer puts in them is
+    // measured here rather than taken on trust — if omamori ever stops writing
+    // `seq: 0` and the sentinel on a fresh unprotected store, this fixture says
+    // so instead of the verifier quietly calling the store broken.
+    assert_eq!(
+        entries[0]["seq"], 0,
+        "(c) setup: the head states position 0"
+    );
+    assert_eq!(
+        entries[0]["prev_hash"], "NO_HMAC_SECRET",
+        "(c) setup: and the anchor omamori writes when it has no key"
+    );
+
+    let (code, out, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 2,
+        "(c) a log nothing in it can be checked against must not exit 0 (stdout={out}, \
+         stderr={err})"
+    );
+    assert!(
+        !out.contains("no entries to verify"),
+        "(c) nor report itself as having nothing to check: {out}"
+    );
+    assert!(
+        err.contains("carry no HMAC"),
+        "(c) what it has is entries it cannot verify, and it has to say so: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #483 (review, P1) — an unprotected entry at the **tail** is not a deleted
+/// tail.
+///
+/// The append path advances the high-water-mark for every entry it writes,
+/// protected or not. The verifier deliberately does not advance
+/// `last_verified_seq` past an unprotected one — that value is what a later
+/// run's mark gets written from, and an unauthenticated end must never become
+/// the mark. Comparing the mark against *it* reported **exit 3, "audit log tail
+/// may have been truncated"**, on a log nothing had been removed from.
+///
+/// That trades #483's permanent exit 2 for a permanent false exit 3, which is
+/// the worse verdict of the two: it accuses. The fix is to keep the two ends
+/// apart — the comparison uses the last seq walked, the write still uses the
+/// last seq authenticated.
+#[cfg(unix)]
+#[test]
+fn an_unprotected_entry_at_the_tail_is_not_read_as_a_deleted_tail() {
+    let (base, audit_path, hook_path, shim_dir) = seed_three_entry_store("483-tail-unprotected");
+    let secret_dir = audit_path
+        .parent()
+        .expect("the log has a parent")
+        .to_path_buf();
+    append_unprotected_entry(&hook_path, &shim_dir, &secret_dir);
+
+    let (code, out, err) = run_audit(&base, &["verify"]);
+    assert_eq!(
+        code, 2,
+        "nothing was removed from this log (stdout={out}, stderr={err})"
+    );
+    assert!(
+        !err.contains("may have been truncated"),
+        "the mark moved with the append; the log is whole: {err}"
+    );
+    assert!(
+        err.contains("carry no HMAC"),
+        "what is true is that the last entry cannot be checked: {err}"
+    );
+
+    // And the mark must not have been rewritten from a run that could not
+    // authenticate the end — a lowered mark disables truncation detection from
+    // then on, silently.
+    let (code, _, err) = run_audit(&base, &["verify"]);
+    assert_eq!(code, 2, "the verdict is stable across runs: {err}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #483 (review, P1) — a log whose head is unprotected still has to line up.
+///
+/// The head skips the genesis anchor, because computing one needs the key this
+/// entry does not have. It must not skip everything: omamori writes `seq: 0` and
+/// the no-key sentinel into `prev_hash` there, and both are checkable without a
+/// key. Without that, replacing a whole log with unprotected lines carrying any
+/// seq and any `prev_hash` lands on "entries carry no HMAC" — a coverage
+/// complaint — rather than on a broken chain.
+///
+/// The asymmetry with an authenticated head is deliberate and runs the other
+/// way: there, `seq` and `prev_hash` are inside the HMAC, so the hash covers
+/// them. Here nothing does, which is exactly why they are checked directly.
+#[cfg(unix)]
+#[test]
+fn an_unprotected_head_entry_must_still_state_the_position_and_anchor_omamori_writes() {
+    for (case, field, planted) in [
+        (
+            "planted-prev-hash",
+            "prev_hash",
+            serde_json::json!("deadbeef"),
+        ),
+        ("planted-seq", "seq", serde_json::json!(41u64)),
+    ] {
+        let (base, audit_path, hook_path, shim_dir) =
+            seed_three_entry_store(&format!("483-head-{case}"));
+        let secret_dir = audit_path
+            .parent()
+            .expect("the log has a parent")
+            .to_path_buf();
+        append_unprotected_entry(&hook_path, &shim_dir, &secret_dir);
+
+        // Keep only the unprotected entry, then plant the field.
+        let mut only: Vec<serde_json::Value> = log_entries(&audit_path)
+            .into_iter()
+            .filter(|e| e["key_id"] == "unresolved")
+            .collect();
+        assert_eq!(
+            only.len(),
+            1,
+            "{case}: setup produced one unprotected entry"
+        );
+        only[0][field] = planted;
+        rewrite_log(&audit_path, &only);
+
+        let (code, out, err) = run_audit(&base, &["verify"]);
+        assert_eq!(
+            code, 1,
+            "{case}: a head that does not match what omamori writes is a broken chain, not \
+             a coverage gap (stdout={out}, stderr={err})"
+        );
+        assert!(
+            !err.contains("carry no HMAC"),
+            "{case}: and it must not be counted as an entry omamori wrote: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// #483 (review, P1) — `report --json` must not call a store with unverifiable
+/// entries `intact`.
+///
+/// The chain's links really are intact on this store, and that was the argument
+/// for leaving `chain_status` alone. It does not survive contact with what the
+/// field is *for*: a consumer branching on `intact` concludes every entry was
+/// checked, `audit verify` exits 2 on the same store, and the two surfaces then
+/// disagree about one log. It is also a silent contract change — before #483
+/// these entries reached the JSON as `key_unavailable`.
+#[cfg(unix)]
+#[test]
+fn report_json_does_not_call_a_partly_unprotected_store_intact() {
+    let (base, audit_path, hook_path, shim_dir) = seed_three_entry_store("483-json-surface");
+    let secret_dir = audit_path
+        .parent()
+        .expect("the log has a parent")
+        .to_path_buf();
+    append_unprotected_entry(&hook_path, &shim_dir, &secret_dir);
+    let (_, _, exit) = run_hook_script(&hook_path, &shim_dir, &pretooluse_bash_json("rm -rf /"));
+    assert_eq!(
+        decision_from_exit(exit),
+        Decision::Block,
+        "setup: an authenticated entry after it, so the links are genuinely whole"
+    );
+
+    let (_, report_out, _) = run_omamori(&base, &["report", "--json"]);
+    assert!(
+        !report_out.contains("\"status\": \"intact\""),
+        "a store `audit verify` exits 2 on must not be `intact` here: {report_out}"
+    );
+    assert!(
+        report_out.contains("\"status\": \"unprotected\""),
+        "it carries entries that were never protected, and that is the status: {report_out}"
+    );
+
+    let (_, doctor_out, _) = run_omamori(&base, &["doctor"]);
+    assert!(
+        !doctor_out.contains("Last 30 days: quiet"),
+        "and doctor must not report the store as quiet: {doctor_out}"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 

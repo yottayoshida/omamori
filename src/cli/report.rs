@@ -162,10 +162,33 @@ fn print_human_report(report: &ReportAggregate, verbose: bool) {
                 println!("  Audit log: cannot verify (key \"{key_id}\" not in keyring)");
             }
         }
+        // #483: the chain links verified; some entries in it carry no HMAC.
+        ChainStatus::Unprotected { entries } => {
+            println!("  Audit log: {entries} entries carry no HMAC and cannot be verified");
+        }
         ChainStatus::KeyringUnusable { reason, .. } => {
             println!("  Audit log: cannot verify — {reason}");
         }
         ChainStatus::Unavailable => println!("  Audit log: unavailable"),
+    }
+
+    // #506: set only when `chain_status` is carrying something else, which in
+    // practice means a truncated tail (see `ReportAggregate::key_store_failure`).
+    // Without this line the store reports the missing tail and says nothing
+    // about why nothing could be authenticated — and an unreadable key store is
+    // how the missing tail was made hard to notice in the first place.
+    if let Some(failure) = &report.key_store_failure {
+        println!("  Audit keys: cannot verify — {}", failure.reason);
+    }
+    // #483: the chain status above is `intact` on this store and is right to be
+    // — the links were checked. What it cannot say is that everything in the log
+    // was authenticated, which is exactly the gap `keyring_warnings` below has
+    // its own line for.
+    if report.never_protected_entries > 0 {
+        println!(
+            "  Audit entries: {} carry no HMAC and cannot be verified",
+            report.never_protected_entries
+        );
     }
 
     // #471 item 3: `doctor` is not the only surface an operator watches, and
@@ -263,9 +286,26 @@ mod tests {
             // (SEC-R2: exactly 8), and a field that is `skip`ped only while it
             // happens to be empty would pass here and leak in production.
             keyring_warnings: vec!["audit keyring: cannot read /tmp/k (denied)".to_string()],
+            // #506: `Some`, for the reason `keyring_warnings` above is
+            // non-empty. A `skip`ped field only ever tested while it is empty
+            // proves nothing about what serializes when it is not — and this
+            // one's `reason` carries the operator's home directory, which is
+            // exactly what must not reach `--json`.
+            key_store_failure: Some(crate::audit::KeyStoreFailure {
+                kind: "directory_unreadable",
+                reason: "audit keyring: cannot list /Users/someone/.local/share/omamori"
+                    .to_string(),
+                remedy: "To fix: make that directory listable again, then re-run.".to_string(),
+            }),
+            // #483: non-zero for the same reason the two above are non-empty.
+            never_protected_entries: 2,
         };
         let json: serde_json::Value = serde_json::to_value(&report).unwrap();
         let obj = json.as_object().unwrap();
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains("someone"),
+            "no part of the key directory's path may reach the JSON surface"
+        );
 
         assert_eq!(
             obj.len(),

@@ -117,7 +117,7 @@ impl ProcessProvenance {
 /// `secret::hmac_targets`'s preimage scheme.
 pub fn hmac_cwd(secret: Option<&[u8; 32]>, cwd: &OsStr) -> String {
     if secret.is_none() {
-        return "NO_HMAC_SECRET".to_string();
+        return super::chain::NO_HMAC_SECRET.to_string();
     }
 
     #[cfg(unix)]

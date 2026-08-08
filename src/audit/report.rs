@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::secret::open_read_nofollow;
-use super::verify::{AuditError, verify_chain};
+use super::verify::{AuditError, KeyStoreFailure, verify_chain};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 
 /// Chain integrity status. Originally 3-state per SEC-R8; #177 B1 step 2
@@ -56,6 +56,26 @@ pub enum ChainStatus {
         #[serde(skip_serializing)]
         at_seq: u64,
         key_id: String,
+    },
+    /// #483: the chain's links are whole, and some of its entries carry no HMAC
+    /// — omamori writes them that way when it cannot resolve a key.
+    ///
+    /// Kept out of `Intact`, which is where the first draft of #483 left this
+    /// store, on the argument that the links really are intact. They are; that
+    /// is not what this field answers. A consumer branching on `intact`
+    /// concludes every entry was checked, `audit verify` exits 2 on the same
+    /// store, and two surfaces then disagree about one log (review). It was also
+    /// a silent contract change — before #483 these entries reached `--json` as
+    /// `key_unavailable`.
+    ///
+    /// Kept out of `KeyUnavailable` as well: nothing is missing and no key would
+    /// resolve them, so the remedy that status carries never applied to this
+    /// state.
+    Unprotected {
+        /// How many entries carry no HMAC. A count, not a path, so unlike every
+        /// other internal on this enum it is safe to serialize — and it is the
+        /// whole of what a consumer can act on.
+        entries: u64,
     },
     /// #457 (Codex Round 2): the key directory could not be listed, so *no*
     /// entry can be checked against the key it names.
@@ -124,6 +144,7 @@ impl ChainStatus {
             // `key_unavailable`. Every pre-existing variant is a single word,
             // which is why this is the first place the two could disagree.
             Self::KeyUnavailable { .. } => "key_unavailable",
+            Self::Unprotected { .. } => "unprotected",
             Self::KeyringUnusable { .. } => "keyring_unusable",
             Self::Inaccessible { .. } => "inaccessible",
             Self::Unavailable => "unavailable",
@@ -149,6 +170,7 @@ impl ChainStatus {
             | Self::Truncated
             | Self::Unverifiable { .. }
             | Self::KeyUnavailable { .. }
+            | Self::Unprotected { .. }
             | Self::KeyringUnusable { .. }
             | Self::Inaccessible { .. } => true,
         }
@@ -196,6 +218,38 @@ pub struct ReportAggregate {
     /// paths.
     #[serde(skip)]
     pub keyring_warnings: Vec<String>,
+    /// #506: the key material could not be used at all, **and** `chain_status`
+    /// is carrying something else.
+    ///
+    /// `chain_status` holds one value, and exactly one other finding can be
+    /// true at the same time as this one: a truncated tail. That pair is the
+    /// whole point of #506 — making the key unreadable is precisely how an
+    /// attacker used to get a deleted tail reported as "cannot verify" and
+    /// nothing more — so the two must not compete for the slot. Truncation
+    /// wins it, because it is the finding that was being hidden, and the key
+    /// failure travels here.
+    ///
+    /// `None` when the failure *is* the `chain_status` (see
+    /// `chain_status_for_key_store_failure`), so a surface can print this
+    /// unconditionally without printing the same fault twice.
+    ///
+    /// Not part of the JSON output (SEC-R2: exactly 8 fields), same as the two
+    /// fields above, and its `reason` carries the key directory's path.
+    #[serde(skip)]
+    pub key_store_failure: Option<KeyStoreFailure>,
+    /// #483: entries omamori wrote with no HMAC, which the walk stepped over
+    /// rather than halting on.
+    ///
+    /// `chain_status` is deliberately left alone. The links really are intact —
+    /// their positions and `prev_hash` values were checked, and neither needs a
+    /// key — and saying otherwise would be its own false statement. What is
+    /// incomplete is the *coverage*, which is the same distinction
+    /// `keyring_warnings` draws and the reason it also travels beside the status
+    /// rather than inside it.
+    ///
+    /// Not part of the JSON output (SEC-R2: exactly 8 fields).
+    #[serde(skip)]
+    pub never_protected_entries: u64,
 }
 
 impl Default for ReportAggregate {
@@ -211,6 +265,34 @@ impl Default for ReportAggregate {
             unknown_tool_fail_opens: 0,
             hwm_tampered: false,
             keyring_warnings: Vec::new(),
+            key_store_failure: None,
+            never_protected_entries: 0,
+        }
+    }
+}
+
+/// The `ChainStatus` a store-level key failure maps to.
+///
+/// #506: these five states used to arrive as `AuditError`s, and this reproduces
+/// the mapping `chain_status_for_error` gave them — deliberately. A given store
+/// must report the same `chain_status` and the same `kind` after this change as
+/// before it; what moved is only that the walk now gets far enough to *also*
+/// notice a missing tail. The one value that does change is
+/// `epoch_record_unreadable`, which used to be flattened into
+/// `directory_unreadable` because the error carried no way to tell them apart.
+///
+/// The two families are told apart by asking the failure, not by matching its
+/// `kind` string here: see `KeyStoreFailure::is_keyring_level`.
+fn chain_status_for_key_store_failure(failure: &KeyStoreFailure) -> ChainStatus {
+    if failure.is_keyring_level() {
+        ChainStatus::KeyringUnusable {
+            reason: failure.reason.clone(),
+            kind: failure.kind,
+        }
+    } else {
+        ChainStatus::Inaccessible {
+            reason: failure.reason.clone(),
+            kind: failure.kind,
         }
     }
 }
@@ -292,6 +374,11 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
     result.chain_status = match verify_chain(config) {
         Ok(verify_result) => {
             result.hwm_tampered = verify_result.hwm_tampered;
+            // #483: unconditional, unlike `key_store_failure` below. It never
+            // competes for the `chain_status` slot — an unprotected entry does
+            // not stop the walk, so the status is whatever the links turned out
+            // to be — so there is no arm for it to be redundant with.
+            result.never_protected_entries = verify_result.never_protected_entries;
             keyring_warnings = verify_result.keyring_warnings.clone();
             // #470: `Truncated` is checked *above* the two halted states, not
             // below them. It used to sit last, which was invisible while
@@ -308,6 +395,17 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
             if let Some(at_seq) = verify_result.broken_at {
                 ChainStatus::Broken { at_seq }
             } else if verify_result.tail_truncated {
+                // #506: truncation takes the slot, and a store-level key
+                // failure — if there is one — travels beside it in
+                // `key_store_failure`. The pair is not hypothetical: making the
+                // key material unreadable is precisely how a deleted tail used
+                // to come out as "cannot verify" and nothing more, so reporting
+                // only one of the two findings would leave that substitution
+                // half-working. This is the only arm that can be reached with a
+                // key failure also set — the three below all require an entry
+                // to have been read and classified, which cannot happen once
+                // the walk is tallying every line.
+                result.key_store_failure = verify_result.key_store_failure.clone();
                 ChainStatus::Truncated
             } else if let (Some(at_seq), Some(chain_version)) = (
                 verify_result.unknown_version_at,
@@ -322,6 +420,24 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
                 verify_result.key_unavailable_id.clone(),
             ) {
                 ChainStatus::KeyUnavailable { at_seq, key_id }
+            } else if let Some(failure) = &verify_result.key_store_failure {
+                // Above `Intact`, and that placement is the whole of the
+                // regression this change had to avoid. An unusable key store
+                // used to be an `Err`, so it could not reach `Ok` at all; with
+                // the walk continuing, a store with an empty log and an
+                // unlistable key directory now completes with nothing set —
+                // zero entries, no halt point, no break — and would land on
+                // `Intact`. `doctor` says nothing for `Intact`. Today it says
+                // "cannot verify — cannot list …", and loud → silent is the
+                // worst regression an audit tool can ship.
+                chain_status_for_key_store_failure(failure)
+            } else if verify_result.never_protected_entries > 0 {
+                // Took the slot, so the parallel field is cleared — a surface
+                // that prints both would report one fault twice.
+                result.never_protected_entries = 0;
+                ChainStatus::Unprotected {
+                    entries: verify_result.never_protected_entries,
+                }
             } else {
                 ChainStatus::Intact
             }

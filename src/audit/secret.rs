@@ -104,12 +104,12 @@ pub(super) fn flock_shared(_file: &fs::File) -> Result<(), std::io::Error> {
 // HMAC targets (event field hashing)
 // ---------------------------------------------------------------------------
 
-use super::chain::HmacSha256;
+use super::chain::{HmacSha256, NO_HMAC_SECRET};
 use hmac::Mac;
 
 pub(super) fn hmac_targets(secret: Option<&[u8; 32]>, targets: &[&str]) -> String {
     let Some(key) = secret else {
-        return "NO_HMAC_SECRET".to_string();
+        return NO_HMAC_SECRET.to_string();
     };
     let mut mac =
         HmacSha256::new_from_slice(key).expect("32-byte key is always valid for HMAC-SHA256");
@@ -1753,6 +1753,33 @@ impl KeyringAnomaly {
             Self::Truncated { .. } | Self::Unreadable { .. } => None,
         }
     }
+
+    /// The path-free classification machine consumers branch on.
+    ///
+    /// #506: the two fatal anomalies used to reach `report --json` as one
+    /// `AuditError::KeyringUnusable`, and `chain_status_for_error` pinned
+    /// `kind: "directory_unreadable"` on both — so a store whose directory was
+    /// perfectly listable and whose epoch record simply stated no epoch
+    /// reported the wrong cause to every consumer of that field. The field's
+    /// own doc calls it stable, which is an argument for not changing it
+    /// lightly and not one for it being right.
+    ///
+    /// Carrying the anomaly through the verifier meant carrying the mislabel
+    /// with it. Splitting the two here is what stops that, and it is why this
+    /// is a method on the anomaly rather than a literal at the call site.
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::DirectoryUnreadable { .. } => "directory_unreadable",
+            Self::EpochRecordUnreadable { .. } => "epoch_record_unreadable",
+            // Neither is fatal, so neither reaches `chain_status` today —
+            // `fatal_anomaly` does not select them. Named rather than left to a
+            // catch-all so that promoting one later is a compile-time question
+            // about what to call it, not a silent inheritance of the label
+            // above it.
+            Self::Truncated { .. } => "keyring_truncated",
+            Self::Unreadable { .. } => "retired_key_unreadable",
+        }
+    }
 }
 
 /// All keys this host can verify with, plus what went wrong assembling them.
@@ -1762,6 +1789,24 @@ pub(super) struct Keyring {
 }
 
 impl Keyring {
+    /// A ring holding nothing, for a caller that reached a verdict before one
+    /// could be assembled.
+    ///
+    /// #506: `verify_chain` now records an unusable key store and keeps
+    /// walking, and one of the states it records — a symlink planted on the
+    /// secret path — is observed *before* the directory is listed, deliberately
+    /// (at mode 0300 the directory is searchable but not listable, so scanning
+    /// first would report "cannot list" and never mention the attack). There is
+    /// no listing to build a ring from at that point, and the walk does not ask
+    /// for one: every line is tallied rather than trusted once the failure is
+    /// recorded. This is what it holds while that is true.
+    pub(super) fn empty() -> Self {
+        Self {
+            keys: BTreeMap::new(),
+            anomalies: Vec::new(),
+        }
+    }
+
     pub(super) fn get(&self, id: &str) -> Option<&[u8; 32]> {
         self.keys.get(id)
     }
