@@ -270,9 +270,19 @@ fn hash_v2(secret: Option<&[u8; 32]>, event: &AuditEvent) -> String {
     hmac_bytes(secret, canonical.as_bytes())
 }
 
+/// The hash value written when there is no key to sign with.
+///
+/// #483 turned this from a display detail into a load-bearing one: it is one of
+/// the two pieces of evidence the verifier requires before treating an entry as
+/// never-protected rather than as unverifiable. Three sites produce it and now
+/// a fourth compares against it, and a literal repeated four times is one edit
+/// away from two of them disagreeing — where the failure mode is a store pinned
+/// at cannot-verify permanently, which is the defect being closed.
+pub(super) const NO_HMAC_SECRET: &str = "NO_HMAC_SECRET";
+
 pub(super) fn hmac_bytes(secret: Option<&[u8; 32]>, data: &[u8]) -> String {
     let Some(key) = secret else {
-        return "NO_HMAC_SECRET".to_string();
+        return NO_HMAC_SECRET.to_string();
     };
     let mut mac =
         HmacSha256::new_from_slice(key).expect("32-byte key is always valid for HMAC-SHA256");

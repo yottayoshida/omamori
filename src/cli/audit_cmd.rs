@@ -77,6 +77,14 @@ fn format_verify_success_message(result: &audit::VerifyResult) -> String {
 /// truncation is only reachable from `Valid` (and is handled by its own exit
 /// arm before either caller runs), so a run that gets here with neither flag
 /// set is one that compared and found the chain long enough.
+///
+/// #483: the name is now narrower than the callers. It is printed by every arm
+/// that ends without an authenticated chain end — which includes the
+/// never-protected one, where `halted()` is false but the mark was still not
+/// written (`VerifyResult::walked_past_unauthenticated`). Kept rather than
+/// renamed because the sentences it prints are about the high-water-mark and
+/// are correct for all of them; what changed is only how many ways there are to
+/// arrive.
 fn print_halted_hwm_notes(result: &audit::VerifyResult) {
     if result.hwm_tampered {
         eprintln!(
@@ -94,6 +102,18 @@ fn print_halted_hwm_notes(result: &audit::VerifyResult) {
             "  Note: there is no high-water-mark file to compare against, and this run \
              did not create one — it could not authenticate the end of the chain. \
              Tail-truncation detection begins once a run verifies the log end to end."
+        );
+    } else if !result.hwm_compared {
+        // #506: the fourth case, and the one that made the three-case reading
+        // above stop being exhaustive. A store whose key material is unusable
+        // halts before the first line, so a log with nothing readable in it
+        // reaches here having compared nothing at all — and the branch below
+        // would have told the operator the chain reaches the mark. It is the
+        // shape this whole change exists to close, reintroduced one level down:
+        // a reassurance stated from an observation that was never made.
+        eprintln!(
+            "  No end could be read from the log, so there was nothing to compare against \
+             the high-water-mark — this run cannot say whether the tail is intact."
         );
     } else {
         eprintln!(
@@ -161,34 +181,59 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                         "omamori audit verify: audit log tail may have been truncated \
                          (chain ends before high-water-mark)."
                     );
-                    if let (Some(seq), Some(chain_version)) =
-                        (result.unknown_version_at, result.unknown_chain_version)
-                    {
+                    // #506: the store-level halt is reported first and on its
+                    // own, because it is not "verification *also* stopped at an
+                    // entry" — it stopped before the first line, so there is no
+                    // entry to name and nothing was verified "before that
+                    // point". This is the pair the change exists for: an
+                    // unreadable key store is what let the missing tail go
+                    // unmentioned, so the operator needs both halves.
+                    if let Some(failure) = &result.key_store_failure {
+                        eprintln!("  Verification could not start: {}", failure.reason);
+                        if !failure.remedy.is_empty() {
+                            eprintln!("  {}", failure.remedy);
+                        }
                         eprintln!(
-                            "  Verification also stopped at entry #{seq}, which declares \
-                             chain_version {chain_version} — unrecognized by this build."
+                            "  No entry was authenticated; {} lines were counted.",
+                            result.unverified_entries_after
                         );
-                    } else if let (Some(seq), Some(key_id)) = (
-                        result.key_unavailable_at,
-                        result.key_unavailable_id.as_deref(),
-                    ) {
                         eprintln!(
-                            "  Verification also stopped at entry #{seq}, which names key \
-                             \"{key_id}\" — not in the keyring."
+                            "  Making the key material unreadable is enough to stop \
+                             verification, and the chain end this warning compared against \
+                             is what the remaining lines claim rather than anything \
+                             authenticated. Two findings on one log is not a coincidence \
+                             to explain away — treat it as possible tampering."
+                        );
+                    } else {
+                        if let (Some(seq), Some(chain_version)) =
+                            (result.unknown_version_at, result.unknown_chain_version)
+                        {
+                            eprintln!(
+                                "  Verification also stopped at entry #{seq}, which declares \
+                                 chain_version {chain_version} — unrecognized by this build."
+                            );
+                        } else if let (Some(seq), Some(key_id)) = (
+                            result.key_unavailable_at,
+                            result.key_unavailable_id.as_deref(),
+                        ) {
+                            eprintln!(
+                                "  Verification also stopped at entry #{seq}, which names key \
+                                 \"{key_id}\" — not in the keyring."
+                            );
+                        }
+                        eprintln!(
+                            "  {} entries verified before that point; unable to verify {} \
+                             entries at or after it.",
+                            result.chain_entries, result.unverified_entries_after
+                        );
+                        eprintln!(
+                            "  Editing a single field is enough to stop verification, and the \
+                             chain end this warning compared against is what the remaining \
+                             lines claim rather than anything authenticated. Two findings on \
+                             one log is not a coincidence to explain away — treat it as \
+                             possible tampering."
                         );
                     }
-                    eprintln!(
-                        "  {} entries verified before that point; unable to verify {} \
-                         entries at or after it.",
-                        result.chain_entries, result.unverified_entries_after
-                    );
-                    eprintln!(
-                        "  Editing a single field is enough to stop verification, and the \
-                         chain end this warning compared against is what the remaining \
-                         lines claim rather than anything authenticated. Two findings on \
-                         one log is not a coincidence to explain away — treat it as \
-                         possible tampering."
-                    );
                 } else {
                     println!("{}", format_verify_success_message(&result));
                     eprintln!(
@@ -256,12 +301,16 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     // no audit entry). It belongs in `hook_integration.rs`.
                     Some(KeyUnavailableKind::NeverProtected) => {
                         eprintln!(
-                            "  omamori wrote this entry itself, while the key directory could \
-                             not be listed, so it carries no HMAC and never did. No key file \
-                             is missing and restoring one will not help; the entry stays \
-                             unverifiable. The key directory is listable again — this run \
-                             just listed it — so the condition that produced this entry \
-                             has already cleared."
+                            "  This entry names the id omamori uses when it cannot resolve a \
+                             key, but it carries an entry_hash — omamori writes the no-key \
+                             sentinel in that state, and this is not it. The two fields \
+                             disagree, and both are ordinary fields of the log."
+                        );
+                        eprintln!(
+                            "  Treat this as possible tampering. #483: an entry that really \
+                             was written unprotected is walked past rather than halted on, \
+                             and does not reach this message — so arriving here means the \
+                             pair did not agree."
                         );
                     }
                     Some(KeyUnavailableKind::NotWriterEmitted) => {
@@ -313,6 +362,62 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 // Parity with the exit-4 branch, which reaches the same state
                 // for a different reason and prints the same notes. Omitting
                 // this made exit 2 the quieter of the two states to arrive at.
+                print_halted_hwm_notes(&result);
+                Ok(2)
+            } else if let Some(failure) = &result.key_store_failure {
+                // #506: exit 2, with the same wording these five states carried
+                // when they were errors — an operator whose store has not
+                // changed sees no change here. What moved is upstream: the walk
+                // now reaches the high-water-mark comparison, so a store that
+                // is *also* missing its tail takes the exit-3 arm above instead
+                // of this one. That substitution — make the key material
+                // unreadable, delete the tail, collect exit 2 and a message
+                // about keys — is the whole of the issue.
+                //
+                // Above the `chain_entries == 0` arms on purpose. An empty log
+                // on a store whose keys cannot be read must not reach
+                // `no entries to verify`, which exits **0**.
+                eprintln!(
+                    "omamori audit verify: cannot verify \u{2014} {}",
+                    failure.reason
+                );
+                if !failure.remedy.is_empty() {
+                    eprintln!("  {}", failure.remedy);
+                }
+                print_halted_hwm_notes(&result);
+                Ok(2)
+            } else if result.never_protected_entries > 0 {
+                // #483: exit 2, and above both `chain_entries == 0` arms. A log
+                // made only of unprotected entries would otherwise reach "no
+                // entries to verify" and exit **0** — a clean bill of health for
+                // a log nothing in it could be checked against.
+                //
+                // Exit 2 rather than 1: these entries are what omamori writes
+                // when it cannot resolve a key, and calling that tampering is
+                // the false accusation #457 exists to remove. Exit 0 is what
+                // #483 exists to remove.
+                eprintln!(
+                    "omamori audit verify: {} entries carry no HMAC and cannot be verified.",
+                    result.never_protected_entries
+                );
+                eprintln!(
+                    "  {} entries verified. omamori writes an unprotected entry when it \
+                     cannot resolve a key — recording the event without protection rather \
+                     than dropping it.",
+                    result.chain_entries
+                );
+                eprintln!(
+                    "  On disk, an entry omamori wrote unprotected and one someone appended \
+                     are not distinguishable. What can be said is that their positions and \
+                     prev_hash links line up with the entries around them, which were \
+                     verified."
+                );
+                eprintln!("  Inspect: omamori audit show --all --json");
+                // Parity with the halted arms: this run could not authenticate
+                // the end of the chain either, so whatever the high-water-mark
+                // machinery did needs saying. A tampered sidecar is a fact about
+                // the sidecar and does not become less true here — the exit-2
+                // arm above learnt that lesson from the exit-4 one.
                 print_halted_hwm_notes(&result);
                 Ok(2)
             } else if result.chain_entries == 0 && result.legacy_entries > 0 {

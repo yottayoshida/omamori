@@ -296,11 +296,24 @@ fn print_risk_signals_section(ai_env: bool) {
     // the printing below. Adding a signal to one and not the other is how a
     // section prints its header and then nothing — or, here, the mirror of it:
     // returns `quiet` and never reaches the line that had something to say.
+    // #506: `key_store_failure` is only ever set alongside a `chain_status` that
+    // `needs_attention()` already covers, so this clause changes nothing today.
+    // It is here because the clause it sits in is the one that decides silence,
+    // and the cost of the two lists drifting apart is a security tool printing
+    // `quiet` over a fault — which is the shape #471 item 3 already had to fix
+    // once, in this exact condition.
     if !has_blocks
         && !has_unknown
         && !chain_broken
         && !report.hwm_tampered
         && report.keyring_warnings.is_empty()
+        && report.key_store_failure.is_none()
+        // #483: this one does **not** reach `chain_broken`. An unprotected entry
+        // leaves the links intact, so `chain_status` is `Intact` and
+        // `needs_attention()` is false — correct about the chain, and silent
+        // about a store `audit verify` exits 2 on. Without this clause the two
+        // surfaces disagree about the same log.
+        && report.never_protected_entries == 0
         && !audit_unwritable
     {
         println!("  [Risk signals] Last 30 days: quiet");
@@ -359,11 +372,28 @@ fn print_risk_signals_section(ai_env: bool) {
             if ai_env {
                 println!("    chain: cannot verify (key \"{key_id}\" not in keyring)");
             } else {
+                // #483: the repair used to be inlined here as "restore the
+                // retired key file". That is right for one of the three
+                // conditions this status covers and wrong for the other two —
+                // an id no writer emits, and an entry whose two key fields
+                // contradict each other, where no key file is missing and
+                // restoring one changes nothing. `audit verify` knows which of
+                // the three it found and prints a different sentence for each;
+                // this line names the cause and delegates, like every sibling
+                // in this list.
                 println!(
                     "    chain: cannot verify — entry names key \"{key_id}\", which is not \
-                     in the keyring; restore the retired key file and re-run \
-                     omamori audit verify"
+                     in the keyring — run omamori audit verify"
                 );
+            }
+        }
+        // #483: the links are whole and some entries could not be checked. The
+        // count is the signal and it carries no path, so both branches print it.
+        ChainStatus::Unprotected { entries } => {
+            if ai_env {
+                println!("    chain: {entries} entries carry no HMAC — cannot be verified");
+            } else {
+                println!("    chain: {entries} entries carry no HMAC — run omamori audit verify");
             }
         }
         // #457 (Codex Round 2): must appear here as well as in `chain_broken`
@@ -407,6 +437,43 @@ fn print_risk_signals_section(ai_env: bool) {
         // header announces a risk signal, and this match prints nothing.
         // These two are the only variants that legitimately print nothing.
         ChainStatus::Intact | ChainStatus::Unavailable => {}
+    }
+    // #506: set only when `chain_status` took another value, which in practice
+    // means a truncated tail — the one finding that can be true at the same
+    // time as this one. Printed beside it because the two together *are* the
+    // gap #506 closes: an unreadable key store is what stopped the verifier
+    // before it could notice the tail, so reporting the tail alone would leave
+    // the operator without the half that explains it.
+    //
+    // `kind` rather than `reason`, on both branches: `reason` carries the data
+    // directory's path, and the sibling `Inaccessible` arm above already
+    // settled that this section names the classification and delegates the
+    // sentence to `audit verify`.
+    if let Some(failure) = &report.key_store_failure {
+        if ai_env {
+            println!("    audit keys: cannot verify ({})", failure.kind);
+        } else {
+            println!(
+                "    audit keys: cannot verify ({}) — run omamori audit verify",
+                failure.kind
+            );
+        }
+    }
+    // #483: beside `chain_status` rather than inside it — the links are intact
+    // and the coverage is not, the same shape `keyring_warnings` has. Counted on
+    // both branches: the count is the whole signal, and it carries no path.
+    if report.never_protected_entries > 0 {
+        if ai_env {
+            println!(
+                "    audit entries: {} carry no HMAC — cannot be verified",
+                report.never_protected_entries
+            );
+        } else {
+            println!(
+                "    audit entries: {} carry no HMAC — run omamori audit verify",
+                report.never_protected_entries
+            );
+        }
     }
     if report.hwm_tampered {
         if ai_env {
