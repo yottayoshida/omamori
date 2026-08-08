@@ -2812,7 +2812,11 @@ fn delete_tail(audit_path: &Path) {
 fn only_a_truncated_store_exits_3_however_the_key_material_was_damaged() {
     for (case, damage, truncate, expect) in [
         // The tail is gone. Every one of these must report it.
-        ("intact-keys", KeyDamage::None, true, 3),
+        // Fixture names are kept clear of every phrase asserted below: each
+        // message quotes both the store path *and* the config path, so a name
+        // sharing a word with an assertion makes that assertion read its own
+        // fixture. `healthy-keys`, not `intact-keys`, for `chain intact`.
+        ("healthy-keys", KeyDamage::None, true, 3),
         ("moved-secret", KeyDamage::SecretMovedAside, true, 3),
         ("unlistable-dir", KeyDamage::DirectoryUnlistable, true, 3),
         ("planted-secret", KeyDamage::SecretPlanted, true, 3),
@@ -2899,7 +2903,14 @@ fn an_unlistable_key_directory_is_neither_called_tampering_nor_passed_over() {
     use std::os::unix::fs::PermissionsExt;
 
     // Half one: a seeded store, keys made unlistable, nothing else touched.
-    let (base, audit_path, ..) = seed_three_entry_store("506-not-tampering");
+    // Named away from every word asserted below — `not-tampering` contains
+    // "tampering", and CI proved that is not academic: with no config file in
+    // the sandbox, `verify` opens with `config not found at <base>/.config/…`,
+    // so the fixture's own name landed inside the text being searched for an
+    // accusation. Locally the same suite passed, because that warning was not
+    // printed there. Same class as the `…-verify-unlistable-…` fixture that
+    // satisfied `contains("listable")` on its own name.
+    let (base, audit_path, ..) = seed_three_entry_store("506-permission-fault");
     let secret_dir = audit_path
         .parent()
         .expect("the log has a parent")
@@ -2911,7 +2922,13 @@ fn an_unlistable_key_directory_is_neither_called_tampering_nor_passed_over() {
     let (_, report_out, _) = run_omamori(&base, &["report", "--json"]);
     restore_key_directory(&secret_dir);
 
-    let strip = |s: String| s.replace(&secret_dir.display().to_string(), "<dir>");
+    // The **sandbox root**, not just the store: every message here quotes one of
+    // two paths under it — the key directory and the config file — and stripping
+    // only the first left the second carrying the fixture's name into the text
+    // below. Belt and braces with the naming above, which is the real defence:
+    // this strip cannot be relied on alone, since macOS prints `/private/var/…`
+    // for a path held as `/var/…`.
+    let strip = |s: String| s.replace(&base.display().to_string(), "<sandbox>");
     let verify_said = strip(format!("{verify_out}{verify_err}"));
     // `doctor` renders far more than this store — PATH shims, hook installs, the
     // integrity baseline — and those sections use "tampered" about their own
@@ -2927,6 +2944,15 @@ fn an_unlistable_key_directory_is_neither_called_tampering_nor_passed_over() {
         !doctor_said.is_empty(),
         "control: doctor must say something about the audit chain for the filter below \
          to be measuring it: {doctor_out}{doctor_err}"
+    );
+    // Control for the strip, for the same reason as the one above: the fixture's
+    // own name lives inside the sandbox path, so a strip that silently stopped
+    // matching would put it back into the text searched for accusations. This is
+    // what CI caught when only the store path was being removed.
+    assert!(
+        !verify_said.contains(&base.display().to_string())
+            && !doctor_said.contains(&base.display().to_string()),
+        "control: the sandbox path must be out of both texts before they are searched"
     );
 
     assert_eq!(
