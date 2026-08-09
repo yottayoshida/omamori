@@ -2383,6 +2383,19 @@ mod tests {
     // G-10: check_path_order direct tests
     // =========================================================================
 
+    // #344: these four rewrite `PATH`, a process global, and carry `home_env`
+    // rather than a group of their own. `full_check` reads `PATH` on every call,
+    // and three tests call it without any tag —
+    // `full_check_returns_report`, `full_check_includes_codex_hook_check_item`
+    // and `full_check_config_hash_ok_when_baseline_matches`. They were left
+    // untagged deliberately: measured, none of the three looks at the PATH item
+    // (they filter for `Shims`, `codex-pretooluse.sh` and `config.toml`), so
+    // there is nothing for this window to change in what they assert, and
+    // `home_env` already holds 205 tests — serialising three more for no present
+    // effect costs suite time and buys nothing.
+    //
+    // **That reasoning expires the moment a `full_check` test asserts on a PATH
+    // item.** At that point it needs the same group as these four.
     #[test]
     #[serial_test::serial(home_env)]
     fn path_order_shim_before_usr_bin_is_ok() {

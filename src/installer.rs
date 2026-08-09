@@ -2003,7 +2003,14 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    // #344: `umask` as well as `home_env`. This asserts `0o755` exactly, and
+    // the mode reaches the file through `OpenOptions::mode()` — that is
+    // `open(2)`'s mode argument, which the process umask masks, not an
+    // `fchmod` that would ignore it. `write_with_mode_mode_is_exact_regardless_of_umask`
+    // holds `umask(0o077)` for the length of one write, and `0o755 & !0o077`
+    // is `0o700`. Until this tag the `umask` group had exactly one member, so
+    // the lock excluded nothing.
+    #[serial_test::serial(home_env, umask)]
     fn install_creates_shims_and_hook_templates() {
         let root = std::env::temp_dir().join(format!("omamori-install-{}", std::process::id()));
         let source = root.join("omamori");
@@ -2203,6 +2210,9 @@ mod tests {
     }
 
     #[test]
+    // #344: same reason as `install_creates_shims_and_hook_templates` above —
+    // asserts `0o755` exactly, and the umask window would make it `0o700`.
+    #[serial_test::serial(umask)]
     fn regenerate_hooks_creates_files() {
         let root = std::env::temp_dir().join(format!("omamori-regen-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -2636,8 +2646,18 @@ mod tests {
         // `target/debug`/`target/release` binary must be recognized by
         // `is_dev_build_path` on the *resolved* path, not just on a raw
         // synthetic path handed directly to the predicate.
-        let dir =
-            std::env::temp_dir().join(format!("omamori-shim-devbuild-{}", std::process::id()));
+        // #344: the label used to be `omamori-shim-devbuild-{pid}`, which
+        // `install_rejects_implicit_dev_build_source_resolved_through_shim`
+        // also used. Same test binary means the same pid, so both resolved to
+        // one directory — and both open by deleting it. One is untagged and the
+        // other holds `serial(home_env)`, so `serial_test` never kept them
+        // apart: whichever started second removed the other's symlink and
+        // `target/` tree mid-run. Nothing about the process globals was
+        // involved, which is why an audit of serial tags found it not at all.
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-shim-devbuild-resolve-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         let target_debug = dir.join("target").join("debug");
         fs::create_dir_all(&target_debug).unwrap();
@@ -3553,8 +3573,17 @@ mod tests {
 
     // --- G-12: auto_setup_codex_if_needed ---
 
+    // #344: `ai_env` as well as `home_env`, on this and the six
+    // `auto_setup_codex_*` tests below. They set and clear `CODEX_CI`, which
+    // `test_support`'s `with_clean_ai_env` names as one of the six detector
+    // variables the `ai_env` group exists for — and
+    // `with_clean_ai_env_actually_clears_and_restores` asserts directly that
+    // `CODEX_CI` is unset. Holding only `home_env` left these two groups free
+    // to run at the same time on the same variable, in both directions: this
+    // family setting `CODEX_CI=1` inside that assertion's window, and that
+    // family's guard restoring over a value this one had saved.
     #[test]
-    #[serial_test::serial(home_env)]
+    #[serial_test::serial(home_env, ai_env)]
     fn auto_setup_codex_skips_without_env() {
         // SAFETY: serial_test ensures no concurrent access to env vars
         let saved = std::env::var_os("CODEX_CI");
@@ -3574,7 +3603,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    #[serial_test::serial(home_env, ai_env)]
     fn auto_setup_codex_skips_without_env_even_with_exe_override() {
         // #379 (Codex test-adversarial review): proves an injected exe can't
         // bypass the CODEX_CI fast-path check — the seam only replaces how
@@ -3604,7 +3633,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    #[serial_test::serial(home_env, ai_env)]
     fn auto_setup_codex_skips_when_wrapper_exists() {
         // CODEX_CI must be SET here (unlike the sibling `_skips_without_env`
         // test above) — otherwise this test trivially passes via the
@@ -3665,7 +3694,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    #[serial_test::serial(home_env, ai_env)]
     fn auto_setup_codex_rejects_implicit_dev_build_source() {
         // #354: the test binary's own current_exe() is always a
         // target/debug (or target/release) path under `cargo test` — the
@@ -3707,7 +3736,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    #[serial_test::serial(home_env, ai_env)]
     fn auto_setup_codex_accepts_genuine_non_dev_build_source() {
         // #379: exercises the ACCEPT path via the exe_override seam — CODEX_CI
         // set, wrapper absent, Codex detected, and a genuine non-dev-build
@@ -3780,7 +3809,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial_test::serial(home_env)]
+    #[serial_test::serial(home_env, ai_env)]
     fn auto_setup_codex_resolves_injected_shim_path() {
         // #379 (Codex test-adversarial review, Round 2): the ACCEPT test
         // above injects a plain path that `resolve_stable_exe_path` leaves
@@ -3851,7 +3880,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env)]
+    #[serial_test::serial(home_env, ai_env)]
     fn auto_setup_codex_rejects_injected_dev_build_source() {
         // Negative control for the exe_override seam (#379): confirms the
         // dev-build gate applies to an INJECTED path too, not just the real
