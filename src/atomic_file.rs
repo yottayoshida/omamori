@@ -181,7 +181,12 @@ pub(crate) fn reject_non_regular(file: &std::fs::File, path: &Path) -> io::Resul
 
 /// Name the thing that was found, so the message says what to remove rather
 /// than only what was expected.
-fn describe_file_type(meta: &std::fs::Metadata) -> &'static str {
+///
+/// `pub(crate)` since #491: `read_hwm` says the same thing about the same
+/// shapes, and two authors of "a FIFO" drift. Callers that reach it after a
+/// failed open must handle a symlink themselves — `symlink_metadata` on one
+/// answers none of the questions below, so it falls through to the catch-all.
+pub(crate) fn describe_file_type(meta: &std::fs::Metadata) -> &'static str {
     let ft = meta.file_type();
     if ft.is_dir() {
         return "a directory";

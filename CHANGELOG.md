@@ -6,6 +6,28 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`audit verify` no longer reports the high-water-mark as reset after discarding the result of resetting it.** ([#490](https://github.com/yottayoshida/omamori/issues/490))
+
+  `verify_chain` wrote the mark with `let _ = write_hwm(…)` and the CLI then told the operator it had happened. `write_hwm` refuses a symlinked path outright and publishes via a temp file it cannot create in a directory omamori may not write, so on the states most worth reporting the sentence was false. Measured on `8d51fe6` against a store with three verified entries: a symlinked sidecar and a directory at the sidecar's path both printed "It has been reset to the current chain end" with nothing written, and neither state repairs itself, so the false sentence repeated on every subsequent run. A data directory without write permission printed "high-water-mark bootstrapped to current chain end" and created no file.
+
+  `VerifyResult` now carries `hwm_write`, and the two sentences are chosen from what `write_hwm` returned. A `chmod 000` sidecar — where `rename` does replace the file, since publishing needs the directory writable and not the file readable — still reports the reset, because there the reset happened. The exit codes do not move: an unusable sidecar was exit 3 before this change and is exit 3 after it.
+
+- **`read_hwm` no longer files every open failure as tampering, and the message no longer names two causes that exclude what was observed.** ([#491](https://github.com/yottayoshida/omamori/issues/491))
+
+  Every non-`NotFound` failure became one state called `Tampered`, and the three messages built from it said "expected a plain integer, found a symlink or invalid content". Neither is what happened when the sidecar is merely unreadable: `EACCES` after a `chmod 000` or a backup restored under the wrong owner, `EMFILE` under descriptor exhaustion. The product's second-strongest wording fired on those all the same.
+
+  The state is now `HwmState::Unusable(HwmUnusable)`, split between `NotAMark` — a symlink, a FIFO, a directory, or content that is not a plain integer, which is exactly the set `SECURITY.md` already recorded as tamper evidence for this file — and `Unreadable`, which was never on that list. Which shape was found is determined by a `stat` **after** the open has already failed, not by an errno test: `O_NOFOLLOW`'s value is not guaranteed to match across the two platforms omamori ships on, and the alternative would be `reject_non_regular` recognising a string it built itself. The refusal is complete before the `stat` runs, so this is diagnosis and not enforcement. `doctor`'s wording is unchanged — "unreadable or tampered" was already the honest disjunction, and is the one surface that did not overclaim.
+
+### Changed
+
+- **`AuditError` moved from `src/audit/verify.rs` to `src/audit/error.rs`.** ([#493](https://github.com/yottayoshida/omamori/issues/493))
+
+  It is the audit subsystem's error type, not verification's, and living in `verify.rs` forced `secret.rs` to import from `verify.rs` while `verify.rs` imported from `secret.rs`. No behaviour changes. Both public paths still resolve — `omamori::audit::AuditError` and `omamori::audit::verify::AuditError` — the latter via a re-export, pinned by an integration test that fails to compile if it is dropped. The self-described dead arm in `run_audit_verify` stays: only splitting the type removes it, and that was costed at roughly 80 lines to remove 9.
+
+- **Library API (not covered by the [breaking-change policy](docs/CONTRACT.md#breaking-change-policy), which names the Rust API as outside it):** `VerifyResult::hwm_tampered: bool` is replaced by `hwm_unusable: Option<HwmUnusable>`. A bool beside a reason is two values that can disagree; the reason alone cannot. `.is_some()` is the direct replacement and covers exactly the states the flag did. `VerifyResult` also gains `hwm_write: HwmWrite`, and `HwmUnusable` / `HwmWrite` are new public types.
+
 ## [1.0.0] - 2026-08-08
 
 **Summary**: The 1.0 gate is closed — `tier-1` holds only the epic that defines it, and every open `security` issue is either fixed or written into SECURITY.md as a residual risk, measured on this commit rather than inferred. From this release the [breaking-change policy](docs/CONTRACT.md#breaking-change-policy) is in force over three surfaces: which command classes are blocked or redirected, the CLI's subcommands and the meaning of its documented exit codes, and the audit chain's verifiability across upgrades. Two surfaces are deliberately outside it and named as such — the `config.toml` schema and the Rust library API, which this release changes in six places (`VerifyResult`, `ChainStatus`, `AuditError`, `AuditSummary`, `RotationResult`, `ReportAggregate`; zero reverse dependencies on crates.io, re-measured). The verification work behind the gate is mostly audit-chain honesty: a verification halt no longer suppresses tail-truncation detection (#470), nor does an unreadable key store (#506); an entry omamori itself wrote unprotected no longer pins a store at cannot-verify permanently (#483); key rotation no longer breaks verification (#457); and `ChainStatus::Unavailable` now means only "there is nothing to check yet", so every other failure reaches `doctor` instead of being filed as healthy (#471/#487).

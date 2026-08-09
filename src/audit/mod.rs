@@ -8,6 +8,7 @@
 //! - `report`: Aggregation for `omamori report` (since v0.10.0, #221)
 
 pub mod chain;
+mod error;
 pub mod provenance;
 pub mod report;
 pub mod retention;
@@ -15,11 +16,12 @@ pub mod secret;
 pub mod verify;
 
 // --- Public re-exports (maintain `omamori::audit::*` API paths) ---
+pub use error::AuditError;
 pub use provenance::hash_cwd_candidates;
 pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, UnprotectedReason, rotate_key};
 pub use verify::{
-    AuditError, AuditSummary, KeyStoreFailure, KeyUnavailableKind, ShowOptions, VerifyResult,
+    AuditSummary, HwmWrite, KeyStoreFailure, KeyUnavailableKind, ShowOptions, VerifyResult,
     audit_summary, count_unknown_tool_fail_opens_within, show_entries, verify_chain,
 };
 
@@ -397,13 +399,17 @@ impl AuditLogger {
             }
             HwmState::Valid(h) => seq > h,
             HwmState::Missing => true,
-            HwmState::Tampered => {
+            HwmState::Unusable(ref reason) => {
                 // Same-user tamper on the tamper-evidence sidecar itself: don't
                 // silently re-bootstrap as if this were a fresh install.
+                //
+                // #491: the reason is quoted rather than guessed. This line
+                // used to name two causes — a symlink, or invalid content —
+                // for a state that also covers a sidecar which merely could
+                // not be read, and said both of them whichever had happened.
                 eprintln!(
-                    "omamori warning: audit high-water-mark is unreadable or has been \
-                     tampered with (expected a plain integer, found a symlink or \
-                     invalid content). Run `omamori audit verify` to investigate."
+                    "omamori warning: the audit high-water-mark could not be used \u{2014} \
+                     {reason}. Run `omamori audit verify` to investigate."
                 );
                 true
             }
@@ -509,14 +515,76 @@ pub(crate) fn hwm_path_for(audit_path: &std::path::Path) -> PathBuf {
 
 /// Result of reading the HWM sidecar file.
 ///
-/// `Missing` (genuinely absent, e.g. first run) is distinct from `Tampered`
-/// (a filesystem entry exists at the path but is a symlink or does not
-/// contain a valid sequence number) so callers can avoid silently treating
-/// tamper evidence as a fresh install.
+/// `Missing` (genuinely absent, e.g. first run) is distinct from `Unusable`
+/// (something is at the path, but this run got no mark out of it) so callers
+/// can avoid silently treating tamper evidence as a fresh install.
 pub(crate) enum HwmState {
     Valid(u64),
     Missing,
-    Tampered,
+    Unusable(HwmUnusable),
+}
+
+/// Why a sidecar that is not absent still yielded no mark.
+///
+/// #491: this used to be a single state named `Tampered`, and the two messages
+/// built from it named two causes — "a symlink or invalid content". Neither is
+/// what happened when the sidecar is merely unreadable: `EACCES` after a
+/// `chmod 000` or a backup restored under the wrong owner, `EMFILE` under
+/// descriptor exhaustion. The product's second-strongest wording — "has been
+/// tampered with", exit 3 — fired on those all the same, naming two causes that
+/// exclude what was observed.
+///
+/// The split is between **something omamori would never have written is
+/// there** and **we could not look**. Both still stop the truncation
+/// comparison and both still exit 3; the verdict does not move. What changes is
+/// that the sentence stops naming a cause this run did not observe.
+///
+/// `NotAMark` covers exactly the shapes SECURITY.md records for `read_hwm` as
+/// tamper evidence — a symlink, a FIFO, a directory — plus content that is not
+/// a mark. `Unreadable` covers what was never on that list.
+///
+/// **This distinction decides wording and nothing else.** No production branch
+/// reads the variant: the callers store it, interpolate it, or ask whether it
+/// is `Some`. That is deliberate and load-bearing. Both halves are chosen by
+/// whoever can write to the sidecar — a `chmod 000` is free — so letting either
+/// one reach a verdict would hand an attacker a way to pick their own exit
+/// code, which is the substitution #506 and #470 each had to close. It is also
+/// what makes the `stat` in `classify_unopenable_hwm` safe to race: winning
+/// that race changes a sentence, not an outcome. **If a future change branches
+/// on this enum, that argument stops holding and has to be re-made.**
+///
+/// **Path-free, like `AuditError`'s `reason` fields and for the same reason.**
+/// Nothing here is serialized today — `VerifyResult` has no `Serialize`, and
+/// `aggregate_report` copies only `.is_some()` — but the strings reach
+/// `verify`'s stderr and the hook's, and a later change that routes them into
+/// `report --json` or `doctor`'s AI-session output must not carry the
+/// operator's home directory with them. The one hole is the race above: if the
+/// path is swapped between the failed open and the `stat`, the fallback carries
+/// `open_read_regular`'s own message, which names the path.
+// Same reasoning as `VerifyResult`, `HwmWrite`, `AuditError` and `ChainStatus`
+// next door: a public type that will keep gaining cases closes the
+// exhaustive-match door before it has downstream matches to break. Within this
+// crate the compiler still checks every `match`, so it costs nothing here.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum HwmUnusable {
+    /// Something omamori never writes is at the path, or the bytes there are
+    /// not a plain integer.
+    NotAMark(String),
+    /// The sidecar could not be read, and the reason says nothing about what is
+    /// there.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for HwmUnusable {
+    /// The observed clause, so the three sentences built from it stay one
+    /// account of one file.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAMark(what) => write!(f, "it is not a mark omamori wrote ({what})"),
+            Self::Unreadable(why) => write!(f, "it could not be read ({why})"),
+        }
+    }
 }
 
 /// The HWM file holds one decimal integer. 64 bytes is far past `u64::MAX`'s
@@ -539,19 +607,58 @@ fn read_hwm(hwm_path: &std::path::Path) -> HwmState {
     let file = match crate::atomic_file::open_read_regular(hwm_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HwmState::Missing,
-        Err(_) => return HwmState::Tampered,
+        Err(e) => return HwmState::Unusable(classify_unopenable_hwm(hwm_path, &e)),
     };
     let mut content = String::new();
-    if std::io::BufReader::new(file)
+    if let Err(e) = std::io::BufReader::new(file)
         .take(MAX_HWM_FILE_BYTES)
         .read_to_string(&mut content)
-        .is_err()
     {
-        return HwmState::Tampered;
+        // #491: `InvalidData` is the read reporting that the bytes are not
+        // UTF-8, which is a statement about the content and belongs with the
+        // other "not a mark" shapes. Anything else — a mid-read `EIO` — is the
+        // read failing, and filing that as invalid content would be the same
+        // overclaim this change exists to remove, one level down.
+        return HwmState::Unusable(if e.kind() == std::io::ErrorKind::InvalidData {
+            HwmUnusable::NotAMark("its contents are not text".to_string())
+        } else {
+            HwmUnusable::Unreadable(e.to_string())
+        });
     }
     match content.trim().parse::<u64>() {
         Ok(v) => HwmState::Valid(v),
-        Err(_) => HwmState::Tampered,
+        Err(_) => HwmState::Unusable(HwmUnusable::NotAMark(
+            "its contents are not a plain integer".to_string(),
+        )),
+    }
+}
+
+/// Name what is at `hwm_path`, for an open that failed and was not `NotFound`.
+///
+/// **Not classified by errno.** `O_NOFOLLOW`'s refusal of a symlink is not
+/// guaranteed to carry the same value on the two platforms omamori ships on,
+/// and `InvalidInput` here would only be `reject_non_regular` recognising its
+/// own message — a value it constructs, not one the type system holds it to.
+/// Either would misname a cause on one platform or after one refactor, which is
+/// the failure this change exists to remove.
+///
+/// **The extra `stat` is not a TOCTOU regression.** It runs only after the open
+/// has already failed, so the refusal is finished before this is reached; the
+/// enforcement is still the descriptor check in `open_read_regular`, exactly as
+/// SECURITY.md describes. An attacker who swaps the path in between changes the
+/// wording of a message and nothing else — the verdict is exit 3 either way.
+fn classify_unopenable_hwm(hwm_path: &std::path::Path, e: &std::io::Error) -> HwmUnusable {
+    match fs::symlink_metadata(hwm_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            HwmUnusable::NotAMark("it is a symlink".to_string())
+        }
+        Ok(meta) if !meta.is_file() => HwmUnusable::NotAMark(format!(
+            "it is {}",
+            crate::atomic_file::describe_file_type(&meta)
+        )),
+        // A regular file that would not open, or a path that will not even
+        // stat. Neither says anything about what omamori did or did not write.
+        _ => HwmUnusable::Unreadable(e.to_string()),
     }
 }
 
@@ -689,7 +796,7 @@ mod tests {
         match read_hwm(hwm_path) {
             HwmState::Valid(v) => v,
             HwmState::Missing => panic!("expected HWM to be Valid, but it was Missing"),
-            HwmState::Tampered => panic!("expected HWM to be Valid, but it was Tampered"),
+            HwmState::Unusable(r) => panic!("expected HWM to be Valid, but it was unusable: {r}"),
         }
     }
 
@@ -3058,14 +3165,21 @@ mod tests {
         let result = verify_chain(&verify_config(&dir)).unwrap();
         assert!(result.key_unavailable_at.is_some(), "sanity: it halted");
         assert!(
-            result.hwm_tampered,
-            "an unreadable sidecar is a fact about the sidecar — a halt in the log does \
-             not make it unknowable"
+            matches!(result.hwm_unusable, Some(HwmUnusable::NotAMark(_))),
+            "an unusable sidecar is a fact about the sidecar — a halt in the log does \
+             not make it unknowable. Content that is not an integer is `NotAMark`, got {:?}",
+            result.hwm_unusable
         );
         assert!(
             !result.tail_truncated,
-            "a Tampered mark yields no comparison at all, so nothing may be claimed \
+            "an unusable mark yields no comparison at all, so nothing may be claimed \
              about the tail"
+        );
+        assert!(
+            matches!(result.hwm_write, verify::HwmWrite::NotAttempted),
+            "#490: withheld, and now said so rather than inferred. A halted run has no \
+             authenticated end it is entitled to write, got {:?}",
+            result.hwm_write
         );
         assert_eq!(
             fs::read_to_string(&hwm_file).unwrap(),
@@ -8416,11 +8530,19 @@ mod tests {
             "malformed HWM is tamper evidence, not a fresh install"
         );
         assert!(
-            result.hwm_tampered,
-            "malformed HWM should be flagged as tampered"
+            matches!(result.hwm_unusable, Some(HwmUnusable::NotAMark(_))),
+            "malformed content is a statement about the content, so it is `NotAMark` \
+             rather than `Unreadable`, got {:?}",
+            result.hwm_unusable
         );
 
-        // Still re-bootstrapped so the tool keeps functioning.
+        // Still re-bootstrapped so the tool keeps functioning — and #490 says
+        // so from the write's own result rather than from the arm's intention.
+        assert!(
+            matches!(result.hwm_write, verify::HwmWrite::Written),
+            "the chain verified end to end, so the mark is written, got {:?}",
+            result.hwm_write
+        );
         let hwm = expect_hwm(&hwm_file);
         assert_eq!(hwm, 2);
 
@@ -8441,17 +8563,20 @@ mod tests {
 
         let hwm_file = hwm_path_for(&logger.path);
         fs::write(&hwm_file, "not-a-number").unwrap();
-        assert!(matches!(read_hwm(&hwm_file), HwmState::Tampered));
+        assert!(matches!(
+            read_hwm(&hwm_file),
+            HwmState::Unusable(HwmUnusable::NotAMark(_))
+        ));
 
         // A subsequent append must re-bootstrap the HWM rather than error
-        // or leave it tampered.
+        // or leave it unusable.
         logger.append(make_event("cmd1")).unwrap();
 
         match read_hwm(&hwm_file) {
             HwmState::Valid(v) => assert_eq!(v, 1, "HWM should advance to the new seq"),
             HwmState::Missing => panic!("HWM should not be Missing after append re-bootstraps it"),
-            HwmState::Tampered => {
-                panic!("HWM should not still be Tampered after append re-bootstraps it")
+            HwmState::Unusable(r) => {
+                panic!("HWM should not still be unusable after append re-bootstraps it: {r}")
             }
         }
 
@@ -8479,8 +8604,104 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Reading a symlinked HWM must report `Tampered`, not follow the link
-    /// and return whatever value the attacker placed at the target.
+    /// #491: every shape `read_hwm` can meet, and which side of the split it
+    /// lands on.
+    ///
+    /// The two the single `Tampered` state could not tell apart are the point:
+    /// a sidecar omamori would never have written (tamper evidence, and the
+    /// wording that goes with it) and one it simply could not read, which says
+    /// nothing about what is there. Both still stop the comparison and both
+    /// still exit 3 — the verdict does not move, only the sentence.
+    ///
+    /// Table-driven rather than one test per shape because the property under
+    /// test is the *partition*: a shape landing on the wrong side is the bug,
+    /// and that is only visible with the shapes side by side.
+    #[cfg(unix)]
+    #[test]
+    fn read_hwm_names_what_it_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("read-hwm-shapes");
+        fs::create_dir_all(&dir).unwrap();
+        let at = |name: &str| dir.join(name);
+
+        let not_a_mark = |path: &std::path::Path, expect: &str| match read_hwm(path) {
+            HwmState::Unusable(HwmUnusable::NotAMark(what)) => assert!(
+                what.contains(expect),
+                "the reason must name what was observed — wanted {expect:?} in {what:?}"
+            ),
+            other => panic!(
+                "{} is not a mark omamori wrote, got {}",
+                path.display(),
+                describe_state(&other)
+            ),
+        };
+
+        assert!(
+            matches!(read_hwm(&at("absent")), HwmState::Missing),
+            "an absent sidecar is the first run, not evidence of anything"
+        );
+
+        fs::write(at("valid"), "42").unwrap();
+        assert!(matches!(read_hwm(&at("valid")), HwmState::Valid(42)));
+
+        fs::write(at("text"), "not-a-number").unwrap();
+        not_a_mark(&at("text"), "plain integer");
+
+        // Not UTF-8 at all, which fails in `read_to_string` rather than in the
+        // parse. Still a statement about the content, so still `NotAMark` —
+        // the arm that separates it from a mid-read I/O failure.
+        fs::write(at("binary"), [0xff, 0xfe, 0x00]).unwrap();
+        not_a_mark(&at("binary"), "not text");
+
+        fs::create_dir(at("adir")).unwrap();
+        not_a_mark(&at("adir"), "directory");
+
+        mkfifo_at(&at("afifo"));
+        not_a_mark(&at("afifo"), "FIFO");
+
+        std::os::unix::fs::symlink(at("valid"), at("alink")).unwrap();
+        not_a_mark(&at("alink"), "symlink");
+
+        // The other side of the split: a perfectly ordinary file holding a
+        // perfectly ordinary mark, which this process may not open. Nothing
+        // here is evidence that anyone touched it.
+        //
+        // Restored before the assertion so a failure does not leave an
+        // unreadable file behind, and asserted as `Unreadable` rather than
+        // skipped under root — running as root makes the open succeed and this
+        // fails loudly instead of passing without measuring anything.
+        fs::write(at("locked"), "7").unwrap();
+        fs::set_permissions(at("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let verdict = read_hwm(&at("locked"));
+        let restored = fs::set_permissions(at("locked"), fs::Permissions::from_mode(0o600));
+        assert!(
+            matches!(verdict, HwmState::Unusable(HwmUnusable::Unreadable(_))),
+            "a readable-in-principle file that would not open says nothing about what is \
+             there, got {}",
+            describe_state(&verdict)
+        );
+        restored.unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Render an `HwmState` for a failure message. `HwmState` deliberately
+    /// carries no `Debug`: `Unusable` holds an operator-facing sentence, and a
+    /// derived `{:?}` would put an escaped copy of it in test output.
+    ///
+    /// Not `#[cfg(unix)]`, unlike the shapes test that uses it: its other
+    /// caller is `read_hwm_symlink_is_tampered`, which is not gated either.
+    fn describe_state(state: &HwmState) -> String {
+        match state {
+            HwmState::Valid(v) => format!("Valid({v})"),
+            HwmState::Missing => "Missing".to_string(),
+            HwmState::Unusable(r) => format!("Unusable({r})"),
+        }
+    }
+
+    /// Reading a symlinked HWM must report it as not a mark, not follow the
+    /// link and return whatever value the attacker placed at the target.
     #[test]
     fn read_hwm_symlink_is_tampered() {
         let dir = test_dir("read-hwm-symlink");
@@ -8491,7 +8712,19 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &hwm_file).unwrap();
 
-        assert!(matches!(read_hwm(&hwm_file), HwmState::Tampered));
+        // #491: the shape is now named, not just bucketed. A symlink is
+        // `NotAMark` — something omamori would never have written — which is
+        // the half of the old `Tampered` bucket that keeps the strong wording.
+        match read_hwm(&hwm_file) {
+            HwmState::Unusable(HwmUnusable::NotAMark(what)) => assert!(
+                what.contains("symlink"),
+                "the reason must name what was observed, got {what:?}"
+            ),
+            other => panic!(
+                "a symlinked sidecar is not a mark omamori wrote, got {}",
+                describe_state(&other)
+            ),
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }
