@@ -14,7 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::verify::AuditError;
+use super::error::AuditError;
 
 // ---------------------------------------------------------------------------
 // File locking (platform-specific)

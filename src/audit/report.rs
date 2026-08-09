@@ -15,8 +15,9 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::error::AuditError;
 use super::secret::open_read_nofollow;
-use super::verify::{AuditError, KeyStoreFailure, verify_chain};
+use super::verify::{KeyStoreFailure, verify_chain};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 
 /// Chain integrity status. Originally 3-state per SEC-R8; #177 B1 step 2
@@ -373,7 +374,12 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
     let mut keyring_warnings = Vec::new();
     result.chain_status = match verify_chain(config) {
         Ok(verify_result) => {
-            result.hwm_tampered = verify_result.hwm_tampered;
+            // #491: `hwm_unusable` replaced the bool this reads. Both states it
+            // now covers were already folded into the old flag, so what `doctor`
+            // is told does not move — and `doctor`'s own wording ("unreadable or
+            // tampered") was already the honest disjunction, which is why it is
+            // the one surface this change leaves alone.
+            result.hwm_tampered = verify_result.hwm_unusable.is_some();
             // #483: unconditional, unlike `key_store_failure` below. It never
             // competes for the `chain_status` slot — an unprotected entry does
             // not stop the walk, so the status is whatever the links turned out

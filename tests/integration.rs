@@ -1456,3 +1456,21 @@ fn config_list_keeps_columns_aligned_for_long_move_to_destination() {
 
     let _ = fs::remove_dir_all(&config_dir);
 }
+
+/// #493: `AuditError` moved out of `verify.rs`, and both public paths to it
+/// still resolve.
+///
+/// This is an integration test rather than a unit one because that is the only
+/// place the distinction exists: inside the crate, `verify::AuditError` would
+/// resolve from the module tree whether or not the re-export is `pub`. Here the
+/// crate is a dependency, so the assertion is the one that matters — a later
+/// tidy-up that drops the `pub use` fails to compile instead of silently
+/// deleting a path a downstream crate may be importing.
+///
+/// Nothing is asserted at runtime. Naming both paths is the whole test.
+#[test]
+fn audit_error_keeps_both_public_paths() {
+    fn takes(_: &omamori::audit::AuditError) {}
+    let e: omamori::audit::verify::AuditError = omamori::audit::verify::AuditError::FileNotFound;
+    takes(&e);
+}

@@ -63,6 +63,51 @@ fn format_verify_success_message(result: &audit::VerifyResult) -> String {
     msg
 }
 
+/// Whether there was a mark before this run, which is the difference between
+/// "reset" and "created" in the sentences below.
+#[derive(Clone, Copy)]
+enum MarkExisted {
+    Yes,
+    No,
+}
+
+/// What the write half of the high-water-mark machinery did — stated from what
+/// `write_hwm` returned, not from the arm that was about to call it.
+///
+/// #490: the two sentences this replaces were unconditional. `verify_chain`
+/// discarded the write's result, so "It has been reset to the current chain
+/// end" and "high-water-mark bootstrapped to current chain end" were printed on
+/// runs where the write had failed. Measured on `8d51fe6`: a symlinked sidecar,
+/// a directory at the sidecar's path, and a data directory omamori may not
+/// write all printed the reassuring half while nothing was written — and the
+/// first two do not repair themselves, so the false sentence repeats forever.
+///
+/// One function for all three states rather than a sentence per call site: the
+/// arms that reach it differ in *which* outcomes are possible, and reasoning
+/// about that per site is what let the unconditional version look correct.
+fn print_hwm_write_note(write: &audit::HwmWrite, existed: MarkExisted) {
+    match (write, existed) {
+        (audit::HwmWrite::Written, MarkExisted::Yes) => {
+            eprintln!("  It has been reset to the current chain end.");
+        }
+        (audit::HwmWrite::Written, MarkExisted::No) => {
+            eprintln!("  One has been created at the current chain end.");
+        }
+        (audit::HwmWrite::Failed(reason), _) => {
+            eprintln!(
+                "  Writing the mark also failed ({reason}), so tail-truncation detection \
+                 stays off until that is repaired."
+            );
+        }
+        (audit::HwmWrite::NotAttempted, _) => {
+            eprintln!(
+                "  No mark was written: this run could not authenticate the end of the \
+                 chain, so it has no value it is entitled to write there."
+            );
+        }
+    }
+}
+
 /// What the high-water-mark machinery did while verification was stopped —
 /// printed by both halted arms, after each has explained its own reason.
 ///
@@ -85,24 +130,30 @@ fn format_verify_success_message(result: &audit::VerifyResult) -> String {
 /// renamed because the sentences it prints are about the high-water-mark and
 /// are correct for all of them; what changed is only how many ways there are to
 /// arrive.
+///
+/// #490: what each arm says about the *write* now comes from
+/// [`print_hwm_write_note`], which reads the outcome rather than the arm's
+/// intention. Every arm reachable here withholds the write on purpose
+/// (`walked_past_unauthenticated` is what gates it), so `NotAttempted` is the
+/// outcome in practice — but that is a fact about the caller, and stating it
+/// from the caller is how the sentence on the success path came to be false.
 fn print_halted_hwm_notes(result: &audit::VerifyResult) {
-    if result.hwm_tampered {
+    if let Some(reason) = &result.hwm_unusable {
+        // #491: the reason is quoted. This used to name two causes — a symlink,
+        // or invalid content — for a state that also covers a sidecar which
+        // merely could not be read, and named both of them whichever it was.
         eprintln!(
-            "  WARNING: the high-water-mark file is unreadable or has been tampered with \
-             (expected a plain integer, found a symlink or invalid content), so no \
+            "  WARNING: the high-water-mark file could not be used \u{2014} {reason}, so no \
              tail-truncation check was possible."
         );
-        eprintln!(
-            "  It has not been reset: this run could not authenticate the end of the \
-             chain, so it has no value it is entitled to write there. Treat this as a \
-             possible attempt to defeat tail-truncation detection."
-        );
+        print_hwm_write_note(&result.hwm_write, MarkExisted::Yes);
+        eprintln!("  Treat this as a possible attempt to defeat tail-truncation detection.");
     } else if result.hwm_missing {
         eprintln!(
-            "  Note: there is no high-water-mark file to compare against, and this run \
-             did not create one — it could not authenticate the end of the chain. \
+            "  Note: there is no high-water-mark file to compare against. \
              Tail-truncation detection begins once a run verifies the log end to end."
         );
+        print_hwm_write_note(&result.hwm_write, MarkExisted::No);
     } else if !result.hwm_compared {
         // #506: the fourth case, and the one that made the three-case reading
         // above stop being exhaustive. A store whose key material is unusable
@@ -437,19 +488,19 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 // and a run arriving here authenticated the chain end, so the
                 // repair each one describes is one it actually performed.
                 println!("{}", format_verify_success_message(&result));
-                if result.hwm_tampered {
+                if let Some(reason) = &result.hwm_unusable {
                     eprintln!(
-                        "  WARNING: high-water-mark file was unreadable or tampered with \
-                         (expected a plain integer, found a symlink or invalid content)."
+                        "  WARNING: the high-water-mark file could not be used \u{2014} {reason}."
                     );
+                    print_hwm_write_note(&result.hwm_write, MarkExisted::Yes);
                     eprintln!(
-                        "  It has been reset to the current chain end, but this may indicate \
-                         an attempt to defeat tail-truncation detection."
+                        "  This may indicate an attempt to defeat tail-truncation detection."
                     );
                     return Ok(3);
                 }
                 if result.hwm_missing {
-                    eprintln!("  Note: high-water-mark bootstrapped to current chain end.");
+                    eprintln!("  Note: there was no high-water-mark file.");
+                    print_hwm_write_note(&result.hwm_write, MarkExisted::No);
                 }
                 Ok(0)
             }

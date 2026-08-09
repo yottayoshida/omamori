@@ -4270,3 +4270,188 @@ fn an_interrupted_rotation_that_cannot_mint_does_not_claim_a_key_exists() {
     set_mode(&store_dir(&base), 0o700);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------------------------------------------------------------------------
+// #490 / #491 — the high-water-mark sentences say what was observed
+// ---------------------------------------------------------------------------
+
+/// The sidecar path for a sandbox's audit log.
+#[cfg(unix)]
+fn hwm_path_in(base: &Path) -> PathBuf {
+    audit_path_for(base).with_file_name("audit.jsonl.hwm")
+}
+
+/// The two clauses #491 is about, so no test spells either by hand.
+///
+/// Both were printed unconditionally from one state that also covers a sidecar
+/// which merely could not be read. Asserting their *absence* is the whole
+/// point, and a substring typed out at four call sites is one typo away from
+/// asserting the absence of something that was never printed.
+#[cfg(unix)]
+const OLD_CAUSE_CLAUSE: &str = "found a symlink or invalid content";
+#[cfg(unix)]
+const OLD_RESET_CLAIM: &str = "It has been reset to the current chain end";
+
+/// #490 — a symlinked sidecar: the mark is *not* reset, and the run says so.
+///
+/// Measured on `8d51fe6` before the fix: exit 3 with "It has been reset to the
+/// current chain end", on a run where `write_hwm` had refused the symlink and
+/// `verify_chain` had discarded the refusal. The state does not repair itself,
+/// so the false sentence was printed on every subsequent run as well.
+///
+/// The link and its target are checked too. "Does not claim a reset" is
+/// satisfied by an implementation that performs one — the claim and the act
+/// have to be pinned separately, which is exactly the pair that came apart
+/// here.
+#[cfg(unix)]
+#[test]
+fn verify_does_not_claim_a_reset_it_could_not_perform() {
+    let (base, audit_path, _hook, _shim) = seed_three_entry_store("490-symlink-sidecar");
+    let hwm = hwm_path_in(&base);
+    let target = audit_path.with_file_name("forged-mark");
+    std::fs::write(&target, "999").unwrap();
+    std::fs::remove_file(&hwm).unwrap();
+    std::os::unix::fs::symlink(&target, &hwm).unwrap();
+
+    let (code, _out, err) = run_audit(&base, &["verify"]);
+
+    assert_eq!(
+        code, 3,
+        "an unusable sidecar is still exit 3 (stderr={err})"
+    );
+    assert!(
+        !err.contains(OLD_RESET_CLAIM),
+        "nothing was reset — `write_hwm` refuses a symlinked path: {err}"
+    );
+    assert!(
+        err.contains("Writing the mark also failed"),
+        "the failure is what happened, so it is what gets said: {err}"
+    );
+    assert!(
+        err.contains("symlink"),
+        "and the reason names the shape actually found: {err}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&hwm)
+            .expect("the sidecar path still exists")
+            .file_type()
+            .is_symlink(),
+        "the run must not have replaced the link — refusing to write is the defence"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "999",
+        "and must not have written through it either"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #491 — an unreadable sidecar: neither named cause is claimed, and the reset
+/// that *did* happen is reported as one.
+///
+/// The write outcome here is the opposite of the symlinked case above, and that
+/// is deliberate. `write_hwm` publishes by `rename`, which needs the directory
+/// writable and not the file readable, so a `chmod 000` sidecar is replaced
+/// while a symlinked one is refused. An implementation that hardcodes either
+/// sentence passes one of these two tests and fails the other.
+///
+/// Measured on `8d51fe6`: both cases printed the same two sentences, and each
+/// sentence was false in exactly one of them.
+#[cfg(unix)]
+#[test]
+fn verify_does_not_name_a_cause_it_did_not_observe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base, _audit_path, _hook, _shim) = seed_three_entry_store("491-unreadable-sidecar");
+    let hwm = hwm_path_in(&base);
+    // A value the chain end (2) cannot coincide with, so "rewritten" and
+    // "left alone" are distinguishable. With the real mark in place both
+    // outcomes read as "2" and the assertion below measures nothing.
+    std::fs::write(&hwm, "0").unwrap();
+    std::fs::set_permissions(&hwm, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (code, _out, err) = run_audit(&base, &["verify"]);
+    let restored = std::fs::set_permissions(&hwm, std::fs::Permissions::from_mode(0o600));
+
+    assert_eq!(
+        code, 3,
+        "an unusable sidecar is still exit 3 (stderr={err})"
+    );
+    assert!(
+        !err.contains(OLD_CAUSE_CLAUSE),
+        "neither cause was observed: the file is a plain file holding plain digits, and \
+         the open failed on permissions: {err}"
+    );
+    assert!(
+        !err.contains("symlink"),
+        "there is no symlink anywhere in this fixture: {err}"
+    );
+    assert!(
+        err.contains("could not be read"),
+        "what happened is that it could not be read, so that is what it says: {err}"
+    );
+    assert!(
+        err.contains(OLD_RESET_CLAIM),
+        "and here the reset *did* happen, so the run must still say so — the fix is to \
+         report the outcome, not to stop claiming one: {err}"
+    );
+    restored.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&hwm).unwrap(),
+        "2",
+        "precondition for the assertion above: `rename` replaced the unreadable file"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// #490 — a sidecar that could not be created is not reported as bootstrapped.
+///
+/// Measured on `8d51fe6`: "Note: high-water-mark bootstrapped to current chain
+/// end." on a data directory omamori may not write, where nothing was created.
+///
+/// Also pins that the reason stays out of `report --json`. The strings carry
+/// the data directory's path — `write_hwm`'s refusal names it outright — and
+/// `report --json` is the surface that must not leak one.
+#[cfg(unix)]
+#[test]
+fn verify_does_not_claim_a_bootstrap_it_could_not_perform() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base, audit_path, _hook, _shim) = seed_three_entry_store("490-unwritable-dir");
+    let data_dir = audit_path.parent().unwrap().to_path_buf();
+    std::fs::remove_file(hwm_path_in(&base)).unwrap();
+    // Read and traverse, no create. The key store's lock file already exists
+    // by this point — the sandbox has run three appends and a verify — so the
+    // only thing this mode stops is the sidecar's temp-then-rename publish.
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let (code, _out, err) = run_audit(&base, &["verify"]);
+    let (report_code, report_out, _) = run_omamori(&base, &["report", "--json"]);
+    let restored = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+
+    assert_eq!(code, 0, "the chain itself verified (stderr={err})");
+    assert!(
+        !err.contains("has been created"),
+        "nothing was created — the directory is not writable: {err}"
+    );
+    assert!(
+        err.contains("Writing the mark also failed"),
+        "the failure is what happened, so it is what gets said: {err}"
+    );
+    assert!(
+        !hwm_path_in(&base).exists(),
+        "precondition for the assertion above: the sidecar really was not created"
+    );
+
+    assert_eq!(report_code, 0, "report still runs in this state");
+    assert!(
+        !report_out.contains(&base.display().to_string()),
+        "the reason strings name the data directory, and `report --json` must not \
+         carry one: {report_out}"
+    );
+
+    restored.unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+}

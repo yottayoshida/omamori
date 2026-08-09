@@ -14,126 +14,12 @@ use super::secret::{
     secret_path_for,
 };
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
-use super::{HwmState, hwm_path_for, read_hwm, write_hwm};
+use super::{HwmState, HwmUnusable, hwm_path_for, read_hwm, write_hwm};
 
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-// #457: gains a variant, so it closes the exhaustive-match door before 1.0 for
-// the same reason `VerifyResult` and `ChainStatus` do.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum AuditError {
-    SecretUnavailable,
-    FileNotFound,
-    /// #457: the key directory could not be listed, so which epochs exist is
-    /// unknown. Kept apart from `SecretUnavailable` (the active key itself is
-    /// often readable in this state) and emphatically apart from a tampering
-    /// verdict — resolving `"default"` to the active key on a rotated store
-    /// would make every entry look altered.
-    ///
-    /// PR-C1 split the repair out of the reason. `Display` renders only
-    /// `reason`, because the surface that shows it most often — `doctor`'s
-    /// one-line risk signal — exists to name a cause and point at
-    /// `omamori audit verify`, and a repair inlined there runs past what sits
-    /// readably next to its one-clause siblings (pinned in `cli.rs`). The
-    /// surfaces that *do* carry a repair print `remedy` on its own line.
-    ///
-    /// The remedy travels with the error rather than being added by the CLI
-    /// arm, for the reason #477 had to withdraw a caller-side one: the arm
-    /// knows the keyring is unusable and not which condition made it so, and
-    /// the conditions need different actions — one is a directory that cannot
-    /// be listed, another a record file that states no epoch while the
-    /// directory is perfectly fine.
-    ///
-    /// **#487 added a third**: the active key is missing on a store that has
-    /// rotated before. Same shape as the other two — the keyring cannot be
-    /// resolved, and the arm cannot tell which condition made it so — and the
-    /// action differs again. Here the operator is to leave the key files alone;
-    /// nothing is broken that they can repair, and the `.retired` file the
-    /// obvious repair reaches for is the only thing authenticating its own
-    /// epoch's entries.
-    ///
-    /// **The last two are produced by `rotate_key` only, and `report --json`
-    /// depends on it.** `aggregate_report` maps `verify_chain`'s result rather
-    /// than rotation's, and pins `kind: "directory_unreadable"` on the
-    /// `ChainStatus` it builds (`report.rs`). That value is honest exactly
-    /// while `verify_chain` has one way to produce this variant. Giving the
-    /// verifier a second one makes the field describe a condition that did not
-    /// occur — the `kind` would have to grow with it, and it exists to be
-    /// stable.
-    ///
-    /// Empty `remedy` is allowed and means "nothing beyond the reason".
-    KeyringUnusable {
-        reason: String,
-        remedy: String,
-    },
-    /// #478: `rename` moved the key being replaced into its retired slot and
-    /// this rotation did not create the replacement.
-    ///
-    /// Not "the store now has no active key" — `source` can be `AlreadyExists`,
-    /// which says some other writer put a file at that path, possibly a usable
-    /// key. What the variant carries is what this process did, which is also
-    /// all the message built from it claims.
-    ///
-    /// Kept apart from `Io` because the store *changed*. The catch-all it came
-    /// from covered five situations, four of which left the key directory
-    /// exactly as they found it; reporting all five as `key rotation failed`
-    /// told the operator nothing about which one they were in, and the one that
-    /// matters is the one where the next append mints a second key under the id
-    /// this rotation was heading for.
-    RotationInterrupted {
-        retired_path: std::path::PathBuf,
-        source: std::io::Error,
-    },
-    /// #471/#487: the store could not be read, and **not** because there is
-    /// nothing in it yet.
-    ///
-    /// Every one of these used to arrive as `SecretUnavailable`, `FileNotFound`
-    /// or `Io`, all of which `aggregate_report` mapped to
-    /// `ChainStatus::Unavailable` — a status `needs_attention()` treats as
-    /// healthy, because it also means "auditing is off" and "there is no log
-    /// yet". So a symlink planted on `audit.jsonl`, an interrupted rotation,
-    /// and an unreadable key all left `doctor` silent.
-    ///
-    /// `kind` is classified **at the call site**, where which file was being
-    /// touched is still known — an `io::Error` on its own cannot say whether it
-    /// came from the log or the key. It is path-free, for the reason
-    /// `KeyringUnusable`'s is: `reason` carries the operator's home directory
-    /// and must stay out of `report --json`.
-    StoreInaccessible {
-        kind: &'static str,
-        reason: String,
-    },
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for AuditError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SecretUnavailable => write!(f, "HMAC secret unavailable"),
-            Self::FileNotFound => write!(f, "audit log not found"),
-            Self::KeyringUnusable { reason, .. } => write!(f, "{reason}"),
-            Self::RotationInterrupted {
-                retired_path,
-                source,
-            } => write!(
-                f,
-                "the previous key was moved to {} and its replacement could not be created: {source}",
-                retired_path.display()
-            ),
-            Self::StoreInaccessible { reason, .. } => write!(f, "{reason}"),
-            Self::Io(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-impl From<std::io::Error> for AuditError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
+// The audit subsystem's error type lives in `error.rs` (#493). Re-exported
+// here because `omamori::audit::verify::AuditError` is a path that resolves
+// today; moving the type without this would delete it.
+pub use super::error::AuditError;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -265,6 +151,27 @@ impl KeyStoreFailure {
     }
 }
 
+/// What `verify_chain` did with the mark it may have been entitled to write.
+///
+/// #490: the outcome is carried rather than discarded because the CLI asserts
+/// it to the operator. `write_hwm` returns a `Result` and both call sites threw
+/// it away, so "it has been reset" was printed from an intention rather than
+/// from an observation — on a symlinked sidecar it was printed on every run and
+/// was never once true.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum HwmWrite {
+    /// No write was made because this run had no authenticated chain end to
+    /// write. Deliberate, not a failure: a mark taken from an unauthenticated
+    /// end is what every later run would compare against.
+    #[default]
+    NotAttempted,
+    /// `write_hwm` returned `Ok`.
+    Written,
+    /// `write_hwm` returned an error, carried here so the sentence can say so.
+    Failed(String),
+}
+
 #[derive(Default)]
 #[non_exhaustive]
 pub struct VerifyResult {
@@ -286,7 +193,28 @@ pub struct VerifyResult {
     pub pruned_count: Option<u64>,
     pub tail_truncated: bool,
     pub hwm_missing: bool,
-    pub hwm_tampered: bool,
+    /// #491: replaces `hwm_tampered: bool`. A bool next to a reason is two
+    /// values that can disagree; the reason on its own cannot.
+    ///
+    /// `Some` means the sidecar exists and this run got no mark out of it —
+    /// which is what the old flag meant, so every verdict built from it is
+    /// unchanged. What it adds is *what was observed*, so the sentences below
+    /// stop naming a cause the run never checked.
+    pub hwm_unusable: Option<HwmUnusable>,
+    /// #490: what the write half actually did.
+    ///
+    /// Both arms below used to spell the write `let _ = write_hwm(…)`, and the
+    /// CLI then told the operator the mark had been reset. `write_hwm` refuses
+    /// a symlinked path and cannot create its temp file in a directory omamori
+    /// may not write, so on a symlinked or directory-occupied sidecar the
+    /// sentence was false on **every run, forever** — nothing was reset, and
+    /// nothing about the state repairs itself.
+    ///
+    /// `NotAttempted` is carried rather than folded into "did not succeed"
+    /// because the two are different things to tell an operator: a halted run
+    /// withholds the write on purpose (it has no authenticated end it is
+    /// entitled to record), while a failed one tried and could not.
+    pub hwm_write: HwmWrite,
     /// Whether the high-water-mark comparison actually ran.
     ///
     /// #506: `audit verify`'s halted note ends by telling the operator that
@@ -1433,31 +1361,50 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             HwmState::Missing => {
                 // Bootstrap: first verify on a chain without HWM
                 result.hwm_missing = true;
-                if let Some(end) = writable_end {
-                    let _ = write_hwm(&hwm_file, end);
-                }
+                result.hwm_write = record_mark(&hwm_file, writable_end);
             }
-            HwmState::Tampered => {
-                // The HWM itself is unreadable or symlinked — this is tamper
-                // evidence, not a fresh install. Surface it distinctly instead
-                // of silently re-bootstrapping as if nothing happened.
+            HwmState::Unusable(reason) => {
+                // Something is at the path and this run got no mark out of it —
+                // not a fresh install. Surface it distinctly instead of
+                // silently re-bootstrapping as if nothing happened.
                 //
                 // #470: reported during a halt too. That the sidecar is
-                // unreadable is a fact about the sidecar, true or false
+                // unusable is a fact about the sidecar, true or false
                 // independently of whether the log could be authenticated, and
                 // suppressing it handed an attacker a second thing one edited
                 // `key_id` bought for free. Only the re-bootstrap is withheld —
                 // so the operator-facing message must not claim the mark was
                 // reset when it was not.
-                result.hwm_tampered = true;
-                if let Some(end) = writable_end {
-                    let _ = write_hwm(&hwm_file, end);
-                }
+                //
+                // #490: which is what it did claim. The write below is the one
+                // that fails on the two states worth reporting, and its result
+                // used to be discarded on the line that made it.
+                result.hwm_unusable = Some(reason);
+                result.hwm_write = record_mark(&hwm_file, writable_end);
             }
         }
     }
 
     Ok(result)
+}
+
+/// Write the mark this run is entitled to, and say what happened.
+///
+/// #490: the two call sites spelled this `let _ = write_hwm(…)`. Both states
+/// that reach it are ones where the write can fail — a symlinked sidecar is
+/// refused by `write_hwm` itself, and a directory omamori may not write cannot
+/// hold the temp file the atomic publish needs — and the CLI asserted the
+/// success of both. `mod.rs`'s append path and `retention.rs`'s prune path call
+/// the same function and have always reported its failure; only this one threw
+/// it away, and only this one's result is stated to the operator.
+fn record_mark(hwm_file: &std::path::Path, end: Option<u64>) -> HwmWrite {
+    let Some(end) = end else {
+        return HwmWrite::NotAttempted;
+    };
+    match write_hwm(hwm_file, end) {
+        Ok(()) => HwmWrite::Written,
+        Err(e) => HwmWrite::Failed(e.to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
