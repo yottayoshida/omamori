@@ -59,14 +59,73 @@ use crate::rules::{CommandInvocation, RuleConfig};
 /// it (#492). A sanitizer written per call site does not reach the next call
 /// site.
 ///
-/// `provenance::sanitize` keeps its own copy deliberately — it caps length for
-/// a field written into every audit entry, and truncating a filesystem error
-/// would cut the path an operator needs.
+/// `provenance::sanitize` stays a separate function — it caps length for a
+/// field written into every audit entry, and truncating a filesystem error
+/// would cut the path an operator needs — but it substitutes **the same set**,
+/// via [`hides_or_reorders_text`]. Two definitions of "dangerous character"
+/// would drift, which is the failure the paragraph above is about one level up.
 pub(crate) fn strip_control_chars(input: &str) -> String {
     input
         .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            if hides_or_reorders_text(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .collect()
+}
+
+/// Whether `c` is a character that **renders as nothing itself** and can change
+/// the order or visibility of the text around it.
+///
+/// #515: the substitution used to be `char::is_control()`, which is Unicode
+/// category `Cc` and nothing else. The bidirectional formatting characters are
+/// `Cf`, so they passed straight through to two sinks — `omamori status` and,
+/// since #513, `break-glass`'s confirmation prompt. An override can make a path
+/// render right-to-left, and on a consent prompt the reader is agreeing on the
+/// strength of what that line says.
+///
+/// **Defined by a rule rather than by a list of code points**, so the next
+/// addition is decidable: a character is in scope when it draws nothing itself
+/// and its *only* effect on the rendered result is to reorder or conceal the
+/// text around it.
+///
+/// - `Cc`, which is what was already covered.
+/// - Bidirectional controls and isolates — they reorder.
+/// - Zero-width padding and layout hints — they conceal, and they let one
+///   rendered string carry characters nobody sees.
+/// - Tag characters — invisible by construction, and the carrier for hiding a
+///   payload inside an otherwise ordinary-looking string.
+///
+/// **Characters with a composing role are out**, because for them reordering or
+/// concealment is not the only effect — they are how legitimate text is built:
+///
+/// - Variation selectors (`U+FE00`–`U+FE0F`, `U+E0100`–`U+E01EF`) change how the
+///   *preceding single character* is drawn.
+/// - `U+200C` ZERO WIDTH NON-JOINER and `U+200D` ZERO WIDTH JOINER combine their
+///   neighbours into one glyph. Review caught this one: they were in the first
+///   version of the set, on the reasoning that they are zero-width — but `👩‍💻`
+///   is a joiner sequence, and so is every family emoji, and both are
+///   orthographic in Persian, Arabic and several Indic scripts. Substituting
+///   them turns a legitimate filename into mojibake.
+///
+/// Widening a sanitizer until an operator cannot read the path they have to act
+/// on is not a safer sanitizer. `U+200B` ZERO WIDTH SPACE stays in: it composes
+/// nothing, and invisible padding is exactly how two different strings are made
+/// to look like one.
+pub(crate) fn hides_or_reorders_text(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            // Bidirectional controls, embeddings, overrides and isolates.
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            // Zero-width padding and invisible layout hints. Not U+200C/U+200D:
+            // those join, and joining is a composing role — see above.
+            | '\u{00AD}' | '\u{180E}' | '\u{200B}' | '\u{2060}' | '\u{FEFF}'
+            // Tag characters.
+            | '\u{E0000}'..='\u{E007F}'
+        )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2548,7 +2607,7 @@ mod tests {
     fn load_or_create_secret_creates_when_missing() {
         let dir = test_dir("secret-create");
         let path = dir.join("audit-secret");
-        let secret = load_or_create_secret(&path);
+        let secret = load_or_create_secret(&path, secret::KeyWarnPolicy::Always);
         assert!(secret.is_some());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2558,7 +2617,7 @@ mod tests {
         let dir = test_dir("secret-read");
         let path = dir.join("audit-secret");
         let created = create_secret(&path).unwrap();
-        let loaded = load_or_create_secret(&path).unwrap();
+        let loaded = load_or_create_secret(&path, secret::KeyWarnPolicy::Always).unwrap();
         assert_eq!(created, loaded);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4541,7 +4600,8 @@ mod tests {
     fn prune_hwm_authenticates_a_retained_entry_signed_with_a_retired_key() {
         let dir = test_dir("prune-hwm-retired-key");
         let secret_path = dir.join("audit-secret");
-        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key is created");
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+            .expect("epoch-1 key is created");
         let path = prune_hwm_fixture(&dir, &epoch1);
 
         let rotation = super::rotate_key(&path).expect("rotation succeeds");
@@ -4801,7 +4861,8 @@ mod tests {
     fn pruned_across_rotation_fixture(dir: &Path) -> (std::path::PathBuf, [u8; 32], [u8; 32]) {
         let path = dir.join("audit.jsonl");
         let secret_path = dir.join("audit-secret");
-        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key is created");
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+            .expect("epoch-1 key is created");
 
         let old_ts = "2025-01-01T00:00:00Z";
         let new_ts = "2026-04-04T00:00:00Z";
@@ -5123,7 +5184,8 @@ mod tests {
             strict: false,
         };
 
-        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+            .expect("epoch-1 key");
 
         let old_ts = "2025-01-01T00:00:00Z";
         let new_ts = "2026-04-04T00:00:00Z";
@@ -5184,7 +5246,8 @@ mod tests {
         let audit_path = dir.join("audit.jsonl");
         let secret_path = dir.join("audit-secret");
 
-        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+            .expect("epoch-1 key");
         for _ in 0..3 {
             super::rotate_key(&audit_path).expect("rotation succeeds");
         }
@@ -5254,7 +5317,8 @@ mod tests {
         };
 
         // Establish epoch 1 and rotate, so epoch-1 becomes the retired key.
-        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+            .expect("epoch-1 key");
         super::rotate_key(&audit_path).expect("rotation succeeds");
         let epoch2 = read_secret(&secret_path).expect("epoch-2 is active");
         assert_ne!(epoch1, epoch2);
@@ -5362,7 +5426,8 @@ mod tests {
             strict: false,
         };
 
-        let epoch1 = load_or_create_secret(&secret_path).expect("epoch-1 key");
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+            .expect("epoch-1 key");
         super::rotate_key(&audit_path).expect("rotation succeeds");
         let epoch2 = read_secret(&secret_path).expect("epoch-2 is active");
 
@@ -8016,6 +8081,11 @@ mod tests {
             secret::WARN_KIND_KEYSTORE,
             secret::WARN_KIND_ROTATION_MINTED,
             secret::WARN_KIND_ROTATION_UNMINTED,
+            // #518
+            secret::WARN_KIND_EPOCH_AT_LIMIT,
+            secret::WARN_KIND_EPOCH_NOT_ADVANCED,
+            secret::WARN_KIND_SECRET_PATH_OCCUPIED,
+            secret::WARN_KIND_SECRET_UNREADABLE,
         ];
         let unique: std::collections::HashSet<_> = kinds.iter().collect();
         assert_eq!(
@@ -8023,6 +8093,127 @@ mod tests {
             kinds.len(),
             "two warning kinds share a sentinel, so one silences the other: {kinds:?}"
         );
+    }
+
+    /// #518: the two `load_or_create_secret` sites really do pass **different**
+    /// kinds — checked by driving each one and reading back the sentinel that
+    /// appeared, not by comparing the constants.
+    ///
+    /// The test above cannot do this and says so: it compares the values of the
+    /// constants, and copy-paste at a call site produces two identical *uses* of
+    /// distinct constants. That is the shape #518 warns about, so it is worth
+    /// one test that goes through the real functions.
+    ///
+    /// **Two of the four new sites, not four.** The two in `claim_next_epoch`
+    /// need a store that has rotated and lost its active key — and, for the
+    /// at-the-limit branch, one sitting at epoch `u32::MAX`. Those fixtures are
+    /// out of proportion to what they would add here, so those two sites are
+    /// covered by constant-distinctness only. Stated rather than left to be
+    /// inferred from what the test happens to touch.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn the_two_secret_sites_take_different_sentinels() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = test_dir("518-sentinel-per-site");
+        let store = home.join("store");
+        fs::create_dir_all(&store).unwrap();
+        let sentinels = home.join(".omamori");
+
+        let names = crate::test_support::with_home(Some(home.to_str().unwrap()), || {
+            // Site A: something is at the secret path that is not a key. A
+            // directory reproduces it — `create_secret` gets `AlreadyExists`
+            // and the re-read then says why it is unusable.
+            let occupied = store.join("audit-secret");
+            fs::create_dir(&occupied).unwrap();
+            secret::load_or_create_secret(&occupied, secret::KeyWarnPolicy::Throttled);
+
+            // Site B: nothing is at the secret path and one cannot be created.
+            // The lock file is made first, because a directory that cannot be
+            // written cannot hold it either and the run would stop earlier than
+            // the branch under test.
+            let ro = home.join("readonly");
+            fs::create_dir_all(&ro).unwrap();
+            let absent = ro.join("audit-secret");
+            fs::write(ro.join("audit-secret.lock"), b"").unwrap();
+            fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
+            secret::load_or_create_secret(&absent, secret::KeyWarnPolicy::Throttled);
+            let restored = fs::set_permissions(&ro, fs::Permissions::from_mode(0o700));
+
+            let mut names: Vec<String> = fs::read_dir(&sentinels)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| n.starts_with("warn-"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            restored.unwrap();
+            names
+        });
+
+        assert_eq!(
+            names.len(),
+            2,
+            "one sentinel per site — a shared kind would leave one file and silence \
+             the other site for the rest of the window. Got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.contains("secret-path-occupied"))
+                && names.iter().any(|n| n.contains("secret-unreadable")),
+            "and each site's own kind is the one that appeared: {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// #518: adding the throttle must not cost the **first** occurrence.
+    ///
+    /// The pair with the test above is the point. That one fails if the four
+    /// sites share a kind; this one fails if the guard is inverted, or if a
+    /// stale sentinel from any earlier run silences a condition's first report.
+    /// An implementation that always prints passes this and fails that one; one
+    /// that always suppresses fails this one. Neither can be satisfied by
+    /// guessing.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn the_first_occurrence_is_never_throttled_away() {
+        let home = test_dir("518-first-occurrence");
+        let store = home.join("store");
+        fs::create_dir_all(&store).unwrap();
+        let occupied = store.join("audit-secret");
+        fs::create_dir(&occupied).unwrap();
+
+        let emitted = crate::test_support::with_home(Some(home.to_str().unwrap()), || {
+            let first = secret::may_warn_for_test(
+                secret::KeyWarnPolicy::Throttled,
+                secret::WARN_KIND_SECRET_PATH_OCCUPIED,
+                &occupied,
+            );
+            let second = secret::may_warn_for_test(
+                secret::KeyWarnPolicy::Throttled,
+                secret::WARN_KIND_SECRET_PATH_OCCUPIED,
+                &occupied,
+            );
+            (first, second)
+        });
+
+        assert_eq!(
+            emitted,
+            (true, false),
+            "the first report of a condition must always be printed, and the second \
+             within the window must not"
+        );
+        assert!(
+            occupied.is_dir(),
+            "precondition: the fixture is one that does not resolve itself, which is \
+             what makes the suppression above meaningful rather than a race"
+        );
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// Only one of the four reasons carries a repair, so the gate must be a

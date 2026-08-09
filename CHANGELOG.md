@@ -6,6 +6,20 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Security
+
+- **The four key-store printers `#473` left unthrottled now go through the throttle, one sentinel kind each.** ([#518](https://github.com/yottayoshida/omamori/issues/518))
+
+  `load_signing_key_locked` runs on every guarded command, and two of the states behind these four resolve on their own only if an operator intervenes — something occupying the audit secret path, an epoch record that cannot be advanced on a read-only mount. Those messages repeated per command for as long as the store stayed broken, which is the defect `#473` was about, reached through four doors it did not close. Four kinds rather than one shared kind: two messages behind one sentinel means the first to fire silences the second for the rest of the window, and neither of these resolves itself.
+
+  **The AI disclosure gate was deliberately not extended to them.** Read against the code, none of the four carries a repair — each states a condition and its consequence, and the only repair sentence in this area (`epoch_record_remedy`) belongs to a different arm that is already gated. There was nothing for the gate to withhold, and adding it would have pressed toward withholding the condition itself, which SEC-R5 forbids. The issue's own title says "throttle and the AI gate"; the code says otherwise.
+
+- **Paths shown to an operator are sanitized against characters that reorder or conceal text, not only against control characters.** ([#515](https://github.com/yottayoshida/omamori/issues/515))
+
+  `strip_control_chars` replaced what `char::is_control` reports, which is Unicode `Cc` and nothing more. The bidirectional formatting characters are `Cf`, so they reached both sinks fed by `AuditSummary::path_error` — `omamori status` and, since `#513`, `break-glass`'s confirmation prompt. An override makes a path render in an order its bytes do not have, and a consent prompt is where the reader agrees on the strength of what that line says.
+
+  The set is now defined by a rule — a character is replaced when it draws nothing itself and can move or conceal the text around it — covering `Cc`, bidirectional controls and isolates, zero-width and invisible separators, and tag characters. `provenance::sanitize` applies the same rule from one shared definition; its length cap stays local to it. **Variation selectors are deliberately excluded**: they change how the preceding character is drawn and conceal nothing around it, and substituting them would alter legitimate filenames containing emoji or CJK.
+
 ### Fixed
 
 - **`audit verify` no longer reports the high-water-mark as reset after discarding the result of resetting it.** ([#490](https://github.com/yottayoshida/omamori/issues/490))
@@ -186,7 +200,7 @@ The format is based on Keep a Changelog.
 
   The throttle moves to `warn_throttle`, shared rather than private to `shim`, and takes a **sentinel per warning kind, per store**. Sharing one would have let the first warning silence a different condition for five minutes — an unlistable key directory and an interrupted rotation need different actions — and would have let `--config` pointed at one store silence another, which also makes in-process tests suppress each other. The sentinel still lives under `~/.omamori` and never in the audit data directory, because every warning it gates fires when something about that directory is unreadable.
 
-  **Throttling applies to the shim's constructor only.** `AuditLogger::from_config` is unchanged and stays loud; `from_config_throttled` is what the five shim call sites use. A separate constructor rather than a parameter, so a call site added later inherits "say it" and has to opt into silence — the direction [#510](https://github.com/yottayoshida/omamori/issues/510) established for the audit status catch-all. Throttling at the print site instead would have let a background shim invocation silence the answer to a question a person had just typed, and `audit key rotate`'s failure message points at "the condition reported above", which is this warning.
+  **Throttling applies to the shim's constructor only.** `AuditLogger::from_config` is unchanged and stays loud; `from_config_throttled` is what four of the shim's five logger constructions use; the fifth, the strict-mode gate, stays on the loud `from_config` deliberately. A separate constructor rather than a parameter, so a call site added later inherits "say it" and has to opt into silence — the direction [#510](https://github.com/yottayoshida/omamori/issues/510) established for the audit status catch-all. Throttling at the print site instead would have let a background shim invocation silence the answer to a question a person had just typed, and `audit key rotate`'s failure message points at "the condition reported above", which is this warning.
 
   **The disclosure gate withholds the repair and nothing else**, and only one of the four reasons has one to withhold. The condition is stated in every case — suppressing the observation would hide a degraded key store from its reader, which inverts what SEC-R5 is for.
 

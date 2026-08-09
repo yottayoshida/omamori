@@ -457,13 +457,15 @@ impl MissingActiveKey {
 /// touching anything), and the alternative is minting under a number the record
 /// does not hold. u32 gives 4.29e9 epochs; weekly rotation for two years
 /// reaches 104.
-fn claim_next_epoch(secret_path: &Path, lost: u32) -> Option<u32> {
+fn claim_next_epoch(secret_path: &Path, lost: u32, policy: KeyWarnPolicy) -> Option<u32> {
     let Some(next) = lost.checked_add(1) else {
-        eprintln!(
-            "omamori warning: audit key epoch {lost} is at the representable limit, so no \
-             successor can be allocated and no replacement key was created. \
-             {ENTRIES_CARRY_NO_HMAC}"
-        );
+        if may_warn(policy, WARN_KIND_EPOCH_AT_LIMIT, secret_path) {
+            eprintln!(
+                "omamori warning: audit key epoch {lost} is at the representable limit, so no \
+                 successor can be allocated and no replacement key was created. \
+                 {ENTRIES_CARRY_NO_HMAC}"
+            );
+        }
         return None;
     };
     match write_epoch_record(secret_path, next) {
@@ -472,43 +474,37 @@ fn claim_next_epoch(secret_path: &Path, lost: u32) -> Option<u32> {
         // mint below will be named by.
         Ok(recorded) => Some(recorded),
         Err(e) => {
-            eprintln!(
-                // "a replacement could not be created" is the wording #478 gave
-                // this outcome, and the outcome is the same one: no key exists at
-                // the active path when this returns. Kept verbatim so the operator
-                // reads one sentence for one state — the reason differs (the record
-                // stopped it before the mint was attempted) and the reason is what
-                // the rest of the sentence is for.
-                // "They stay unverifiable", not "they will be reported as
-                // tampering" — the consequence the *other* failed-mint branch has.
-                // The difference is the label: that branch returns a resolvable
-                // `key-{N}`, so clearing the fault mints a key under it and the
-                // entries written meanwhile fail against it. This one returns
-                // `UNRESOLVED_KEY_ID`, which no keyring can hold, so they stay in
-                // cannot-verify instead. Same words as the unlistable-directory
-                // site because the same thing happens there and for the same
-                // reason, checked rather than assumed (#478 Phase 8) — and written
-                // out rather than shared through a constant, so a third site
-                // cannot inherit a consequence nobody re-derived for it.
-                "omamori warning: the key for audit epoch {lost} is missing and a replacement could \
+            if may_warn(policy, WARN_KIND_EPOCH_NOT_ADVANCED, secret_path) {
+                eprintln!(
+                    // "a replacement could not be created" is the wording #478 gave
+                    // this outcome, and the outcome is the same one: no key exists at
+                    // the active path when this returns. Kept verbatim so the operator
+                    // reads one sentence for one state — the reason differs (the record
+                    // stopped it before the mint was attempted) and the reason is what
+                    // the rest of the sentence is for.
+                    // "They stay unverifiable", not "they will be reported as
+                    // tampering" — the consequence the *other* failed-mint branch has.
+                    // The difference is the label: that branch returns a resolvable
+                    // `key-{N}`, so clearing the fault mints a key under it and the
+                    // entries written meanwhile fail against it. This one returns
+                    // `UNRESOLVED_KEY_ID`, which no keyring can hold, so they stay in
+                    // cannot-verify instead. Same words as the unlistable-directory
+                    // site because the same thing happens there and for the same
+                    // reason, checked rather than assumed (#478 Phase 8) — and written
+                    // out rather than shared through a constant, so a third site
+                    // cannot inherit a consequence nobody re-derived for it.
+                    "omamori warning: the key for audit epoch {lost} is missing and a replacement could \
              not be created — {EPOCH_RECORD_NAME} could not be advanced to {next}: {e}. \
              Creating one under an epoch the store has not recorded is what puts two keys under \
              a single id. {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the condition \
              protects later ones, not those."
-            );
+                );
+            }
             None
         }
     }
 }
 
-/// Resolve the active signing key and its `key_id` together.
-///
-/// #457: the secret and its id used to be resolved by two separate calls, each
-/// reading the key directory independently. A rotation landing between them
-/// minted one entry signed with the old key but labelled with the new id — a
-/// permanently unverifiable entry that no amount of verifier-side repair can
-/// reclassify, because the id is present and only the bytes are wrong. The two
-/// reads are now one value *and* one locked observation.
 /// Throttle sentinel kinds. Named rather than inline so the invariant that
 /// binds them — **no two messages with different content may share one** — has
 /// something a test can hold onto. The bug this prevents does not fail to
@@ -518,6 +514,15 @@ fn claim_next_epoch(secret_path: &Path, lost: u32) -> Option<u32> {
 pub(super) const WARN_KIND_KEYSTORE: &str = "keystore";
 pub(super) const WARN_KIND_ROTATION_MINTED: &str = "rotation-minted";
 pub(super) const WARN_KIND_ROTATION_UNMINTED: &str = "rotation-unminted";
+/// #518: the four printers `load_signing_key_locked` reaches that #473 left
+/// unthrottled. One kind each, not one shared kind — two messages behind one
+/// sentinel means the first to fire silences the second, and the states these
+/// four report do not resolve on their own, so the silenced one would stay
+/// silenced for as long as the store is broken.
+pub(super) const WARN_KIND_EPOCH_AT_LIMIT: &str = "epoch-at-limit";
+pub(super) const WARN_KIND_EPOCH_NOT_ADVANCED: &str = "epoch-not-advanced";
+pub(super) const WARN_KIND_SECRET_PATH_OCCUPIED: &str = "secret-path-occupied";
+pub(super) const WARN_KIND_SECRET_UNREADABLE: &str = "secret-unreadable";
 
 /// How loudly `load_signing_key` may talk about a degraded key store (#473).
 ///
@@ -550,10 +555,27 @@ pub(super) fn load_signing_key(secret_path: &Path) -> SigningKey {
     load_signing_key_with(secret_path, KeyWarnPolicy::Always)
 }
 
+/// Resolve the active signing key and its `key_id` together.
+///
+/// #457: the secret and its id used to be resolved by two separate calls, each
+/// reading the key directory independently. A rotation landing between them
+/// minted one entry signed with the old key but labelled with the new id — a
+/// permanently unverifiable entry that no amount of verifier-side repair can
+/// reclassify, because the id is present and only the bytes are wrong. The two
+/// reads are now one value *and* one locked observation.
 pub(super) fn load_signing_key_with(secret_path: &Path, policy: KeyWarnPolicy) -> SigningKey {
     with_key_store_lock(secret_path, false, |_lock| {
         load_signing_key_locked(secret_path, policy)
     })
+}
+
+/// `may_warn`, for the test that pins "the first occurrence is never throttled
+/// away" (#518). Exposed rather than reached through a fixture because the
+/// property is about this function and not about any one call site — the call
+/// sites are pinned separately, by the sentinel each one leaves behind.
+#[cfg(test)]
+pub(super) fn may_warn_for_test(policy: KeyWarnPolicy, kind: &str, store: &Path) -> bool {
+    may_warn(policy, kind, store)
 }
 
 /// Whether a warning of `kind` about `store` may be printed under `policy`.
@@ -907,7 +929,8 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
     // the record first is what makes the mint below name a generation the next
     // command will still name the same way.
     let epoch = match missing {
-        Some(MissingActiveKey::Unbacked(lost)) => match claim_next_epoch(secret_path, lost) {
+        Some(MissingActiveKey::Unbacked(lost)) => match claim_next_epoch(secret_path, lost, policy)
+        {
             Some(next) => next,
             None => {
                 return SigningKey {
@@ -923,7 +946,7 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
     // read — normally because this is a fresh install and it has to be created.
     let secret = match active {
         Ok(secret) => Some(secret),
-        Err(_) => load_or_create_secret(secret_path),
+        Err(_) => load_or_create_secret(secret_path, policy),
     };
     let id = key_id_for_epoch(epoch);
 
@@ -1991,7 +2014,7 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
 // Secret I/O (symlink-safe)
 // ---------------------------------------------------------------------------
 
-pub(super) fn load_or_create_secret(path: &Path) -> Option<[u8; 32]> {
+pub(super) fn load_or_create_secret(path: &Path, policy: KeyWarnPolicy) -> Option<[u8; 32]> {
     if let Ok(secret) = read_secret(path) {
         return Some(secret);
     }
@@ -2011,15 +2034,24 @@ pub(super) fn load_or_create_secret(path: &Path) -> Option<[u8; 32]> {
                 // permissions fault as transient contention, which is the
                 // difference between an operator who runs `ls -l` and one who
                 // retries.
-                eprintln!(
-                    "omamori warning: something already occupies the audit secret path \
-                     and cannot be read as a key: {e}"
-                );
+                //
+                // #518: throttled, and this is the site that made the case for
+                // it — the file is still there on the next command, so this
+                // repeated on every guarded one for as long as the store stayed
+                // broken.
+                if may_warn(policy, WARN_KIND_SECRET_PATH_OCCUPIED, path) {
+                    eprintln!(
+                        "omamori warning: something already occupies the audit secret path \
+                         and cannot be read as a key: {e}"
+                    );
+                }
                 None
             }
         },
         Err(e) => {
-            eprintln!("omamori warning: audit secret unavailable: {e}");
+            if may_warn(policy, WARN_KIND_SECRET_UNREADABLE, path) {
+                eprintln!("omamori warning: audit secret unavailable: {e}");
+            }
             None
         }
     }
