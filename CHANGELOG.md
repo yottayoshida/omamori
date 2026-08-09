@@ -6,9 +6,17 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
-### Fixed
+## [1.0.1] - 2026-08-09
 
-- **Five real races between concurrently-running tests, and two mechanical checks so the classes cannot come back.** ([#344](https://github.com/yottayoshida/omamori/issues/344))
+### Changed
+- **`AuditError` moved from `src/audit/verify.rs` to `src/audit/error.rs`.** ([#493](https://github.com/yottayoshida/omamori/issues/493))
+
+  It is the audit subsystem's error type, not verification's, and living in `verify.rs` forced `secret.rs` to import from `verify.rs` while `verify.rs` imported from `secret.rs`. No behaviour changes. Both public paths still resolve — `omamori::audit::AuditError` and `omamori::audit::verify::AuditError` — the latter via a re-export, pinned by an integration test that fails to compile if it is dropped. The self-described dead arm in `run_audit_verify` stays: only splitting the type removes it, and that was costed at roughly 80 lines to remove 9.
+
+- **Library API (not covered by the [breaking-change policy](docs/CONTRACT.md#breaking-change-policy), which names the Rust API as outside it):** `VerifyResult::hwm_tampered: bool` is replaced by `hwm_unusable: Option<HwmUnusable>`. A bool beside a reason is two values that can disagree; the reason alone cannot. `.is_some()` is the direct replacement and covers exactly the states the flag did. `VerifyResult` also gains `hwm_write: HwmWrite`, and `HwmUnusable` / `HwmWrite` are new public types.
+
+### Fixed
+- **Six real races between concurrently-running tests, and two mechanical checks so the classes cannot come back.** ([#344](https://github.com/yottayoshida/omamori/issues/344))
 
   The issue asks for an audit: find tests that mutate a process global without a `serial_test` tag. Run exactly that and it returns **nothing** — every mutator of `HOME`, the process CWD and the env vars is tagged, including the ones reached through helpers. The audit is not wrong; the question is too narrow. It asks only about tag *presence*, only about *writers*, and only about *process globals* — and each of those three omissions was hiding something.
 
@@ -20,21 +28,7 @@ The format is based on Keep a Changelog.
 
   **Nothing here claims the reported flake is gone.** Of the two symptoms the issue names, one is unreachable by construction now (`context.rs`'s git-context tests stopped touching the process CWD, and `clippy.toml` bans the method crate-wide with a reason string citing this issue); the other is not explained by any of the five. What is claimed is that five specific races existed, were traced end to end in the code, and are closed.
 
-### Security
 
-- **The four key-store printers `#473` left unthrottled now go through the throttle, one sentinel kind each.** ([#518](https://github.com/yottayoshida/omamori/issues/518))
-
-  `load_signing_key_locked` runs on every guarded command, and two of the states behind these four resolve on their own only if an operator intervenes — something occupying the audit secret path, an epoch record that cannot be advanced on a read-only mount. Those messages repeated per command for as long as the store stayed broken, which is the defect `#473` was about, reached through four doors it did not close. Four kinds rather than one shared kind: two messages behind one sentinel means the first to fire silences the second for the rest of the window, and neither of these resolves itself.
-
-  **The AI disclosure gate was deliberately not extended to them.** Read against the code, none of the four carries a repair — each states a condition and its consequence, and the only repair sentence in this area (`epoch_record_remedy`) belongs to a different arm that is already gated. There was nothing for the gate to withhold, and adding it would have pressed toward withholding the condition itself, which SEC-R5 forbids. The issue's own title says "throttle and the AI gate"; the code says otherwise.
-
-- **Paths shown to an operator are sanitized against characters that reorder or conceal text, not only against control characters.** ([#515](https://github.com/yottayoshida/omamori/issues/515))
-
-  `strip_control_chars` replaced what `char::is_control` reports, which is Unicode `Cc` and nothing more. The bidirectional formatting characters are `Cf`, so they reached both sinks fed by `AuditSummary::path_error` — `omamori status` and, since `#513`, `break-glass`'s confirmation prompt. An override makes a path render in an order its bytes do not have, and a consent prompt is where the reader agrees on the strength of what that line says.
-
-  The set is now defined by a rule — a character is replaced when it draws nothing itself and can move or conceal the text around it — covering `Cc`, bidirectional controls and isolates, zero-width and invisible separators, and tag characters. `provenance::sanitize` applies the same rule from one shared definition; its length cap stays local to it. **Variation selectors are deliberately excluded**: they change how the preceding character is drawn and conceal nothing around it, and substituting them would alter legitimate filenames containing emoji or CJK.
-
-### Fixed
 
 - **`audit verify` no longer reports the high-water-mark as reset after discarding the result of resetting it.** ([#490](https://github.com/yottayoshida/omamori/issues/490))
 
@@ -48,13 +42,18 @@ The format is based on Keep a Changelog.
 
   The state is now `HwmState::Unusable(HwmUnusable)`, split between `NotAMark` — a symlink, a FIFO, a directory, or content that is not a plain integer, which is exactly the set `SECURITY.md` already recorded as tamper evidence for this file — and `Unreadable`, which was never on that list. Which shape was found is determined by a `stat` **after** the open has already failed, not by an errno test: `O_NOFOLLOW`'s value is not guaranteed to match across the two platforms omamori ships on, and the alternative would be `reject_non_regular` recognising a string it built itself. The refusal is complete before the `stat` runs, so this is diagnosis and not enforcement. `doctor`'s wording is unchanged — "unreadable or tampered" was already the honest disjunction, and is the one surface that did not overclaim.
 
-### Changed
+### Security
+- **The four key-store printers `#473` left unthrottled now go through the throttle, one sentinel kind each.** ([#518](https://github.com/yottayoshida/omamori/issues/518))
 
-- **`AuditError` moved from `src/audit/verify.rs` to `src/audit/error.rs`.** ([#493](https://github.com/yottayoshida/omamori/issues/493))
+  `load_signing_key_locked` runs on every guarded command, and two of the states behind these four resolve on their own only if an operator intervenes — something occupying the audit secret path, an epoch record that cannot be advanced on a read-only mount. Those messages repeated per command for as long as the store stayed broken, which is the defect `#473` was about, reached through four doors it did not close. Four kinds rather than one shared kind: two messages behind one sentinel means the first to fire silences the second for the rest of the window, and neither of these resolves itself.
 
-  It is the audit subsystem's error type, not verification's, and living in `verify.rs` forced `secret.rs` to import from `verify.rs` while `verify.rs` imported from `secret.rs`. No behaviour changes. Both public paths still resolve — `omamori::audit::AuditError` and `omamori::audit::verify::AuditError` — the latter via a re-export, pinned by an integration test that fails to compile if it is dropped. The self-described dead arm in `run_audit_verify` stays: only splitting the type removes it, and that was costed at roughly 80 lines to remove 9.
+  **The AI disclosure gate was deliberately not extended to them.** Read against the code, none of the four carries a repair — each states a condition and its consequence, and the only repair sentence in this area (`epoch_record_remedy`) belongs to a different arm that is already gated. There was nothing for the gate to withhold, and adding it would have pressed toward withholding the condition itself, which SEC-R5 forbids. The issue's own title says "throttle and the AI gate"; the code says otherwise.
 
-- **Library API (not covered by the [breaking-change policy](docs/CONTRACT.md#breaking-change-policy), which names the Rust API as outside it):** `VerifyResult::hwm_tampered: bool` is replaced by `hwm_unusable: Option<HwmUnusable>`. A bool beside a reason is two values that can disagree; the reason alone cannot. `.is_some()` is the direct replacement and covers exactly the states the flag did. `VerifyResult` also gains `hwm_write: HwmWrite`, and `HwmUnusable` / `HwmWrite` are new public types.
+- **Paths shown to an operator are sanitized against characters that reorder or conceal text, not only against control characters.** ([#515](https://github.com/yottayoshida/omamori/issues/515))
+
+  `strip_control_chars` replaced what `char::is_control` reports, which is Unicode `Cc` and nothing more. The bidirectional formatting characters are `Cf`, so they reached both sinks fed by `AuditSummary::path_error` — `omamori status` and, since `#513`, `break-glass`'s confirmation prompt. An override makes a path render in an order its bytes do not have, and a consent prompt is where the reader agrees on the strength of what that line says.
+
+  The set is now defined by a rule — a character is replaced when it draws nothing itself and can move or conceal the text around it — covering `Cc`, bidirectional controls and isolates, zero-width and invisible separators, and tag characters. `provenance::sanitize` applies the same rule from one shared definition; its length cap stays local to it. **Variation selectors are deliberately excluded**: they change how the preceding character is drawn and conceal nothing around it, and substituting them would alter legitimate filenames containing emoji or CJK.
 
 ## [1.0.0] - 2026-08-08
 
