@@ -6,6 +6,20 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Five real races between concurrently-running tests, and two mechanical checks so the classes cannot come back.** ([#344](https://github.com/yottayoshida/omamori/issues/344))
+
+  The issue asks for an audit: find tests that mutate a process global without a `serial_test` tag. Run exactly that and it returns **nothing** — every mutator of `HOME`, the process CWD and the env vars is tagged, including the ones reached through helpers. The audit is not wrong; the question is too narrow. It asks only about tag *presence*, only about *writers*, and only about *process globals* — and each of those three omissions was hiding something.
+
+  `omamori-shim-devbuild-{pid}` was built by two tests in `installer.rs`. One test binary means one pid, so both resolved to one directory, and both open by deleting it; one held `serial(home_env)` and the other no tag, so nothing kept them apart. No process global is involved, which is why a tag audit cannot see it. The `umask` group had exactly one member — a lock that excludes nothing — while the two tests asserting an exact `0o755` sat outside it; the mode reaches the file through `OpenOptions::mode()`, which is `open(2)`'s argument and therefore masked, so `0o755` becomes `0o700` inside that window. Seven `auto_setup_codex_*` tests set and cleared `CODEX_CI` under `home_env` alone, while `CODEX_CI` is one of the six variables the `ai_env` group exists for and an `ai_env` test asserts directly that it is unset — two independent groups, one variable. Seventeen tests read `$HOME` through `actions.rs`'s `make_temp_dir` with no tag at all, and the 205 tests in `home_env` set `HOME` to `""`, to a relative path, or unset. Eight tests read the process CWD through `ProcessProvenance::collect` outside the `cwd` group, whose one chdir-ing member deletes the directory it moved into.
+
+  A sixth surfaced in review and belongs to the same family as the last two: three tests reach the CWD read through `run_command`, which takes `ProcessProvenance::collect` as a **method reference** rather than calling it — so the scan that found the other readers, which looked for a call, could not see them.
+
+  The two checks added to `check-invariants.sh` are the two a machine can decide without guessing: **no temp-dir path or fixture label is used twice within one test binary**, and **no serial group has a single member**. The first covers both halves of R1's class — the literal and the label passed to a fixture helper, since two tests handing `test_dir` the same string collide exactly as two identical literals do. Deliberately not mechanised: "every reader of a process global carries the group". Readers arrive through two levels of helper here, and through a method reference in one case; any fixed traversal either misses or false-positives. Those six were fixed by hand with the reasoning written at each site.
+
+  **Nothing here claims the reported flake is gone.** Of the two symptoms the issue names, one is unreachable by construction now (`context.rs`'s git-context tests stopped touching the process CWD, and `clippy.toml` bans the method crate-wide with a reason string citing this issue); the other is not explained by any of the five. What is claimed is that five specific races existed, were traced end to end in the code, and are closed.
+
 ### Security
 
 - **The four key-store printers `#473` left unthrottled now go through the throttle, one sentinel kind each.** ([#518](https://github.com/yottayoshida/omamori/issues/518))

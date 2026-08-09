@@ -427,13 +427,23 @@ mod tests {
         assert!(get_ppid().is_some());
     }
 
+    // #344: `serial(cwd)` on this and every other test that reaches
+    // `ProcessProvenance::collect`, here and in `audit/mod.rs` and
+    // `cli/break_glass_cmd.rs`. `collect` reads the process CWD, and
+    // `context::tests::process_base_fails_closed_when_cwd_is_unlinked` — which
+    // does hold `cwd` — moves the process into a temp directory and then
+    // deletes it. A reader outside the lock sees `current_dir()` fail with
+    // `ENOENT` and gets `cwd: None`, which does not panic: it makes the
+    // `if prov.cwd.is_some()` arm below skip, silently.
     #[test]
+    #[serial_test::serial(cwd)]
     fn collect_never_panics_and_populates_pid() {
         let prov = ProcessProvenance::collect();
         assert!(prov.pid > 0);
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn as_audit_fields_without_secret_degrades_cwd_hash_to_marker() {
         let prov = ProcessProvenance::collect();
         let (_, _, _, cwd_hash) = ProcessProvenance::as_audit_fields(Some(&prov), None);
@@ -456,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn as_audit_fields_some_provenance_populates_pid_and_cwd_hash() {
         let prov = ProcessProvenance::collect();
         let (pid, _, _, cwd_hash) =

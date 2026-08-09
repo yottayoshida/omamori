@@ -609,6 +609,15 @@ mod tests {
 
     /// Create a temp dir under $HOME to avoid macOS blocked prefix issue.
     /// On macOS, std::env::temp_dir() → /private/var/... which is a blocked prefix.
+    ///
+    /// #344: **every caller carries `#[serial_test::serial(home_env)]`**, and
+    /// that is not because they mutate `HOME` — they read it. The 188 tests in
+    /// that group set `HOME` to `""`, to a relative path, or unset it, for the
+    /// length of their own body. A reader outside the lock lands in that window
+    /// and builds its fixture from `PathBuf::from("")`. The audit that first
+    /// looked for this counted mutators and found nothing to fix, which is the
+    /// reason this comment names the direction: **the lock is on the variable,
+    /// not on writing to it.**
     fn make_temp_dir(suffix: &str) -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let dir = PathBuf::from(home).join(format!(
@@ -626,6 +635,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_happy_path() {
         let root = make_temp_dir("g04-happy");
         let dest = root.join("dest");
@@ -642,6 +652,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_nonexistent_destination() {
         let root = make_temp_dir("g04-noexist");
         let dest = root.join("nonexistent");
@@ -657,6 +668,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_non_directory_destination() {
         let root = make_temp_dir("g04-nondir");
         let dest = root.join("afile");
@@ -673,6 +685,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_symlink_destination_rejected() {
         let root = make_temp_dir("g04-symlink");
         let real_dest = root.join("real_dest");
@@ -698,6 +711,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_blocked_prefix() {
         // /private/var is a blocked prefix on macOS
         // We test by checking that canonicalize of the dest resolves to a blocked path
@@ -719,6 +733,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_dedup_basenames() {
         let root = make_temp_dir("g04-dedup");
         let dest = root.join("dest");
@@ -766,6 +781,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_canonicalize_fail_close_blocked() {
         // V-015: Test that canonicalize failure doesn't bypass blocked prefix check
         // Since our fix now requires canonicalize to succeed (fail-close),
@@ -784,6 +800,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_symlink_to_blocked_prefix_caught() {
         // Codex②: symlink dest → real path under blocked prefix should be caught
         // We can't easily create dirs under /var, but we verify the mechanism
@@ -810,6 +827,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_blocked_system_path_rejected() {
         // Codex②: system paths like /usr, /var etc. should be caught by blocked prefix
         let root = make_temp_dir("g04-sysblocked");
@@ -831,6 +849,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_relative_path_bypass_prevented() {
         // QA adversarial: ../../usr/... should be caught after canonicalize
         // We can't create a dest that resolves to /usr from tempdir, but we test
@@ -873,6 +892,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn create_staging_subdir_succeeds_on_first_try() {
         let root = make_temp_dir("g04-staging-first");
         let candidate = create_staging_subdir(&root, 1_700_000_000, fixed_suffixes(vec!["aaaa"]))
@@ -883,6 +903,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn create_staging_subdir_retries_past_an_existing_real_directory() {
         let root = make_temp_dir("g04-staging-collide-dir");
         // Pre-occupy the first candidate with an ordinary directory — the
@@ -907,6 +928,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial(home_env)]
     fn create_staging_subdir_retries_past_a_planted_symlink() {
         // The attack #410 closes: a symlink pre-planted at the predictable
         // first-candidate path must not be followed or reused — the function
@@ -949,6 +971,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn create_staging_subdir_fails_closed_after_exhausting_attempts() {
         // All MAX_STAGING_DIR_ATTEMPTS candidates pre-occupied — this must
         // fail closed (Err) rather than fall back to a non-exclusive create
@@ -986,6 +1009,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn create_staging_subdir_propagates_suffix_generator_error() {
         // If the suffix generator itself fails (e.g. random_hex_suffix's
         // /dev/urandom open/read failing), that must fail closed too, not
@@ -999,6 +1023,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn create_staging_subdir_does_not_retry_on_non_already_exists_error() {
         // A non-AlreadyExists create_dir failure (here: the parent
         // `destination` itself does not exist, so every candidate under it
@@ -1079,6 +1104,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(home_env)]
     fn move_to_dir_uses_real_timestamp_and_random_suffix_end_to_end() {
         // Codex adversarial test review: prior tests only exercised
         // `create_staging_subdir` directly via the injectable seam — none

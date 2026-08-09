@@ -1050,6 +1050,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn bypass_event_with_provenance_carries_real_fields() {
         let provenance = ProcessProvenance::collect();
         let event = create_bypass_event(

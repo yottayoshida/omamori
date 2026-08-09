@@ -1411,6 +1411,174 @@ if [ "$fixture_fail" -ne 0 ]; then
     fail=1
 fi
 
+# ---------- Invariant: temp-dir path literals are unique per test binary (#344) ----------
+# Two tests that build the same temp path collide even when neither touches a
+# process global, because `std::process::id()` is the same for every thread in
+# one test binary. `omamori-shim-devbuild-{pid}` was used by two tests that both
+# open by deleting that directory; one held `serial(home_env)` and the other no
+# tag at all, so nothing kept them apart and whichever started second removed the
+# other's fixture mid-run. An audit of serial tags does not find this: the defect
+# is in the path, not in the globals.
+#
+# Scoped per compilation unit -- all of `src/` is the lib-test binary, and each
+# `tests/*.rs` is its own -- because identical literals in two separate binaries
+# cannot collide (`tests/cli.rs` and `tests/integration.rs` legitimately share
+# `omamori-{name}-{nanos}`).
+#
+# Both counts are asserted, so an extraction that stopped matching cannot pass as
+# "no duplicates found". Falsified once by restoring the original label and
+# confirming it is reported.
+#
+# **Remove this when** temp fixtures stop being built from `process::id()` -- a
+# per-test counter or `mktemp` makes collisions unreachable and this check moot.
+pathdup_fail=0
+if ! python3 - <<'PYEOF'
+import re, pathlib, sys
+from collections import defaultdict
+
+# Floors per pattern, not on the total: the two patterns are independent, and a
+# combined floor of 300 would still be met by the labels alone if the path
+# pattern stopped matching entirely. That is the "0 findings" and "the check
+# stopped looking" pair this file exists to keep apart.
+MIN_PATHS, MIN_LABELS, MIN_UNITS = 120, 200, 4
+# Only paths rooted at the temp dir. A `dir.join(format!(...))` under a fixture
+# directory that is already unique per test inherits that uniqueness, and
+# flagging those was the first version's false positive: `.omamori-tmp-{}-collide`
+# is built twice in `atomic_file.rs`, under `test_dir("retry-collide")` and
+# `test_dir("retry-symlink-temp")`, which are different directories.
+LITERAL = re.compile(
+    r'temp_dir\(\)\s*\.join\(\s*format!\(\s*"([^"]*)"', re.S
+)
+# Review (#344): the pattern above sees the *literal*, so a fixture helper that
+# takes a label -- `test_dir("retry-collide")` -- contributes one literal no
+# matter how many tests call it, and two tests passing the same label would
+# collide exactly as R1 did. The labels are the second half of the same class,
+# so they are collected too, keyed apart from the literals.
+LABELLED = re.compile(
+    r'\b(test_dir|unique_dir|fresh_test_dir|hash_cwd_test_dir|with_temp_home'
+    r'|heartbeat_test_dir|seed_rotatable_home)\(\s*"([^"]*)"'
+)
+
+units = {"src": sorted(pathlib.Path("src").rglob("*.rs"))}
+for t in sorted(pathlib.Path("tests").glob("*.rs")):
+    units[str(t)] = [t]
+
+paths_seen = labels_seen = 0
+violations = []
+for unit, paths in units.items():
+    where = defaultdict(list)
+    for path in paths:
+        # Comment lines are stripped, and the blank line keeps every remaining
+        # line at its original number. A doc comment quoting a fixture label is
+        # not a second call site -- `audit/mod.rs`'s `read_secret_rejects_symlink`
+        # explains its own assertion by naming `test_dir("symlink-secret-read")`,
+        # and the first version of this check reported that as a duplicate.
+        text = "\n".join(
+            "" if l.lstrip().startswith("//") else l
+            for l in path.read_text().splitlines()
+        )
+        for m in LITERAL.finditer(text):
+            paths_seen += 1
+            line_no = text.count("\n", 0, m.start()) + 1
+            where[("path", m.group(1))].append(f"{path}:{line_no}")
+        for m in LABELLED.finditer(text):
+            labels_seen += 1
+            line_no = text.count("\n", 0, m.start()) + 1
+            where[(m.group(1), m.group(2))].append(f"{path}:{line_no}")
+    for key, sites in where.items():
+        if len(sites) > 1:
+            kind, lit = key
+            shown = lit if kind == "path" else f"{kind}({lit!r})"
+            violations.append((unit, shown, sites))
+
+if paths_seen < MIN_PATHS or labels_seen < MIN_LABELS or len(units) < MIN_UNITS:
+    print(f"FAIL [invariant temp-path-uniqueness/#344]: extraction found "
+          f"{paths_seen} temp-dir paths and {labels_seen} fixture labels across "
+          f"{len(units)} units (expected at least {MIN_PATHS}, {MIN_LABELS} and "
+          f"{MIN_UNITS}) -- a pattern has stopped matching the source.")
+    sys.exit(1)
+
+for unit, lit, sites in violations:
+    print(f"FAIL [invariant temp-path-uniqueness/#344]: {lit!r} is built at "
+          f"{len(sites)} sites in one test binary ({unit}): {', '.join(sites)} "
+          f"-- same pid means the same directory, so these fixtures overwrite "
+          f"each other whenever they run concurrently.")
+if violations:
+    sys.exit(1)
+
+print(f"temp-path-uniqueness OK: no temp-dir path or fixture label is used twice "
+      f"within one test binary ({paths_seen} paths + {labels_seen} labels across {len(units)} units)")
+PYEOF
+then
+    pathdup_fail=1
+fi
+if [ "$pathdup_fail" -ne 0 ]; then
+    fail=1
+fi
+
+# ---------- Invariant: no serial group has a single member (#344) ----------
+# `#[serial_test::serial(g)]` excludes other members of `g` and nothing else, so
+# a group with one member is a lock that locks nothing. `umask` was exactly that:
+# one test set `umask(0o077)` under it while the two tests asserting an exact
+# `0o755` -- which `OpenOptions::mode()` masks, being `open(2)`'s mode and not an
+# `fchmod` -- sat outside. `context.rs` records the same shape being found once
+# before, for `cwd`.
+#
+# A single-member group is not always wrong in principle; it is always useless,
+# and the useful reading is that whoever added it meant to exclude something.
+#
+# Both counts are asserted so a broken regex cannot report "all groups fine".
+# Falsified once by removing a member and confirming the group is reported.
+#
+# **Remove this when** the suite stops using `serial_test`, or when a group with
+# one member becomes the intended shape for a reason worth writing down here.
+solo_fail=0
+if ! python3 - <<'PYEOF'
+import re, pathlib, sys
+from collections import defaultdict
+
+MIN_ATTRS, MIN_GROUPS = 100, 3
+ATTR = re.compile(r'#\[serial_test::serial\(([^)]*)\)\]')
+
+members = defaultdict(list)
+attrs_seen = 0
+for path in sorted(pathlib.Path("src").rglob("*.rs")):
+    for i, line in enumerate(path.read_text().splitlines(), 1):
+        if line.lstrip().startswith("//"):
+            continue
+        m = ATTR.search(line)
+        if not m:
+            continue
+        attrs_seen += 1
+        for g in (x.strip() for x in m.group(1).split(",")):
+            if g:
+                members[g].append(f"{path}:{i}")
+
+if attrs_seen < MIN_ATTRS or len(members) < MIN_GROUPS:
+    print(f"FAIL [invariant serial-group-membership/#344]: extraction found "
+          f"{attrs_seen} attributes in {len(members)} groups (expected at least "
+          f"{MIN_ATTRS} and {MIN_GROUPS}) -- the pattern has stopped matching.")
+    sys.exit(1)
+
+solo = {g: sites for g, sites in members.items() if len(sites) < 2}
+for g, sites in solo.items():
+    print(f"FAIL [invariant serial-group-membership/#344]: serial group {g!r} has "
+          f"one member ({sites[0]}) -- it excludes nothing. Either another test "
+          f"shares the resource and is missing the tag, or the tag is dead.")
+if solo:
+    sys.exit(1)
+
+sizes = ", ".join(f"{g}={len(v)}" for g, v in sorted(members.items()))
+print(f"serial-group-membership OK: every group has at least two members "
+      f"({attrs_seen} attributes; {sizes})")
+PYEOF
+then
+    solo_fail=1
+fi
+if [ "$solo_fail" -ne 0 ]; then
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"

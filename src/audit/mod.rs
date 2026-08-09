@@ -973,6 +973,7 @@ mod tests {
     // verify cleanly in the *same* chain — this is the load-bearing claim
     // behind "CHAIN_VERSION stays 1, existing chains are unaffected".
     #[test]
+    #[serial_test::serial(cwd)]
     fn verify_chain_mixes_pre_420_and_post_420_entries() {
         let dir = test_dir("verify-mixed-420");
         let logger = test_logger(&dir);
@@ -1045,6 +1046,7 @@ mod tests {
     /// v1/v2 asymmetry (shape enumeration §5). `_remains_silent_on_v1_entries`
     /// below covers the still-undetectable v1 side.
     #[test]
+    #[serial_test::serial(cwd)]
     fn provenance_value_tampering_is_detected_on_v2_entries() {
         let dir = test_dir("tamper-semantic-420-v2");
         let logger = provenance_tamper_fixture(&dir);
@@ -1083,6 +1085,7 @@ mod tests {
     /// above for `wrapper_kind`, the second field HashableEventV2 newly
     /// protects.
     #[test]
+    #[serial_test::serial(cwd)]
     fn wrapper_kind_tampering_is_detected_on_v2_entries() {
         let dir = test_dir("tamper-wrapper-kind-177b3-v2");
         let logger = test_logger(&dir);
@@ -1484,6 +1487,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cwd)]
     fn provenance_type_corruption_causes_downstream_chain_break() {
         let dir = test_dir("tamper-syntactic-420");
         let logger = provenance_tamper_fixture(&dir);

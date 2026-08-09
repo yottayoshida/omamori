@@ -812,7 +812,7 @@ mod tests {
     // --- run_shim: protection continues when HOME is unusable (#373 T1, V-001/V-002) ---
 
     #[test]
-    #[serial_test::serial(home_env, ai_env)]
+    #[serial_test::serial(home_env, ai_env, cwd)]
     fn run_shim_still_blocks_dangerous_command_when_home_unset() {
         // #373 T1 (release-blocker per plan): an unusable HOME must degrade
         // self-heal/housekeeping (Steps 1-3) only, never the protection
@@ -1933,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(home_env, ai_env)]
+    #[serial_test::serial(home_env, ai_env, cwd)]
     fn run_command_wires_provenance_into_the_layer1_block_audit_event() {
         let dir = std::env::temp_dir().join(format!(
             "omamori-shim-provenance-wiring-{}",
@@ -1981,7 +1981,7 @@ mod tests {
     /// "human terminal" fast path — a distinct `create_event` call site
     /// with its own `provenance.as_ref()`) had no positive test either.
     #[test]
-    #[serial_test::serial(home_env, ai_env)]
+    #[serial_test::serial(home_env, ai_env, cwd)]
     fn run_command_wires_provenance_into_the_layer1_fast_path_audit_event() {
         let dir = std::env::temp_dir().join(format!(
             "omamori-shim-provenance-fastpath-{}",
