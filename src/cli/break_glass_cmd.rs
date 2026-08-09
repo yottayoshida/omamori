@@ -880,6 +880,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #515: the same route, for the characters `char::is_control` does not
+    /// report.
+    ///
+    /// `U+202E` RIGHT-TO-LEFT OVERRIDE is category `Cf`, so the check the test
+    /// above makes — "no control characters survived" — was true of a string
+    /// that still rendered in an order the bytes do not have. On a prompt whose
+    /// whole purpose is that the operator agrees to what the line says, the gap
+    /// between displayed and actual is the thing being paid for.
+    ///
+    /// The second half is the one that makes this a test rather than a
+    /// tautology: a path with Japanese and an emoji must come through
+    /// **unchanged**. Widening the substitution until an operator cannot read
+    /// the path they have to act on trades one failure for another, and an
+    /// implementation that replaces everything non-ASCII passes the first
+    /// assertion.
+    #[test]
+    fn bidi_overrides_in_the_audit_path_cannot_reorder_the_prompt() {
+        let dir = std::env::temp_dir().join(format!("omamori-bg-cmd-bidi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let planted = dir.join("\u{202E}gnl.tidua\u{202C}");
+        std::fs::create_dir_all(&planted).unwrap(); // a directory, so the read fails
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(planted),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let summary = crate::audit::audit_summary(&audit_config);
+        let err = summary
+            .path_error
+            .as_deref()
+            .expect("a directory at the audit path must produce a path_error");
+        assert!(
+            !err.contains('\u{202E}') && !err.contains('\u{202C}'),
+            "the override survived into path_error: {err:?}"
+        );
+
+        let text = format_audit_expectation(outlook(&summary));
+        assert!(
+            !text.contains('\u{202E}') && !text.contains('\u{202C}'),
+            "and it must not reach the prompt: {text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The control half of the pair: ordinary non-ASCII is not the threat and
+        // must survive byte for byte.
+        let legible = std::env::temp_dir().join(format!(
+            "omamori-bg-cmd-ja-{}/監査ログ-\u{1F512}\u{FE0F}.jsonl",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&legible).unwrap();
+        let summary = crate::audit::audit_summary(&crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(legible.clone()),
+            retention_days: 0,
+            strict: false,
+        });
+        let err = summary
+            .path_error
+            .as_deref()
+            .expect("a directory at the audit path must produce a path_error");
+        assert!(
+            err.contains("監査ログ") && err.contains('\u{1F512}') && err.contains('\u{FE0F}'),
+            "a legible path must come through intact, variation selector included: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(legible.parent().unwrap());
+    }
+
     #[test]
     fn unreadable_config_says_so_rather_than_guessing() {
         let text = format_audit_expectation(None);

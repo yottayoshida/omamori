@@ -244,21 +244,39 @@ fn proc_pidpath(_pid: u32) -> Option<String> {
     None
 }
 
-/// Strip ASCII/Unicode control characters and cap length. Applied once at
-/// collection time so every downstream consumer (`--json`, a future display
-/// table, any tool that pipes the log through `jq -r`) is safe by
-/// construction, rather than requiring each display site to sanitize
+/// Substitute the characters that reorder or conceal text, and cap length.
+/// Applied once at collection time so every downstream consumer (`--json`, a
+/// future display table, any tool that pipes the log through `jq -r`) is safe
+/// by construction, rather than requiring each display site to sanitize
 /// separately.
+///
+/// #515: this said "control characters" and meant it — the set was
+/// `char::is_control`. It is now [`crate::audit::hides_or_reorders_text`],
+/// which is wider, and the sentence above is worth keeping accurate because
+/// SECURITY.md describes this field by quoting it.
 ///
 /// Residual risk (documented, not closed by this function): under Design A
 /// the field is outside the hash chain, so a same-user attacker with direct
 /// write access to audit.jsonl can hand-craft a line with raw control bytes
 /// in this field regardless of what omamori's own collection path does —
 /// see SECURITY.md.
+///
+/// #515: the *which characters* half is no longer this function's own. It used
+/// to be a second copy of `is_control()`, and when the set widened to cover the
+/// bidirectional and zero-width characters, a private copy is exactly what
+/// would have been left behind. What stays local is the length cap: this field
+/// goes into every audit entry, and `strip_control_chars`'s callers must not
+/// have a filesystem error truncated out from under them.
 fn sanitize(input: &str) -> String {
     input
         .chars()
-        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .map(|c| {
+            if crate::audit::hides_or_reorders_text(c) {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
         .take(PARENT_PROCESS_MAX_LEN)
         .collect()
 }
@@ -351,6 +369,48 @@ mod tests {
         assert!(
             !round_tripped.chars().any(|c| c.is_control()),
             "round-tripping through JSON must not reintroduce raw control bytes"
+        );
+    }
+
+    /// #515: this function and `audit::strip_control_chars` substitute the same
+    /// set, and this one still caps length.
+    ///
+    /// Both halves in one test on purpose. Sharing the set is the change; the
+    /// cap is what was deliberately *not* shared, and an implementation that
+    /// took the set by deleting this function's own `map` would take the `take`
+    /// with it. The pair is what tells those two apart.
+    #[test]
+    fn sanitize_shares_the_set_and_keeps_the_cap() {
+        let dirty = "\u{202E}drowssap\u{202C} \u{200B}hidden\u{FEFF} \u{E0041}tag";
+        let clean = sanitize(dirty);
+        for c in ['\u{202E}', '\u{202C}', '\u{200B}', '\u{FEFF}', '\u{E0041}'] {
+            assert!(
+                !clean.contains(c),
+                "U+{:04X} reorders or conceals and must be substituted: {clean:?}",
+                c as u32
+            );
+        }
+        assert!(clean.contains('\u{FFFD}'));
+
+        // Ordinary non-ASCII is out of scope by the rule and must survive —
+        // including the two kinds of composing character the rule excludes.
+        // A joiner sequence is the case review caught: `U+200D` is zero-width,
+        // and the first version of the set took it for that reason alone, which
+        // would have rendered this filename as mojibake.
+        let legible = "/Applications/日本語 \u{1F512}\u{FE0F} \u{1F469}\u{200D}\u{1F4BB}/node";
+        assert_eq!(
+            sanitize(legible),
+            legible,
+            "a variation selector and a ZWJ emoji sequence both compose rather than \
+             conceal, so both stay"
+        );
+
+        // The cap this function keeps for itself.
+        let long = "\u{202E}".repeat(PARENT_PROCESS_MAX_LEN + 500);
+        assert_eq!(
+            sanitize(&long).chars().count(),
+            PARENT_PROCESS_MAX_LEN,
+            "sharing the character set must not take the length cap with it"
         );
     }
 
