@@ -1,6 +1,6 @@
 # ADR-0009: Config-authoritative detection for disclosure, built-in detection for enforcement
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-08-11
 - **Plan**: `~/.claude/plans/prancy-seeking-axolotl.md`
 - **Issue**: [#527](https://github.com/yottayoshida/omamori/issues/527), supersedes the scoping in
