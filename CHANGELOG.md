@@ -6,6 +6,8 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-08-11
+
 ### Fixed
 - **`break-glass` no longer promises logging on a log it cannot write.** ([#514](https://github.com/yottayoshida/omamori/issues/514))
 

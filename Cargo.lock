@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "omamori"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "criterion",
  "hmac",
