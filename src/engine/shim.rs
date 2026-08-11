@@ -103,11 +103,7 @@ fn touch_heartbeat_inner(path: &Path) -> Option<()> {
             return None;
         }
         let mtime = meta.modified().ok()?;
-        let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
-            .ok()?
-            .date()
-            .to_julian_day();
+        let mtime_jd = crate::util::system_time_utc_julian_day(mtime)?;
         if mtime_jd == today_jd {
             return Some(());
         }

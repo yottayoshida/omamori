@@ -6,6 +6,13 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+- **The `SystemTime` → UTC calendar-day conversion lives in one place.** ([#308](https://github.com/yottayoshida/omamori/issues/308))
+
+  Three call sites spelled the same four steps out independently — the heartbeat's "was this written today" check, and `doctor`'s two "how many days ago" readouts. The issue reported two; the third is `gather_staging_info`'s oldest-file age, and it does not start from a `Metadata`, which is why `util::system_time_utc_julian_day` takes a `SystemTime` rather than the `&Metadata` the issue proposed. What each caller does with the day number — compare it to today, or subtract — stays at the call site, because those three differ; only the conversion moved. `now_utc()` is still read where it was read before, so nothing changes across a UTC day boundary.
+
+  Two gaps in the existing tests were closed while the extraction was made: `doctor` reporting a *negative* day count for a future mtime (only `shim`'s rewrite behaviour was covered), and the conversion's refusal of pre-epoch instants. A source-level check keeps the duplicate from coming back.
+
 ## [1.0.2] - 2026-08-11
 
 ### Fixed

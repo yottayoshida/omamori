@@ -232,12 +232,130 @@ pub(crate) fn resolve_real_command_from_path(
 }
 
 // ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+
+/// The UTC calendar day `t` falls on, as a Julian day number.
+///
+/// #308: three call sites spelled this conversion out independently — the
+/// heartbeat's "was this written today" check (`engine::shim`), and `doctor`'s
+/// two "how many days ago" readouts (the heartbeat, and the oldest staging
+/// file). The issue reported two; the third does not start from a `Metadata`,
+/// which is why the signature takes a `SystemTime` rather than the
+/// `&Metadata` the issue proposed.
+///
+/// **UTC, always.** [`time::OffsetDateTime::from_unix_timestamp`] yields a UTC
+/// value, and this function deliberately takes no "now" and no offset — the
+/// caller cannot accidentally introduce a local-time reading. What each caller
+/// does with the day number (compare it to today, or subtract) stays at the
+/// call site, because those three differ.
+///
+/// `None` for a pre-epoch `t`: `duration_since(UNIX_EPOCH)` fails there, which
+/// is what all three sites did before this was extracted. `time` does provide
+/// `impl From<SystemTime> for OffsetDateTime` and it would fold the four steps
+/// into one, but it represents pre-epoch instants as `UNIX_EPOCH - duration`
+/// rather than refusing them — adopting it would change that behaviour, or
+/// require a pre-epoch guard that costs back what it saved.
+pub(crate) fn system_time_utc_julian_day(t: std::time::SystemTime) -> Option<i32> {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(
+        time::OffsetDateTime::from_unix_timestamp(secs as i64)
+            .ok()?
+            .date()
+            .to_julian_day(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #308: the four-step conversion exists here and nowhere else.
+    ///
+    /// Source-level because the defect is a *duplicate* — three independent
+    /// spellings that drift apart when one is changed. No runtime assertion can
+    /// see a second copy that happens to agree today.
+    ///
+    /// Scoped as "absent from the other files" rather than "present exactly
+    /// once", because this file's own doc comment names the function it wraps;
+    /// counting occurrences would break on a comment edit.
+    ///
+    /// The ban is deliberately wider than mtime: review noted that an unrelated
+    /// Unix-timestamp conversion added to either file would fail this. Kept
+    /// anyway — a false positive stops CI and gets read by a person, while a
+    /// false negative lets the duplicate come back unnoticed, which is the whole
+    /// point. If a legitimate unrelated use ever appears, narrow the assertion
+    /// to that file's mtime-reading functions rather than deleting it.
+    #[test]
+    fn the_mtime_conversion_lives_only_in_this_module() {
+        for (name, src) in [
+            ("engine/shim.rs", include_str!("engine/shim.rs")),
+            ("cli/doctor.rs", include_str!("cli/doctor.rs")),
+        ] {
+            assert!(
+                !src.contains("from_unix_timestamp"),
+                "{name} spells the mtime conversion out again — call \
+                 system_time_utc_julian_day instead (#308)"
+            );
+            assert!(
+                src.contains("system_time_utc_julian_day"),
+                "{name} no longer reaches the shared conversion; if its use was \
+                 removed on purpose, this list is stale (#308)"
+            );
+        }
+
+        // Control: the conversion is genuinely somewhere, so that "no
+        // duplicates" cannot be satisfied by "no implementation".
+        //
+        // Deliberately a behavioural check rather than another string search.
+        // Two string searches were tried and both were unsound against this
+        // file: the bare function name also matches the doc comment above, and
+        // the name-with-argument also matches *this test's own source*, since
+        // `include_str!("util.rs")` reads the file it is written in. A search
+        // that finds its own needle always passes.
+        assert!(
+            system_time_utc_julian_day(std::time::UNIX_EPOCH).is_some(),
+            "the shared conversion should still be implemented and working here"
+        );
+    }
+
+    /// #308: what the shared conversion promises, from both sides.
+    ///
+    /// The day number is a *calendar day* in UTC — it must not move with the
+    /// clock inside one day, and it must advance by exactly one across a day
+    /// boundary. Pre-epoch is refused, which is what all three call sites did
+    /// before this was extracted.
+    #[test]
+    fn utc_julian_day_counts_calendar_days_and_refuses_pre_epoch() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let epoch_jd = system_time_utc_julian_day(UNIX_EPOCH).expect("the epoch converts");
+
+        let late_same_day: SystemTime = UNIX_EPOCH + Duration::from_secs(23 * 3600 + 59 * 60);
+        assert_eq!(
+            system_time_utc_julian_day(late_same_day),
+            Some(epoch_jd),
+            "the day number must not move with the clock inside one UTC day"
+        );
+
+        let next_day: SystemTime = UNIX_EPOCH + Duration::from_secs(24 * 3600);
+        assert_eq!(
+            system_time_utc_julian_day(next_day),
+            Some(epoch_jd + 1),
+            "crossing midnight UTC must advance the day number by exactly one"
+        );
+
+        let before_epoch: SystemTime = UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(
+            system_time_utc_julian_day(before_epoch),
+            None,
+            "a pre-epoch instant is refused, not folded backwards"
+        );
+    }
 
     #[test]
     fn binary_name_uses_file_name() {
