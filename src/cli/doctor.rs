@@ -599,11 +599,7 @@ fn gather_staging_info() -> StagingInfo {
     }
 
     let oldest_days_ago = oldest_mtime.and_then(|mt| {
-        let secs = mt.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-        let mt_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
-            .ok()?
-            .date()
-            .to_julian_day();
+        let mt_jd = crate::util::system_time_utc_julian_day(mt)?;
         let today_jd = OffsetDateTime::now_utc().date().to_julian_day();
         Some(i64::from(today_jd - mt_jd))
     });
@@ -717,11 +713,7 @@ fn heartbeat_days_ago(path: &Path) -> Option<i64> {
         return None;
     }
     let mtime = meta.modified().ok()?;
-    let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    let mtime_jd = OffsetDateTime::from_unix_timestamp(secs as i64)
-        .ok()?
-        .date()
-        .to_julian_day();
+    let mtime_jd = crate::util::system_time_utc_julian_day(mtime)?;
     let today_jd = OffsetDateTime::now_utc().date().to_julian_day();
     Some(i64::from(today_jd - mtime_jd))
 }
@@ -1927,6 +1919,45 @@ mod tests {
 
         let days = heartbeat_days_ago(&path).unwrap();
         assert!((4..=6).contains(&days), "expected ~5 days ago, got {days}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #308 regression: a future mtime reports a *negative* day count.
+    ///
+    /// Uncovered before this change. The five siblings walk missing / today /
+    /// past / symlink / directory, and `shim.rs`'s future-mtime test asserts
+    /// that the heartbeat gets rewritten — not what `doctor` reports about it.
+    /// Extracting the conversion into a shared helper is exactly the kind of
+    /// change that can flip a sign or swap the operands, so the gap is worth
+    /// closing while the extraction is being made.
+    ///
+    /// `gather_staging_info`'s day count is the same expression over the same
+    /// helper, but it takes no directory argument and reads the real staging
+    /// directory, so it cannot be driven to a known mtime without restructuring
+    /// it — deliberately out of this PR's scope.
+    #[test]
+    fn heartbeat_days_ago_future() {
+        let dir = PathBuf::from(format!(
+            "/tmp/omamori-hb-doctor-future-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("heartbeat");
+        std::fs::write(&path, "test").unwrap();
+
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(86400 * 5);
+        let times = std::fs::FileTimes::new().set_modified(future);
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_times(times).unwrap();
+        drop(file);
+
+        let days = heartbeat_days_ago(&path).unwrap();
+        assert!(
+            (-6..=-4).contains(&days),
+            "a mtime five days ahead must read as about -5 days, got {days}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
