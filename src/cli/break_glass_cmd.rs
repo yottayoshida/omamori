@@ -5,7 +5,7 @@ use std::io::{self, IsTerminal, Write};
 
 use crate::AppError;
 use crate::audit::provenance::ProcessProvenance;
-use crate::audit::{self, AuditLogger, AuditSummary, UnprotectedReason};
+use crate::audit::{self, AppendOutlook, AuditLogger, AuditSummary, UnprotectedReason};
 use crate::break_glass::{
     self, ActivationError, DEFAULT_DURATION_SECS, format_duration_human, format_remaining,
 };
@@ -209,6 +209,47 @@ fn format_audit_expectation(outlook: Option<AuditOutlook<'_>>) -> String {
             "  Bypassed executions will NOT be recorded — the audit log cannot be read:\n    \
              {err}\n    {consequence}"
         );
+    }
+
+    // #514: the log opens for reading and refuses writing. Every field checked
+    // above passes here — `path_error` comes from an `O_RDONLY` open, so a log
+    // at mode `0400` reports no error — and the sentence below would promise
+    // exactly what cannot happen.
+    //
+    // Placed before the key arms for the reason the `path_error` arm above
+    // gives: a write that cannot happen makes the signing story irrelevant. It
+    // therefore also takes the two states where the key is missing or unusable,
+    // where "omamori will try to create one on the next write" would describe a
+    // write that never reaches the disk.
+    match &summary.append_outlook {
+        Some(AppendOutlook::NotWritable(err)) => {
+            let consequence = if strict {
+                "`[audit] strict = true` is set, so the bypass will be REFUSED rather than\n    \
+                 run unrecorded."
+            } else {
+                "the bypass will still run, unrecorded."
+            };
+            return format!(
+                "  Bypassed executions will NOT be recorded — the audit log cannot be \
+                 written:\n    {err}\n    {consequence}"
+            );
+        }
+        // No log yet. `append` creates one, together with its parent directory,
+        // and whether that succeeds cannot be answered without performing it —
+        // `#492`'s rule forbids resolving this by writing. So the uncertainty is
+        // stated rather than guessed in either direction.
+        Some(AppendOutlook::NoLogYet) => {
+            let consequence = if strict {
+                "if that fails, `[audit] strict = true` means the bypass is REFUSED."
+            } else {
+                "if that fails, the bypass still runs, unrecorded."
+            };
+            return format!(
+                "  Bypassed executions will be logged once the audit log is created:\n    \
+                 omamori writes it on the first append — {consequence}"
+            );
+        }
+        _ => {}
     }
 
     if summary.secret_available {
@@ -578,6 +619,9 @@ mod tests {
             unprotected_reason: None,
             retention_days: 90,
             path_error: None,
+            // The existing fixtures all describe stores whose appends land; the
+            // states where they do not get their own tests below (#514).
+            append_outlook: Some(crate::audit::AppendOutlook::Writable),
         }
     }
 
@@ -587,6 +631,130 @@ mod tests {
             summary,
             strict: false,
         })
+    }
+
+    /// #514/#492: asking what a write would meet must not perform one.
+    ///
+    /// The probe added for `#514` is `open_audit_rw` minus `create`, and the
+    /// missing flag is the whole point — the version with it would bring
+    /// `audit.jsonl` into being as a side effect of rendering a consent prompt.
+    /// `#492` found exactly this shape once already, where asking for status
+    /// minted a key file.
+    ///
+    /// The directory listing is compared whole rather than just checking for
+    /// `audit.jsonl`: the store also holds keys, an epoch record and a lock, and
+    /// a side effect on any of them is the same defect.
+    #[test]
+    fn asking_what_a_write_would_meet_creates_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-bg-cmd-noprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let listing = |d: &std::path::Path| {
+            let mut names: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let before = listing(&dir);
+        assert!(
+            before.is_empty(),
+            "precondition: the store starts empty, so anything below is the probe's doing"
+        );
+
+        let summary = crate::audit::audit_summary(&audit_config);
+        let _ = format_audit_expectation(outlook(&summary));
+
+        assert_eq!(
+            listing(&dir),
+            before,
+            "asking for status created something in the store"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #514: a log that opens for reading and refuses writing must not be
+    /// promised as recorded — and the two neighbouring states must still say
+    /// what they said.
+    ///
+    /// Driven through the real `audit_summary` on a real store rather than a
+    /// hand-built `AuditSummary`. A fixture handing the formatter
+    /// `NotWritable` would pass even if nothing ever produced that value, which
+    /// is the half of this change that could silently not exist.
+    ///
+    /// All three states in one test on purpose: the defect was that `0400` and
+    /// "no log yet" both reached the sentence `0600` deserves, so the cases only
+    /// discriminate against each other.
+    #[test]
+    #[cfg(unix)]
+    fn a_log_that_cannot_be_written_is_not_promised_as_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("omamori-bg-cmd-rofile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(log.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+
+        // 1. No log yet. `append` would create one; whether that succeeds is the
+        //    parent's question, so the sentence states the attempt.
+        let absent = format_audit_expectation(outlook(&crate::audit::audit_summary(&audit_config)));
+        assert!(
+            absent.contains("once the audit log is created"),
+            "with no log file, the prompt must say the log is yet to be written: {absent}"
+        );
+
+        // 2. Seed a real store, writable. This is the control: without it, an
+        //    implementation that always warns would score full marks below.
+        let logger = crate::audit::AuditLogger::from_config_for_test(&audit_config).unwrap();
+        logger
+            .append(create_activation_event(
+                "rm-recursive-to-trash",
+                "2030-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        let writable =
+            format_audit_expectation(outlook(&crate::audit::audit_summary(&audit_config)));
+        assert!(
+            writable.contains("will be logged to the audit chain"),
+            "control failed — a writable store must still reach the reassuring \
+             sentence, or the assertion below is not about writability: {writable}"
+        );
+
+        // 3. The same store, readable but not writable.
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let read_only =
+            format_audit_expectation(outlook(&crate::audit::audit_summary(&audit_config)));
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            !read_only.contains("will be logged to the audit chain"),
+            "a log that refuses writing must not be promised as recorded: {read_only}"
+        );
+        assert!(
+            read_only.contains("cannot be written"),
+            "and the prompt must say which way it is broken — reading still \
+             works here, so 'cannot be read' would be wrong: {read_only}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

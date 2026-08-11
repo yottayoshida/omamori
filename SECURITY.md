@@ -386,11 +386,24 @@ all recorded rather than fixed:
 
   **Not closed by the same change**, and each recorded rather than assumed away:
 
-  - **Other SEC-R5 sites still ask the built-in list** — `doctor`, `explain` and `setup` call
-    `is_ai_environment()` directly ([#519](https://github.com/yottayoshida/omamori/issues/519),
-    which stays open for exactly this). `setup` is structural rather than pending: it decides
-    before the point documented as failing ahead of any file I/O, so `load_config` cannot go
-    there.
+  - ~~**Other SEC-R5 sites still ask the built-in list**~~
+    ([#519](https://github.com/yottayoshida/omamori/issues/519)) — **closed for `doctor`.** Its
+    verdict now comes from the configuration the invocation loaded, and `--fix`'s three failure
+    messages are gated as well: that path is reachable in a declared-detector session precisely
+    because `guard_ai_config_modification` reads the built-in list, so such a session is refused
+    disclosure and permitted enforcement. The verdict **fails closed** on a config that cannot
+    be read, is `degraded` (the merge has already fallen back to the built-in list), or has no
+    resolvable path at all — `HOME` unusable with no absolute `XDG_CONFIG_HOME` produces
+    `Ok(degraded: false)` from `load_config`, which would otherwise read as "no detectors
+    declared".
+
+    **The earlier wording here named `explain`, which was wrong.** `cli/explain.rs` makes no
+    SEC-R5 decision — it holds no `is_ai_environment()` call and no detector evaluation; its
+    "run this command directly in your terminal (not via AI)" is a fixed line on the blocked
+    branch. Nothing about it changed; the list did.
+
+    **`setup` remains**, and structurally rather than pending: `cli/setup.rs` decides before the
+    point documented as failing ahead of any file I/O, so `load_config` cannot go there.
   - **Enforcement keeps its own answer.** `guard_ai_config_modification` reads the built-in
     list on purpose — an agent that can narrow the operator's list must not thereby unlock the
     guard against narrowing it. The consequence is visible: a session that added a detector has
@@ -777,7 +790,11 @@ Appending is best-effort in the same sense as config mutation events: the rename
 
 `[audit] strict = true` is **not** consulted here, nor for config mutations, nor for a break-glass *activation*. The rule is about ordering, not about the command: strict withholds an action whose audit entry would be written *before* it happens, and each of those three is already on disk by the time its record is attempted, so there is nothing left to withhold. A break-glass **bypass** is the opposite case — the guarded command has not run yet — and it does consult strict, blocking with exit 2 when its entry cannot be written.
 
-**Residual risk — the activation prompt asks whether the log can be read, not written** ([#514](https://github.com/yottayoshida/omamori/issues/514)). Since [#492](https://github.com/yottayoshida/omamori/issues/492) the confirmation prompt describes what will actually happen to the bypasses being authorised instead of promising audit logging unconditionally, and it reaches that answer through a read-only inspection of the store — deliberately, because the writer's own path creates a key file as a side effect and a prompt must not write before consent. A log that opens for reading and refuses writing therefore still gets the reassuring sentence: mode `0400`, a read-only mount, or an `audit.path` aimed at a file this user can read but not write. Every append then fails, and under `strict` the paragraph above applies — the bypass is **refused** rather than run unrecorded, which is the opposite of what the operator was told. Reaching this state needs either a filesystem the operator arranged or a `config.toml` write, the same trust level as the rest of this section. Narrower than what it replaced, since that sentence was unconditional in every state, but the same class.
+~~**Residual risk — the activation prompt asks whether the log can be read, not written**~~ ([#514](https://github.com/yottayoshida/omamori/issues/514)) — **closed.** The prompt now asks the writer's question with the writer's own opener: `open_audit_existing_rw` is `open_audit_rw` minus `create(true)`, keeping `O_NOFOLLOW`, `O_NONBLOCK` and the regular-file rejection, so a store that answers "writable" here is one `append` can actually write. A log that opens for reading and refuses writing — mode `0400`, a read-only mount, an `audit.path` this user can read but not write — is now named as such, and under `strict` the prompt says the bypass will be **refused** rather than run unrecorded.
+
+`create` is the one property deliberately dropped, and its absence is why the question is safe to ask before consent: a probe carrying it would bring `audit.jsonl` into being while rendering the prompt, which is [#492](https://github.com/yottayoshida/omamori/issues/492)'s defect (a status query that minted a key file) on a different file.
+
+**One state is reported as uncertainty rather than resolved**: when no log exists yet, `append` creates it *and its parent directory*, and establishing whether that would succeed requires performing it. The prompt says the log is yet to be written and names the consequence if that fails, instead of guessing in either direction.
 
 **The path shown on that prompt is sanitized against reordering and concealment, not only against control characters** ([#515](https://github.com/yottayoshida/omamori/issues/515), closed). An absolute `audit.path` reaches the prompt (and `omamori status`) inside a filesystem error message, and `config.toml` is attacker-controlled in this threat model. The substitution used to be `char::is_control` — Unicode `Cc` — which stopped cursor movement and line erasure but let the bidirectional formatting characters through, so a path could still be made to render in an order other than its bytes on the one prompt whose honesty the surrounding change exists to establish.
 

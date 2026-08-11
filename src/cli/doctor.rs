@@ -109,7 +109,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     println!();
 
     let sections = group_by_section(items);
-    let ai_env = is_ai_environment();
+    let ai_env = doctor_ai_env();
 
     for (section, section_items) in &sections {
         let pass = section_items
@@ -834,7 +834,7 @@ fn print_fix_shim_activity_footer(ai_env: bool) {
 /// Deduplicate and execute repairs in the correct order (DI-10).
 /// Order: RunInstall → RegenerateHooks → ChmodConfig → RegenerateBaseline (last).
 fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, AppError> {
-    let ai_env = is_ai_environment();
+    let ai_env = doctor_ai_env();
     let problems: Vec<_> = items
         .iter()
         .filter(|i| i.status != CheckStatus::Ok)
@@ -900,10 +900,10 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
     // 2. RegenerateHooks (only if install wasn't needed)
     if needs_regen_hooks {
         print!("  [Layer 2] regenerating hook scripts...");
-        let outcome = describe_regen_hooks_outcome(installer::regenerate_hooks_with_verifier(
-            base_dir,
-            installer::verify_hook_contract,
-        ));
+        let outcome = describe_regen_hooks_outcome(
+            installer::regenerate_hooks_with_verifier(base_dir, installer::verify_hook_contract),
+            ai_env,
+        );
         println!("{}", outcome.message());
         if outcome.is_failure() {
             failed += 1;
@@ -1082,27 +1082,55 @@ impl RegenHooksOutcome {
 /// path started tripping the new check first — the existing test's `code == 1`
 /// assertion couldn't tell the difference, so `VerificationFailed`'s message
 /// lost direct coverage without any test failing).
+/// #519: three of these arms end in a command for the reader to run, and
+/// `--fix` printed them whatever was reading.
+///
+/// Reachable in an agent session precisely because of ADR-0009's asymmetry:
+/// `guard_ai_config_modification("doctor --fix")` asks the built-in detector
+/// list, so a session that declared its own detector is refused disclosure and
+/// permitted enforcement — it passes the guard and arrives here. The condition
+/// and the failure stay in every case; only the instruction moves, matching how
+/// `remediation_hint` already handles the same class.
 fn describe_regen_hooks_outcome(
     result: Result<installer::HookOutcome, std::io::Error>,
+    ai_env: bool,
 ) -> RegenHooksOutcome {
+    let run_it_yourself = " Run the repair directly in your terminal (not via AI).";
     match result {
         Ok(installer::HookOutcome::Written) => RegenHooksOutcome::Fixed(" [fixed]".to_string()),
         Ok(installer::HookOutcome::KeptExisting(
             installer::HookKeptReason::VerificationFailed(status),
-        )) => RegenHooksOutcome::Failed(format!(
-            " [FAILED] resolved binary failed the hook-check contract ({status:?}); existing hook kept — try `omamori install --hooks`"
-        )),
+        )) => RegenHooksOutcome::Failed(if ai_env {
+            format!(
+                " [FAILED] resolved binary failed the hook-check contract ({status:?}); existing hook kept.{run_it_yourself}"
+            )
+        } else {
+            format!(
+                " [FAILED] resolved binary failed the hook-check contract ({status:?}); existing hook kept — try `omamori install --hooks`"
+            )
+        }),
         Ok(installer::HookOutcome::KeptExisting(
             installer::HookKeptReason::ExeResolutionFailed,
-        )) => RegenHooksOutcome::Failed(
-            " [FAILED] could not resolve the current omamori binary; existing hook kept — try `omamori install --hooks`".to_string(),
-        ),
-        Ok(installer::HookOutcome::KeptExisting(
-            installer::HookKeptReason::NonDeploymentPath,
-        )) => RegenHooksOutcome::Failed(format!(
-            " [FAILED] resolved binary {}; existing hook kept — rebuild from a stable path, or run `omamori install --hooks --source <path>` explicitly",
-            installer::DEV_BUILD_PATH_DESCRIPTION
-        )),
+        )) => RegenHooksOutcome::Failed(if ai_env {
+            format!(
+                " [FAILED] could not resolve the current omamori binary; existing hook kept.{run_it_yourself}"
+            )
+        } else {
+            " [FAILED] could not resolve the current omamori binary; existing hook kept — try `omamori install --hooks`".to_string()
+        }),
+        Ok(installer::HookOutcome::KeptExisting(installer::HookKeptReason::NonDeploymentPath)) => {
+            RegenHooksOutcome::Failed(if ai_env {
+                format!(
+                    " [FAILED] resolved binary {}; existing hook kept.{run_it_yourself}",
+                    installer::DEV_BUILD_PATH_DESCRIPTION
+                )
+            } else {
+                format!(
+                    " [FAILED] resolved binary {}; existing hook kept — rebuild from a stable path, or run `omamori install --hooks --source <path>` explicitly",
+                    installer::DEV_BUILD_PATH_DESCRIPTION
+                )
+            })
+        }
         Err(e) => RegenHooksOutcome::Failed(format!(" [FAILED] {e}")),
     }
 }
@@ -1164,6 +1192,67 @@ fn remediation_hint(rem: &Remediation, ai_env: bool) -> String {
             Remediation::ManualOnly(hint) => format!("manual: {hint}"),
         }
     }
+}
+
+/// `doctor`'s SEC-R5 verdict, from the operator's own detector set (#519).
+///
+/// ADR-0009: disclosure follows the configuration this invocation loaded, while
+/// enforcement (`engine::guard`) keeps the built-in list. `doctor` was left on
+/// [`is_ai_environment`] when `#527` converted the shim and `audit verify`, so
+/// an operator who declared a detector for a tool omamori does not ship with
+/// got their repairs printed by this command alone.
+///
+/// **Fails closed.** A config that cannot be read means "assume an agent is
+/// reading", not "assume a human is". The sibling helpers here fail *open* on
+/// the same error — `print_risk_signals_section` returns and prints nothing —
+/// and that is right for them: a section that cannot be computed is better
+/// omitted. The direction differs because the stakes do. Omitting a diagnostic
+/// costs information; printing a repair recipe into an agent's session is the
+/// thing SEC-R5 exists to prevent.
+///
+/// `doctor` takes no `--config`, so the default path is the only configuration
+/// this command can be talking about.
+fn doctor_ai_env() -> bool {
+    // `load_config` collapses two different states into `Ok(degraded: false)`:
+    // a config file that is simply absent (normal — the built-in rules are the
+    // operator's configuration), and a **config path that cannot be resolved
+    // at all** because `HOME` is unusable and `XDG_CONFIG_HOME` is unset or
+    // relative (`config::default_config_path` returns `None`, which
+    // `default_config_path_none_when_home_empty` pins). In the second the
+    // operator's declaration is unknowable, not empty — reading the built-in
+    // list there answers a question nobody asked.
+    if crate::config::default_config_path().is_none() {
+        return true;
+    }
+    doctor_ai_env_from(crate::config::load_config(None).as_ref().ok(), &env_pairs())
+}
+
+/// The decision [`doctor_ai_env`] makes, with both inputs supplied.
+///
+/// Split out so the two branches can be checked without a `$HOME` fixture or a
+/// process-wide environment variable — the latter is what `#344` traced six
+/// races to. `None` stands for "the configuration could not be read".
+fn doctor_ai_env_from(
+    loaded: Option<&crate::config::ConfigLoadResult>,
+    env_pairs: &[(String, String)],
+) -> bool {
+    match loaded {
+        // `degraded` means the file existed but could not be parsed, or its
+        // permissions were too open — and in that case `build_merged_config`
+        // has already fallen back to the built-in detector list. Reading the
+        // operator's intent off that fallback would answer with the very list
+        // ADR-0009 moved away from, so this is treated as "intent unknown" and
+        // fails closed, exactly as `ConfigLoadResult::degraded` asks callers
+        // making security-sensitive decisions to do.
+        Some(load_result) if !load_result.degraded => {
+            !crate::detector::repair_gate_reporting_with(&load_result.config.detectors, env_pairs)
+        }
+        _ => true,
+    }
+}
+
+fn env_pairs() -> Vec<(String, String)> {
+    std::env::vars().collect()
 }
 
 /// Lightweight AI environment check reusing the detector infrastructure.
@@ -1277,6 +1366,116 @@ fn remediation_to_str(rem: &Remediation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #519: `doctor`'s disclosure verdict follows the operator's detector set,
+    /// and fails closed when that set cannot be trusted.
+    ///
+    /// Driven through `doctor_ai_env_from` with both inputs supplied, so no
+    /// `$HOME` fixture and no `std::env::set_var` are involved — the latter is
+    /// what `#344` traced six inter-test races to.
+    ///
+    /// The discriminating case is the second one. Without it, "always withhold"
+    /// scores full marks: every other branch here also withholds.
+    #[test]
+    fn doctor_disclosure_follows_the_operator_and_fails_closed() {
+        let declared = |key: &str| crate::config::ConfigLoadResult {
+            config: crate::config::Config {
+                detectors: vec![crate::detector::DetectorConfig::env_var(
+                    "my-agent", key, "1",
+                )],
+                ..Default::default()
+            },
+            warnings: Vec::new(),
+            degraded: false,
+        };
+
+        // A detector the built-in list does not contain — the case
+        // `is_ai_environment()` structurally cannot see.
+        assert!(
+            !crate::config::default_detectors()
+                .iter()
+                .any(|d| d.env_key == "MY_AGENT_RUNTIME"),
+            "this test only discriminates while the key is absent from the built-in list"
+        );
+        let matched = vec![("MY_AGENT_RUNTIME".to_string(), "1".to_string())];
+        let unmatched = vec![("PATH".to_string(), "/usr/bin".to_string())];
+
+        assert!(
+            doctor_ai_env_from(Some(&declared("MY_AGENT_RUNTIME")), &matched),
+            "an operator-declared detector must put doctor on its AI path"
+        );
+        assert!(
+            !doctor_ai_env_from(Some(&declared("MY_AGENT_RUNTIME")), &unmatched),
+            "and the same config with nothing matching must not — otherwise this \
+             suite is satisfied by an implementation that always withholds"
+        );
+
+        // Unreadable config: intent unknown, so withhold.
+        assert!(
+            doctor_ai_env_from(None, &unmatched),
+            "a config that cannot be read must fail closed, not fall back to 'human'"
+        );
+
+        // Degraded config: the merge has already fallen back to the built-in
+        // list, so reading intent off it would answer with the wrong list.
+        let mut degraded = declared("MY_AGENT_RUNTIME");
+        degraded.degraded = true;
+        assert!(
+            doctor_ai_env_from(Some(&degraded), &unmatched),
+            "a degraded load must fail closed — its detector list is the fallback, \
+             not the operator's declaration"
+        );
+    }
+
+    /// #519 review (P1): an unresolvable config path is not an empty config.
+    ///
+    /// `load_config` reports both as `Ok(degraded: false)` — a file that is
+    /// simply absent, and a path that cannot be formed because `HOME` is
+    /// unusable and `XDG_CONFIG_HOME` is unset or relative. The first is a
+    /// normal install; the second means the operator's declaration is
+    /// unknowable, so `doctor_ai_env` refuses before loading.
+    ///
+    /// Goes through `doctor_ai_env` rather than `_from`, because the guard
+    /// being tested lives above that split — checking `_from` would pass on the
+    /// code that shipped this defect.
+    ///
+    /// **The AI env vars must be cleared too.** Without that, the built-in
+    /// detector list matches under any AI tool running `cargo test`, the loader
+    /// path returns `true` for that reason, and the assertion passes whether or
+    /// not the guard exists — measured: removing the guard left this green
+    /// until `with_clean_ai_env` was added.
+    #[test]
+    #[serial_test::serial(home_env)]
+    #[serial_test::serial(ai_env)]
+    fn an_unresolvable_config_path_withholds() {
+        use crate::test_support::{with_clean_ai_env, with_home_and_xdg};
+
+        assert!(
+            with_clean_ai_env(|| with_home_and_xdg(Some(""), doctor_ai_env)),
+            "with no resolvable config path the operator's detector set cannot be \
+             read, so doctor must assume an agent is reading — and no built-in \
+             detector is matching here, so this can only come from the guard"
+        );
+
+        // Control: a resolvable path reaches the loader, so the assertion above
+        // is about resolvability and not about `with_home_and_xdg` blanket-
+        // failing everything. This directory has no config, which is the
+        // "absent but normal" state — and the test runner's own environment
+        // carries a built-in detector under an AI tool, so the verdict there is
+        // whatever the built-in list says; only its *reachability* is asserted.
+        let probe =
+            std::env::temp_dir().join(format!("omamori-doctor-cfgpath-{}", std::process::id()));
+        std::fs::create_dir_all(&probe).unwrap();
+        let reachable = with_home_and_xdg(probe.to_str(), || {
+            crate::config::default_config_path().is_some()
+        });
+        let _ = std::fs::remove_dir_all(&probe);
+        assert!(
+            reachable,
+            "control failed — a usable HOME must produce a config path, or the \
+             assertion above is not measuring resolvability"
+        );
+    }
 
     // hook_script_is_current was removed in favor of
     // `regenerate_hooks_with_verifier` returning `HookOutcome` directly
@@ -1641,18 +1840,21 @@ mod tests {
 
     #[test]
     fn describe_regen_hooks_outcome_written_is_fixed_not_failure() {
-        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::Written));
+        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::Written), false);
         assert_eq!(outcome.message(), " [fixed]");
         assert!(!outcome.is_failure());
     }
 
     #[test]
     fn describe_regen_hooks_outcome_verification_failed_is_failure() {
-        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::KeptExisting(
-            installer::HookKeptReason::VerificationFailed(
-                installer::HookContractStatus::ExitNonZero(1),
-            ),
-        )));
+        let outcome = describe_regen_hooks_outcome(
+            Ok(installer::HookOutcome::KeptExisting(
+                installer::HookKeptReason::VerificationFailed(
+                    installer::HookContractStatus::ExitNonZero(1),
+                ),
+            )),
+            false,
+        );
         assert!(outcome.is_failure());
         let message = outcome.message();
         assert!(
@@ -1664,9 +1866,12 @@ mod tests {
 
     #[test]
     fn describe_regen_hooks_outcome_exe_resolution_failed_is_failure() {
-        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::KeptExisting(
-            installer::HookKeptReason::ExeResolutionFailed,
-        )));
+        let outcome = describe_regen_hooks_outcome(
+            Ok(installer::HookOutcome::KeptExisting(
+                installer::HookKeptReason::ExeResolutionFailed,
+            )),
+            false,
+        );
         assert!(outcome.is_failure());
         assert!(
             outcome
@@ -1679,9 +1884,12 @@ mod tests {
 
     #[test]
     fn describe_regen_hooks_outcome_non_deployment_path_is_failure() {
-        let outcome = describe_regen_hooks_outcome(Ok(installer::HookOutcome::KeptExisting(
-            installer::HookKeptReason::NonDeploymentPath,
-        )));
+        let outcome = describe_regen_hooks_outcome(
+            Ok(installer::HookOutcome::KeptExisting(
+                installer::HookKeptReason::NonDeploymentPath,
+            )),
+            false,
+        );
         assert!(outcome.is_failure());
         assert!(
             outcome.message().contains("cargo build artifact"),
@@ -1692,10 +1900,13 @@ mod tests {
 
     #[test]
     fn describe_regen_hooks_outcome_err_is_failure() {
-        let outcome = describe_regen_hooks_outcome(Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "permission denied",
-        )));
+        let outcome = describe_regen_hooks_outcome(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            )),
+            false,
+        );
         assert!(outcome.is_failure());
         assert!(
             outcome.message().contains("permission denied"),

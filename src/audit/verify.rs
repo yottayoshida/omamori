@@ -10,8 +10,8 @@ use super::retention::is_prune_point;
 use super::secret::{
     KeyStoreOutlook, Keyring, UNRESOLVED_KEY_ID, UnprotectedReason, classify_secret_failure,
     expected_key_file, flock_shared, interrupted_rotation_evidence, is_symlink_attack,
-    is_writer_emitted_key_id, key_store_outlook, load_keyring, open_read_nofollow, read_secret,
-    secret_path_for,
+    is_writer_emitted_key_id, key_store_outlook, load_keyring, open_audit_existing_rw,
+    open_read_nofollow, read_secret, secret_path_for,
 };
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, HwmUnusable, hwm_path_for, read_hwm, write_hwm};
@@ -430,6 +430,42 @@ pub struct AuditSummary {
     pub unprotected_reason: Option<UnprotectedReason>,
     pub retention_days: u32,
     pub path_error: Option<String>,
+    /// Whether an append could actually write (#514).
+    ///
+    /// None of the fields above answers this. `path_error` comes from a
+    /// **read** (`open_read_nofollow`, `O_RDONLY`), so a log at mode `0400`
+    /// leaves it empty; `logger_available` says a logger can be built, not that
+    /// its writes land; `secret_available` describes the key store. All three
+    /// pass on a store whose every append fails with `EACCES`.
+    ///
+    /// `None` means **not probed**, which the two early returns above report:
+    /// auditing off, and an audit path that does not resolve. Neither has
+    /// somewhere to write, so there is nothing to ask — and "did not look" is a
+    /// different answer from [`AppendOutlook::NoLogYet`], which is an
+    /// observation that a file is absent.
+    pub append_outlook: Option<AppendOutlook>,
+}
+
+/// What a write to the audit log would meet right now (#514).
+///
+/// Three states rather than a `bool`, because "no log yet" is not a degree of
+/// writability — it is a different question, and one this type deliberately
+/// does not answer (see [`AppendOutlook::NoLogYet`]). A two-valued field would
+/// force callers to fold it into one of the other two and phrase a consequence
+/// that does not follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AppendOutlook {
+    /// The existing log opened under the writer's own conditions.
+    Writable,
+    /// It did not. The string is the reason, for callers that name it.
+    NotWritable(String),
+    /// There is no log file. `append` will try to create one — along with its
+    /// parent directory — and whether that succeeds is a question about the
+    /// parent, which cannot be answered without `create_dir_all`. Asking for
+    /// status may not have side effects (`#492`), so this state is reported as
+    /// uncertainty rather than resolved into the other two.
+    NoLogYet,
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,6 +1575,8 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             unprotected_reason: None,
             retention_days: 0,
             path_error: None,
+            // Not probed: auditing is off, so no append is attempted.
+            append_outlook: None,
         };
     }
 
@@ -1556,6 +1594,8 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             path_error: Some(
                 "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
             ),
+            // Not probed: there is no resolved path to probe.
+            append_outlook: None,
         };
     };
     // #471: the writer's own question, asked the writer's way. `read_secret`
@@ -1587,6 +1627,19 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         }),
     };
     let secret_available = unprotected_reason.is_none();
+
+    // #514: asked with the writer's own opener, minus `create`. The read below
+    // cannot stand in for it — it opens `O_RDONLY`, so a log at mode `0400`
+    // reads fine and reports no error while every append fails.
+    let append_outlook = Some(match open_audit_existing_rw(&path) {
+        Ok(_) => AppendOutlook::Writable,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppendOutlook::NoLogYet,
+        // Sanitized for the reason the read arm below states at length: this
+        // message ends with the audit path, `config.toml` can put escape
+        // sequences into an absolute `audit.path`, and `break-glass` prints
+        // this two lines above the prompt the operator is answering.
+        Err(e) => AppendOutlook::NotWritable(super::strip_control_chars(&e.to_string())),
+    });
 
     let (entry_count, path_error) = match open_read_nofollow(&path) {
         Ok(f) => {
@@ -1624,6 +1677,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         unprotected_reason,
         retention_days: config.retention_days,
         path_error,
+        append_outlook,
     }
 }
 

@@ -2284,6 +2284,37 @@ pub(super) fn open_audit_rw(path: &Path) -> Result<fs::File, std::io::Error> {
     Ok(file)
 }
 
+/// [`open_audit_rw`] minus `create` — asks whether an append could write to a
+/// log that **already exists**, without bringing one into being (#514).
+///
+/// Every other property is deliberately identical, because the answer is only
+/// worth having if it is the writer's answer. Dropping `O_NONBLOCK` would let
+/// the probe hang on a FIFO *while an operator is reading a consent prompt*;
+/// dropping [`crate::atomic_file::reject_non_regular`] would report a directory
+/// or a socket as writable, which is precisely the state `append` refuses.
+///
+/// `create` is the one thing removed, and its absence is the point. Asking
+/// "could this be written?" must not answer by writing — `#492` established
+/// that for the key store (a status query that minted a key file), and a probe
+/// that creates `audit.jsonl` would be the same defect on the log.
+///
+/// `Err(NotFound)` therefore means "no log yet", not "not writable". Whether
+/// the *creation* would succeed is a question about the parent directory, and
+/// answering it needs `create_dir_all` — a side effect, so callers state the
+/// uncertainty instead.
+pub(super) fn open_audit_existing_rw(path: &Path) -> Result<fs::File, std::io::Error> {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).map_err(|e| eloop_message(e, path))?;
+    crate::atomic_file::reject_non_regular(&file, path)?;
+    Ok(file)
+}
+
 /// Convert ELOOP into a user-friendly error message.
 fn eloop_message(e: std::io::Error, path: &Path) -> std::io::Error {
     #[cfg(unix)]
