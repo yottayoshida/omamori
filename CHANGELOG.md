@@ -6,6 +6,8 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-08-11
+
 ### Fixed
 - **SEC-R5's repair gate: the wrong question, five ungated print sites, and a substitute that led back to the answer.** ([#527](https://github.com/yottayoshida/omamori/issues/527), supersedes the scoping in [#519](https://github.com/yottayoshida/omamori/issues/519))
 
