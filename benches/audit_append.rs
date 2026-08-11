@@ -56,7 +56,10 @@ fn make_logger(dir: &Path) -> AuditLogger {
         retention_days: 0,
         strict: false,
     };
-    AuditLogger::from_config(&config).expect("logger constructs in writable bench dir")
+    // `true`: the bench measures append throughput, and the SEC-R5 verdict only
+    // changes warning text on a degraded key store. Resolving it from the real
+    // environment would make the bench's output depend on who ran it.
+    AuditLogger::from_config(&config, true).expect("logger constructs in writable bench dir")
 }
 
 fn make_event(logger: &AuditLogger) -> AuditEvent {

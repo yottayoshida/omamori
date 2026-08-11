@@ -908,7 +908,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("audit enabled");
+        let logger = AuditLogger::from_config_for_test(&config).expect("audit enabled");
         logger
             .append(AuditEvent {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
@@ -1017,7 +1017,7 @@ mod tests {
 
         // Append one entry so verify_chain() has a chain to walk, then
         // corrupt the HWM the same way append() would have written it.
-        let logger = AuditLogger::from_config(&config).expect("audit enabled");
+        let logger = AuditLogger::from_config_for_test(&config).expect("audit enabled");
         logger
             .append(AuditEvent {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),

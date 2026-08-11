@@ -272,8 +272,25 @@ impl AuditLogger {
         &self.signing_key.id
     }
 
-    pub fn from_config(config: &AuditConfig) -> Option<Self> {
-        Self::build(config, secret::KeyWarnPolicy::Always)
+    /// `allow_repair` is this invocation's SEC-R5 verdict — see
+    /// `detector::repair_gate`. It is a parameter rather than something resolved
+    /// here because the constructor cannot see which configuration the caller
+    /// loaded, and resolving it from the built-in detector list is the defect
+    /// `#527` removes (ADR-0009).
+    pub fn from_config(config: &AuditConfig, allow_repair: bool) -> Option<Self> {
+        Self::build(config, secret::KeyWarnPolicy::always(allow_repair))
+    }
+
+    /// `from_config(.., allow_repair = true)`, kept for the tests that predate
+    /// the disclosure gate (`#527`), mirroring what `#473` did for the throttle
+    /// parameter. Every production caller states its own verdict.
+    ///
+    /// `true` rather than "whatever the environment says": a test that resolved
+    /// this from the real environment would print repairs under CI and withhold
+    /// them under Claude Code, where `CLAUDECODE=1` is a built-in detector.
+    #[cfg(test)]
+    pub(crate) fn from_config_for_test(config: &AuditConfig) -> Option<Self> {
+        Self::from_config(config, true)
     }
 
     /// `from_config` for callers that run on every command rather than because
@@ -289,8 +306,8 @@ impl AuditLogger {
     /// opt into silence. That is the direction `#510` established for the audit
     /// status catch-all, for the same reason — the failure that costs something
     /// is the quiet one.
-    pub(crate) fn from_config_throttled(config: &AuditConfig) -> Option<Self> {
-        Self::build(config, secret::KeyWarnPolicy::Throttled)
+    pub(crate) fn from_config_throttled(config: &AuditConfig, allow_repair: bool) -> Option<Self> {
+        Self::build(config, secret::KeyWarnPolicy::throttled(allow_repair))
     }
 
     fn build(config: &AuditConfig, policy: secret::KeyWarnPolicy) -> Option<Self> {
@@ -904,7 +921,7 @@ mod tests {
             retention_days: 0,
             strict: false,
         };
-        assert!(AuditLogger::from_config(&config).is_none());
+        assert!(AuditLogger::from_config_for_test(&config).is_none());
     }
 
     #[test]
@@ -916,7 +933,7 @@ mod tests {
             retention_days: 0,
             strict: false,
         };
-        let logger = AuditLogger::from_config(&config).expect("should create logger");
+        let logger = AuditLogger::from_config_for_test(&config).expect("should create logger");
         assert!(logger.secret_available());
         assert!(dir.join("audit-secret").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -936,7 +953,7 @@ mod tests {
             retention_days: 0,
             strict: false,
         };
-        let logger = AuditLogger::from_config(&config);
+        let logger = AuditLogger::from_config_for_test(&config);
         assert!(logger.is_some(), "should create logger with default path");
     }
 
@@ -2611,7 +2628,7 @@ mod tests {
     fn load_or_create_secret_creates_when_missing() {
         let dir = test_dir("secret-create");
         let path = dir.join("audit-secret");
-        let secret = load_or_create_secret(&path, secret::KeyWarnPolicy::Always);
+        let secret = load_or_create_secret(&path, secret::KeyWarnPolicy::always(true));
         assert!(secret.is_some());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2621,7 +2638,7 @@ mod tests {
         let dir = test_dir("secret-read");
         let path = dir.join("audit-secret");
         let created = create_secret(&path).unwrap();
-        let loaded = load_or_create_secret(&path, secret::KeyWarnPolicy::Always).unwrap();
+        let loaded = load_or_create_secret(&path, secret::KeyWarnPolicy::always(true)).unwrap();
         assert_eq!(created, loaded);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4079,7 +4096,7 @@ mod tests {
         fs::set_permissions(&retired, fs::Permissions::from_mode(0o000)).unwrap();
 
         let config = verify_config(&dir);
-        let writer = AuditLogger::from_config(&config).expect("audit is enabled");
+        let writer = AuditLogger::from_config_for_test(&config).expect("audit is enabled");
         writer.append(make_event("seed")).unwrap();
 
         let report = aggregate_report(&config, 30);
@@ -4157,7 +4174,7 @@ mod tests {
 
             let config = verify_config(&dir);
             let summary = audit_summary(&config);
-            let writer = AuditLogger::from_config(&config).expect("audit is enabled");
+            let writer = AuditLogger::from_config_for_test(&config).expect("audit is enabled");
             let _ = writer.append(make_event("probe"));
 
             let last = fs::read_to_string(dir.join("audit.jsonl"))
@@ -4604,7 +4621,7 @@ mod tests {
     fn prune_hwm_authenticates_a_retained_entry_signed_with_a_retired_key() {
         let dir = test_dir("prune-hwm-retired-key");
         let secret_path = dir.join("audit-secret");
-        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::always(true))
             .expect("epoch-1 key is created");
         let path = prune_hwm_fixture(&dir, &epoch1);
 
@@ -4865,7 +4882,7 @@ mod tests {
     fn pruned_across_rotation_fixture(dir: &Path) -> (std::path::PathBuf, [u8; 32], [u8; 32]) {
         let path = dir.join("audit.jsonl");
         let secret_path = dir.join("audit-secret");
-        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::always(true))
             .expect("epoch-1 key is created");
 
         let old_ts = "2025-01-01T00:00:00Z";
@@ -4994,7 +5011,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         assert_eq!(
             logger.key_id(),
             "default",
@@ -5005,7 +5022,7 @@ mod tests {
 
         super::rotate_key(&audit_path).expect("rotation succeeds");
 
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         assert_eq!(
             logger.key_id(),
             "key-2",
@@ -5073,7 +5090,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("first")).unwrap();
         logger.append(make_event("second")).unwrap();
         drop(logger);
@@ -5119,7 +5136,7 @@ mod tests {
         };
 
         // Epoch 1: write and discard, so the surviving log starts later.
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1-discarded")).unwrap();
         drop(logger);
         super::rotate_key(&audit_path).expect("rotation 1");
@@ -5127,7 +5144,7 @@ mod tests {
         let _ = fs::remove_file(hwm_path_for(&audit_path));
 
         // Epoch 2: this is the log that survives, so its head names `key-2`.
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         assert_eq!(logger.key_id(), "key-2");
         logger.append(make_event("epoch-2-head")).unwrap();
         drop(logger);
@@ -5188,7 +5205,7 @@ mod tests {
             strict: false,
         };
 
-        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::always(true))
             .expect("epoch-1 key");
 
         let old_ts = "2025-01-01T00:00:00Z";
@@ -5250,7 +5267,7 @@ mod tests {
         let audit_path = dir.join("audit.jsonl");
         let secret_path = dir.join("audit-secret");
 
-        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::always(true))
             .expect("epoch-1 key");
         for _ in 0..3 {
             super::rotate_key(&audit_path).expect("rotation succeeds");
@@ -5321,7 +5338,7 @@ mod tests {
         };
 
         // Establish epoch 1 and rotate, so epoch-1 becomes the retired key.
-        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::always(true))
             .expect("epoch-1 key");
         super::rotate_key(&audit_path).expect("rotation succeeds");
         let epoch2 = read_secret(&secret_path).expect("epoch-2 is active");
@@ -5367,11 +5384,11 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("before")).unwrap();
         drop(logger);
         super::rotate_key(&audit_path).expect("rotation succeeds");
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         logger.append(make_event("after")).unwrap();
         logger.append(make_event("after-2")).unwrap();
         drop(logger);
@@ -5430,7 +5447,7 @@ mod tests {
             strict: false,
         };
 
-        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::Always)
+        let epoch1 = load_or_create_secret(&secret_path, secret::KeyWarnPolicy::always(true))
             .expect("epoch-1 key");
         super::rotate_key(&audit_path).expect("rotation succeeds");
         let epoch2 = read_secret(&secret_path).expect("epoch-2 is active");
@@ -5532,12 +5549,12 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
 
         super::rotate_key(&audit_path).expect("rotation succeeds");
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         logger.append(make_event("epoch-2")).unwrap();
         drop(logger);
 
@@ -5845,7 +5862,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
         super::rotate_key(&audit_path).expect("rotation succeeds");
@@ -5853,7 +5870,7 @@ mod tests {
         // The crash window, entered before the new epoch signed anything.
         fs::remove_file(&secret_path).unwrap();
 
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         assert_eq!(
             logger.key_id(),
             "key-3",
@@ -5918,12 +5935,12 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
         super::rotate_key(&audit_path).expect("rotation succeeds");
 
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         assert_eq!(logger.key_id(), "key-2");
         logger.append(make_event("epoch-2")).unwrap();
         drop(logger);
@@ -6253,7 +6270,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
         super::rotate_key(&audit_path).expect("first rotation");
@@ -6376,7 +6393,7 @@ mod tests {
                 strict: false,
             };
 
-            let logger = AuditLogger::from_config(&config).expect("logger constructs");
+            let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
             logger.append(make_event("epoch-1")).unwrap();
             drop(logger);
             let before = fs::read_to_string(&secret_path).expect("the active key exists");
@@ -6444,7 +6461,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
 
@@ -6496,7 +6513,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
 
@@ -6559,11 +6576,11 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
         super::rotate_key(&audit_path).expect("rotation succeeds");
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         logger.append(make_event("epoch-2")).unwrap();
         drop(logger);
         assert!(
@@ -6705,11 +6722,11 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("epoch-1")).unwrap();
         drop(logger);
         super::rotate_key(&audit_path).expect("rotation succeeds");
-        let logger = AuditLogger::from_config(&config).expect("logger reconstructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger reconstructs");
         logger.append(make_event("epoch-2")).unwrap();
         drop(logger);
         assert!(verify_chain(&config).unwrap().broken_at.is_none());
@@ -6989,7 +7006,7 @@ mod tests {
             strict: false,
         };
 
-        let logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
         logger.append(make_event("before")).unwrap();
         drop(logger);
         // Rotate first: on an unrotated store `"default"` and the active key
@@ -6999,7 +7016,7 @@ mod tests {
         super::rotate_key(&audit_path).expect("rotation succeeds");
 
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o100)).unwrap();
-        let blind = AuditLogger::from_config(&config).expect("logger still constructs");
+        let blind = AuditLogger::from_config_for_test(&config).expect("logger still constructs");
         assert_eq!(
             blind.key_id(),
             UNRESOLVED_KEY_ID,
@@ -8131,7 +8148,7 @@ mod tests {
             // and the re-read then says why it is unusable.
             let occupied = store.join("audit-secret");
             fs::create_dir(&occupied).unwrap();
-            secret::load_or_create_secret(&occupied, secret::KeyWarnPolicy::Throttled);
+            secret::load_or_create_secret(&occupied, secret::KeyWarnPolicy::throttled(true));
 
             // Site B: nothing is at the secret path and one cannot be created.
             // The lock file is made first, because a directory that cannot be
@@ -8142,7 +8159,7 @@ mod tests {
             let absent = ro.join("audit-secret");
             fs::write(ro.join("audit-secret.lock"), b"").unwrap();
             fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
-            secret::load_or_create_secret(&absent, secret::KeyWarnPolicy::Throttled);
+            secret::load_or_create_secret(&absent, secret::KeyWarnPolicy::throttled(true));
             let restored = fs::set_permissions(&ro, fs::Permissions::from_mode(0o700));
 
             let mut names: Vec<String> = fs::read_dir(&sentinels)
@@ -8193,12 +8210,12 @@ mod tests {
 
         let emitted = crate::test_support::with_home(Some(home.to_str().unwrap()), || {
             let first = secret::may_warn_for_test(
-                secret::KeyWarnPolicy::Throttled,
+                secret::KeyWarnPolicy::throttled(true),
                 secret::WARN_KIND_SECRET_PATH_OCCUPIED,
                 &occupied,
             );
             let second = secret::may_warn_for_test(
-                secret::KeyWarnPolicy::Throttled,
+                secret::KeyWarnPolicy::throttled(true),
                 secret::WARN_KIND_SECRET_PATH_OCCUPIED,
                 &occupied,
             );
@@ -8237,6 +8254,148 @@ mod tests {
                 "{reason:?} has no repair to withhold, so the gate must not alter it"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // #527: the disclosure gate answers from the configuration this
+    // invocation loaded, and every print site of a key-store repair asks it.
+    // -----------------------------------------------------------------
+
+    /// Every sentence a degraded key store can put in front of a reader.
+    ///
+    /// Collected in one place because the defect was never in any single one of
+    /// them: four of the six print sites had no gate at all, and the one that
+    /// did asked the wrong question. A test that walked one site passed on
+    /// `b322bde` while five others printed the recipe.
+    ///
+    /// Three functions rather than six because `remedy_line` is the shared body
+    /// of four print sites (`audit verify` × 3, `key rotate` × 1). If a fifth
+    /// site is ever added that does not route through it, this list is where the
+    /// omission has to be noticed — the assertions below cannot see call sites.
+    fn repair_sentences(allow_repair: bool) -> Vec<(&'static str, String)> {
+        let reason = secret::UnprotectedReason::EpochRecordUnreadable(
+            "audit-secret.epoch states no epoch".to_string(),
+        );
+        vec![
+            (
+                "shim key-store warning",
+                secret::keystore_warning(&reason, allow_repair),
+            ),
+            (
+                "audit verify / key rotate remedy",
+                crate::cli::audit_cmd::remedy_line(
+                    "Removing audit-secret.epoch puts this store back on deriving the epoch.",
+                    allow_repair,
+                )
+                .expect("a non-empty remedy always produces a line"),
+            ),
+            (
+                "shim strict-mode block",
+                crate::engine::shim::strict_mode_fix_line(allow_repair).to_string(),
+            ),
+        ]
+    }
+
+    /// Falsification 1 — the discriminating case.
+    ///
+    /// Without this, "withhold everywhere, always" scores full marks on the test
+    /// below: both of its cases assert that something is withheld. The gate is
+    /// only worth having if the other answer is reachable.
+    #[test]
+    fn a_human_terminal_gets_the_repair_at_every_print_site() {
+        let detectors = crate::config::default_detectors();
+        // No detector matches, whatever the real environment happens to be —
+        // `repair_gate` takes the pairs rather than reading `std::env`, which is
+        // what keeps this test's answer the same under CI and under an agent
+        // whose own `CLAUDECODE=1` is one of the built-in detectors.
+        let env_pairs = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        let gate = crate::detector::repair_gate(&detectors, &env_pairs);
+        assert!(gate.allow_repair, "no built-in detector matches this env");
+
+        for (site, text) in repair_sentences(gate.allow_repair) {
+            assert!(
+                !text.contains("not via AI"),
+                "{site} withheld the repair from a human terminal: {text}"
+            );
+        }
+        assert!(
+            repair_sentences(gate.allow_repair)[0]
+                .1
+                .contains("Removing"),
+            "the key-store warning must carry its repair here"
+        );
+    }
+
+    /// Falsification 2 — the case the shipped gate cannot see.
+    ///
+    /// A detector the operator added for a tool omamori does not ship with.
+    /// Declaring any `[[detectors]]` replaces the built-in list outright, so the
+    /// shim enters its protected path while `is_ai_environment()` — which reads
+    /// `default_detectors()` — answers "not an AI session". This test fails on
+    /// `b322bde` at every one of the three sites.
+    #[test]
+    fn an_operator_declared_detector_withholds_at_every_print_site() {
+        let detectors = vec![crate::detector::DetectorConfig::env_var(
+            "my-agent",
+            "MY_AGENT_RUNTIME",
+            "1",
+        )];
+        assert!(
+            !crate::config::default_detectors()
+                .iter()
+                .any(|d| d.env_key == "MY_AGENT_RUNTIME"),
+            "this case only discriminates while the key is absent from the built-in list"
+        );
+
+        let env_pairs = vec![("MY_AGENT_RUNTIME".to_string(), "1".to_string())];
+        let gate = crate::detector::repair_gate(&detectors, &env_pairs);
+        assert!(
+            !gate.allow_repair,
+            "the operator declared this an AI session"
+        );
+
+        for (site, text) in repair_sentences(gate.allow_repair) {
+            assert!(
+                text.contains("not via AI"),
+                "{site} printed the repair into a declared AI session: {text}"
+            );
+        }
+        assert!(
+            !repair_sentences(gate.allow_repair)[0]
+                .1
+                .contains("Removing"),
+            "the withheld sentence is the one naming the file"
+        );
+    }
+
+    /// Falsification 3 — a fail-closed gate that cannot say why is a gate the
+    /// operator cannot fix.
+    ///
+    /// `evaluate_detectors` reports `protected = true` for a detector it cannot
+    /// evaluate, so a typo in `config.toml` withholds every repair. The reason
+    /// only reaches a screen if the caller prints `warnings`, which is why
+    /// `RepairGate` carries them out rather than dropping them.
+    #[test]
+    fn an_invalid_detector_withholds_and_says_why() {
+        let detectors = vec![crate::detector::DetectorConfig::env_var("broken", "", "1")];
+        let gate = crate::detector::repair_gate(&detectors, &[]);
+
+        assert!(!gate.allow_repair, "an unevaluable detector fails closed");
+        assert!(
+            gate.warnings.iter().any(|w| w.contains("broken")),
+            "the reason must survive for the caller to print: {:?}",
+            gate.warnings
+        );
+
+        // Control: the same detector spelled correctly, unmatched, produces
+        // neither a withhold nor a warning — so the assertions above are
+        // reporting the invalid spelling and not the shape of the test.
+        let valid = vec![crate::detector::DetectorConfig::env_var(
+            "fine", "SOME_KEY", "1",
+        )];
+        let control = crate::detector::repair_gate(&valid, &[]);
+        assert!(control.allow_repair);
+        assert!(control.warnings.is_empty());
     }
 
     #[test]
@@ -9067,7 +9226,7 @@ mod tests {
             strict: false,
         };
         assert!(
-            with_home(Some(""), || AuditLogger::from_config(&config)).is_none(),
+            with_home(Some(""), || AuditLogger::from_config_for_test(&config)).is_none(),
             "logger creation must fail closed (unavailable), not write into CWD"
         );
     }
@@ -9127,7 +9286,7 @@ mod tests {
             retention_days: 0,
             strict: false,
         };
-        let logger = with_home(home.to_str(), || AuditLogger::from_config(&config))
+        let logger = with_home(home.to_str(), || AuditLogger::from_config_for_test(&config))
             .expect("relative override + usable HOME must still produce a working logger");
         assert_eq!(logger.path, home.join(".local/share/omamori/audit.jsonl"));
 
@@ -9144,7 +9303,7 @@ mod tests {
             strict: false,
         };
         assert!(
-            with_home(Some(""), || AuditLogger::from_config(&config)).is_none(),
+            with_home(Some(""), || AuditLogger::from_config_for_test(&config)).is_none(),
             "relative override + unusable HOME must fail closed, not write into CWD"
         );
     }

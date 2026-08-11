@@ -494,6 +494,20 @@ pub(crate) fn emit_config_warnings(load_result: &ConfigLoadResult) {
 // Core command execution pipeline
 // ---------------------------------------------------------------------------
 
+/// The second line of the strict-mode block message (#527).
+///
+/// Returned rather than printed so both sides of the gate stay checkable — the
+/// same split `audit::secret::keystore_warning` and `cli::audit_cmd::remedy_line`
+/// use.
+pub(crate) fn strict_mode_fix_line(allow_repair: bool) -> &'static str {
+    if allow_repair {
+        "omamori: to fix, re-create the secret or set audit.strict = false in config.toml"
+    } else {
+        "omamori: to see how to clear it, run 'omamori audit verify' directly in your terminal \
+         (not via AI)."
+    }
+}
+
 pub(crate) fn run_command(
     program: String,
     args: &[OsString],
@@ -531,7 +545,9 @@ pub(crate) fn run_command(
         for warning in &detection.warnings {
             eprintln!("omamori warning: {warning}");
         }
-        if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
+        if let Some(logger) =
+            AuditLogger::from_config_throttled(&load_result.config.audit, !detection.protected)
+        {
             let event = logger.create_event(
                 &invocation,
                 None,
@@ -557,7 +573,9 @@ pub(crate) fn run_command(
         for warning in &detection.warnings {
             eprintln!("omamori warning: {warning}");
         }
-        if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
+        if let Some(logger) =
+            AuditLogger::from_config_throttled(&load_result.config.audit, !detection.protected)
+        {
             let event = logger.create_event(
                 &invocation,
                 None,
@@ -587,12 +605,23 @@ pub(crate) fn run_command(
     // off. A blocked command is not repetition to be damped down; it is the
     // event, and the operator is being asked to act on it.
     if load_result.config.audit.strict && load_result.config.audit.enabled {
-        match AuditLogger::from_config(&load_result.config.audit) {
+        match AuditLogger::from_config(&load_result.config.audit, !detection.protected) {
             Some(logger) if !logger.secret_available() => {
                 eprintln!("omamori: audit strict mode — HMAC secret unavailable, blocking command");
-                eprintln!(
-                    "omamori: to fix, re-create the secret or set audit.strict = false in config.toml"
-                );
+                // #527: the condition is stated in both branches; only the
+                // second line moves. It is the worst of the repair sentences to
+                // hand an agent — one of its two suggestions is to switch off
+                // the enforcement that just blocked the command, which is the
+                // action a blocked agent is most motivated to take. The comment
+                // above this block already noted that "its other suggestion is
+                // to switch the enforcement off"; the gate was simply never
+                // extended here.
+                //
+                // The substitute points at `audit verify` rather than `doctor`:
+                // `verify` is where the key-store remedy is actually printed
+                // (gated by the same verdict), so a human following the route
+                // arrives at the sentence, and an agent does not.
+                eprintln!("{}", strict_mode_fix_line(!detection.protected));
                 return Ok(1);
             }
             None => {
@@ -711,7 +740,9 @@ pub(crate) fn run_command(
                 rule.name
             );
             // Audit the bypass
-            if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
+            if let Some(logger) =
+                AuditLogger::from_config_throttled(&load_result.config.audit, !detection.protected)
+            {
                 let provider = detection
                     .matched_detectors
                     .first()
@@ -759,7 +790,9 @@ pub(crate) fn run_command(
         eprintln!("omamori warning: {warning}");
     }
 
-    if let Some(logger) = AuditLogger::from_config_throttled(&load_result.config.audit) {
+    if let Some(logger) =
+        AuditLogger::from_config_throttled(&load_result.config.audit, !detection.protected)
+    {
         let event = logger.create_event(
             &invocation,
             effective_rule,
@@ -1202,7 +1235,7 @@ mod tests {
 
     #[test]
     fn try_audit_append_strict_returns_exit_code_on_failure() {
-        let logger = AuditLogger::from_config(&crate::audit::AuditConfig {
+        let logger = AuditLogger::from_config_for_test(&crate::audit::AuditConfig {
             enabled: true,
             path: Some(PathBuf::from("/nonexistent/dir/audit.jsonl")),
             retention_days: 0,
@@ -1227,7 +1260,7 @@ mod tests {
 
     #[test]
     fn try_audit_append_non_strict_returns_none_on_failure() {
-        let logger = AuditLogger::from_config(&crate::audit::AuditConfig {
+        let logger = AuditLogger::from_config_for_test(&crate::audit::AuditConfig {
             enabled: true,
             path: Some(PathBuf::from("/nonexistent/dir/audit.jsonl")),
             retention_days: 0,

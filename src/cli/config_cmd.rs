@@ -397,11 +397,15 @@ fn build_config_mutation_event(rule_name: &str, action: &str, command: String) -
 /// is unaffected by the rule mutation this event describes).
 fn append_config_mutation_event(
     audit_config: &crate::audit::AuditConfig,
+    // #527: the caller's SEC-R5 verdict. Building the logger can print a
+    // key-store warning that carries a repair, so this path needs the answer
+    // even though its own job is only to append an event.
+    allow_repair: bool,
     rule_name: &str,
     action: &str,
     command: String,
 ) {
-    if let Some(logger) = AuditLogger::from_config(audit_config) {
+    if let Some(logger) = AuditLogger::from_config(audit_config, allow_repair) {
         let event = build_config_mutation_event(rule_name, action, command);
         if let Err(e) = logger.append(event) {
             eprintln!("omamori warning: failed to audit-log config mutation: {e}");
@@ -469,6 +473,8 @@ fn run_config_disable(rule_name: &str) -> Result<i32, AppError> {
     })?;
     append_config_mutation_event(
         &precheck.config.audit,
+        // #527: from the configuration this command loaded, not the built-in list.
+        crate::detector::repair_gate_reporting(&precheck.config.detectors),
         rule_name,
         "config-disable",
         format!("config disable {rule_name}"),
@@ -581,6 +587,8 @@ fn run_config_enable(rule_name: &str) -> Result<i32, AppError> {
     })?;
     append_config_mutation_event(
         &precheck.config.audit,
+        // #527: from the configuration this command loaded, not the built-in list.
+        crate::detector::repair_gate_reporting(&precheck.config.detectors),
         rule_name,
         "config-enable",
         format!("config enable {rule_name}"),
@@ -893,6 +901,8 @@ fn run_config_add(args: &[OsString]) -> Result<i32, AppError> {
     // break-glass's state-first-then-log ordering.
     append_config_mutation_event(
         &precheck.config.audit,
+        // #527: from the configuration this command loaded, not the built-in list.
+        crate::detector::repair_gate_reporting(&precheck.config.detectors),
         &parsed.rule_name,
         "config-add",
         format!("config add {}", parsed.rule_name),
@@ -1491,6 +1501,7 @@ mod tests {
 
         append_config_mutation_event(
             &audit_config,
+            true,
             "my-custom-rule",
             "config-disable",
             "config disable my-custom-rule".to_string(),
@@ -1525,6 +1536,7 @@ mod tests {
 
         append_config_mutation_event(
             &audit_config,
+            true,
             "my-custom-rule",
             "config-add",
             "config add my-custom-rule".to_string(),
