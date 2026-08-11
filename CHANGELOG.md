@@ -6,6 +6,17 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **`break-glass` no longer promises logging on a log it cannot write.** ([#514](https://github.com/yottayoshida/omamori/issues/514))
+
+  The consent prompt reached its answer through a read: `audit_summary` opens `O_RDONLY`, so a log at mode `0400` leaves `path_error` empty, `logger_available` true and `secret_available` true — every field the prompt consulted passed, and it printed "All bypassed executions will be logged to the audit chain." Each append then failed with `EACCES`, and under `[audit] strict = true` the bypass the operator had just authorised was **refused** rather than run unrecorded: the opposite of what obtained the consent. The prompt now asks with the writer's own opener, minus `create(true)` — keeping `O_NOFOLLOW`, `O_NONBLOCK` and the regular-file rejection, so "writable" here means what `append` means by it. Dropping `create` is what makes the question safe to ask before consent; carrying it would create `audit.jsonl` while rendering a prompt, which is #492's defect on a different file. A log that does not exist yet is reported as an attempt rather than probed, because settling it would require `create_dir_all`.
+
+- **`doctor` asks the operator's detector set, including under `--fix`.** ([#519](https://github.com/yottayoshida/omamori/issues/519))
+
+  ADR-0009 puts disclosure on the configuration an invocation loaded and leaves enforcement on the built-in list; #527 converted the shim and `audit verify`, and `doctor` was left behind. It now reads the loaded configuration, and **fails closed** on three states where the operator's declaration cannot be trusted: an unreadable config, a `degraded` one (the merge has already substituted the built-in list), and one whose path does not resolve at all — `HOME` unusable with no absolute `XDG_CONFIG_HOME` yields `Ok(degraded: false)` from `load_config`, which would otherwise read as "no detectors declared". `--fix`'s three hook-regeneration failure messages are gated as well: that path is reachable from a declared-detector session *because* the enforcement guard reads the built-in list, so such a session is refused disclosure and permitted enforcement.
+
+  Correction to #527's note in `SECURITY.md`: it listed `explain` among the sites calling `is_ai_environment()`. `cli/explain.rs` makes no SEC-R5 decision at all — no such call, no detector evaluation, and its "not via AI" line is fixed text on the blocked branch. `setup` does remain, structurally: it decides before the point documented as failing ahead of any file I/O.
+
 ### Changed
 - **The `SystemTime` → UTC calendar-day conversion lives in one place.** ([#308](https://github.com/yottayoshida/omamori/issues/308))
 

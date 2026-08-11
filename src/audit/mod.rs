@@ -21,8 +21,8 @@ pub use provenance::hash_cwd_candidates;
 pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, UnprotectedReason, rotate_key};
 pub use verify::{
-    AuditSummary, HwmWrite, KeyStoreFailure, KeyUnavailableKind, ShowOptions, VerifyResult,
-    audit_summary, count_unknown_tool_fail_opens_within, show_entries, verify_chain,
+    AppendOutlook, AuditSummary, HwmWrite, KeyStoreFailure, KeyUnavailableKind, ShowOptions,
+    VerifyResult, audit_summary, count_unknown_tool_fail_opens_within, show_entries, verify_chain,
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---

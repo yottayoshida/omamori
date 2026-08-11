@@ -125,20 +125,6 @@ pub fn repair_gate(detectors: &[DetectorConfig], env_pairs: &[(String, String)])
     }
 }
 
-/// [`repair_gate`] against the current process environment.
-///
-/// Private on purpose. Returning the whole gate to a caller means the caller can
-/// take `allow_repair` and drop `warnings`, which review found at three call
-/// sites before this was closed — and a rule that has to be remembered at every
-/// new call site is the kind of rule that gets forgotten. Callers go through
-/// [`repair_gate_reporting`], which cannot be used wrongly in that way.
-/// [`repair_gate`] itself stays public and parameterised so tests can decide a
-/// verdict without touching the real environment.
-fn repair_gate_from_env(detectors: &[DetectorConfig]) -> RepairGate {
-    let env_pairs: Vec<(String, String)> = std::env::vars().collect();
-    repair_gate(detectors, &env_pairs)
-}
-
 /// [`repair_gate_from_env`], reduced to the verdict, with the warnings printed.
 ///
 /// For call sites whose own job is something else — appending an event, logging
@@ -148,7 +134,24 @@ fn repair_gate_from_env(detectors: &[DetectorConfig]) -> RepairGate {
 /// quiet with nothing on screen to act on. Returning `bool` makes that the
 /// convenient path rather than the one a caller has to remember.
 pub fn repair_gate_reporting(detectors: &[DetectorConfig]) -> bool {
-    let gate = repair_gate_from_env(detectors);
+    let env_pairs: Vec<(String, String)> = std::env::vars().collect();
+    repair_gate_reporting_with(detectors, &env_pairs)
+}
+
+/// [`repair_gate_reporting`] against an explicit environment.
+///
+/// For call sites that need the same verdict-and-warnings behaviour but must be
+/// testable without `std::env::set_var` — `cli::doctor` is one, since its
+/// verdict has branches (unreadable config, degraded config) that have to be
+/// checked against a known environment.
+///
+/// Kept here rather than reimplemented at the call site: the warning loop is
+/// one line, and one line duplicated is how the two spellings drift.
+pub fn repair_gate_reporting_with(
+    detectors: &[DetectorConfig],
+    env_pairs: &[(String, String)],
+) -> bool {
+    let gate = repair_gate(detectors, env_pairs);
     for warning in &gate.warnings {
         eprintln!("omamori warning: {warning}");
     }
@@ -161,17 +164,20 @@ mod tests {
 
     /// #527 review (P1): no call site may take the verdict and drop the reasons.
     ///
-    /// Review found three files doing `repair_gate_from_env(..).allow_repair`,
+    /// Review found three files taking `.allow_repair` off a whole [`RepairGate`],
     /// which throws away the warning explaining why an unevaluable detector
-    /// withheld every repair — the exact failure `RepairGate::warnings`
-    /// documents. `repair_gate_reporting` is the fix; this keeps the shape from
+    /// withheld every repair — the exact failure [`RepairGate::warnings`]
+    /// documents. The reporting forms are the fix; this keeps the shape from
     /// coming back.
     ///
     /// Source-level on purpose. The defect is the *absence* of a print at a call
     /// site, and no runtime assertion can observe code that was never written.
     ///
-    /// Privacy already makes the shape unreachable from outside this module —
-    /// this is the second lock, and the one that says why in a failure message.
+    /// Phrased against `.allow_repair` rather than against a helper's name:
+    /// `#519` removed `repair_gate_from_env` (the name the first version of this
+    /// test searched for) once nothing called it, and a test that names a
+    /// deleted function passes because the string is gone — the "no call sites"
+    /// failure this test's own control was written to catch.
     #[test]
     fn no_call_site_takes_the_verdict_without_the_warnings() {
         for (name, src) in [
@@ -183,20 +189,24 @@ mod tests {
             ("engine/hook.rs", include_str!("engine/hook.rs")),
             ("engine/shim.rs", include_str!("engine/shim.rs")),
             ("cli/audit_cmd.rs", include_str!("cli/audit_cmd.rs")),
+            ("cli/doctor.rs", include_str!("cli/doctor.rs")),
         ] {
             assert!(
-                !src.contains("repair_gate_from_env"),
-                "{name} calls repair_gate_from_env directly. Use repair_gate_reporting, or the \
-                 reason a repair was withheld never reaches the operator (#527 review P1)."
+                !src.contains(".allow_repair"),
+                "{name} reads .allow_repair off a RepairGate directly. Use a reporting \
+                 form, or the reason a repair was withheld never reaches the operator \
+                 (#527 review P1)."
             );
         }
 
         // Control: the replacement is genuinely in use. Without this the loop
-        // above would also pass on a tree where neither name appears at all —
-        // "no bad call sites" and "no call sites" are the same string search.
+        // above would also pass on a tree where the gate is not consulted at all
+        // — "no bad call sites" and "no call sites" are the same string search.
         assert!(
-            include_str!("cli/audit_cmd.rs").contains("repair_gate_reporting"),
-            "audit_cmd should be reaching the gate through the reporting form"
+            include_str!("cli/audit_cmd.rs").contains("repair_gate_reporting")
+                && include_str!("cli/doctor.rs").contains("repair_gate_reporting_with"),
+            "both reporting forms should be in use; if a caller was removed on \
+             purpose, this control is stale"
         );
     }
 
