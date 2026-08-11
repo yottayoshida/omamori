@@ -577,7 +577,8 @@ mod tests {
             retention_days: 0,
             strict: false,
         };
-        AuditLogger::from_config(&config).expect("logger constructs in a writable temp dir");
+        AuditLogger::from_config_for_test(&config)
+            .expect("logger constructs in a writable temp dir");
 
         // Control: readable, so there are candidates and nothing to report.
         assert!(
@@ -613,7 +614,7 @@ mod tests {
         };
         // Establish a real keyring on disk (contents don't matter here,
         // only that `load_keyring` finds at least one key).
-        let _logger = AuditLogger::from_config(&config).expect("logger constructs");
+        let _logger = AuditLogger::from_config_for_test(&config).expect("logger constructs");
 
         let nonexistent = dir.join("does-not-exist");
         let candidates = hash_cwd_candidates(&config, &nonexistent)
@@ -646,8 +647,8 @@ mod tests {
             strict: false,
         };
 
-        let logger_before =
-            AuditLogger::from_config(&config).expect("logger constructs in a writable temp dir");
+        let logger_before = AuditLogger::from_config_for_test(&config)
+            .expect("logger constructs in a writable temp dir");
         let original_secret = *logger_before
             .secret_ref()
             .expect("from_config must create a secret in a fresh dir");
@@ -702,8 +703,8 @@ mod tests {
             retention_days: 0,
             strict: false,
         };
-        let logger =
-            AuditLogger::from_config(&config).expect("logger constructs in a writable temp dir");
+        let logger = AuditLogger::from_config_for_test(&config)
+            .expect("logger constructs in a writable temp dir");
         let secret = *logger
             .secret_ref()
             .expect("from_config must create a secret in a fresh dir");

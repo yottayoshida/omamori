@@ -702,10 +702,13 @@ fn run_hook_check_command(
                 "omamori hook: break-glass bypass active for '{rule_name}' — allowing (expires {expires_at})"
             );
             // Audit the bypass — in strict mode, audit failure blocks the command
-            if let Some(logger) = crate::config::load_config(None)
-                .ok()
-                .and_then(|r| AuditLogger::from_config(&r.config.audit))
-            {
+            if let Some(logger) = crate::config::load_config(None).ok().and_then(|r| {
+                // #527: the verdict follows the configuration this load
+                // produced — building the logger can print a key-store
+                // warning, and that warning carries a repair.
+                let allow_repair = crate::detector::repair_gate_reporting(&r.config.detectors);
+                AuditLogger::from_config(&r.config.audit, allow_repair)
+            }) {
                 // Layer 2 provenance is out of scope for #420 — pass None
                 // deliberately (see create_bypass_event's doc comment).
                 let event = crate::cli::break_glass_cmd::create_bypass_event(
@@ -1018,15 +1021,18 @@ fn audit_log_unknown_tool_fail_open(
             return;
         }
     };
-    let logger = match crate::audit::AuditLogger::from_config(&load_result.config.audit) {
-        Some(l) => l,
-        None => {
-            // Audit disabled in config — that's a user choice, not an
-            // error, so stay quiet (the user opted out of the review
-            // surface entirely).
-            return;
-        }
-    };
+    // #527: verdict from this load's detector set, not the built-in list.
+    let allow_repair = crate::detector::repair_gate_reporting(&load_result.config.detectors);
+    let logger =
+        match crate::audit::AuditLogger::from_config(&load_result.config.audit, allow_repair) {
+            Some(l) => l,
+            None => {
+                // Audit disabled in config — that's a user choice, not an
+                // error, so stay quiet (the user opted out of the review
+                // surface entirely).
+                return;
+            }
+        };
 
     // Synthetic invocation: the "command" field of the audit event will
     // hold the tool_name; targets are the recognised top-level keys of
@@ -1328,7 +1334,9 @@ fn audit_log_materialize(
         "detection_layer value must come from VALID_DETECTION_LAYERS taxonomy: got {detection_layer:?}"
     );
 
-    let logger = match AuditLogger::from_config(&merged_config.audit) {
+    // #527: verdict from the merged configuration this path already built.
+    let allow_repair = crate::detector::repair_gate_reporting(&merged_config.detectors);
+    let logger = match AuditLogger::from_config(&merged_config.audit, allow_repair) {
         Some(l) => l,
         None => return, // audit disabled — staging file is the primary artifact
     };
@@ -1439,13 +1447,16 @@ fn audit_log_hook_block(
             return;
         }
     };
-    let logger = match crate::audit::AuditLogger::from_config(&load_result.config.audit) {
-        Some(l) => l,
-        None => {
-            // Audit disabled in config — user opted out, stay quiet.
-            return;
-        }
-    };
+    // #527: verdict from this load's detector set, not the built-in list.
+    let allow_repair = crate::detector::repair_gate_reporting(&load_result.config.detectors);
+    let logger =
+        match crate::audit::AuditLogger::from_config(&load_result.config.audit, allow_repair) {
+            Some(l) => l,
+            None => {
+                // Audit disabled in config — user opted out, stay quiet.
+                return;
+            }
+        };
 
     let invocation = CommandInvocation::new(command.to_string(), Vec::new());
     let detectors = vec![provider.to_string()];

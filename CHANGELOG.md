@@ -6,6 +6,28 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **SEC-R5's repair gate: the wrong question, five ungated print sites, and a substitute that led back to the answer.** ([#527](https://github.com/yottayoshida/omamori/issues/527), supersedes the scoping in [#519](https://github.com/yottayoshida/omamori/issues/519))
+
+  The rule is that a session an AI agent is reading gets the *condition* of a degraded key store but not the *repair* — the sentence naming a file and saying what to do to it. Three things were true of that rule and none of them alone would have looked serious.
+
+  The gate asked `is_ai_environment()`, which evaluates the **built-in** detector list, while the shim had already answered the same question from `config.toml` a few frames up and discarded it. Declaring any `[[detectors]]` replaces the built-in list outright, so the two disagreed in both directions; the direction that mattered printed the repair into exactly the session the gate exists to withhold it from.
+
+  Counting **print sites** rather than producers turned three into six. `audit verify` reaches the sentence through `Ok(result).key_store_failure.remedy` as well as through `Err(KeyringUnusable)` — two sites, neither gated. `audit key rotate` is a third. The sixth is not a `remedy` at all: the shim's strict-mode block printed "re-create the secret or set `audit.strict = false`", one of whose two suggestions is to switch off the enforcement that had just blocked the command, handed to the reader most motivated to act on it.
+
+  And the substitute named `omamori doctor`, which does not print this remedy — it prints `KeyringAnomaly::describe` and then says "run omamori audit verify", which printed the withheld sentence with no gate at all. Following the route the gate offered reached the withheld text in two hops.
+
+  The verdict now travels from the caller that loaded the configuration, the way `KeyWarnPolicy` already carried the throttle decision — `secret.rs` had written down why that direction is right for the throttle, and the same argument applies one level over. All six sites ask it, and the gate is placed on the `remedy` **field** rather than on each sentence, so the four texts `rotate_key_locked` and `KeyringAnomaly::remedy` produce between them are covered by one decision.
+
+  The substitutes differ by who is speaking, which is the point of them. The shim's two — the key-store warning and the strict-mode block — name `omamori audit verify`, because that is the command where the sentence is actually printed. `audit verify` and `key rotate`, which print it themselves, say to rerun **this** command in a terminal; naming a different command is what produced the two-hop route in the first place.
+
+  Three tests pin it, each driving all three message-producing functions from one verdict. The discriminating one is the case where the repair **is** printed: without it, "withhold everywhere, always" scores full marks. Verified by mutation — breaking the gate in `repair_gate`, in `remedy_line` and in `strict_mode_fix_line` each fails the withhold test while leaving the print test passing.
+
+  **Not closed here** (see `SECURITY.md`): `doctor`, `explain` and `setup` still ask the built-in list (`#519` stays open); `guard_ai_config_modification` keeps the built-in list on purpose, so a session that added a detector has its repairs withheld while still being able to run `audit key rotate`; and the `pub` values `KeyStoreFailure.remedy` / `AuditError::KeyringUnusable` still carry the text to a Rust caller — SEC-R5 is a rule about what this CLI prints.
+
+### Changed
+- **Library API (not covered by the [breaking-change policy](docs/CONTRACT.md#breaking-change-policy), which names the Rust API as outside it):** `AuditLogger::from_config` takes a second parameter, `allow_repair: bool` — this invocation's SEC-R5 verdict, as produced by the new `detector::repair_gate`. Building a logger can print a key-store warning that carries a repair, and the constructor cannot see which configuration the caller loaded. `from_config_throttled` (crate-internal) changes the same way. `detector::RepairGate`, `detector::repair_gate` and `detector::repair_gate_from_env` are new; `repair_gate` takes the environment as a parameter so a caller — or a test — is never answered from a different environment than the one it is reasoning about.
+
 ## [1.0.1] - 2026-08-09
 
 ### Changed

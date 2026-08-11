@@ -370,20 +370,46 @@ all recorded rather than fixed:
   extended to them**: read against the code, none of the four carries a repair — they state a
   condition and a consequence — so there was nothing for it to withhold, and adding it would
   have pressed toward removing the condition itself, which the rule above forbids.
-- **The disclosure gate consults the built-in detector list, not the operator's**
-  ([#519](https://github.com/yottayoshida/omamori/issues/519)). A detector added in
-  `config.toml` for a tool omamori does not ship with puts the shim on its protected path
-  while the gate answers "not an AI session", and the repair is printed into exactly the
-  session it exists to withhold from. Pre-existing at every SEC-R5 call site.
+- ~~**The disclosure gate consults the built-in detector list, not the operator's**~~
+  ([#527](https://github.com/yottayoshida/omamori/issues/527)) — **closed for the key-store
+  repair.** The verdict now travels from the caller that loaded the configuration, the way
+  `KeyWarnPolicy` already carried the throttle decision (ADR-0009). Counting **print sites**
+  rather than producers turned three into six: `audit verify` reaches the sentence through
+  `Ok(result).key_store_failure.remedy` as well as through `Err(KeyringUnusable)`, and the
+  shim's strict-mode block carried a repair of its own — one of whose two suggestions was to
+  switch off the enforcement that had just blocked the command. The shim's substitutes now name
+  `omamori audit verify`, which is where the sentence is actually printed; they used to name
+  `doctor`, which does not print it and forwards to `audit verify`, so following the route
+  reached the withheld text in two hops. `audit verify` and `key rotate` print it themselves, so
+  when they withhold they point at rerunning **that** command in a terminal — naming a different
+  command is what built the two-hop route.
 
-  **Measured while scoping the fix, and wider than the issue states.** The sentence the gate
-  withholds — `epoch_record_remedy()` — has three producers, and the other two travel on
-  `AuditError::KeyringUnusable`'s `remedy`, which `audit verify` prints with no gate at all.
-  So an agent that meets the withheld warning can read the same sentence by running one
-  adjacent command. The substitute the gate offers ("run `omamori doctor` directly in your
-  terminal") points at a command that does not print it. Both halves need settling together
-  with the detector-list question; tracked as one piece in
-  [#527](https://github.com/yottayoshida/omamori/issues/527).
+  **Not closed by the same change**, and each recorded rather than assumed away:
+
+  - **Other SEC-R5 sites still ask the built-in list** — `doctor`, `explain` and `setup` call
+    `is_ai_environment()` directly ([#519](https://github.com/yottayoshida/omamori/issues/519),
+    which stays open for exactly this). `setup` is structural rather than pending: it decides
+    before the point documented as failing ahead of any file I/O, so `load_config` cannot go
+    there.
+  - **Enforcement keeps its own answer.** `guard_ai_config_modification` reads the built-in
+    list on purpose — an agent that can narrow the operator's list must not thereby unlock the
+    guard against narrowing it. The consequence is visible: a session that added a detector has
+    its repairs withheld while still being able to run `omamori audit key rotate`, because the
+    guard does not see the added detector.
+  - **The gate is on omamori's own output, not on the values.** `KeyStoreFailure.remedy` and
+    `AuditError::KeyringUnusable` are `pub`, so a Rust caller embedding omamori still receives
+    the text. SEC-R5 is a rule about what this CLI prints.
+  - **`config.toml` is now a disclosure-control surface.** It is covered by
+    `PROTECTED_FILE_PATTERNS` and by the guard above, but neither stops a direct write by the
+    same OS user — the trust level this document already records. The decision rests on the
+    operator's declaration being authoritative, not on the file being tamper-proof.
+
+  **Deliberately outside SEC-R5**, both found by re-scanning the print sites after the fix and
+  recorded so the next reading of this rule does not have to re-derive them: `audit verify`'s
+  "look for `<file>`, in the directory holding `audit.jsonl`, and re-run" names a file but asks
+  the reader to *look*, not to change or delete anything; and `audit key rotate`'s "set
+  `audit.path` explicitly in `config.toml`, or fix `HOME`" describes an environment that cannot
+  resolve a path at all, not a degraded key store, and setting a path weakens no protection.
 - **The throttle sentinel is outside `PROTECTED_FILE_PATTERNS`**
   ([#520](https://github.com/yottayoshida/omamori/issues/520)). `~/.omamori` is covered only
   as two named files, so a guarded agent can create or refresh the sentinel — its name is a

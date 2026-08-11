@@ -117,10 +117,14 @@ fn run_activate(
     match break_glass::activate(rule_id, duration_secs, reason) {
         Ok((entry, expired)) => {
             // Audit-log activation
-            if let Some(logger) = config::load_config(None)
-                .ok()
-                .and_then(|r| AuditLogger::from_config(&r.config.audit))
-            {
+            if let Some(logger) = config::load_config(None).ok().and_then(|r| {
+                // #527: the verdict comes from the detector set this load
+                // produced, not from the built-in list. Building the logger
+                // can print a key-store warning, and that warning carries a
+                // repair.
+                let allow_repair = crate::detector::repair_gate_reporting(&r.config.detectors);
+                AuditLogger::from_config(&r.config.audit, allow_repair)
+            }) {
                 let event = create_activation_event(rule_id, &entry.expires_at);
                 if let Err(e) = logger.append(event) {
                     eprintln!("omamori warning: failed to audit-log activation: {e}");
@@ -257,10 +261,14 @@ fn run_clear(rule_id: Option<&str>) -> Result<i32, AppError> {
     match rule_id {
         Some(id) => {
             let (removed, expired) = break_glass::clear_rule(id)?;
-            if let Some(logger) = config::load_config(None)
-                .ok()
-                .and_then(|r| AuditLogger::from_config(&r.config.audit))
-            {
+            if let Some(logger) = config::load_config(None).ok().and_then(|r| {
+                // #527: the verdict comes from the detector set this load
+                // produced, not from the built-in list. Building the logger
+                // can print a key-store warning, and that warning carries a
+                // repair.
+                let allow_repair = crate::detector::repair_gate_reporting(&r.config.detectors);
+                AuditLogger::from_config(&r.config.audit, allow_repair)
+            }) {
                 if removed {
                     let event = create_deactivation_event(id);
                     if let Err(e) = logger.append(event) {
@@ -314,10 +322,12 @@ fn run_status() -> Result<i32, AppError> {
 /// Records a denied non-interactive activation attempt so the refusal is a
 /// forensically observable event rather than a silent stderr-only message.
 fn log_denied_activation(rule_id: &str) {
-    if let Some(logger) = config::load_config(None)
-        .ok()
-        .and_then(|r| AuditLogger::from_config(&r.config.audit))
-    {
+    if let Some(logger) = config::load_config(None).ok().and_then(|r| {
+        // #527: see the sibling call sites — the verdict follows the
+        // configuration this load produced.
+        let allow_repair = crate::detector::repair_gate_reporting(&r.config.detectors);
+        AuditLogger::from_config(&r.config.audit, allow_repair)
+    }) {
         let event = create_denied_activation_event(rule_id);
         if let Err(e) = logger.append(event) {
             eprintln!("omamori warning: failed to audit-log denied activation: {e}");
@@ -765,7 +775,7 @@ mod tests {
         // Seed a real key so the store is healthy first — that establishes the
         // control: the reassuring sentence is reachable here, so the assertion
         // below is about the permission change and nothing else.
-        let logger = crate::audit::AuditLogger::from_config(&audit_config).unwrap();
+        let logger = crate::audit::AuditLogger::from_config_for_test(&audit_config).unwrap();
         logger
             .append(create_activation_event(
                 "rm-recursive-to-trash",
@@ -1148,8 +1158,8 @@ mod tests {
             retention_days: 0,
             strict: false,
         };
-        let logger =
-            crate::audit::AuditLogger::from_config(&audit_config).expect("should create logger");
+        let logger = crate::audit::AuditLogger::from_config_for_test(&audit_config)
+            .expect("should create logger");
 
         let expired = vec![
             entry("rm-recursive-to-trash", "2020-01-01T01:00:00Z"),

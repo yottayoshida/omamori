@@ -175,10 +175,53 @@ fn print_halted_hwm_notes(result: &audit::VerifyResult) {
     }
 }
 
+/// Print a key-store remedy, or SEC-R5's substitute when disclosure is withheld.
+///
+/// #527: `remedy` reaches four print sites in this file and none of them was
+/// gated, while the one warning that *is* gated (`secret::keystore_warning`)
+/// pointed the reader here. The gate is placed on the field rather than on each
+/// sentence: `KeyringAnomaly::remedy` and `rotate_key_locked` between them
+/// produce four different texts, and a per-sentence gate would have to grow an
+/// arm for each one.
+///
+/// The substitute names *this* command rather than another. A human running the
+/// same line gets the sentence; an agent gets a route that does not end in the
+/// recipe. Pointing somewhere else is what produced the two-hop path this issue
+/// exists to close.
+/// The text of that line, or `None` when there is nothing to say.
+///
+/// Split from the printing for the reason `secret::keystore_warning` is: a
+/// function that returns the sentence can be checked from both sides of the
+/// gate, and a function that prints it cannot. The defect this issue closes
+/// survived because the only tests that existed took the gate's `bool` as an
+/// input instead of deciding it.
+pub(crate) fn remedy_line(remedy: &str, allow_repair: bool) -> Option<String> {
+    if remedy.is_empty() {
+        return None;
+    }
+    Some(if allow_repair {
+        format!("  {remedy}")
+    } else {
+        "  To see how to clear it, run this command directly in your terminal (not via AI)."
+            .to_string()
+    })
+}
+
+fn print_remedy(remedy: &str, allow_repair: bool) {
+    if let Some(line) = remedy_line(remedy, allow_repair) {
+        eprintln!("{line}");
+    }
+}
+
 fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
     let config_path = parse_config_flag(&args[3..])?;
     let load_result = load_config(config_path.as_deref())?;
     emit_config_warnings(&load_result);
+
+    // #527: one verdict for the whole command, from the configuration this
+    // invocation loaded — including a `--config` path, which is why it is not
+    // resolved at the print sites.
+    let allow_repair = crate::detector::repair_gate_reporting(&load_result.config.detectors);
 
     match audit::verify_chain(&load_result.config.audit) {
         Ok(result) => {
@@ -241,9 +284,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     // unmentioned, so the operator needs both halves.
                     if let Some(failure) = &result.key_store_failure {
                         eprintln!("  Verification could not start: {}", failure.reason);
-                        if !failure.remedy.is_empty() {
-                            eprintln!("  {}", failure.remedy);
-                        }
+                        print_remedy(&failure.remedy, allow_repair);
                         eprintln!(
                             "  No entry was authenticated; {} lines were counted.",
                             result.unverified_entries_after
@@ -432,9 +473,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                     "omamori audit verify: cannot verify \u{2014} {}",
                     failure.reason
                 );
-                if !failure.remedy.is_empty() {
-                    eprintln!("  {}", failure.remedy);
-                }
+                print_remedy(&failure.remedy, allow_repair);
                 print_halted_hwm_notes(&result);
                 Ok(2)
             } else if result.never_protected_entries > 0 {
@@ -528,9 +567,7 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
             // perfectly readable to make it listable: the same mistake #477
             // withdrew a caller-side remedy for, one variant later.
             eprintln!("omamori audit verify: cannot verify \u{2014} {reason}");
-            if !remedy.is_empty() {
-                eprintln!("  {remedy}");
-            }
+            print_remedy(&remedy, allow_repair);
             Ok(2)
         }
         // #478: `verify_chain` does not produce this — only `rotate_key` does.
@@ -729,6 +766,14 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
             let load_result = load_config(None)?;
             emit_config_warnings(&load_result);
 
+            // #527: the guard above reads the built-in detector list, so a
+            // session that added its own detector reaches this line — which is
+            // exactly the session the remedies below must not be printed into.
+            // Closing that guard is `#519`'s wider question and is deliberately
+            // not done here (ADR-0009); withholding the recipe is.
+            let allow_repair =
+                crate::detector::repair_gate_reporting(&load_result.config.detectors);
+
             let Some(path) = audit::resolved_audit_path(&load_result.config.audit) else {
                 eprintln!("omamori: cannot resolve audit path — HOME is unset, empty, or relative");
                 eprintln!("  set audit.path explicitly in config.toml, or fix HOME, and retry");
@@ -777,6 +822,7 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
                     eprintln!("  Run `omamori audit verify` to confirm chain integrity.");
                     append_key_rotation_event(
                         &load_result.config.audit,
+                        allow_repair,
                         &result.retired_key_id,
                         &result.new_key_id,
                     );
@@ -810,9 +856,7 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
                 // refusal test allows exactly that one file.
                 Err(audit::AuditError::KeyringUnusable { reason, remedy }) => {
                     eprintln!("omamori: key rotation refused — {reason}");
-                    if !remedy.is_empty() {
-                        eprintln!("  {remedy}");
-                    }
+                    print_remedy(&remedy, allow_repair);
                     Ok(1)
                 }
                 // #478: the one rotation failure that leaves the store changed.
@@ -979,10 +1023,12 @@ fn build_key_rotation_event(retired_key_id: &str, new_key_id: &str) -> audit::Au
 /// where an operator would look for it.
 fn append_key_rotation_event(
     audit_config: &audit::AuditConfig,
+    // #527: see `config_cmd::append_config_mutation_event` — the same reason.
+    allow_repair: bool,
     retired_key_id: &str,
     new_key_id: &str,
 ) {
-    let Some(logger) = audit::AuditLogger::from_config(audit_config) else {
+    let Some(logger) = audit::AuditLogger::from_config(audit_config, allow_repair) else {
         eprintln!(
             "omamori warning: auditing is disabled, so this key rotation was not recorded \
              in the audit log. The rotation itself completed."
@@ -1345,7 +1391,8 @@ mod tests {
             // path, mirroring what a real `omamori` invocation would have
             // done before an investigator ever runs `hash-cwd`.
             let config = audit_config(None);
-            let _logger = audit::AuditLogger::from_config(&config).expect("logger constructs");
+            let _logger =
+                audit::AuditLogger::from_config_for_test(&config).expect("logger constructs");
 
             let args: Vec<OsString> = vec![
                 "omamori".into(),

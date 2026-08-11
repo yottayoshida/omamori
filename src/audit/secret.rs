@@ -538,8 +538,35 @@ pub(super) const WARN_KIND_SECRET_UNREADABLE: &str = "secret-unreadable";
 /// would let a background shim invocation silence the answer to a question a
 /// person just asked — and `audit_cmd`'s rotation failure explicitly points at
 /// "the condition reported above", which is this warning.
+///
+/// #527: the disclosure decision now travels the same way, and for the same
+/// reason one level over. It used to be taken at the print site by
+/// `may_print_repair()`, which re-evaluated `config::default_detectors()` — the
+/// **built-in** list — while the shim had already answered the question from
+/// the operator's own `config.toml` a few frames up and discarded it. Declaring
+/// any `[[detectors]]` replaces the built-in list outright (`config.rs`), so the
+/// two disagreed in both directions; the one that mattered printed the repair
+/// into exactly the session the gate exists to withhold it from. ADR-0009.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyWarnPolicy {
+pub(crate) struct KeyWarnPolicy {
+    throttle: Throttle,
+    /// Whether the sentence naming a file and an action may be printed (SEC-R5).
+    ///
+    /// Only ever the caller's verdict — there is no fallback to re-evaluating
+    /// the environment here. A call site that cannot decide has to say so at the
+    /// type level rather than inheriting an answer computed from a different
+    /// detector set, which is the failure this field exists to remove.
+    allow_repair: bool,
+}
+
+/// How often a given warning kind may reach stderr.
+///
+/// Private: callers state their case through [`KeyWarnPolicy::always`] or
+/// [`KeyWarnPolicy::throttled`], which forces them to answer the disclosure
+/// question in the same breath. Leaving this public would let a new call site
+/// pick a throttle without noticing the second axis exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Throttle {
     /// Say it every time. The default, and what every interactive command uses.
     Always,
     /// At most once per throttle window, per warning kind, per store. Used by
@@ -548,11 +575,34 @@ pub(crate) enum KeyWarnPolicy {
     Throttled,
 }
 
+impl KeyWarnPolicy {
+    /// Unthrottled, for callers that run because someone typed a command.
+    pub(crate) fn always(allow_repair: bool) -> Self {
+        Self {
+            throttle: Throttle::Always,
+            allow_repair,
+        }
+    }
+
+    /// Throttled, for callers that run on every guarded command.
+    pub(crate) fn throttled(allow_repair: bool) -> Self {
+        Self {
+            throttle: Throttle::Throttled,
+            allow_repair,
+        }
+    }
+
+    /// Whether literal repair instructions may be printed under this policy.
+    pub(super) fn allows_repair(&self) -> bool {
+        self.allow_repair
+    }
+}
+
 /// `load_signing_key_with(.., Always)`, kept for the tests that predate the
 /// policy parameter (#473). Every production caller now states its policy.
 #[cfg(test)]
 pub(super) fn load_signing_key(secret_path: &Path) -> SigningKey {
-    load_signing_key_with(secret_path, KeyWarnPolicy::Always)
+    load_signing_key_with(secret_path, KeyWarnPolicy::always(true))
 }
 
 /// Resolve the active signing key and its `key_id` together.
@@ -580,9 +630,9 @@ pub(super) fn may_warn_for_test(policy: KeyWarnPolicy, kind: &str, store: &Path)
 
 /// Whether a warning of `kind` about `store` may be printed under `policy`.
 fn may_warn(policy: KeyWarnPolicy, kind: &str, store: &Path) -> bool {
-    match policy {
-        KeyWarnPolicy::Always => true,
-        KeyWarnPolicy::Throttled => {
+    match policy.throttle {
+        Throttle::Always => true,
+        Throttle::Throttled => {
             let name = crate::warn_throttle::sentinel_name_for_store(kind, store);
             match crate::warn_throttle::sentinel_path(&name) {
                 Some(p) => crate::warn_throttle::should_emit_at(&p),
@@ -628,8 +678,16 @@ pub(super) fn keystore_warning(reason: &UnprotectedReason, with_repair: bool) ->
                 // degraded key store and no sanctioned next step is what makes
                 // it improvise one inside the audit directory, which is the
                 // outcome the gate exists to prevent.
-                " To see how to clear it, run 'omamori doctor' directly in your terminal \
-                 (not via AI)."
+                //
+                // #527: the route used to name `doctor`, and `doctor` does not
+                // print this remedy — it prints `KeyringAnomaly::describe`, and
+                // then says "run omamori audit verify". Following the route
+                // therefore took two hops and arrived at `audit verify`, which
+                // printed the withheld sentence with no gate at all. Naming
+                // `audit verify` directly makes the route one hop and lands it
+                // on a print site that now asks the same question this one did.
+                " To see how to clear it, run 'omamori audit verify' directly in your \
+                 terminal (not via AI)."
                     .to_string()
             }
         ),
@@ -649,17 +707,6 @@ pub(super) fn keystore_warning(reason: &UnprotectedReason, with_repair: bool) ->
              unverifiable."
         ),
     }
-}
-
-/// Whether literal repair instructions may be printed (SEC-R5).
-///
-/// The condition itself is always reported — suppressing the observation would
-/// hide a degraded store, which is the opposite of the point. What is withheld
-/// in an AI session is the part that names a key file and says what to do to
-/// it, which is a recipe handed to the reader most likely to act on it
-/// unsupervised.
-fn may_print_repair() -> bool {
-    !crate::cli::doctor::is_ai_environment()
 }
 
 /// Why an append made right now could not be HMAC-protected.
@@ -870,7 +917,7 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
             // the others for the window would be the sharing this change exists
             // to remove — between *kinds*, not within one.
             if may_warn(policy, WARN_KIND_KEYSTORE, secret_path) {
-                eprintln!("{}", keystore_warning(&reason, may_print_repair()));
+                eprintln!("{}", keystore_warning(&reason, policy.allows_repair()));
             }
             return SigningKey {
                 id: UNRESOLVED_KEY_ID.to_string(),
