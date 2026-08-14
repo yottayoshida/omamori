@@ -1627,15 +1627,17 @@ impl MatchKind {
         }
     }
 
-    fn matches(self, path: &std::path::Path, pattern: &str) -> bool {
+    fn matches(self, path: &crate::context::MatchPath<'_>, pattern: &str) -> bool {
         if self == MatchKind::Subpath {
-            return crate::context::path_matches_pattern(path, pattern);
+            // #374: reuses the components collected once at `MatchPath::new`
+            // instead of re-collecting per pattern.
+            return path.matches_pattern(pattern);
         }
         // Remaining kinds all key off the filename — extracted once
         // instead of duplicated per arm. `Subpath` is handled above; the
         // arm below returns `false` rather than `unreachable!()` since
         // this is a security-relevant match path (never panic here).
-        let Some(file_name) = path.file_name().and_then(|f| f.to_str()) else {
+        let Some(file_name) = path.path().file_name().and_then(|f| f.to_str()) else {
             return false;
         };
         match self {
@@ -1848,22 +1850,22 @@ fn is_protected_file_path(path: &str, base: Option<&Path>) -> Option<FileProtect
             .collect(),
     };
 
+    // #374: build each MatchPath once, ahead of the pattern loop, instead of
+    // re-collecting the same path's components inside every Subpath check.
+    // Lexical first — per pattern, the lexical path is checked before any
+    // candidate, preserving the pre-#374 verdict order.
+    let match_paths: Vec<crate::context::MatchPath> = std::iter::once(&lexical)
+        .chain(candidates.iter())
+        .map(|p| crate::context::MatchPath::new(p))
+        .collect();
+
     for &(pattern, kind, reason) in PROTECTED_FILE_PATTERNS {
-        if kind.matches(&lexical, pattern) {
+        if match_paths.iter().any(|mp| kind.matches(mp, pattern)) {
             return Some(FileProtectionVerdict::Matched {
                 pattern,
                 kind,
                 description: reason,
             });
-        }
-        for candidate in &candidates {
-            if kind.matches(candidate, pattern) {
-                return Some(FileProtectionVerdict::Matched {
-                    pattern,
-                    kind,
-                    description: reason,
-                });
-            }
         }
     }
     None
