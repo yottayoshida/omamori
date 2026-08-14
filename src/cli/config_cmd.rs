@@ -1477,12 +1477,39 @@ mod tests {
     }
 
     fn read_audit_lines(dir: &Path) -> Vec<String> {
-        std::fs::read_to_string(dir.join("audit.jsonl"))
-            .unwrap_or_default()
+        let path = dir.join("audit.jsonl");
+        // #344 diagnostics: a read failure must not masquerade as an empty
+        // log — 0 lines (the append never landed) and an unreadable file
+        // (fixture/path problem) point at opposite causes, and the old
+        // `unwrap_or_default()` collapsed both into `len() == 0`.
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read audit log {path:?}: {e}"));
+        content
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    /// #344 diagnostics: when the count assert fails, the panic message
+    /// itself must identify the foreign writer — each JSONL line carries
+    /// `command` / `action` / `provider` / `seq`, so dumping the lines and
+    /// the hwm sidecar turns the next rare CI reproduction into
+    /// attribution data instead of a bare `left: 2`. Reads and asserts in
+    /// one step so the lines shown can never come from a different dir
+    /// than the sidecar dumped next to them.
+    #[track_caller]
+    fn read_exactly_one_audit_line(audit_dir: &Path, operation: &str) -> String {
+        let mut lines = read_audit_lines(audit_dir);
+        let hwm_path = crate::audit::hwm_path_for(&audit_dir.join("audit.jsonl"));
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one event for one successful {operation} — #344 diagnostics: \
+             fixture dir {audit_dir:?}; hwm sidecar: {:?}; full audit lines: {lines:#?}",
+            std::fs::read_to_string(&hwm_path),
+        );
+        lines.pop().expect("length asserted above")
     }
 
     /// V-394-3: a successful config mutation actually reaches the real
@@ -1653,17 +1680,12 @@ mod tests {
             });
         });
 
-        let lines = read_audit_lines(audit_path.parent().unwrap());
-        assert_eq!(
-            lines.len(),
-            1,
-            "exactly one event for one successful disable"
-        );
-        assert!(lines[0].contains("\"action\":\"config-disable\""));
-        assert!(lines[0].contains("\"rule_id\":\"my-rule\""));
-        assert!(lines[0].contains("\"provider\":\"cli\""));
-        assert!(lines[0].contains("\"detection_layer\":\"config-mutation\""));
-        assert!(lines[0].contains("\"command\":\"config disable my-rule\""));
+        let line = read_exactly_one_audit_line(audit_path.parent().unwrap(), "disable");
+        assert!(line.contains("\"action\":\"config-disable\""));
+        assert!(line.contains("\"rule_id\":\"my-rule\""));
+        assert!(line.contains("\"provider\":\"cli\""));
+        assert!(line.contains("\"detection_layer\":\"config-mutation\""));
+        assert!(line.contains("\"command\":\"config disable my-rule\""));
 
         let audit_config = test_audit_config(audit_path.parent().unwrap());
         let verify = crate::audit::verify_chain(&audit_config);
@@ -1687,7 +1709,16 @@ mod tests {
                 run_config_disable("my-rule").expect("setup: disable must succeed");
             });
         });
-        std::fs::remove_file(&audit_path).ok(); // isolate the enable event only
+        // Isolate the enable event only. #344 diagnostics: a swallowed
+        // removal failure here leaves the setup disable event in place and
+        // produces exactly the historical `left: 2` — the old `.ok()` made
+        // that mechanism indistinguishable from a foreign concurrent writer.
+        // NotFound is loud too: the setup disable succeeded, so a missing
+        // file here means its best-effort append never landed — the 0-line
+        // flake mechanism, which `.ok()` would have let pass green.
+        std::fs::remove_file(&audit_path).unwrap_or_else(|e| {
+            panic!("could not remove the setup disable event at {audit_path:?}: {e}")
+        });
 
         crate::test_support::with_home_and_xdg(Some(dir.to_str().unwrap()), || {
             crate::test_support::with_clean_ai_env(|| {
@@ -1696,21 +1727,15 @@ mod tests {
             });
         });
 
-        let lines = read_audit_lines(audit_path.parent().unwrap());
-        assert_eq!(
-            lines.len(),
-            1,
-            "exactly one event for one successful enable"
-        );
-        assert!(lines[0].contains("\"action\":\"config-enable\""));
-        assert!(lines[0].contains("\"rule_id\":\"my-rule\""));
-        assert!(lines[0].contains("\"provider\":\"cli\""));
-        assert!(lines[0].contains("\"detection_layer\":\"config-mutation\""));
+        let line = read_exactly_one_audit_line(audit_path.parent().unwrap(), "enable");
+        assert!(line.contains("\"action\":\"config-enable\""));
+        assert!(line.contains("\"rule_id\":\"my-rule\""));
+        assert!(line.contains("\"provider\":\"cli\""));
+        assert!(line.contains("\"detection_layer\":\"config-mutation\""));
         assert!(
-            lines[0].contains("\"command\":\"config enable my-rule\""),
+            line.contains("\"command\":\"config enable my-rule\""),
             "Codex R2: command field must say enable, not (e.g.) a stale/wrong \
-             copy-pasted disable string: {}",
-            lines[0]
+             copy-pasted disable string: {line}"
         );
 
         let audit_config = test_audit_config(audit_path.parent().unwrap());
@@ -1769,18 +1794,16 @@ mod tests {
             });
         });
 
-        let lines = read_audit_lines(&audit_dir);
-        assert_eq!(lines.len(), 1, "exactly one event for one successful add");
-        assert!(lines[0].contains("\"action\":\"config-add\""));
-        assert!(lines[0].contains("\"rule_id\":\"my-new-rule\""));
-        assert!(lines[0].contains("\"command\":\"config add my-new-rule\""));
+        let line = read_exactly_one_audit_line(&audit_dir, "add");
+        assert!(line.contains("\"action\":\"config-add\""));
+        assert!(line.contains("\"rule_id\":\"my-new-rule\""));
+        assert!(line.contains("\"command\":\"config add my-new-rule\""));
         assert!(
-            !lines[0].contains("curl")
-                && !lines[0].contains("--insecure")
-                && !lines[0].contains("secret internal note"),
+            !line.contains("curl")
+                && !line.contains("--insecure")
+                && !line.contains("secret internal note"),
             "the rule's command/match tokens/message must never appear in the audit \
-             event, only its name: {}",
-            lines[0]
+             event, only its name: {line}"
         );
 
         let audit_config = test_audit_config(&audit_dir);

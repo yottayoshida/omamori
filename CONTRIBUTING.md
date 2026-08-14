@@ -88,6 +88,38 @@ tags (`@v4`, `@main`) are rejected by the `action-pin-check` CI job.
 
 ---
 
+## Issue labels (#358)
+
+Every open issue carries **exactly one priority label** (`tier-1` / `tier-2` /
+`tier-3`) and **at least one type label**. This is an operating convention kept
+by whoever triages, not something machinery enforces — the issue forms do not
+auto-apply these labels, so a freshly filed issue may violate it until the next
+triage pass.
+
+Priority (`tier-N` — **not** the product-support "Tier 1 / Tier 2" defined in
+[docs/CONTRACT.md](docs/CONTRACT.md); that tiering classifies *tool support
+commitments*, this one ranks *issue urgency*, and the two share nothing but the
+word):
+
+| Label | Meaning |
+|-------|---------|
+| `tier-1` | High priority: verified defect or v1.0-contract critical |
+| `tier-2` | Next phase: thesis-aligned hardening/UX |
+| `tier-3` | Low-risk maintenance, documentation, and backlog hygiene |
+
+Type (one or more of): `bug`, `security`, `enhancement`, `documentation`,
+`maintenance`. The boundary that has needed spelling out: **`bug` means
+something misbehaves today** — in the shipped product *or* in the repo's own
+signal (a flaky test suite and a canary that false-fails are both `bug`);
+**`maintenance` means nothing misbehaves but hygiene work is due** (a test that
+proves less than it claims, a gitignored script, an opportunistic refactor).
+`tier-3` + `maintenance` together mark low-risk backlog hygiene specifically.
+
+Other labels (`epic`, `trust`, `false-positive`, `author-input-required`,
+`dev:*`) are workflow or theme markers, orthogonal to the two axes above.
+
+---
+
 ## Before opening a PR
 
 Run the local gate once. It is a thin wrapper around the CI jobs, with

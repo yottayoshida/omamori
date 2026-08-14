@@ -6,6 +6,20 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Changed
+- **`is_protected_file_path` collects a path's components once per candidate, not once per Subpath pattern.** ([#374](https://github.com/yottayoshida/omamori/issues/374))
+
+  `path_matches_pattern` re-ran `components().collect()` on the same path for every `Subpath` entry in `PROTECTED_FILE_PATTERNS` — with the lexical path plus up to one canonicalized candidate against 5 patterns, roughly 10 small `Vec` allocations per call. A `MatchPath` view now owns the collect: its constructor is the only place components are gathered, so the slice can never describe a different path than the one it was built from, and the pattern loop reuses it. Rule-matching is a frozen 1.0 surface, so the refactor ships with a differential oracle — a verbatim copy of the pre-refactor algorithm pinned as the spec, asserted equal across a boundary corpus (absolute/relative, root, empty, dot segments, every Subpath entry's shape) — and the public `path_matches_pattern` signature is unchanged.
+
+- **The audit-count test flake (#344) will name its own mechanism on its next reproduction.** ([#344](https://github.com/yottayoshida/omamori/issues/344))
+
+  Not a fix claim — the flake reproduces too rarely to assert absence. What changed: the config-mutation e2e tests' count assertion now dumps every audit line (each carries `command`, `action`, `provider`, `seq`), the hwm sidecar content and the fixture path into the panic message; `read_audit_lines` no longer collapses a read failure into "0 lines" (opposite causes looked identical); and the enable test's setup-event removal no longer swallows errors — a swallowed removal leaves the setup `config-disable` line in place and produces exactly the historical `left: 2`, previously indistinguishable from a foreign concurrent writer.
+
+### Added
+- **CONTRIBUTING.md documents the issue-label taxonomy.** ([#358](https://github.com/yottayoshida/omamori/issues/358))
+
+  Exactly one `tier-N` priority label plus at least one type label per open issue, the `bug`-vs-`maintenance` boundary ("misbehaves today" vs "hygiene due"), and the explicit disclaimer that issue-priority `tier-N` shares nothing but a word with `docs/CONTRACT.md`'s product-support Tier 1/2. The convention is kept by triage, not enforced by machinery.
+
 ## [1.0.3] - 2026-08-11
 
 ### Fixed

@@ -236,21 +236,50 @@ pub(crate) fn data_dir() -> Option<PathBuf> {
 // Component boundary matching
 // ---------------------------------------------------------------------------
 
+/// A path bundled with its pre-collected components, for callers that match
+/// several patterns against the same path (#374). [`MatchPath::new`] is the
+/// only place the collect happens, so the component slice can never describe
+/// a different path than `path` itself — passing path and components as two
+/// separate arguments would let them drift apart in a security-load-bearing
+/// matcher.
+pub(crate) struct MatchPath<'a> {
+    path: &'a Path,
+    components: Vec<Component<'a>>,
+}
+
+impl<'a> MatchPath<'a> {
+    pub(crate) fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            components: path.components().collect(),
+        }
+    }
+
+    pub(crate) fn path(&self) -> &'a Path {
+        self.path
+    }
+
+    /// Component-boundary window match against `pattern` — the semantics of
+    /// [`path_matches_pattern`], reusing the components collected at
+    /// construction instead of re-collecting per pattern.
+    pub(crate) fn matches_pattern(&self, pattern: &str) -> bool {
+        let pattern_components: Vec<Component> = Path::new(pattern).components().collect();
+
+        if pattern_components.is_empty() {
+            return false;
+        }
+
+        self.components
+            .windows(pattern_components.len())
+            .any(|window| window == pattern_components.as_slice())
+    }
+}
+
 /// Check if `normalized` path contains `pattern` as a contiguous subsequence
 /// of path components. This ensures "target" matches "/foo/target/bar" but
 /// NOT "/foo/target_dir/bar".
 pub fn path_matches_pattern(normalized: &Path, pattern: &str) -> bool {
-    let pattern_path = Path::new(pattern);
-    let pattern_components: Vec<Component> = pattern_path.components().collect();
-    let path_components: Vec<Component> = normalized.components().collect();
-
-    if pattern_components.is_empty() {
-        return false;
-    }
-
-    path_components
-        .windows(pattern_components.len())
-        .any(|window| window == pattern_components.as_slice())
+    MatchPath::new(normalized).matches_pattern(pattern)
 }
 
 /// The reason [`evaluate_context`] gives when it refuses to decide Priority 1
@@ -311,8 +340,11 @@ fn pattern_needs_base(pattern: &str) -> bool {
 
 /// Check if a path matches any pattern in a list.
 fn matches_any_pattern(path: &Path, patterns: &[String]) -> Option<String> {
+    // #374: same one-path × many-patterns shape as PROTECTED_FILE_PATTERNS —
+    // collect the path's components once, not once per pattern.
+    let match_path = MatchPath::new(path);
     for pattern in patterns {
-        if path_matches_pattern(path, pattern) {
+        if match_path.matches_pattern(pattern) {
             return Some(pattern.clone());
         }
     }
@@ -906,6 +938,87 @@ mod tests {
 
         let path_slash = base.join("target/");
         assert!(path_matches_pattern(&path_slash, "target"));
+    }
+
+    /// #374 differential oracle: verbatim copy of the pre-#374
+    /// `path_matches_pattern` body (collect-per-call). Rule-matching is a
+    /// frozen 1.0 surface, so the refactor must not change a single verdict —
+    /// this pins the old algorithm as the spec rather than trusting that the
+    /// hoisted-collect version "obviously" agrees.
+    fn reference_path_matches_pattern(normalized: &Path, pattern: &str) -> bool {
+        let pattern_path = Path::new(pattern);
+        let pattern_components: Vec<Component> = pattern_path.components().collect();
+        let path_components: Vec<Component> = normalized.components().collect();
+
+        if pattern_components.is_empty() {
+            return false;
+        }
+
+        path_components
+            .windows(pattern_components.len())
+            .any(|window| window == pattern_components.as_slice())
+    }
+
+    #[test]
+    fn refactored_matcher_agrees_with_pre_374_reference_on_boundary_corpus() {
+        // Paths cover: absolute/relative, root alone, empty, un-normalized
+        // dot segments, trailing slash, names that embed a pattern as a
+        // substring but not a component, and every PROTECTED_FILE_PATTERNS
+        // Subpath entry's home shape.
+        let paths = [
+            "/",
+            "",
+            ".",
+            "..",
+            "/home/user/.config/omamori/config.toml",
+            "/home/user/omamori/config.toml.bak",
+            "/home/user/.local/share/omamori/audit.jsonl",
+            "/home/user/.local/share/omamori-extra/audit.jsonl",
+            "/home/user/.codex/hooks.json",
+            "/home/user/.codex/config.toml",
+            "/home/user/.claude/settings.json",
+            "/home/user/project/.claude/settings.json/nested",
+            "relative/omamori/config.toml",
+            "omamori/config.toml",
+            "./omamori/../omamori/config.toml",
+            "/tmp/proj/secret",
+            "/foo/target/bar",
+            "/foo/target_dir/bar",
+            "target",
+        ];
+        let edge_patterns = [
+            "",
+            "/",
+            ".",
+            "..",
+            "config.toml",
+            "target",
+            "target/",
+            "/tmp/proj/secret",
+            "./omamori",
+        ];
+        // The Subpath entries come from the constant itself, not hand copies —
+        // a Subpath pattern added to PROTECTED_FILE_PATTERNS later is covered
+        // here without anyone remembering this test exists.
+        let subpath_patterns: Vec<&str> = crate::engine::hook::PROTECTED_FILE_PATTERNS
+            .iter()
+            .filter(|(_, kind, _)| *kind == crate::engine::hook::MatchKind::Subpath)
+            .map(|(pattern, _, _)| *pattern)
+            .collect();
+        assert!(
+            !subpath_patterns.is_empty(),
+            "the Subpath filter found nothing — the oracle corpus silently shrank"
+        );
+        for path in paths {
+            for pattern in edge_patterns.iter().chain(subpath_patterns.iter()) {
+                let p = Path::new(path);
+                assert_eq!(
+                    path_matches_pattern(p, pattern),
+                    reference_path_matches_pattern(p, pattern),
+                    "verdict diverged from pre-#374 reference for path={path:?} pattern={pattern:?}"
+                );
+            }
+        }
     }
 
     // --- NEVER_REGENERABLE ---
