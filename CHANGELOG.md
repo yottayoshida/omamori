@@ -6,6 +6,8 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-08-14
+
 ### Changed
 - **`is_protected_file_path` collects a path's components once per candidate, not once per Subpath pattern.** ([#374](https://github.com/yottayoshida/omamori/issues/374))
 
