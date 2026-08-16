@@ -6,6 +6,8 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-08-16
+
 ### Fixed
 - **A prune no longer removes the evidence that something was unverifiable.** ([#461](https://github.com/yottayoshida/omamori/issues/461))
 
@@ -16,6 +18,9 @@ The format is based on Keep a Changelog.
   **The counts are not the verdict `verify_chain` reaches, and are deliberately not a re-derivation of its walk.** `legacy_splice` and `broken` are 0 or 1 because the verifier fails closed on either and stops; an entry whose HMAC merely fails to match is not counted at all; a break between the range's first line and whatever preceded it is outside the scan. `SECURITY.md` states what is and is not counted, because a `0` here does not mean a clean range in every sense. Reported by `audit verify` — above the verdict branches, so a halt cannot swallow it — and by `doctor`. `chain_status`, the exit codes, and `report --json`'s eight fields (SEC-R2) are unchanged: the links that remain really are intact, and this is a statement about entries that are gone.
 
   Auto-prune is off by default (`retention_days = 0`), so this path does not run in a default install.
+
+### Changed
+- **Library API**: `audit::retention::PrunedFindings` is new, and `VerifyResult` and `ReportAggregate` each gain a `pruned_findings` field. Both structs already carry `#[non_exhaustive]`, so this is additive for any external consumer. The Rust library API is not one of the three surfaces 1.0 freezes — see [docs/CONTRACT.md](docs/CONTRACT.md) — and `audit verify`'s exit codes, `report --json`'s eight fields, and `chain_status` are all unchanged by this release.
 
 ## [1.0.4] - 2026-08-14
 
