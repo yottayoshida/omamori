@@ -1221,6 +1221,7 @@ retention_days = 90  # 0 = unlimited (default)
 | Minimum entry count | 1000 entries always retained regardless of age |
 | Config protection | `omamori/config.toml` protected by `PROTECTED_FILE_PATTERNS` |
 | Trigger frequency | Every 1000 appends (seq % 1000); zero overhead otherwise |
+| Findings record ([#461](https://github.com/yottayoshida/omamori/issues/461)) | `rule_id` = `pruned:{counter}={n};…` when the removed range held entries the verifier could not have checked, absent otherwise. `rule_id` is inside both hash preimages, so editing a count breaks the prune point's own `entry_hash`. Carried forward across prunes, and only from a prior prune point that authenticates against the key it names — see [What a prune records about what it removed](#what-a-prune-records-about-what-it-removed-461) |
 
 **Threat model**:
 
@@ -1273,7 +1274,38 @@ Two states leave the mark untouched rather than guessing at it. **No retained en
 
 Auto-prune is off by default (`retention_days = 0`), so none of this path runs in a default install.
 
-**Still open in the same file.** A prune that removes a range containing unverifiable entries leaves no record that it did: `prune_point` carries an entry count and nothing about how many of those entries could not be verified, so a `verify` that reported exit 4 before the prune reports exit 0 after it. That is the remaining half of [#461](https://github.com/yottayoshida/omamori/issues/461); it needs a field the `AuditEvent` schema does not have today, which is a `chain_version` question rather than a change to this recomputation.
+**The other half of #461 is below.** A prune that removed a range containing entries the verifier could not have checked used to leave no record that it did; see the next section.
+
+### What a Prune Records About What It Removed (#461)
+
+`prune_point` used to carry an entry count and nothing else, so a store reporting exit 4 before a prune reported exit 0 after it: the fact that the log had ever held something unverifiable was gone with the entries. A prune now counts what the removed range would have cost the verifier and writes that count into the prune point's `rule_id`.
+
+`rule_id` is a member of both hash preimages (`HashableEvent` and `HashableEventV2`), so the record is covered by the prune point's own `entry_hash` — editing a count without the key breaks the chain at entry #0. It was chosen over a new field because a prune point stands at the **head of the file**: a new field is hash-coverage surface, hash-coverage surface is `chain_version`, and a prune point declaring a version an older release does not recognise makes that release report exit 4 at line 1, having verified nothing. The reasoning, and the shapes rejected along the way, are in [ADR-0010](docs/adr/0010-prune-findings-ride-an-already-hashed-field.md).
+
+**What is counted**, all with no key and all from the removed range alone:
+
+| Counter | Condition | What `verify` would have said |
+|---|---|---|
+| `unverifiable` | `chain_version` outside `SUPPORTED_CHAIN_VERSIONS` | exit 4 |
+| `unprotected` | `key_id` is the unresolved sentinel **and** `entry_hash` is the no-key sentinel (#483's two-piece evidence) | exit 2 |
+| `legacy_splice` | an entry with no `chain_version` after the chain had started | exit 1 |
+| `broken` | an adjacent pair inside the range failing `prev_hash`/`seq` continuity | exit 1 |
+| `prior_lost` | a previous prune point's record could not be carried forward, because that prune point did not authenticate against the key it names | — |
+
+**What is not counted, and why it matters when reading a `0`:**
+
+- **An entry whose HMAC does not match its contents.** That needs a hash per removed line; the scan is keyless and single-pass. Tracked separately.
+- **An entry naming a key that is merely missing.** Restoring the key resolves it, so recording it permanently would state a fault that no longer exists.
+- **A break between the range's first line and whatever preceded it.** The scan sees adjacent pairs *inside* the range only.
+- **Torn lines**, and lines this build cannot parse into an `AuditEvent` — both are already handled as torn by the verifier and cost it no verdict.
+
+`legacy_splice` and `broken` are `0` or `1`, not tallies: `verify_chain` fails closed on either and stops, so the scan stops with it — a single spliced line disturbs two adjacent pairs, and counting both would describe one line as two findings. `unverifiable` and `unprotected` are true counts, because the verifier walks past those.
+
+**These counts are not the verdict `verify_chain` reaches**, and are deliberately not a re-derivation of its walk: reproducing it inside `retention.rs` would be a second implementation of a 1.0-frozen surface, with nothing to catch the two drifting apart.
+
+The record is carried across prunes — a prune discards the prune point in front of it along with the range it covered, so without this the trace would last exactly one prune (1000 appends). It is carried **only from a prior prune point that authenticates against the key its own `key_id` names**, the same rule the high-water-mark follows above; every other outcome increments `prior_lost` rather than silently reading, or silently dropping, an unverified record.
+
+Reported by `audit verify` (before the verdict, so a halt cannot swallow it) and by `doctor`. Not part of `report --json`, which SEC-R2 fixes at eight fields. `chain_status` is unaffected: the links that remain really are intact, and this is a statement about entries that are gone.
 
 ### What "Unavailable" Means (#471, #487)
 

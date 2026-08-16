@@ -299,6 +299,15 @@ mod tests {
             }),
             // #483: non-zero for the same reason the two above are non-empty.
             never_protected_entries: 2,
+            // #461: `Some`, and with non-zero counts, for the same reason. A
+            // `skip`ped field tested only while it is `None` proves nothing
+            // about what serializes once a prune has actually recorded
+            // something.
+            pruned_findings: Some(crate::audit::retention::PrunedFindings {
+                unverifiable: 2,
+                broken: 1,
+                ..Default::default()
+            }),
         };
         let json: serde_json::Value = serde_json::to_value(&report).unwrap();
         let obj = json.as_object().unwrap();
