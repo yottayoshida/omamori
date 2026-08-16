@@ -6,7 +6,7 @@ use super::chain::{
     NO_HMAC_SECRET, RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes,
     is_supported_chain_version, prune_genesis_hash,
 };
-use super::retention::is_prune_point;
+use super::retention::{PrunedFindings, decode_findings, is_prune_point};
 use super::secret::{
     KeyStoreOutlook, Keyring, UNRESOLVED_KEY_ID, UnprotectedReason, classify_secret_failure,
     expected_key_file, flock_shared, interrupted_rotation_evidence, is_symlink_attack,
@@ -191,6 +191,22 @@ pub struct VerifyResult {
     pub broken_at: Option<u64>,
     pub pruned: bool,
     pub pruned_count: Option<u64>,
+    /// #461: what a prune recorded about the entries it removed.
+    ///
+    /// A prune that took away a range containing entries this verifier could
+    /// not have checked used to leave nothing behind — `pruned_count` says how
+    /// many lines went, never how many of them were unverifiable — so a store
+    /// reporting exit 4 before a prune reported exit 0 after it. The counts are
+    /// read from the prune point's `rule_id`, and only *after* that entry's own
+    /// `entry_hash` has been recomputed and matched, so a record that reaches
+    /// here was written by something holding the key.
+    ///
+    /// `None` means no prune point carried a record: either the prune found
+    /// nothing worth recording, or it predates #461. The two are deliberately
+    /// not distinguished — a prune that found nothing writes the same bytes the
+    /// previous release wrote, which is what keeps every existing log
+    /// byte-identical.
+    pub pruned_findings: Option<PrunedFindings>,
     pub tail_truncated: bool,
     pub hwm_missing: bool,
     /// #491: replaces `hwm_tampered: bool`. A bool next to a reason is two
@@ -1268,6 +1284,24 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         if is_prune {
             result.pruned = true;
             result.pruned_count = Some(event.target_count as u64);
+            // #461: read only from here — past the `entry_hash` comparison
+            // above — so the counts came from an entry that authenticated
+            // under the key it names. Reading them at the `is_prune_point`
+            // check further up would take tamper-evidence about the log out
+            // of the log without checking it, which is the root #456 closed
+            // on the append side and #461's first half closed on the
+            // high-water-mark.
+            //
+            // Merged rather than assigned: a log can hold more than one prune
+            // point only if a prune was interrupted, but the arithmetic is
+            // what makes that state add up instead of reporting whichever one
+            // happened to be last.
+            if let Some(findings) = decode_findings(event.rule_id.as_deref()) {
+                result.pruned_findings = Some(match result.pruned_findings {
+                    Some(existing) => existing.merge(findings),
+                    None => findings,
+                });
+            }
         }
         prev_prune = is_prune.then(|| PruneBind {
             target_hash: event.target_hash.clone(),
@@ -1476,6 +1510,18 @@ pub fn show_entries(
         };
 
         if let Some(ref filter) = opts.rule {
+            // #461: a prune point never matches, whatever its `rule_id` holds.
+            // That field carries the findings record now, so a substring
+            // filter would surface prune points for `--rule pruned` — and,
+            // through `--json`, emit a `command: "_prune"` object into a
+            // stream a caller is filtering by rule. Before the record existed
+            // the field was always `None` and the arm below dropped every
+            // prune point; this keeps that true rather than depending on the
+            // field staying empty. Rendering is unaffected: the table draws
+            // prune points as a separator further down, not as a row.
+            if is_prune_point(&event) {
+                continue;
+            }
             match &event.rule_id {
                 Some(rule) if rule.contains(filter.as_str()) => {}
                 _ => continue,

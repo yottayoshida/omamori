@@ -6,6 +6,17 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **A prune no longer removes the evidence that something was unverifiable.** ([#461](https://github.com/yottayoshida/omamori/issues/461))
+
+  `prune_point` carried an entry count and nothing about what those entries were, so a store that `omamori audit verify` reported at exit 4 before an auto-prune reported exit 0 after it — the log's own history of having held something the verifier could not check went with the entries. A prune now counts, with no key and from the removed range alone, four things the verifier would have had to say about it: entries declaring an unrecognized `chain_version`, entries carrying no HMAC (#483's two-piece evidence, both halves required), a `chain_version`-less line spliced in after the chain had started, and a break in `prev_hash`/`seq` continuity between adjacent lines. The counts go into the prune point's `rule_id`, which is inside both hash preimages — editing one breaks that entry's own `entry_hash` — and are carried forward across later prunes, but **only** from a prior prune point that authenticates against the key its own `key_id` names; every other outcome is recorded as `prior_lost` rather than being silently read or silently dropped. Without that carry-forward the trace would have lasted exactly one prune, since a prune discards the prune point in front of it along with the range it covered.
+
+  **A prune that finds nothing writes what the previous release wrote** (`rule_id` stays `null`), so no existing log changes shape and every existing binary reads a pruned log exactly as before. This is why no `chain_version` was added: a prune point stands at the head of the file, so one declaring a version an older release does not recognize would make that release report exit 4 at line 1 having verified nothing — a larger gap than the one being closed. [ADR-0010](docs/adr/0010-prune-findings-ride-an-already-hashed-field.md) records that reasoning and the shapes rejected on the way, including the two #505 had already ruled out.
+
+  **The counts are not the verdict `verify_chain` reaches, and are deliberately not a re-derivation of its walk.** `legacy_splice` and `broken` are 0 or 1 because the verifier fails closed on either and stops; an entry whose HMAC merely fails to match is not counted at all; a break between the range's first line and whatever preceded it is outside the scan. `SECURITY.md` states what is and is not counted, because a `0` here does not mean a clean range in every sense. Reported by `audit verify` — above the verdict branches, so a halt cannot swallow it — and by `doctor`. `chain_status`, the exit codes, and `report --json`'s eight fields (SEC-R2) are unchanged: the links that remain really are intact, and this is a statement about entries that are gone.
+
+  Auto-prune is off by default (`retention_days = 0`), so this path does not run in a default install.
+
 ## [1.0.4] - 2026-08-14
 
 ### Changed

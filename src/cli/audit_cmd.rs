@@ -233,6 +233,15 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
             for warning in &result.keyring_warnings {
                 eprintln!("omamori warning: {warning}");
             }
+            // #461: above the verdict arms, for the reason the keyring
+            // warnings are — this has to be said whatever the verdict turns
+            // out to be. Putting it inside `format_verify_success_message`
+            // instead would have printed it on exactly two of the six
+            // branches, and lost it on every halt: the states where a log's
+            // history matters most are the states that arm never reaches.
+            if let Some(findings) = result.pruned_findings {
+                eprintln!("omamori warning: {}", findings.summary());
+            }
             if let Some(seq) = result.broken_at {
                 eprintln!("omamori audit verify: chain broken at entry #{seq}");
                 eprintln!("  The audit log may have been tampered with.");

@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::error::AuditError;
+use super::retention::PrunedFindings;
 use super::secret::open_read_nofollow;
 use super::verify::{KeyStoreFailure, verify_chain};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
@@ -251,6 +252,22 @@ pub struct ReportAggregate {
     /// Not part of the JSON output (SEC-R2: exactly 8 fields).
     #[serde(skip)]
     pub never_protected_entries: u64,
+    /// #461: what a prune recorded about the entries it removed.
+    ///
+    /// `chain_status` is left alone for the same reason `never_protected_entries`
+    /// above leaves it alone, and the reason is sharper here: this is a statement
+    /// about a range that is *gone*. The links that remain really are intact, and
+    /// the entries the record counts were removed by a prune that was entitled to
+    /// remove them. What the operator needs to know is that the log once held
+    /// something the verifier could not check — a fact about its history, not its
+    /// current state, and `chain_status` answers the latter.
+    ///
+    /// Not part of the JSON output (SEC-R2: exactly 8 fields), same as the fields
+    /// above. Unlike `keyring_warnings` and `key_store_failure` it carries no
+    /// path — it is counts only — so the reason here is SEC-R2 alone. Widening
+    /// that limit is its own decision and is tracked separately.
+    #[serde(skip)]
+    pub pruned_findings: Option<PrunedFindings>,
 }
 
 impl Default for ReportAggregate {
@@ -268,6 +285,7 @@ impl Default for ReportAggregate {
             keyring_warnings: Vec::new(),
             key_store_failure: None,
             never_protected_entries: 0,
+            pruned_findings: None,
         }
     }
 }
@@ -385,6 +403,11 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
             // not stop the walk, so the status is whatever the links turned out
             // to be — so there is no arm for it to be redundant with.
             result.never_protected_entries = verify_result.never_protected_entries;
+            // #461: unconditional for the same reason as the line above — a
+            // pruned range's findings never compete for the `chain_status`
+            // slot, since they say nothing about the links that are still
+            // here.
+            result.pruned_findings = verify_result.pruned_findings;
             keyring_warnings = verify_result.keyring_warnings.clone();
             // #470: `Truncated` is checked *above* the two halted states, not
             // below them. It used to sit last, which was invisible while
