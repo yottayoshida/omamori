@@ -7106,3 +7106,220 @@ fn doctor_reports_shim_install_drift_and_fix_does_not_relink_the_shims() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// #544: a departed stdout reader does not change doctor's / status's verdict
+// ---------------------------------------------------------------------------
+
+/// Runs `omamori <args>` under an isolated `HOME` with **the stdout reader
+/// already gone**, and returns its exit code.
+///
+/// The read end is closed **before the child exists**, so the first write it
+/// attempts already fails. Spawning with `Stdio::piped()` and dropping the
+/// handle afterwards — the shape `tests/hook_integration.rs` uses for the same
+/// question about `audit show` — races the child: these commands print little
+/// enough to fit in the pipe buffer, so a child scheduled first can finish
+/// every write before the parent drops anything, and a `println!`-based
+/// implementation would exit normally and pass (Codex review, P1). Handing the
+/// child a write end whose reader is already gone removes the schedule from
+/// the test.
+fn exit_code_with_no_reader(
+    home: &std::path::Path,
+    path_prefix: Option<&str>,
+    args: &[&str],
+) -> i32 {
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    drop(reader);
+
+    let status = doctor_cmd(home, path_prefix, args)
+        .stdout(std::process::Stdio::from(writer))
+        .spawn()
+        .expect("spawn omamori")
+        .wait()
+        .expect("omamori exits");
+    status
+        .code()
+        .unwrap_or_else(|| panic!("terminated by signal, not an exit code: {status:?}"))
+}
+
+/// Same command and environment, with stdout left alone.
+/// Shared setup for the two helpers below: isolated `HOME`, no AI detector
+/// vars, and an optional `PATH` prefix (`check_path_order` warns when the shim
+/// dir is missing from `PATH`, which is what separates the warn-only fixture
+/// from the healthy one).
+fn doctor_cmd(home: &std::path::Path, path_prefix: Option<&str>, args: &[&str]) -> Command {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(args)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+    if let Some(prefix) = path_prefix {
+        let path = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{prefix}:{path}"));
+    }
+    cmd
+}
+
+/// Same command and environment, with stdout left alone.
+fn exit_code_with_reader(home: &std::path::Path, path_prefix: Option<&str>, args: &[&str]) -> i32 {
+    doctor_cmd(home, path_prefix, args)
+        .stdout(std::process::Stdio::null())
+        .output()
+        .expect("omamori runs")
+        .status
+        .code()
+        .expect("exit code")
+}
+
+/// `doctor`'s three documented codes all survive losing the reader.
+///
+/// Asserting three *different* expected values is what makes this a test of
+/// the verdict rather than of the exit path: an implementation that returns a
+/// constant satisfies one arm and fails the other two, and the pre-#544
+/// implementation fails all three with 101.
+#[test]
+fn doctor_keeps_each_documented_exit_code_when_the_reader_goes_away() {
+    let root = unique_dir("544-doctor-codes");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+
+    // 1 — nothing installed under this base dir, so the shim checks fail.
+    let bare = root.join("bare");
+    let bare_args = ["doctor", "--base-dir", bare.to_str().unwrap()];
+
+    // 2 and 0 — a real install. Whether the shim dir is on PATH is the only
+    // difference: `check_path_order` warns when it is missing, and that lone
+    // warning is what separates the two codes.
+    let base = root.join("installed");
+    let install = run_installed(
+        std::path::Path::new(&binary()),
+        &home,
+        &[
+            "install",
+            "--base-dir",
+            base.to_str().unwrap(),
+            "--source",
+            &binary(),
+            "--hooks",
+        ],
+    );
+    assert!(
+        install.status.success(),
+        "install should succeed. stderr: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let shim_dir = base.join("shim");
+    let installed_args = ["doctor", "--base-dir", base.to_str().unwrap()];
+
+    for (label, path_prefix, args, expected) in [
+        ("fail", None, &bare_args, 1),
+        ("warn-only", None, &installed_args, 2),
+        (
+            "healthy",
+            Some(shim_dir.to_str().unwrap()),
+            &installed_args,
+            0,
+        ),
+    ] {
+        assert_eq!(
+            exit_code_with_reader(&home, path_prefix, args.as_slice()),
+            expected,
+            "control: the {label} fixture must produce {expected} with a reader attached"
+        );
+        assert_eq!(
+            exit_code_with_no_reader(&home, path_prefix, args.as_slice()),
+            expected,
+            "{label}: losing the reader must not change the verdict (pre-#544 this was 101)"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `status` renders through the same sink and answers the same way.
+#[test]
+fn status_keeps_its_exit_code_when_the_reader_goes_away() {
+    let root = unique_dir("544-status-code");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let base = root.join("bare");
+    let args = ["status", "--base-dir", base.to_str().unwrap()];
+
+    let with_reader = exit_code_with_reader(&home, None, &args);
+    assert_eq!(
+        exit_code_with_no_reader(&home, None, &args),
+        with_reader,
+        "status must return the same code with and without a reader (pre-#544: 101)"
+    );
+    assert_ne!(
+        with_reader, 101,
+        "control: 101 is not a code status ever means to return"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A departed reader must not abandon `doctor --fix` half-done.
+///
+/// This is the reason the sink swallows write errors instead of propagating
+/// them: `run_fix` interleaves printing with repairs, so a `writeln!(…)?`
+/// conversion would return at the first dead write and leave the repair
+/// undone — trading #544 for something worse than #544.
+#[test]
+fn doctor_fix_completes_its_repair_when_the_reader_goes_away() {
+    let root = unique_dir("544-fix-repair");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    let base = root.join("installed");
+
+    let install = run_installed(
+        std::path::Path::new(&binary()),
+        &home,
+        &[
+            "install",
+            "--base-dir",
+            base.to_str().unwrap(),
+            "--source",
+            &binary(),
+            "--hooks",
+        ],
+    );
+    assert!(install.status.success(), "install should succeed");
+
+    // Corrupt the baseline. `doctor` reports it and offers RegenerateBaseline,
+    // which — unlike the hook repair — is not refused for a cargo-build source,
+    // so the repair genuinely runs under `cargo test`.
+    let baseline = base.join(".integrity.json");
+    fs::write(&baseline, "not json").unwrap();
+
+    let fix_args = ["doctor", "--fix", "--base-dir", base.to_str().unwrap()];
+    let code = exit_code_with_no_reader(&home, None, &fix_args);
+
+    let repaired = fs::read_to_string(&baseline).expect("baseline still readable");
+    let parsed: serde_json::Value = serde_json::from_str(&repaired).unwrap_or_else(|e| {
+        panic!(
+            "--fix must rewrite the baseline even with no reader attached; \
+             content was {repaired:?} ({e})"
+        )
+    });
+    assert_eq!(
+        parsed["version"],
+        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+        "the regenerated baseline names the running version"
+    );
+    // Re-run the identical repair with a reader attached and pin the two
+    // against each other. `!= 101` alone would accept any of the other
+    // documented codes, so it does not say the verdict was preserved — only
+    // that it was not a panic (Codex review, P2).
+    fs::write(&baseline, "not json").unwrap();
+    let with_reader = exit_code_with_reader(&home, None, &fix_args);
+    assert_eq!(
+        code, with_reader,
+        "`--fix` must reach the same verdict with and without a reader"
+    );
+    assert_ne!(code, 101, "and that verdict is never the panic code");
+
+    let _ = fs::remove_dir_all(&root);
+}

@@ -20,7 +20,7 @@ use crate::util::{USAGE_HINT, flag_value};
 
 use time::OffsetDateTime;
 
-use super::checks_display::{DoctorSection, group_by_section};
+use super::checks_display::{DoctorSection, Out, group_by_section, out, out_part};
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -94,6 +94,9 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
 // ---------------------------------------------------------------------------
 
 fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
+    let mut stdout = std::io::stdout().lock();
+    let o = &mut Out::new(&mut stdout);
+
     let has_fail = items.iter().any(|i| i.status == CheckStatus::Fail);
     let has_warn = items.iter().any(|i| i.status == CheckStatus::Warn);
 
@@ -105,8 +108,8 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     } else {
         "OK"
     };
-    println!("Protection status: {status_word}");
-    println!();
+    out!(o, "Protection status: {status_word}");
+    out!(o);
 
     let sections = group_by_section(items);
     let ai_env = doctor_ai_env();
@@ -119,9 +122,9 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         let total = section_items.len();
         let all_ok = pass == total;
 
-        println!("  {} {pass}/{total}", section.heading());
+        out!(o, "  {} {pass}/{total}", section.heading());
         for annotate in section_annotations(*section) {
-            annotate(ai_env);
+            annotate(o, ai_env);
         }
         if all_ok {
             continue;
@@ -129,7 +132,8 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         for item in section_items {
             if item.status == CheckStatus::Ok {
                 if verbose {
-                    println!(
+                    out!(
+                        o,
                         "    {:<6} {} {}",
                         item.status.label(),
                         item.name,
@@ -138,28 +142,29 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
                 }
                 continue;
             }
-            println!(
+            out!(
+                o,
                 "    {:<6} {} {}",
                 item.status.label(),
                 item.name,
                 item.detail
             );
             if let Some(ref rem) = item.remediation {
-                println!("           {}", remediation_hint(rem, ai_env));
+                out!(o, "           {}", remediation_hint(rem, ai_env));
             }
         }
     }
 
     // Section 4: Recent risk signals (from audit aggregation)
-    print_risk_signals_section(ai_env);
+    print_risk_signals_section(o, ai_env);
 
     // Section 5: Break-glass status
-    print_break_glass_section(ai_env);
+    print_break_glass_section(o, ai_env);
 
     // Section 6: Staging usage (#313)
-    print_staging_section();
+    print_staging_section(o);
 
-    println!();
+    out!(o);
 
     let problems: Vec<_> = items
         .iter()
@@ -172,18 +177,21 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
                 .is_some_and(|r| !matches!(r, Remediation::ManualOnly(_)))
         });
         if has_fixable && !ai_env {
-            println!("  run `omamori doctor --fix` to auto-repair");
+            out!(o, "  run `omamori doctor --fix` to auto-repair");
         } else if has_fixable {
-            println!("  issues detected — run doctor --fix directly in your terminal");
+            out!(
+                o,
+                "  issues detected — run doctor --fix directly in your terminal"
+            );
         }
     }
 
     if verbose && !items.is_empty() {
-        println!();
-        println!("All checks:");
-        print_all_items(items);
+        out!(o);
+        out!(o, "All checks:");
+        print_all_items(o, items);
     } else if problems.is_empty() {
-        println!("  run `omamori doctor --verbose` for full details");
+        out!(o, "  run `omamori doctor --verbose` for full details");
     }
 
     if has_fail {
@@ -212,7 +220,7 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
 /// check items, and folding it in here would interleave it between the
 /// Layer 1 heading and Layer 1's own FAIL/WARN item list whenever Layer 1
 /// has failures.
-fn section_annotations(section: DoctorSection) -> &'static [fn(bool)] {
+fn section_annotations(section: DoctorSection) -> &'static [fn(&mut Out<'_>, bool)] {
     match section {
         DoctorSection::Layer1 => &[print_heartbeat_line],
         DoctorSection::Layer2 | DoctorSection::Integrity => &[],
@@ -309,7 +317,7 @@ fn risk_signals_are_quiet(report: &ReportAggregate, audit_unwritable: bool) -> b
         && !audit_unwritable
 }
 
-fn print_risk_signals_section(ai_env: bool) {
+fn print_risk_signals_section(o: &mut Out<'_>, ai_env: bool) {
     let Ok(load_result) = crate::config::load_config(None) else {
         return;
     };
@@ -324,22 +332,24 @@ fn print_risk_signals_section(ai_env: bool) {
         );
 
     if risk_signals_are_quiet(&report, audit_unwritable) {
-        println!("  [Risk signals] Last 30 days: quiet");
+        out!(o, "  [Risk signals] Last 30 days: quiet");
         return;
     }
 
-    println!("  [Risk signals] Last 30 days");
+    out!(o, "  [Risk signals] Last 30 days");
     if has_blocks {
-        println!("    {} block(s)", report.total_blocks);
+        out!(o, "    {} block(s)", report.total_blocks);
     }
     if has_unknown {
         if ai_env {
-            println!(
+            out!(
+                o,
                 "    {} unknown-tool fail-open(s) detected",
                 report.unknown_tool_fail_opens
             );
         } else {
-            println!(
+            out!(
+                o,
                 "    {} unknown-tool fail-open(s) — review: omamori audit unknown",
                 report.unknown_tool_fail_opens
             );
@@ -348,26 +358,28 @@ fn print_risk_signals_section(ai_env: bool) {
     match &report.chain_status {
         ChainStatus::Broken { .. } => {
             if ai_env {
-                println!("    chain: broken");
+                out!(o, "    chain: broken");
             } else {
-                println!("    chain: broken — run omamori audit verify");
+                out!(o, "    chain: broken — run omamori audit verify");
             }
         }
         ChainStatus::Truncated => {
             if ai_env {
-                println!("    chain: truncated (entries may have been removed)");
+                out!(o, "    chain: truncated (entries may have been removed)");
             } else {
-                println!("    chain: truncated — run omamori audit verify");
+                out!(o, "    chain: truncated — run omamori audit verify");
             }
         }
         ChainStatus::Unverifiable { chain_version, .. } => {
             if ai_env {
-                println!(
+                out!(
+                    o,
                     "    chain: unverifiable (entry declares chain_version {chain_version}, \
                      unrecognized by this build)"
                 );
             } else {
-                println!(
+                out!(
+                    o,
                     "    chain: unverifiable — entry declares chain_version {chain_version}, \
                      unrecognized by this build — run omamori audit verify"
                 );
@@ -378,7 +390,10 @@ fn print_risk_signals_section(ai_env: bool) {
         // and the remedy is to restore the key, not to distrust the log.
         ChainStatus::KeyUnavailable { key_id, .. } => {
             if ai_env {
-                println!("    chain: cannot verify (key \"{key_id}\" not in keyring)");
+                out!(
+                    o,
+                    "    chain: cannot verify (key \"{key_id}\" not in keyring)"
+                );
             } else {
                 // #483: the repair used to be inlined here as "restore the
                 // retired key file". That is right for one of the three
@@ -389,7 +404,8 @@ fn print_risk_signals_section(ai_env: bool) {
                 // the three it found and prints a different sentence for each;
                 // this line names the cause and delegates, like every sibling
                 // in this list.
-                println!(
+                out!(
+                    o,
                     "    chain: cannot verify — entry names key \"{key_id}\", which is not \
                      in the keyring — run omamori audit verify"
                 );
@@ -399,9 +415,15 @@ fn print_risk_signals_section(ai_env: bool) {
         // count is the signal and it carries no path, so both branches print it.
         ChainStatus::Unprotected { entries } => {
             if ai_env {
-                println!("    chain: {entries} entries carry no HMAC — cannot be verified");
+                out!(
+                    o,
+                    "    chain: {entries} entries carry no HMAC — cannot be verified"
+                );
             } else {
-                println!("    chain: {entries} entries carry no HMAC — run omamori audit verify");
+                out!(
+                    o,
+                    "    chain: {entries} entries carry no HMAC — run omamori audit verify"
+                );
             }
         }
         // #457 (Codex Round 2): must appear here as well as in `chain_broken`
@@ -409,7 +431,7 @@ fn print_risk_signals_section(ai_env: bool) {
         // header claimed a risk signal existed.
         ChainStatus::KeyringUnusable { reason, .. } => {
             if ai_env {
-                println!("    chain: cannot verify ({reason})");
+                out!(o, "    chain: cannot verify ({reason})");
             } else {
                 // Delegates rather than inlining the repair, like every
                 // sibling in this list ("chain: broken — run omamori audit
@@ -424,7 +446,10 @@ fn print_risk_signals_section(ai_env: bool) {
                 // unreachable from an AI session, so the #477 dry-run could
                 // not print it, and the separator that used to sit here landed
                 // straight after that full stop.
-                println!("    chain: cannot verify — {reason} Run omamori audit verify.");
+                out!(
+                    o,
+                    "    chain: cannot verify — {reason} Run omamori audit verify."
+                );
             }
         }
         // #471/#487: the states that used to land in `Unavailable` and so
@@ -433,9 +458,12 @@ fn print_risk_signals_section(ai_env: bool) {
         // the `KeyringUnusable` arm above delegates rather than inlining.
         ChainStatus::Inaccessible { kind, .. } => {
             if ai_env {
-                println!("    chain: cannot be read ({kind})");
+                out!(o, "    chain: cannot be read ({kind})");
             } else {
-                println!("    chain: cannot be read ({kind}) — run omamori audit verify");
+                out!(
+                    o,
+                    "    chain: cannot be read ({kind}) — run omamori audit verify"
+                );
             }
         }
         // Listed rather than caught by `_`. `needs_attention()` is exhaustive
@@ -459,9 +487,10 @@ fn print_risk_signals_section(ai_env: bool) {
     // sentence to `audit verify`.
     if let Some(failure) = &report.key_store_failure {
         if ai_env {
-            println!("    audit keys: cannot verify ({})", failure.kind);
+            out!(o, "    audit keys: cannot verify ({})", failure.kind);
         } else {
-            println!(
+            out!(
+                o,
                 "    audit keys: cannot verify ({}) — run omamori audit verify",
                 failure.kind
             );
@@ -472,12 +501,14 @@ fn print_risk_signals_section(ai_env: bool) {
     // both branches: the count is the whole signal, and it carries no path.
     if report.never_protected_entries > 0 {
         if ai_env {
-            println!(
+            out!(
+                o,
                 "    audit entries: {} carry no HMAC — cannot be verified",
                 report.never_protected_entries
             );
         } else {
-            println!(
+            out!(
+                o,
                 "    audit entries: {} carry no HMAC — run omamori audit verify",
                 report.never_protected_entries
             );
@@ -491,9 +522,10 @@ fn print_risk_signals_section(ai_env: bool) {
     // path, so there is nothing to withhold from an AI session.
     if let Some(findings) = report.pruned_findings {
         if ai_env {
-            println!("    audit history: {}", findings.summary());
+            out!(o, "    audit history: {}", findings.summary());
         } else {
-            println!(
+            out!(
+                o,
                 "    audit history: {} — run omamori audit verify",
                 findings.summary()
             );
@@ -501,9 +533,10 @@ fn print_risk_signals_section(ai_env: bool) {
     }
     if report.hwm_tampered {
         if ai_env {
-            println!("    audit high-water-mark: unreadable/tampered");
+            out!(o, "    audit high-water-mark: unreadable/tampered");
         } else {
-            println!(
+            out!(
+                o,
                 "    audit high-water-mark: unreadable or tampered — run omamori audit verify"
             );
         }
@@ -518,7 +551,8 @@ fn print_risk_signals_section(ai_env: bool) {
     // directory's path, and this section is reachable from one.
     if !report.keyring_warnings.is_empty() {
         if ai_env {
-            println!(
+            out!(
+                o,
                 "    audit keyring: {} problem(s) — coverage is incomplete",
                 report.keyring_warnings.len()
             );
@@ -528,17 +562,21 @@ fn print_risk_signals_section(ai_env: bool) {
                 // opens with "audit keyring: ", so adding one printed it twice
                 // (review). `verify` prints these under `omamori warning: `,
                 // which does not collide.
-                println!("    {warning}");
+                out!(o, "    {warning}");
             }
         }
     }
     if audit_unwritable {
         if ai_env {
-            println!(
+            out!(
+                o,
                 "    audit log: not writable — protection decisions are unaffected, but forensic trail is degraded"
             );
         } else {
-            println!("    audit log: not writable — run omamori doctor --verbose to diagnose");
+            out!(
+                o,
+                "    audit log: not writable — run omamori doctor --verbose to diagnose"
+            );
         }
     }
 }
@@ -549,19 +587,20 @@ fn print_risk_signals_section(ai_env: bool) {
 /// exactly which protection rule has an active bypass window and how long it
 /// has left — the same class of leak SEC-R5 already closes for remediation
 /// hints.
-fn print_break_glass_section(ai_env: bool) {
+fn print_break_glass_section(o: &mut Out<'_>, ai_env: bool) {
     let entries = crate::break_glass::read_active_entries();
     if entries.is_empty() {
         return;
     }
-    println!();
-    println!("  [Break-glass] {} active bypass(es)", entries.len());
+    out!(o);
+    out!(o, "  [Break-glass] {} active bypass(es)", entries.len());
     if ai_env {
         return;
     }
     for entry in &entries {
         let remaining = entry.remaining_secs().unwrap_or(0);
-        println!(
+        out!(
+            o,
             "    {}: {} remaining",
             entry.rule_id,
             crate::break_glass::format_remaining(remaining)
@@ -645,11 +684,11 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn print_staging_section() {
+fn print_staging_section(o: &mut Out<'_>) {
     let info = gather_staging_info();
 
     if info.file_count == 0 {
-        println!("  [Staging] empty");
+        out!(o, "  [Staging] empty");
         return;
     }
 
@@ -659,7 +698,8 @@ fn print_staging_section() {
         Some(n) => format!("{n} days"),
         None => "unknown".to_string(),
     };
-    println!(
+    out!(
+        o,
         "  [Staging] {} file(s), {}, oldest: {}",
         info.file_count,
         format_bytes(info.total_bytes),
@@ -672,14 +712,19 @@ fn print_staging_section() {
     let cfg = &load_result.config.structural;
 
     if cfg.max_files > 0 && info.file_count > u64::from(cfg.max_files) {
-        println!("    WARN  file count exceeds max_files ({})", cfg.max_files);
+        out!(
+            o,
+            "    WARN  file count exceeds max_files ({})",
+            cfg.max_files
+        );
     }
     if cfg.retention_days > 0
         && info
             .oldest_days_ago
             .is_some_and(|days| days > i64::from(cfg.retention_days) * 2)
     {
-        println!(
+        out!(
+            o,
             "    WARN  oldest file exceeds 2\u{00d7} retention_days ({})",
             cfg.retention_days
         );
@@ -751,14 +796,16 @@ fn heartbeat_days_ago(path: &Path) -> Option<i64> {
 /// every other doctor-output string this PR gates on `ai_env` follows the
 /// same "run it yourself, directly in your terminal" phrasing (SEC-R5;
 /// /code-review finding — this hint was the one exception).
-fn print_heartbeat_awaiting_hint(ai_env: bool) {
+fn print_heartbeat_awaiting_hint(o: &mut Out<'_>, ai_env: bool) {
     if ai_env {
-        println!(
+        out!(
+            o,
             "        hint: still awaiting first invocation \u{2014} run a harmless guarded \
              command, then re-run 'omamori doctor' directly in your terminal (not via AI)."
         );
     } else {
-        println!(
+        out!(
+            o,
             "        hint: open a new terminal tab, then have your AI tool run a harmless guarded \
              command (e.g. 'git status'). Re-run 'omamori doctor' \u{2014} this should switch to \
              \"last active: today\". Still awaiting? check that shims are on PATH."
@@ -770,11 +817,14 @@ fn print_heartbeat_awaiting_hint(ai_env: bool) {
 /// `heartbeat_path()` returning `None` and `heartbeat_days_ago()` returning
 /// `None` as two separate duplicated cases — /code-review finding) and
 /// prints accordingly.
-fn print_heartbeat_line(ai_env: bool) {
+fn print_heartbeat_line(o: &mut Out<'_>, ai_env: bool) {
     let days = crate::engine::shim::heartbeat_path().and_then(|p| heartbeat_days_ago(&p));
     match days {
         Some(days) if days < 0 => {
-            println!("    WARN  last active: future timestamp \u{2014} clock skew detected");
+            out!(
+                o,
+                "    WARN  last active: future timestamp \u{2014} clock skew detected"
+            );
         }
         Some(days) => {
             let label = match days {
@@ -783,16 +833,17 @@ fn print_heartbeat_line(ai_env: bool) {
                 n => format!("{n} days ago"),
             };
             if days <= 3 {
-                println!("    last active: {label}");
+                out!(o, "    last active: {label}");
             } else {
-                println!(
+                out!(
+                    o,
                     "    WARN  last active: {label} \u{2014} shims may not be in PATH for AI tools"
                 );
             }
         }
         None => {
-            println!("    last active: awaiting first invocation");
-            print_heartbeat_awaiting_hint(ai_env);
+            out!(o, "    last active: awaiting first invocation");
+            print_heartbeat_awaiting_hint(o, ai_env);
         }
     }
 }
@@ -848,16 +899,19 @@ fn heartbeat_json_summary() -> serde_json::Value {
 /// through rather than each caller re-deriving it, but still passes it (not
 /// a literal `false`) so `print_break_glass_section`'s AI-oracle gate (T8)
 /// holds on its own terms if the guard's placement ever changes.
-fn print_fix_shim_activity_footer(ai_env: bool) {
-    println!();
-    println!("  [Shim activity]");
-    print_heartbeat_line(ai_env);
-    print_break_glass_section(ai_env);
+fn print_fix_shim_activity_footer(o: &mut Out<'_>, ai_env: bool) {
+    out!(o);
+    out!(o, "  [Shim activity]");
+    print_heartbeat_line(o, ai_env);
+    print_break_glass_section(o, ai_env);
 }
 
 /// Deduplicate and execute repairs in the correct order (DI-10).
 /// Order: RunInstall → RegenerateHooks → ChmodConfig → RegenerateBaseline (last).
 fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, AppError> {
+    let mut stdout = std::io::stdout().lock();
+    let o = &mut Out::new(&mut stdout);
+
     let ai_env = doctor_ai_env();
     let problems: Vec<_> = items
         .iter()
@@ -865,8 +919,8 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
         .collect();
 
     if problems.is_empty() {
-        println!("omamori doctor --fix: nothing to repair, all healthy");
-        print_fix_shim_activity_footer(ai_env);
+        out!(o, "omamori doctor --fix: nothing to repair, all healthy");
+        print_fix_shim_activity_footer(o, ai_env);
         return Ok(0);
     }
 
@@ -898,7 +952,8 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
         needs_regen_baseline = false;
     }
 
-    println!(
+    out!(
+        o,
         "omamori doctor --fix: repairing {} issue(s)\n",
         problems.len()
     );
@@ -908,14 +963,14 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 1. RunInstall (covers shims + hooks + baseline)
     if needs_install {
-        print!("  [Layer 1] re-running full install...");
+        out_part!(o, "  [Layer 1] re-running full install...");
         match run_install_repair(base_dir) {
             Ok(()) => {
-                println!(" [fixed]");
+                out!(o, " [fixed]");
                 fixed += 1;
             }
             Err(e) => {
-                println!(" [FAILED] {e}");
+                out!(o, " [FAILED] {e}");
                 failed += 1;
             }
         }
@@ -923,12 +978,12 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 2. RegenerateHooks (only if install wasn't needed)
     if needs_regen_hooks {
-        print!("  [Layer 2] regenerating hook scripts...");
+        out_part!(o, "  [Layer 2] regenerating hook scripts...");
         let outcome = describe_regen_hooks_outcome(
             installer::regenerate_hooks_with_verifier(base_dir, installer::verify_hook_contract),
             ai_env,
         );
-        println!("{}", outcome.message());
+        out!(o, "{}", outcome.message());
         if outcome.is_failure() {
             failed += 1;
         } else {
@@ -938,14 +993,14 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 3. ChmodConfig
     for path in &chmod_targets {
-        print!("  [Integrity] chmod 600 {}...", path.display());
+        out_part!(o, "  [Integrity] chmod 600 {}...", path.display());
         match chmod_600(path) {
             Ok(()) => {
-                println!(" [fixed]");
+                out!(o, " [fixed]");
                 fixed += 1;
             }
             Err(e) => {
-                println!(" [FAILED] {e}");
+                out!(o, " [FAILED] {e}");
                 failed += 1;
             }
         }
@@ -953,14 +1008,14 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 4. RegenerateBaseline (LAST per DI-10)
     if needs_regen_baseline {
-        print!("  [Integrity] regenerating integrity baseline...");
+        out_part!(o, "  [Integrity] regenerating integrity baseline...");
         match regen_baseline(base_dir) {
             Ok(()) => {
-                println!(" [fixed]");
+                out!(o, " [fixed]");
                 fixed += 1;
             }
             Err(e) => {
-                println!(" [FAILED] {e}");
+                out!(o, " [FAILED] {e}");
                 failed += 1;
             }
         }
@@ -968,35 +1023,37 @@ fn run_fix(items: &[CheckItem], base_dir: &Path, verbose: bool) -> Result<i32, A
 
     // 5. Manual items
     if !manual_items.is_empty() {
-        println!();
+        out!(o);
         for (item, hint) in &manual_items {
-            println!("  [MANUAL] [{}] {} — {}", item.category, item.name, hint);
+            out!(o, "  [MANUAL] [{}] {} — {}", item.category, item.name, hint);
         }
     }
 
-    println!();
+    out!(o);
     if failed == 0 && manual_items.is_empty() {
-        println!("  all issues fixed");
+        out!(o, "  all issues fixed");
     } else if failed == 0 {
-        println!(
+        out!(
+            o,
             "  {fixed} fixed, {} require manual action",
             manual_items.len()
         );
     } else {
-        println!(
+        out!(
+            o,
             "  {fixed} fixed, {failed} failed, {} manual",
             manual_items.len()
         );
     }
 
-    print_fix_shim_activity_footer(ai_env);
+    print_fix_shim_activity_footer(o, ai_env);
 
     if verbose {
         // Re-check after repair
-        println!();
-        println!("Post-repair check:");
+        out!(o);
+        out!(o, "Post-repair check:");
         let recheck = integrity::full_check(base_dir);
-        print_all_items(&recheck.items);
+        print_all_items(o, &recheck.items);
     }
 
     // exit code
@@ -1287,15 +1344,16 @@ pub(crate) fn is_ai_environment() -> bool {
     detection.protected
 }
 
-fn print_all_items(items: &[CheckItem]) {
+fn print_all_items(o: &mut Out<'_>, items: &[CheckItem]) {
     let sections = group_by_section(items);
     for (section, section_items) in &sections {
         if section_items.is_empty() {
             continue;
         }
-        println!("  {}:", section.heading());
+        out!(o, "  {}:", section.heading());
         for item in section_items {
-            println!(
+            out!(
+                o,
                 "    {:<6} {:<36} {}",
                 item.status.label(),
                 item.name,
@@ -1361,8 +1419,11 @@ fn build_json_output(items: &[CheckItem], fix_mode: bool) -> serde_json::Value {
 }
 
 fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i32, AppError> {
+    let mut stdout = std::io::stdout().lock();
+    let o = &mut Out::new(&mut stdout);
+
     let output = build_json_output(items, fix_mode);
-    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    out!(o, "{}", serde_json::to_string_pretty(&output).unwrap());
 
     if items.iter().any(|i| i.status == CheckStatus::Fail) {
         Ok(1)
@@ -1558,8 +1619,12 @@ mod tests {
             DoctorSection::Integrity,
         ] {
             for annotate in section_annotations(section) {
-                annotate(false);
-                annotate(true);
+                // #544: rendered into a buffer rather than the test runner's
+                // own stdout, which is what these calls used to write to.
+                let mut buf = Vec::new();
+                let o = &mut Out::new(&mut buf);
+                annotate(o, false);
+                annotate(o, true);
             }
         }
     }
