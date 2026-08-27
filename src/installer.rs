@@ -491,7 +491,7 @@ pub(crate) enum HookKeptReason {
 /// `debug`/`release` (matching Cargo's own two documented layouts, not an
 /// open-ended "anywhere later" match, which would false-positive on
 /// unrelated paths like `target/staging/release/...`).
-fn is_dev_build_path(path: &Path) -> bool {
+pub(crate) fn is_dev_build_path(path: &Path) -> bool {
     let components: Vec<_> = path.components().collect();
     let is_target = |c: &std::path::Component| c.as_os_str() == "target";
     let is_profile_dir =

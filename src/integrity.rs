@@ -762,6 +762,20 @@ fn check_claude_settings_integration_with_verifier(
     }
 }
 
+/// Whether two paths name the same file on disk. Canonicalizes both sides —
+/// falling back to the raw path when canonicalization fails, so a dangling or
+/// unreadable path still compares by spelling — which makes a Homebrew stable
+/// symlink and the versioned Cellar path it currently points at compare equal.
+/// Extracted from `shim_matches_baseline` so `detect_shim_install_drift`
+/// (#542) shares one notion of "the same binary": both ask whether a shim
+/// resolves to a given install, and a spelling-only comparison would report
+/// drift every time Homebrew relinks its stable path.
+fn same_binary_path(a: &Path, b: &Path) -> bool {
+    let ca = fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    ca == cb
+}
+
 /// Compare a shim's resolved target against the baseline record.
 /// Returns `true` (match) when baseline is absent, entry is missing, or paths agree.
 fn shim_matches_baseline(
@@ -776,11 +790,7 @@ fn shim_matches_baseline(
     if entry.target.is_empty() {
         return true;
     }
-    // Canonicalize both sides to handle Homebrew Cellar ↔ stable symlinks
-    let actual = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
-    let expected =
-        fs::canonicalize(Path::new(&entry.target)).unwrap_or_else(|_| PathBuf::from(&entry.target));
-    actual == expected
+    same_binary_path(target, Path::new(&entry.target))
 }
 
 /// Result of resolving "the currently running omamori exe" — resolved once
@@ -795,6 +805,114 @@ fn shim_matches_baseline(
 /// rather than injecting a re-callable resolver function as the prior
 /// `ExeResolver` fn-pointer seam did.
 type ResolvedExe = std::io::Result<PathBuf>;
+
+/// Whether a shim points at the same install as the binary running this check
+/// (#542).
+///
+/// Layer 2 detects a stale install for free: `check_hook_hash` compares the
+/// hook file against what the *running* binary would render right now, so a
+/// hook written by an older install fails the hash comparison. Layer 1 had no
+/// equivalent — `shim_matches_baseline` compares the symlink against
+/// `.integrity.json`, and that record is rewritten from current state by three
+/// separate paths (`install`, `status --refresh`, and `doctor --fix`'s
+/// `RegenerateBaseline` step). A shim left pointing at a five-version-old
+/// binary therefore agreed with its own record, and Layer 1 reported full
+/// marks for the entire nine days that every rule decision came from that old
+/// binary. The running binary is the one thing in the comparison that cannot
+/// be rewritten from disk, which is why it is the reference here.
+#[derive(Debug, PartialEq, Eq)]
+enum ShimInstallDrift {
+    /// The shim resolves to the same file as the binary running this check.
+    Matches,
+    /// This check is running from a `cargo build` artifact. A throwaway binary
+    /// is not evidence about which install should be in force, so no
+    /// conclusion is drawn — otherwise every `cargo run -- doctor` during
+    /// development would report all five shims as wrong.
+    RunnerIsDevBuild,
+    /// `current_exe()` could not be resolved, so there is nothing to compare
+    /// against. Reported as a `Warn` to match `resolve_exe_or_warn`, which
+    /// already surfaces this exact failure for the Layer 2 hash checks.
+    RunnerUnresolved,
+    /// The shim resolves to a different file than the running binary.
+    Drift { runner: PathBuf },
+}
+
+/// Classify one shim's target against the running binary. Never reads the
+/// baseline: the whole point of #542 is that a baseline-derived answer is
+/// self-confirming. Never executes `target` either — the target's version is
+/// not knowable without running it, which is why nothing here names a version
+/// (the `version` field in `.integrity.json` records the process that wrote
+/// the baseline, not the install that created the shims, so it cannot stand
+/// in for one).
+fn detect_shim_install_drift(target: &Path, running_exe: &ResolvedExe) -> ShimInstallDrift {
+    let Ok(runner) = running_exe else {
+        return ShimInstallDrift::RunnerUnresolved;
+    };
+    if installer::is_dev_build_path(runner) {
+        return ShimInstallDrift::RunnerIsDevBuild;
+    }
+    if same_binary_path(target, runner) {
+        ShimInstallDrift::Matches
+    } else {
+        ShimInstallDrift::Drift {
+            runner: runner.clone(),
+        }
+    }
+}
+
+/// Render `detect_shim_install_drift`'s result as the `(status, detail,
+/// remediation)` triple `full_check`'s shim loop uses for an otherwise-healthy
+/// shim.
+///
+/// The remediation is deliberately `ManualOnly`, not `RunInstall`:
+/// `doctor --fix`'s install repair re-links every shim at
+/// `current_exe()` (`run_install_repair`), which would silently discard a
+/// target the operator pinned with `install --source` — the one documented way
+/// to make that provenance judgement yourself (README, Troubleshooting).
+/// Which install should be in force is a decision, not a repair.
+///
+/// Nothing here establishes *what* the target is. The three branches that
+/// speak to that — basename, existence, and the baseline comparison — run
+/// before this one, so reaching it means all three agreed; this arm adds only
+/// that the target is not the install running the check.
+fn shim_install_drift_outcome(
+    target: &Path,
+    running_exe: &ResolvedExe,
+) -> (CheckStatus, String, Option<Remediation>) {
+    let shown = target.display();
+    match detect_shim_install_drift(target, running_exe) {
+        ShimInstallDrift::Matches => (CheckStatus::Ok, format!("-> {shown}"), None),
+        ShimInstallDrift::RunnerIsDevBuild => (
+            CheckStatus::Ok,
+            format!(
+                "-> {shown} (install comparison skipped — this check is running from a cargo build artifact)"
+            ),
+            None,
+        ),
+        ShimInstallDrift::RunnerUnresolved => (
+            CheckStatus::Warn,
+            format!(
+                "-> {shown} (cannot resolve the running omamori exe — install comparison skipped)"
+            ),
+            None,
+        ),
+        ShimInstallDrift::Drift { runner } => (
+            CheckStatus::Warn,
+            format!(
+                "-> {shown} (not the install running this check: {})",
+                runner.display()
+            ),
+            // The detail line above already names both paths, and `doctor`
+            // prints this hint under every item — with all five shims sharing
+            // one target (they always do after an `install`), repeating the
+            // pair here turned the Layer 1 section into a wall of near-identical
+            // text. Found by running it, not by a test.
+            Some(Remediation::ManualOnly(format!(
+                "run `omamori install --hooks` from the install you want in force, or `omamori install --hooks --source {shown}` to keep the shims as they are"
+            ))),
+        ),
+    }
+}
 
 /// The "(cannot resolve omamori exe — hash check skipped)" detail string
 /// with drift suffix appended — shared by `resolve_exe_or_warn` (which
@@ -963,6 +1081,37 @@ fn check_codex_hook_hash(hooks_dir: &Path, resolved_exe: &ResolvedExe) -> CheckI
 
 /// Run a full integrity check of all defense layers.
 pub fn full_check(base_dir: &Path) -> IntegrityReport {
+    full_check_with_exe(base_dir, &std::env::current_exe())
+}
+
+/// `full_check` with the running omamori exe supplied by the caller.
+///
+/// The seam exists because the shim install-drift check (#542) compares
+/// against that exe, and the whole test suite runs from a `cargo` build
+/// artifact — which the check deliberately declines to draw conclusions from
+/// (`ShimInstallDrift::RunnerIsDevBuild`). Without an injection point, every
+/// test of the new branch would take the skip arm and pass vacuously.
+///
+/// `running_exe` is the **raw** `current_exe()`, not
+/// `installer::resolved_current_omamori_exe()`. The two differ on a Homebrew
+/// install: `resolve_stable_exe_path` rewrites a versioned Cellar path to the
+/// stable path whenever that stable path exists. That is right for the hook
+/// checks — a hook has to embed a path that survives the next `brew upgrade` —
+/// and wrong for the shim comparison, which asks which file is executing right
+/// now. Running an older Cellar binary directly while the stable link points at
+/// a newer one would otherwise compare the shims against the *newer* install
+/// and report a genuinely stale shim as `Matches` (Codex review, P1). The
+/// stable spelling the hooks need is derived below.
+pub(crate) fn full_check_with_exe(base_dir: &Path, running_exe: &ResolvedExe) -> IntegrityReport {
+    // `io::Error` is not `Clone`, and every consumer of this value branches
+    // only on Ok/Err (`resolve_exe_or_warn` discards the error with
+    // `map_err(|_| ...)`), so rebuilding it from kind + message loses nothing
+    // that is read anywhere.
+    let stable_exe: ResolvedExe = match running_exe {
+        Ok(exe) => Ok(installer::resolve_stable_exe_path(exe)),
+        Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+    };
+
     let mut items = Vec::new();
     let baseline = read_baseline(base_dir).ok().flatten();
 
@@ -995,7 +1144,12 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
                         Some(Remediation::RunInstall),
                     )
                 } else {
-                    (CheckStatus::Ok, format!("-> {}", target.display()), None)
+                    // Last: the shim is exactly what the baseline recorded, so
+                    // every check above agrees it is untouched. That is the
+                    // state #542 lives in — untouched and stale at the same
+                    // time — and the only reference left that disk cannot
+                    // rewrite is the binary running right now.
+                    shim_install_drift_outcome(&target, running_exe)
                 }
             }
             Err(_) => (
@@ -1033,12 +1187,15 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
     // pointer to a closure/trait-object type (`&dyn Fn`) with `OnceCell`-based
     // caching — real added complexity for a single extra stderr line in a
     // narrow scenario. Accepted as-is.
-    let resolved_exe = installer::resolved_current_omamori_exe();
+    //
+    // #542 moved the resolution itself up to `full_check`, which now hands it
+    // in as a parameter: the shim loop above needs the same value, and the
+    // shims run before the hooks.
     let hooks_dir = base_dir.join("hooks");
-    items.push(check_claude_hook_hash(&hooks_dir, &resolved_exe));
+    items.push(check_claude_hook_hash(&hooks_dir, &stable_exe));
 
     // codex-pretooluse.sh — hash comparison + version drift (#381)
-    items.push(check_codex_hook_hash(&hooks_dir, &resolved_exe));
+    items.push(check_codex_hook_hash(&hooks_dir, &stable_exe));
 
     // claude-settings.snippet.json — existence check only
     let settings_snippet = hooks_dir.join("claude-settings.snippet.json");
@@ -1062,17 +1219,17 @@ pub fn full_check(base_dir: &Path) -> IntegrityReport {
 
     // claude-code-settings — verify ~/.claude/settings.json is wired up (#196)
     // Calls `_with_verifier` directly (not the `check_claude_settings_integration`
-    // convenience wrapper) so it shares `resolved_exe` above instead of
+    // convenience wrapper) so it shares `stable_exe` above instead of
     // resolving its own copy.
     items.push(check_claude_settings_integration_with_verifier(
         base_dir,
         installer::verify_hook_contract,
-        &resolved_exe,
+        &stable_exe,
     ));
 
     // cursor-hooks.snippet.json — hash comparison + dangling path detection (#56, T8, #382)
     let cursor_snippet = hooks_dir.join("cursor-hooks.snippet.json");
-    items.push(check_cursor_snippet(&cursor_snippet, &resolved_exe));
+    items.push(check_cursor_snippet(&cursor_snippet, &stable_exe));
 
     // --- Config ---
     if let Some(entry) = read_config_entry() {
@@ -2584,6 +2741,306 @@ mod tests {
         };
         let any_path = PathBuf::from("/any/path/omamori");
         assert!(shim_matches_baseline(&any_path, "rm", Some(&baseline)));
+    }
+
+    // --- #542: shim install drift ---
+
+    /// Every shim item `full_check_with_exe` reported as pointing somewhere
+    /// other than the running install. Filters on the rendered detail rather
+    /// than on `CheckStatus::Warn` alone so a Warn arriving from one of the
+    /// three older branches (unexpected target / dangling / differs from
+    /// baseline) can never be miscounted as this one.
+    fn drift_items(report: &IntegrityReport) -> Vec<&CheckItem> {
+        report
+            .items
+            .iter()
+            .filter(|i| {
+                i.category == "Shims" && i.detail.contains("not the install running this check")
+            })
+            .collect()
+    }
+
+    /// Two installs plus a stable symlink to the second, and a base dir whose
+    /// shims all point at the second install's binary. None of the paths
+    /// contain a `target/debug` component, so `is_dev_build_path` does not
+    /// suppress the comparison — the fixture has to opt into that separately.
+    struct ShimDriftFixture {
+        root: PathBuf,
+        base: PathBuf,
+        /// A different install from the one the shims point at.
+        other_install: PathBuf,
+        /// The binary every shim resolves to.
+        shim_target: PathBuf,
+        /// A symlink to `shim_target` under a different directory — the shape
+        /// a Homebrew stable path has relative to its Cellar binary.
+        stable_link: PathBuf,
+    }
+
+    fn shim_drift_fixture(label: &str) -> ShimDriftFixture {
+        let root = std::env::temp_dir().join(format!("omamori-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let make_bin = |dir: &str, contents: &str| {
+            let d = root.join(dir);
+            fs::create_dir_all(&d).unwrap();
+            let bin = d.join("omamori");
+            fs::write(&bin, contents).unwrap();
+            bin
+        };
+        let other_install = make_bin("inst-a", "binary A");
+        let shim_target = make_bin("inst-b", "binary B");
+
+        let stable_dir = root.join("stable");
+        fs::create_dir_all(&stable_dir).unwrap();
+        let stable_link = stable_dir.join("omamori");
+        symlink(&shim_target, &stable_link).unwrap();
+
+        let base = root.join("base");
+        let shim_dir = base.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        for command in installer::SHIM_COMMANDS {
+            symlink(&shim_target, shim_dir.join(command)).unwrap();
+        }
+
+        ShimDriftFixture {
+            root,
+            base,
+            other_install,
+            shim_target,
+            stable_link,
+        }
+    }
+
+    /// The check fires when — and only when — the shim resolves to a different
+    /// *file* than the running binary. The third arm is the one that separates
+    /// this from a path-string comparison: a stable symlink is spelled
+    /// differently and is still the same install, which is exactly what every
+    /// healthy Homebrew setup looks like after `brew upgrade` relinks it.
+    #[test]
+    fn full_check_reports_shim_install_drift_only_when_the_resolved_file_differs() {
+        let f = shim_drift_fixture("shimdrift-callsite");
+        let expected = installer::SHIM_COMMANDS.len();
+
+        let drifted = full_check_with_exe(&f.base, &Ok(f.other_install.clone()));
+        let items = drift_items(&drifted);
+        assert_eq!(
+            items.len(),
+            expected,
+            "every shim should report drift, got: {:?}",
+            items
+                .iter()
+                .map(|i| (i.name.as_str(), i.detail.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            items.iter().all(|i| i.status == CheckStatus::Warn),
+            "drift is a warning, not a failure: {:?}",
+            items.iter().map(|i| i.status).collect::<Vec<_>>()
+        );
+        assert!(
+            items
+                .iter()
+                .all(|i| matches!(i.remediation, Some(Remediation::ManualOnly(_)))),
+            "drift must not carry RunInstall — `doctor --fix` would then re-link \
+             every shim at the running binary, discarding an `install --source` pin"
+        );
+
+        let same = full_check_with_exe(&f.base, &Ok(f.shim_target.clone()));
+        assert!(
+            drift_items(&same).is_empty(),
+            "the install the shims point at is not drift"
+        );
+
+        let via_link = full_check_with_exe(&f.base, &Ok(f.stable_link.clone()));
+        assert!(
+            drift_items(&via_link).is_empty(),
+            "a stable symlink to the same binary is a different spelling, not a different install"
+        );
+
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    /// #542's actual mechanism: `.integrity.json` is rewritten from current
+    /// state by `install`, `status --refresh` and `doctor --fix`, so a stale
+    /// shim ends up agreeing with its own record. This pins that the new check
+    /// does not consult the baseline — with a record that blesses the stale
+    /// shims *and* names the running version, every baseline-derived check
+    /// reads healthy and the drift is still reported.
+    #[test]
+    fn shim_install_drift_survives_a_baseline_refreshed_over_stale_shims() {
+        let f = shim_drift_fixture("shimdrift-baseline");
+        let expected = installer::SHIM_COMMANDS.len();
+
+        assert_eq!(
+            drift_items(&full_check_with_exe(&f.base, &Ok(f.other_install.clone()))).len(),
+            expected,
+            "with no baseline on disk the drift is reported"
+        );
+
+        write_baseline(
+            &f.base,
+            &IntegrityBaseline {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                generated_at: "2026-08-27T00:00:00Z".to_string(),
+                omamori_exe: f.other_install.display().to_string(),
+                shims: installer::SHIM_COMMANDS
+                    .iter()
+                    .map(|c| ShimEntry {
+                        command: (*c).to_string(),
+                        target: f.shim_target.display().to_string(),
+                    })
+                    .collect(),
+                hooks: vec![],
+                config: None,
+            },
+        )
+        .unwrap();
+
+        let report = full_check_with_exe(&f.base, &Ok(f.other_install.clone()));
+        assert_eq!(
+            drift_items(&report).len(),
+            expected,
+            "a refreshed baseline must not launder the stale shims"
+        );
+
+        let baseline_item = report
+            .items
+            .iter()
+            .find(|i| i.name == ".integrity.json")
+            .expect("full_check should include a baseline CheckItem");
+        assert_eq!(
+            baseline_item.status,
+            CheckStatus::Ok,
+            "control: the baseline check itself is green here, so it cannot be \
+             the thing reporting the drift — detail: {}",
+            baseline_item.detail
+        );
+
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    /// A `cargo build` artifact is not evidence about which install should be
+    /// in force, so the comparison is skipped — but only for that reason. The
+    /// second arm keeps the suppression from widening into "never compares":
+    /// the same fixture, checked from a non-dev path, reports all five.
+    #[test]
+    fn shim_install_drift_draws_no_conclusion_from_a_cargo_build_artifact() {
+        let f = shim_drift_fixture("shimdrift-devbuild");
+
+        let dev_dir = f.root.join("target").join("debug");
+        fs::create_dir_all(&dev_dir).unwrap();
+        let dev_bin = dev_dir.join("omamori");
+        fs::write(&dev_bin, "dev build").unwrap();
+
+        assert!(
+            drift_items(&full_check_with_exe(&f.base, &Ok(dev_bin))).is_empty(),
+            "a target/debug runner draws no conclusion about the installed shims"
+        );
+        assert_eq!(
+            drift_items(&full_check_with_exe(&f.base, &Ok(f.other_install.clone()))).len(),
+            installer::SHIM_COMMANDS.len(),
+            "control: the same fixture from a stable path does report drift"
+        );
+
+        let _ = fs::remove_dir_all(&f.root);
+    }
+
+    /// The comparison follows the file that is executing, not the stable
+    /// spelling of it. `resolve_stable_exe_path` rewrites a Cellar path to the
+    /// Homebrew stable path when that exists — correct for the hook checks,
+    /// which must embed a path that survives `brew upgrade`, and wrong here:
+    /// with an older Cellar binary running and the stable link already moved to
+    /// a newer one, using the rewritten path compares the shims against an
+    /// install that is not running. Both arms matter, and the second is the
+    /// dangerous one: it is a stale shim reported as healthy.
+    #[test]
+    fn shim_install_drift_follows_the_running_cellar_binary_not_its_stable_link() {
+        let root =
+            std::env::temp_dir().join(format!("omamori-shimdrift-cellar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let cellar_bin = |version: &str| {
+            let d = root
+                .join("Cellar")
+                .join("omamori")
+                .join(version)
+                .join("bin");
+            fs::create_dir_all(&d).unwrap();
+            let bin = d.join("omamori");
+            fs::write(&bin, format!("binary {version}")).unwrap();
+            bin
+        };
+        let running = cellar_bin("1.0.4");
+        let newer = cellar_bin("1.0.5");
+
+        // The stable path `cellar_to_stable_path` derives from either Cellar
+        // path, already relinked to the newer install.
+        let stable_dir = root.join("bin");
+        fs::create_dir_all(&stable_dir).unwrap();
+        symlink(&newer, stable_dir.join("omamori")).unwrap();
+
+        let base = root.join("base");
+        let shim_dir = base.join("shim");
+        fs::create_dir_all(&shim_dir).unwrap();
+        let link_shims_at = |target: &Path| {
+            for command in installer::SHIM_COMMANDS {
+                let p = shim_dir.join(command);
+                let _ = fs::remove_file(&p);
+                symlink(target, &p).unwrap();
+            }
+        };
+
+        link_shims_at(&running);
+        assert!(
+            drift_items(&full_check_with_exe(&base, &Ok(running.clone()))).is_empty(),
+            "shims pointing at the binary that is actually running are not drift, \
+             even though the stable link has moved on"
+        );
+
+        link_shims_at(&newer);
+        assert_eq!(
+            drift_items(&full_check_with_exe(&base, &Ok(running.clone()))).len(),
+            installer::SHIM_COMMANDS.len(),
+            "shims pointing at an install other than the running one are drift — \
+             resolving the runner through its stable link would hide exactly this"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// With no running exe to compare against there is no verdict to give, and
+    /// the shim items say so rather than counting as passes — matching
+    /// `resolve_exe_or_warn`, which already surfaces this failure for the
+    /// Layer 2 hash checks.
+    #[test]
+    fn shim_install_drift_warns_when_the_running_exe_cannot_be_resolved() {
+        let f = shim_drift_fixture("shimdrift-unresolved");
+
+        let report = full_check_with_exe(
+            &f.base,
+            &Err(std::io::Error::other("current_exe unavailable")),
+        );
+        let shims: Vec<_> = report
+            .items
+            .iter()
+            .filter(|i| i.category == "Shims")
+            .collect();
+        assert_eq!(shims.len(), installer::SHIM_COMMANDS.len());
+        assert!(
+            shims.iter().all(|i| i.status == CheckStatus::Warn
+                && i.detail.contains("cannot resolve the running omamori exe")),
+            "got: {:?}",
+            shims
+                .iter()
+                .map(|i| (i.status, i.detail.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            drift_items(&report).is_empty(),
+            "an unresolved runner is not a drift claim — nothing was compared"
+        );
+
+        let _ = fs::remove_dir_all(&f.root);
     }
 
     // --- #103: config hash baseline comparison ---
