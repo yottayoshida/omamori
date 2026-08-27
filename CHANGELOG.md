@@ -6,6 +6,17 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **`doctor` no longer reports Layer 1 as sound when the shims point at a different install.** ([#542](https://github.com/yottayoshida/omamori/issues/542))
+
+  Layer 1 compared each shim symlink against `.integrity.json` and nothing else, and that record is not an install log — `generate_baseline` reads the links as they currently are, and `install`, `status --refresh` and `doctor --fix`'s baseline step all call it. A shim left pointing at an older install therefore agreed with its own record and Layer 1 reported `6/6`. Found on a machine where every shim pointed at a v0.16.0 binary while v1.0.4 sat later on `PATH`: Layer 1 is what a plain `rm` in a terminal actually hits, so nothing in v1.0.0 through v1.0.4 was in force for nine days, and `doctor` said Layer 1 was fine the whole time. Layer 2 named the same drift precisely, because its check compares against what the *running* binary would render right now.
+
+  Layer 1 now does the same: each shim's resolved file is compared against the resolved file of the binary running the check — the one input to the comparison that cannot be rewritten from disk. Paths are canonicalized, so a Homebrew stable path and the Cellar binary behind it are the same install and `brew upgrade` relinking that path is not drift. **No version is named**: a symlink carries no version metadata, reading the target's would mean executing it, and `.integrity.json`'s `version` records the process that wrote the baseline rather than the install that created the shims. The message names the two paths.
+
+  **The finding is a warning with a manual remediation, not an automatic repair.** `doctor --fix`'s install repair re-links every shim at `current_exe()`, which would silently discard a target pinned with `install --source` — the documented way to make that provenance judgement yourself. Which install should be in force is a decision, so `doctor --fix` reports it and exits 2 rather than acting on it. **The check does not establish what the target is**: it compares two paths, and the branches that speak to the target's identity (basename, existence, baseline) run before it. The comparison is skipped when `doctor` itself is running from a `cargo` build artifact, since a throwaway binary is not evidence about the installed shims. [ADR-0011](docs/adr/0011-shim-install-drift-is-a-warning-the-operator-resolves.md) records the alternatives, including why storing install provenance in the baseline does not work.
+
+  Each drifting shim is its own item, so Layer 1's pass count drops by one for each — normally all five, since `install` writes them in one loop from a single source. On a machine with nothing else warning or failing that also moves `doctor` from exit 0 to exit 2 and `--json`'s `protection_status` from `ok` to `warn`; where something was already warning, only the counts move. `status` and `setup`'s verification summary render the same items and move with them. The meaning of exit 2 is unchanged — see [docs/CONTRACT.md](docs/CONTRACT.md).
+
 ## [1.0.5] - 2026-08-16
 
 ### Fixed

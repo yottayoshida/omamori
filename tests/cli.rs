@@ -967,13 +967,8 @@ fn seed_rotatable_home(name: &str) -> (PathBuf, PathBuf) {
 /// `clean_ai_env` runs against the AI guard, and one that forgets
 /// `XDG_CONFIG_HOME` reads the developer's real config.
 fn run_in(home: &std::path::Path, args: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(binary());
-    clean_ai_env(&mut cmd);
-    cmd.args(args)
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run omamori {}: {e}", args.join(" ")))
+    // `run_installed` (added with #542) is this with the exe made a parameter.
+    run_installed(std::path::Path::new(&binary()), home, args)
 }
 
 fn rotate_in(home: &std::path::Path) -> std::process::Output {
@@ -6944,4 +6939,170 @@ fn an_unlistable_key_directory_reaches_report_json_and_doctor() {
     );
 
     drop_store(&home, &data);
+}
+
+// ---------------------------------------------------------------------------
+// #542: doctor reports a shim pointing at another install, and does not
+// silently re-point it
+// ---------------------------------------------------------------------------
+
+/// Runs a *copy* of the test binary placed at `exe`, with `HOME` pinned.
+/// `run_in` can't be reused: it always launches `binary()`, which lives under
+/// `target/debug` — a path `is_dev_build_path` recognises, so the drift check
+/// declines to draw any conclusion from it. Copying to a plain directory is
+/// what makes this scenario reachable at all from an integration test.
+fn run_installed(
+    exe: &std::path::Path,
+    home: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    let mut cmd = Command::new(exe);
+    clean_ai_env(&mut cmd);
+    cmd.args(args)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {} {}: {e}", exe.display(), args.join(" ")))
+}
+
+fn copy_binary_to(dir: &std::path::Path) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
+    let exe = dir.join("omamori");
+    fs::copy(binary(), &exe).unwrap();
+    exe
+}
+
+/// Reproduces #542 end to end, including the step that made it invisible.
+///
+/// A machine with two genuine installs runs `install` from the first, then
+/// ends up with its shims pointing at the second (here: re-linked directly,
+/// which is what a `cargo install` after a `brew install` amounts to). A
+/// baseline refresh then records the stale shims as correct, so every
+/// baseline-derived check goes green — that is why `doctor` reported Layer 1
+/// as sound for nine days.
+///
+/// Two things are pinned: the drift reaches the CLI surface, and `--fix` does
+/// not quietly re-link the shims at whatever binary happened to run it (which
+/// would discard an `install --source` pin — see ADR-0011).
+#[test]
+fn doctor_reports_shim_install_drift_and_fix_does_not_relink_the_shims() {
+    let root = unique_dir("shim-drift-e2e");
+    let home = root.join("home");
+    // `install --hooks` only merges into ~/.claude and only writes the Codex
+    // wrapper when those directories exist. Creating both keeps every Layer 2
+    // check green, so **no finding here carries `RunInstall`** — that, not "the
+    // drift is the only finding", is what the `--fix` assertion below needs. A
+    // second finding does remain: the shim dir is not on this child's `PATH`,
+    // so `check_path_order` warns with a `ManualOnly` remediation, which
+    // `run_fix` does not act on. The Layer 1 tallies asserted below count it,
+    // which is why they are 5/6 and 0/6 rather than 6/6 and 1/6.
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+
+    let checker = copy_binary_to(&root.join("inst-a"));
+    let other = copy_binary_to(&root.join("inst-b"));
+    let base = root.join("base");
+
+    let install = run_installed(
+        &checker,
+        &home,
+        &[
+            "install",
+            "--base-dir",
+            base.to_str().unwrap(),
+            "--source",
+            checker.to_str().unwrap(),
+            "--hooks",
+        ],
+    );
+    assert!(
+        install.status.success(),
+        "install should succeed. stderr: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    // Control: straight after an install the shims are the install running the
+    // check, and Layer 1 counts every one of them as a pass. Without this the
+    // assertions further down cannot tell "the drift moved the tally" from
+    // "the tally was never full in this fixture".
+    let before = run_installed(
+        &checker,
+        &home,
+        &["doctor", "--base-dir", base.to_str().unwrap()],
+    );
+    let before_out = String::from_utf8_lossy(&before.stdout);
+    assert!(
+        before_out.contains("[Layer 1] PATH shims 5/6"),
+        "a fresh install should pass every shim check: {before_out}"
+    );
+    assert!(
+        !before_out.contains("not the install running this check"),
+        "a fresh install is not drift: {before_out}"
+    );
+
+    let shim_dir = base.join("shim");
+    let shims: Vec<PathBuf> = fs::read_dir(&shim_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(!shims.is_empty(), "install should have created shims");
+    for shim in &shims {
+        fs::remove_file(shim).unwrap();
+        std::os::unix::fs::symlink(&other, shim).unwrap();
+    }
+
+    // The laundering step: the record now agrees with the stale shims.
+    let refresh = run_installed(
+        &checker,
+        &home,
+        &["status", "--refresh", "--base-dir", base.to_str().unwrap()],
+    );
+    assert!(
+        String::from_utf8_lossy(&refresh.stdout).contains("Baseline refreshed"),
+        "status --refresh should rewrite the baseline: {}",
+        String::from_utf8_lossy(&refresh.stdout)
+    );
+
+    let diagnose = run_installed(
+        &checker,
+        &home,
+        &["doctor", "--base-dir", base.to_str().unwrap()],
+    );
+    let diagnose_out = String::from_utf8_lossy(&diagnose.stdout);
+    assert!(
+        diagnose_out.contains("not the install running this check"),
+        "doctor must name the shim drift: {diagnose_out}"
+    );
+    assert!(
+        diagnose_out.contains("[Layer 1] PATH shims 0/6"),
+        "each drifting shim drops out of Layer 1's pass count: {diagnose_out}"
+    );
+    assert_eq!(
+        diagnose.status.code(),
+        Some(2),
+        "warnings and no failures is exit 2: {diagnose_out}"
+    );
+
+    let fixed = run_installed(
+        &checker,
+        &home,
+        &["doctor", "--fix", "--base-dir", base.to_str().unwrap()],
+    );
+    let fixed_out = String::from_utf8_lossy(&fixed.stdout);
+    assert!(
+        !fixed_out.contains("re-running full install"),
+        "the drift must not trigger an install repair — that would re-link every \
+         shim at the running binary: {fixed_out}"
+    );
+    for shim in &shims {
+        let target = fs::read_link(shim).unwrap();
+        assert_eq!(
+            target,
+            other,
+            "--fix must leave {} pointing where the operator put it",
+            shim.display()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
 }
