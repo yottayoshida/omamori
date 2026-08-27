@@ -697,16 +697,16 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
 
 /// Did the reader on the other end of stdout go away?
 ///
-/// Rust disables the default `SIGPIPE` handler at startup, so `cmd | head -20`
-/// does not kill the process the way a C program would — the write returns
-/// `EPIPE` and it surfaces as an error. Printing `Broken pipe (os error 32)`
-/// and exiting 1 for what is a normal, deliberate way to read a long log is
-/// wrong, and #457 made it worse by adding a recovery hint (`audit show --all
-/// | head -20`) that walks straight into it: measured, that exact command
-/// printed the error whenever the log outgrew the pipe buffer — which is
-/// precisely when a user would reach for it.
+/// #457 added a recovery hint (`audit show --all | head -20`) that walked
+/// straight into the failure this answers: measured, that exact command
+/// printed `Broken pipe (os error 32)` and exited 1 whenever the log outgrew
+/// the pipe buffer — precisely when a user would reach for it.
+///
+/// The reasoning, and the same question asked of a plain `io::Error`, live in
+/// `util::is_broken_pipe`; #544 gave `doctor`/`status` the same answer and the
+/// two must not drift.
 fn is_broken_pipe(e: &audit::AuditError) -> bool {
-    matches!(e, audit::AuditError::Io(io) if io.kind() == std::io::ErrorKind::BrokenPipe)
+    matches!(e, audit::AuditError::Io(io) if crate::util::is_broken_pipe(io))
 }
 
 /// `omamori audit unknown` — show all `unknown_tool_fail_open` events.

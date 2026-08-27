@@ -7,6 +7,27 @@ use std::path::{Path, PathBuf};
 use super::AppError;
 
 // ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+/// Did the reader on the other end of an output stream go away?
+///
+/// Rust disables the default `SIGPIPE` handler at startup, so `cmd | head`
+/// does not kill the process the way a C program would — the write returns
+/// `EPIPE` and surfaces as an ordinary error. Treating that as a failure is
+/// wrong: reading the first few lines of a long report is a normal, deliberate
+/// thing to do, and the command's verdict was decided before any of it was
+/// printed.
+///
+/// `audit show` reached this conclusion first (#457, `cli::audit_cmd`); #544
+/// extended it to `doctor`/`status`, whose `println!` calls panicked instead
+/// and replaced a documented 0/1/2 exit code with 101. Shared from here so the
+/// two answers cannot drift apart.
+pub(crate) fn is_broken_pipe(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::BrokenPipe
+}
+
+// ---------------------------------------------------------------------------
 // Usage text
 // ---------------------------------------------------------------------------
 
