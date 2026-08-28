@@ -6,6 +6,8 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-08-28
+
 ### Fixed
 - **`doctor` and `status` no longer replace their exit code when the reader goes away.** ([#544](https://github.com/yottayoshida/omamori/issues/544))
 
@@ -15,6 +17,9 @@ The format is based on Keep a Changelog.
 
   Restoring the default `SIGPIPE` disposition process-wide was considered and rejected: it would kill the process before `audit show`'s existing handling could run, it replaces 101 with death by signal rather than restoring 0/1/2, and the disposition is inherited by the commands the shim spawns. [ADR-0012](docs/adr/0012-a-departed-reader-does-not-change-the-verdict.md) records that and what is still exposed — the 10 other files that write to stdout with `println!` are unchanged, and `report` avoids the failure only by emitting its whole output at once, not by design.
 - **`doctor` no longer reports Layer 1 as sound when the shims point at a different install.** ([#542](https://github.com/yottayoshida/omamori/issues/542))
+
+### Docs
+- **`doctor` and `status` now state their exit codes in the README command reference.** Both return 0 (healthy), 1 (a check failed) or 2 (warnings only), and both were already pinned by tests — but neither appeared in the reference, which annotates `audit verify` and `config validate` the same way. Found while checking the README against this release: [#544](https://github.com/yottayoshida/omamori/issues/544)'s own reasoning called them "the documented three-code contract" while they were documented nowhere a user could read. `docs/CONTRACT.md` freezes the meaning of documented exit codes, so these two are now covered by that freeze explicitly rather than by implication.
 
   Layer 1 compared each shim symlink against `.integrity.json` and nothing else, and that record is not an install log — `generate_baseline` reads the links as they currently are, and `install`, `status --refresh` and `doctor --fix`'s baseline step all call it. A shim left pointing at an older install therefore agreed with its own record and Layer 1 reported `6/6`. Found on a machine where every shim pointed at a v0.16.0 binary while v1.0.4 sat later on `PATH`: Layer 1 is what a plain `rm` in a terminal actually hits, so nothing in v1.0.0 through v1.0.4 was in force for nine days, and `doctor` said Layer 1 was fine the whole time. Layer 2 named the same drift precisely, because its check compares against what the *running* binary would render right now.
 

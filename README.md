@@ -308,10 +308,10 @@ max_files = 500      # cap on staging file count; oldest deleted first. 0 = disa
 ```
 omamori setup [--dry-run] [--non-interactive] [--source PATH]  # One-command install + shell profile + verify
 omamori install [--hooks] [--source PATH]  # Install shims + hooks (no shell profile)
-omamori doctor [--fix] [--verbose] [--json]  # Diagnose and auto-repair installation
+omamori doctor [--fix] [--verbose] [--json]  # Diagnose and auto-repair installation (exit 0/1/2)
 omamori explain [--json] -- <cmd...>     # Show what would happen to a command and why
 omamori test [--config PATH]             # Verify policy rules
-omamori status [--refresh]               # Health check all defense layers
+omamori status [--refresh]               # Health check all defense layers (exit 0/1/2)
 omamori exec [--config PATH] -- CMD      # Run command through policy engine
 
 omamori report [--last 7d] [--json] [--verbose]  # Aggregate audit summary (1d–90d)
