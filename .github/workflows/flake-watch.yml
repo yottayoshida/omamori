@@ -1,0 +1,218 @@
+name: Flake watch
+
+# #344: the suite fails at a low rate (38 measured runs, one failure) in test
+# groups unrelated to each other. Two of the three symptoms reported there are
+# closed; the third — `config enable` seeing a count of audit lines other than
+# one — has never been observed with diagnostics in place, so the mechanism is
+# still unknown and nothing can be fixed from a report that only says "it
+# failed".
+#
+# This job exists to make the next occurrence self-describing rather than
+# waiting for one to land on a PR, where the run is re-run and the evidence is
+# lost. It repeats the suite and keeps the **full output** of every failing
+# iteration: the diagnostics added for that assertion (#536) print the fixture
+# directory, the high-water-mark sidecar and every audit line, and the previous
+# measurement harness threw exactly that away.
+#
+# Scope, stated rather than implied: **ubuntu-latest only**, while ci.yml's
+# `test` job runs on macOS too. `std::env::temp_dir()` is a shared `/tmp` on
+# Linux and a per-user directory on macOS, and fixture-path collisions between
+# tests (#529's R1) are sensitive to exactly that difference — so a race that
+# only exists on macOS stays invisible here. Widening this to a matrix is a
+# cost decision (macOS runners bill at 10x), left to the owner.
+#
+# Sunset: delete this workflow once #344 is closed. It measures one open
+# question and has no value after that question is answered.
+
+on:
+  schedule:
+    # Weekly, offset from the nightly fuzz run so the two do not queue together.
+    - cron: '0 5 * * 1'
+  # A workflow that only ever runs on a schedule ships unexercised. Editing it
+  # runs the loop twice here and self-tests the capture path against a fixed
+  # sample. Two runs decide nothing about the flake rate, so this leg never
+  # fails the PR — see the step below.
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/flake-watch.yml'
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'How many times to run the suite'
+        required: false
+        default: '20'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # Mirrors ci.yml and fuzz.yml: third-party actions in this workflow cannot
+  # execute until their pinning has been validated.
+  action-pin-check:
+    name: Action pin check (flake watch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Verify every uses ref is SHA-pinned
+        run: ./scripts/check-action-pins.sh
+
+  repeat:
+    name: Repeat suite
+    runs-on: ubuntu-latest
+    needs: action-pin-check
+    # 20 runs at roughly a minute each, plus the build. The cap is well above
+    # that so a slow runner reports a result instead of being cancelled with
+    # its evidence unuploaded.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # Built once, outside the loop, so the measured iterations are test runs
+      # rather than compilations.
+      - name: Build the test binaries
+        run: cargo test --locked --no-run
+
+      # Proves the capture path before the loop uses it, in the shape ci.yml's
+      # `--self-test` steps established: feed the extraction a sample that is
+      # known to contain assertion values, and fail if they do not come out.
+      # Without this, a green PR leg would only mean "the loop ran" — and the
+      # one thing #529's harness got wrong was keeping the failure but not the
+      # values (`left: 2` versus `left: 0` point at opposite causes).
+      - name: Self-test the failure extraction
+        run: |
+          cat > /tmp/flake-sample.log <<'SAMPLE'
+          running 2 tests
+          test t::passes ... ok
+          test t::fails ... FAILED
+
+          failures:
+
+          ---- t::fails stdout ----
+          thread 't::fails' panicked at src/lib.rs:23:9:
+          assertion `left == right` failed: exactly one event
+            left: 2
+           right: 1
+
+          failures:
+              t::fails
+
+          test result: FAILED. 1 passed; 1 failed; 0 ignored
+          SAMPLE
+          extracted=$(sed -n '/^failures:$/,$p' /tmp/flake-sample.log | head -200)
+          for needle in 'left: 2' 'right: 1' 't::fails'; do
+            printf '%s\n' "$extracted" | grep -qF "$needle" || {
+              echo "extraction lost '$needle' — the loop below would record a failure with no cause"
+              exit 1
+            }
+          done
+          echo "extraction self-test OK"
+
+      - name: Repeat the suite
+        env:
+          # Not interpolated into the script body: `${{ }}` is textual
+          # substitution, and this value is operator-supplied.
+          REQUESTED_RUNS: ${{ github.event.inputs.runs || '20' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            requested=2
+          else
+            requested="$REQUESTED_RUNS"
+          fi
+          # Rejects 0 as well as non-numbers: `seq`/`while` over zero
+          # iterations would leave completed=0 and failed=0, and a floor
+          # derived from the request would then clear itself.
+          case "$requested" in
+            ''|*[!0-9]*) echo "runs must be a positive integer, got '$requested'"; exit 1 ;;
+          esac
+          if [ "$requested" -lt 1 ]; then
+            echo "runs must be at least 1, got '$requested'"
+            exit 1
+          fi
+          mkdir -p flake-logs
+          failed=0
+          completed=0
+          # Bounded by time as well as by count. A suite run has been measured
+          # at both ~1 minute and ~9 minutes depending on the machine, and a
+          # loop that only counts would be cancelled on the slow end — taking
+          # its evidence with it, because a cancelled job runs no upload step.
+          deadline=$(( $(date +%s) + 60 * 60 ))
+          i=0
+          while [ "$i" -lt "$requested" ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "deadline reached after $completed runs"
+              break
+            fi
+            i=$((i + 1))
+            completed=$((completed + 1))
+            # Wrapped in the isolation canary for the reason ci.yml wraps all
+            # three of its `cargo test` jobs (#210: the suite twice damaged the
+            # real ~/.claude/settings.json). Here it is also a detector: a run
+            # that escapes into the real HOME is #344's own class of defect,
+            # and running bare would discard exactly that evidence.
+            if ./scripts/test-isolation-canary.sh -- cargo test --locked \
+                 > "flake-logs/run-$i.log" 2>&1; then
+              rm -f "flake-logs/run-$i.log"
+            else
+              failed=$((failed + 1))
+              echo "::group::run $i FAILED"
+              # The assertion values are the point (#344): print the failure
+              # blocks here as well as keeping the whole file as an artifact,
+              # so the mechanism is readable without downloading anything.
+              # A run that died before printing a `failures:` block (an abort,
+              # or a cargo-level error) has no such marker — fall back to the
+              # tail rather than emitting an empty group.
+              extracted=$(sed -n '/^failures:$/,$p' "flake-logs/run-$i.log" | head -200)
+              if [ -n "$extracted" ]; then
+                printf '%s\n' "$extracted"
+              else
+                echo "(no 'failures:' block — last 200 lines)"
+                tail -200 "flake-logs/run-$i.log"
+              fi
+              echo "::endgroup::"
+            fi
+          done
+          echo "## Flake watch: $failed of $completed completed runs failed (requested $requested)" \
+            >> "$GITHUB_STEP_SUMMARY"
+          # Measuring nothing must not read as measuring no failures. A loop
+          # that never entered, or one the deadline cut to a couple of runs,
+          # has not observed a 3-5% event and may not report green on that
+          # basis.
+          floor=$(( requested < 2 ? requested : 2 ))
+          if [ "$completed" -lt "$floor" ]; then
+            echo "only $completed of $requested runs completed — too few to report on"
+            exit 1
+          fi
+          # A clean batch is a measurement, not a verdict: at the reported
+          # 3-5% rate, 20 runs come back clean about a third to a half of the
+          # time. Only a failure is evidence, which is why this exits non-zero
+          # only then — and not at all on the self-test leg, where two runs
+          # decide nothing and a red PR would be reporting luck.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "self-test leg: the loop completed $completed runs, $failed failed (never fails the PR)"
+            exit 0
+          fi
+          test "$failed" -eq 0
+
+      # `always()`, not `failure()`: the self-test leg exits 0 even when it
+      # captured something, and that capture is the whole point of the leg.
+      # Passing runs delete their own log, so a clean batch uploads nothing.
+      - name: Upload the failing runs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: flake-watch-logs
+          path: flake-logs/
+          if-no-files-found: ignore
+          # Long enough to outlive one weekly cycle with margin, so evidence
+          # from Monday's run is still there when someone looks the following
+          # week. Bounded for the reason fuzz.yml bounds its crash artifacts:
+          # this is public-repo output showing an unfixed race in a security
+          # tool, and a stale run should not advertise it indefinitely.
+          retention-days: 14
