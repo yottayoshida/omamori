@@ -784,8 +784,8 @@ fn run_audit_key(args: &[OsString]) -> Result<i32, AppError> {
                 crate::detector::repair_gate_reporting(&load_result.config.detectors);
 
             let Some(path) = audit::resolved_audit_path(&load_result.config.audit) else {
-                eprintln!("omamori: cannot resolve audit path — HOME is unset, empty, or relative");
-                eprintln!("  set audit.path explicitly in config.toml, or fix HOME, and retry");
+                eprintln!("omamori: {AUDIT_PATH_UNRESOLVED}");
+                eprintln!("{AUDIT_PATH_UNRESOLVED_REMEDY}");
                 return Ok(1);
             };
 
@@ -1074,6 +1074,18 @@ fn append_key_rotation_event(
 
 const AUDIT_USAGE_HINT: &str = "Run `omamori audit` for usage.";
 
+/// One author for the two `audit` subcommands that *print* this state:
+/// `run_audit_key` and `hash_cwd_unavailable_lines`. It does not reach the
+/// third spelling — `verify` and `report` carry the same diagnosis with the
+/// clauses reversed inside a serialized `reason` field (`verify.rs`,
+/// `report.rs`), where the wording is part of what consumers read.
+const AUDIT_PATH_UNRESOLVED: &str = "cannot resolve audit path — HOME is unset, empty, or relative";
+
+/// The route out of [`AUDIT_PATH_UNRESOLVED`], shared with it: a diagnosis
+/// whose repair is spelled separately in each place is how the two drift.
+const AUDIT_PATH_UNRESOLVED_REMEDY: &str =
+    "  set audit.path explicitly in config.toml, or fix HOME, and retry";
+
 fn audit_usage() -> &'static str {
     "omamori audit — audit log commands
 
@@ -1114,8 +1126,8 @@ fn run_audit_hash_cwd(args: &[OsString]) -> Result<i32, AppError> {
 
     let load_result = load_config(None)?;
     emit_config_warnings(&load_result);
-    match audit::hash_cwd_candidates(&load_result.config.audit, &candidate) {
-        Some(candidates) => {
+    match audit::hash_cwd_candidates_classified(&load_result.config.audit, &candidate) {
+        Ok(candidates) => {
             println!("Candidate cwd_hash values for {}:", candidate.display());
             for (key_id, form, hash) in candidates {
                 println!("  [{key_id}, {form}] {hash}");
@@ -1124,24 +1136,164 @@ fn run_audit_hash_cwd(args: &[OsString]) -> Result<i32, AppError> {
             println!("Grep the audit log for any of the above cwd_hash values.");
             Ok(0)
         }
-        None => {
-            // #484: `None` carries one bit and three causes reach it, so this
-            // line is wrong for one of them — an unlistable key directory,
-            // where both the path and the secret are fine. The true cause is
-            // printed above it by the keyring's anomaly report (#477), which
-            // is why this was left rather than fixed here: correcting it means
-            // widening a `pub use`d signature.
-            eprintln!(
-                "omamori audit hash-cwd: no audit path or HMAC secret available — nothing to hash against"
-            );
+        Err(cause) => {
+            // #484: the fixed line this replaces ("no audit path or HMAC
+            // secret available") named two causes and was false for most of
+            // the states that reached it.
+            //
+            // #527: same verdict source as `run_audit_verify`. Computed in
+            // this arm rather than above the `match`, so a successful lookup
+            // keeps printing exactly what it printed before — the gate emits
+            // warnings of its own for an unevaluable detector config.
+            let allow_repair =
+                crate::detector::repair_gate_reporting(&load_result.config.detectors);
+            for line in hash_cwd_unavailable_lines(&cause, allow_repair) {
+                eprintln!("{line}");
+            }
             Ok(1)
         }
+    }
+}
+
+/// The stderr for a `hash-cwd` run with nothing to hash against — one arm per
+/// cause (#484). Split from the printing for the reason `remedy_line` is: the
+/// sentences can be checked from both sides of the repair gate, and a function
+/// that prints them cannot.
+fn hash_cwd_unavailable_lines(
+    cause: &audit::HashCwdUnavailable,
+    allow_repair: bool,
+) -> Vec<String> {
+    match cause {
+        audit::HashCwdUnavailable::AuditPathUnresolved => vec![
+            // A sentence break rather than a third dash: the shared constant
+            // already carries one, and two in a line reads as one clause.
+            format!("omamori audit hash-cwd: {AUDIT_PATH_UNRESOLVED}. Nothing to hash against."),
+            // The same second line `run_audit_key` prints. This is the one
+            // cause of the five an operator fixes directly, and sharing only
+            // the first sentence would have left it the one without a route.
+            AUDIT_PATH_UNRESOLVED_REMEDY.to_string(),
+        ],
+        audit::HashCwdUnavailable::AuditDisabled => vec![
+            "omamori audit hash-cwd: auditing is disabled ([audit] enabled = false), so this \
+             store holds no HMAC key and no command will create one — nothing to hash against"
+                .to_string(),
+        ],
+        audit::HashCwdUnavailable::KeyStoreUnusable { remedy } => {
+            let mut lines = vec![
+                "omamori audit hash-cwd: no usable HMAC key — the warning above names the \
+                 cause. Nothing to hash against."
+                    .to_string(),
+            ];
+            lines.extend(
+                remedy
+                    .as_deref()
+                    .and_then(|remedy| remedy_line(remedy, allow_repair)),
+            );
+            lines
+        }
+        audit::HashCwdUnavailable::KeyFilesMissing => vec![
+            "omamori audit hash-cwd: the key store's epoch record shows a key existed, but \
+             no key file could be found — nothing to hash against"
+                .to_string(),
+        ],
+        audit::HashCwdUnavailable::NoKeyYet => vec![
+            "omamori audit hash-cwd: no HMAC key exists yet — one is created the first time \
+             a guarded command writes an audit entry. Nothing to hash against."
+                .to_string(),
+        ],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #484. Every arm names its own cause, no arm names another's, and the
+    /// withdrawn fixed line appears nowhere. The last check is the defect
+    /// itself: that sentence claimed two causes at once and was false for
+    /// most states that reached it.
+    #[test]
+    fn hash_cwd_unavailable_lines_name_only_the_cause_that_happened() {
+        use crate::audit::HashCwdUnavailable as Cause;
+
+        let cases: Vec<(Cause, &str)> = vec![
+            (Cause::AuditPathUnresolved, "cannot resolve audit path"),
+            (Cause::AuditDisabled, "auditing is disabled"),
+            (
+                Cause::KeyStoreUnusable { remedy: None },
+                "no usable HMAC key",
+            ),
+            (
+                Cause::KeyFilesMissing,
+                "epoch record shows a key existed, but no key file could be found",
+            ),
+            (Cause::NoKeyYet, "no HMAC key exists yet"),
+        ];
+        let all_markers: Vec<&str> = cases.iter().map(|(_, marker)| *marker).collect();
+
+        for (cause, marker) in &cases {
+            let text = hash_cwd_unavailable_lines(cause, true).join("\n");
+            assert!(
+                text.contains(marker),
+                "the cause must be named: {marker:?} not in {text:?}"
+            );
+            for other in all_markers.iter().filter(|m| *m != marker) {
+                assert!(
+                    !text.contains(other),
+                    "a cause that did not happen must not be claimed: {other:?} in {text:?}"
+                );
+            }
+            assert!(
+                !text.contains("no audit path or HMAC secret available"),
+                "the withdrawn fixed line must not come back: {text:?}"
+            );
+        }
+
+        // #484 R1 (P1): the action a sentence names has to be one that works
+        // in the state that sentence describes. `NoKeyYet` may promise key
+        // creation because `AuditLogger::build` reaches it; `AuditDisabled` is
+        // the state where it never does, which is why the two are separate
+        // arms rather than one sentence covering both.
+        let disabled = hash_cwd_unavailable_lines(&Cause::AuditDisabled, true).join("\n");
+        assert!(
+            !disabled.contains("guarded command"),
+            "auditing is off — no guarded command creates a key: {disabled:?}"
+        );
+        assert!(
+            hash_cwd_unavailable_lines(&Cause::NoKeyYet, true)
+                .join("\n")
+                .contains("guarded command"),
+            "and with auditing on, that is exactly what does create one"
+        );
+    }
+
+    /// #484 + #527: the one remedy this command can print rides the repair
+    /// gate. Open gate → the anomaly's own repair; closed gate → SEC-R5's
+    /// substitute, not silence and not the recipe.
+    #[test]
+    fn hash_cwd_store_unusable_remedy_rides_the_repair_gate() {
+        use crate::audit::HashCwdUnavailable as Cause;
+
+        let cause = Cause::KeyStoreUnusable {
+            remedy: Some("To fix: make that directory listable again, then re-run.".to_string()),
+        };
+
+        let open = hash_cwd_unavailable_lines(&cause, true).join("\n");
+        assert!(
+            open.contains("make that directory listable again"),
+            "open gate: the repair itself: {open:?}"
+        );
+
+        let closed = hash_cwd_unavailable_lines(&cause, false).join("\n");
+        assert!(
+            !closed.contains("make that directory listable again"),
+            "closed gate: the recipe is withheld: {closed:?}"
+        );
+        assert!(
+            closed.contains("run this command directly in your terminal"),
+            "closed gate: the substitute still gives the operator a route: {closed:?}"
+        );
+    }
 
     /// #478. The rotation failure that leaves the store mutated is the one this
     /// arm exists for, and it is the one no end-to-end test can reach: `rename`

@@ -18,6 +18,7 @@ pub mod verify;
 // --- Public re-exports (maintain `omamori::audit::*` API paths) ---
 pub use error::AuditError;
 pub use provenance::hash_cwd_candidates;
+pub(crate) use provenance::{HashCwdUnavailable, hash_cwd_candidates_classified};
 pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, UnprotectedReason, rotate_key};
 pub use verify::{
@@ -7182,6 +7183,89 @@ mod tests {
              anomaly is indistinguishable from a store with no keys"
         );
         restored.unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #484: an active key that exists but cannot be read must not produce a
+    /// silent empty ring. The retired loop has reported this class since #457;
+    /// the active slot was the one read whose failure said nothing, and
+    /// `hash_cwd_candidates` then classified the store as never initialized —
+    /// over a state (a planted symlink) that can be an attack in progress.
+    ///
+    /// A symlink rather than mode 000: `read_secret` rejects it by shape, so
+    /// the fixture holds under root, where permission bits stop nothing.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_active_key_registers_an_anomaly() {
+        let dir = test_dir("484-active-unreadable");
+        let secret_path = dir.join("audit-secret");
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &secret_path).unwrap();
+
+        let ring = load_keyring(&secret_path);
+
+        assert!(ring.is_empty(), "no key loads through a symlink");
+        let described: Vec<String> = ring.anomalies().iter().map(|a| a.describe()).collect();
+        assert_eq!(
+            described.len(),
+            1,
+            "the failed read must be reported, not swallowed: {described:?}"
+        );
+        assert!(
+            described[0].contains("cannot read the active key"),
+            "the report must name the active slot, not a retired one: {}",
+            described[0]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #484, the other half of #478's absent/unreachable distinction: a store
+    /// where the active key is genuinely *absent* — nothing at the path, no
+    /// epoch record, no retired slots — reports nothing. Every fresh install
+    /// is this state; an anomaly here would put a warning on first run.
+    #[test]
+    fn a_fresh_store_with_no_key_stays_quiet() {
+        let dir = test_dir("484-fresh-quiet");
+        let secret_path = dir.join("audit-secret");
+
+        let ring = load_keyring(&secret_path);
+
+        assert!(ring.is_empty());
+        assert!(
+            ring.anomalies().is_empty(),
+            "absence is not a fault — a fresh store must not warn"
+        );
+        assert!(
+            !ring.prior_key_evidence(),
+            "nothing on disk shows a key ever existed"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #484: the epoch record outliving every key file is *evidence*, not a
+    /// fresh store. `hash_cwd_candidates` tells "never created" apart from
+    /// "created and now gone" by this flag alone — retired files cannot reach
+    /// the empty-and-quiet state (a readable one fills the ring, an unreadable
+    /// one warns), so the record is the only sign left.
+    #[test]
+    fn an_epoch_record_without_key_files_is_evidence_of_a_prior_key() {
+        let dir = test_dir("484-record-outlives-keys");
+        let secret_path = dir.join("audit-secret");
+        fs::write(dir.join("audit-secret.epoch"), "2").unwrap();
+
+        let ring = load_keyring(&secret_path);
+
+        assert!(ring.is_empty(), "no key file, so nothing loads");
+        assert!(
+            ring.anomalies().is_empty(),
+            "a readable record and a missing file are each fine on their own"
+        );
+        assert!(
+            ring.prior_key_evidence(),
+            "the record says epoch 2 was handed out — this store is not fresh"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

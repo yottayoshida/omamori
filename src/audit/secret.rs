@@ -1757,6 +1757,16 @@ pub(super) enum KeyringAnomaly {
     },
     /// A file that is shaped like a retired key but could not be read.
     Unreadable { name: String, reason: String },
+    /// The active key file is there but could not be read. `NotFound` is the
+    /// one `read_secret` failure that means *absent* (#478); every other — a
+    /// symlink planted on the path, unreadable permissions, a wrong shape or
+    /// size — means the key is unreachable, and swallowing those left the ring
+    /// empty with nothing said. `hash_cwd_candidates` then reported the store
+    /// as holding nothing, over a state that can be an attack in progress
+    /// (#484). Not a separate arm of [`Self::Unreadable`]: that variant's
+    /// `kind()` is `"retired_key_unreadable"`, and #506 split kinds precisely
+    /// so two causes never share one label.
+    ActiveKeyUnreadable { name: String, reason: String },
     /// The key directory itself could not be listed, so which epochs exist is
     /// unknown. Every id resolution below is a guess; callers must treat this
     /// as "cannot verify" rather than as an empty key set.
@@ -1783,6 +1793,10 @@ impl KeyringAnomaly {
             Self::Unreadable { name, reason } => format!(
                 "audit keyring: cannot read {name} ({reason}) — entries signed with that key \
                  cannot be verified."
+            ),
+            Self::ActiveKeyUnreadable { name, reason } => format!(
+                "audit keyring: cannot read the active key {name} ({reason}) — entries \
+                 signed with it cannot be verified."
             ),
             Self::DirectoryUnreadable { reason } => format!(
                 "audit keyring: {reason} — which key epochs exist is unknown, so no entry can \
@@ -1820,7 +1834,13 @@ impl KeyringAnomaly {
                 Some("To fix: make that directory listable again, then re-run.".to_string())
             }
             Self::EpochRecordUnreadable { .. } => Some(epoch_record_remedy()),
-            Self::Truncated { .. } | Self::Unreadable { .. } => None,
+            // `ActiveKeyUnreadable` carries its reason in `describe` and no
+            // single repair covers its shapes (a symlink is an incident to
+            // investigate, a permission bit is a chmod) — same rule as the
+            // other non-fatal rows.
+            Self::Truncated { .. } | Self::Unreadable { .. } | Self::ActiveKeyUnreadable { .. } => {
+                None
+            }
         }
     }
 
@@ -1848,6 +1868,12 @@ impl KeyringAnomaly {
             // above it.
             Self::Truncated { .. } => "keyring_truncated",
             Self::Unreadable { .. } => "retired_key_unreadable",
+            // Unreachable today for the same reason as the two above —
+            // `fatal_anomaly` never selects it, and `verify` resolves the
+            // secret itself before consulting the ring. Named anyway (#506):
+            // promoting it must be a compile-time question about the label,
+            // not a silent inheritance of `retired_key_unreadable`.
+            Self::ActiveKeyUnreadable { .. } => "active_key_unreadable",
         }
     }
 }
@@ -1856,6 +1882,13 @@ impl KeyringAnomaly {
 pub(super) struct Keyring {
     keys: BTreeMap<String, [u8; 32]>,
     anomalies: Vec<KeyringAnomaly>,
+    /// Whether the store shows any sign a key has ever been handed out, for
+    /// telling "never created" apart from "created and now gone" on an empty
+    /// ring (#484). At the one decision point that consults it — empty ring,
+    /// no anomalies — this is exactly `recorded > 0`: retired files cannot
+    /// contribute there (a readable one puts a key in the ring, an unreadable
+    /// one pushes an anomaly), so the epoch record is the only sign left.
+    prior_key_evidence: bool,
 }
 
 impl Keyring {
@@ -1874,7 +1907,14 @@ impl Keyring {
         Self {
             keys: BTreeMap::new(),
             anomalies: Vec::new(),
+            prior_key_evidence: false,
         }
+    }
+
+    /// See the field. Meaningful only alongside [`Self::anomalies`] — a ring
+    /// with anomalies already has its cause reported.
+    pub(super) fn prior_key_evidence(&self) -> bool {
+        self.prior_key_evidence
     }
 
     pub(super) fn get(&self, id: &str) -> Option<&[u8; 32]> {
@@ -1980,7 +2020,13 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
     let (retired, record) = match scan_key_dir(secret_path) {
         KeyDirScan::Unlistable(reason) => {
             anomalies.push(KeyringAnomaly::DirectoryUnreadable { reason });
-            return Keyring { keys, anomalies };
+            // `prior_key_evidence` is dead on this path (anomalies is
+            // non-empty); `false` states only what was observed — nothing.
+            return Keyring {
+                keys,
+                anomalies,
+                prior_key_evidence: false,
+            };
         }
         KeyDirScan::Listed { retired, epoch, .. } => (retired, epoch),
     };
@@ -1994,30 +2040,49 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
             anomalies.push(KeyringAnomaly::EpochRecordUnreadable {
                 reason: reason.to_string(),
             });
-            return Keyring { keys, anomalies };
+            // Dead here too, but a record file was seen — the store is not
+            // pristine, so `true` is the accurate dead value.
+            return Keyring {
+                keys,
+                anomalies,
+                prior_key_evidence: true,
+            };
         }
     };
     let epoch = active_epoch(&retired, recorded);
 
     // Active key → the id the writer is currently stamping.
-    if let Ok(secret) = read_secret(secret_path) {
-        keys.insert(key_id_for_epoch(epoch), secret);
-        // Before any rotation the active key *is* epoch 1, which is what
-        // `"default"` names. After a rotation `"default"` belongs to
-        // `.1.retired` instead, registered below.
-        //
-        // PR-C1 (Codex Round 3, Minor-1): the condition is the *epoch*, not
-        // `max_retired == 0`, and the difference is the whole of the
-        // deleted-retired-key defect. On a store that recorded epoch 2 and then
-        // had its only retired key removed, `max_retired` is 0 — so the old
-        // condition aliased `"default"` onto the epoch-2 key, and every epoch-1
-        // entry was checked against bytes that never signed it and reported as
-        // tampering. With the record consulted, `"default"` resolves to nothing
-        // and those entries land in cannot-verify, which is what actually
-        // became of them.
-        if epoch == 1 {
-            keys.insert("default".to_string(), secret);
+    match read_secret(secret_path) {
+        Ok(secret) => {
+            keys.insert(key_id_for_epoch(epoch), secret);
+            // Before any rotation the active key *is* epoch 1, which is what
+            // `"default"` names. After a rotation `"default"` belongs to
+            // `.1.retired` instead, registered below.
+            //
+            // PR-C1 (Codex Round 3, Minor-1): the condition is the *epoch*, not
+            // `max_retired == 0`, and the difference is the whole of the
+            // deleted-retired-key defect. On a store that recorded epoch 2 and then
+            // had its only retired key removed, `max_retired` is 0 — so the old
+            // condition aliased `"default"` onto the epoch-2 key, and every epoch-1
+            // entry was checked against bytes that never signed it and reported as
+            // tampering. With the record consulted, `"default"` resolves to nothing
+            // and those entries land in cannot-verify, which is what actually
+            // became of them.
+            if epoch == 1 {
+                keys.insert("default".to_string(), secret);
+            }
         }
+        // Absent is not a fault: a fresh store has no active key and nothing
+        // to report (#478's absent/unreachable distinction, applied to the
+        // reader).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // #484: every other failure used to be swallowed here — the one spot
+        // in this function that dropped a read error without an anomaly, while
+        // the retired loop below reports the same failure on its files.
+        Err(e) => anomalies.push(KeyringAnomaly::ActiveKeyUnreadable {
+            name: secret_path.display().to_string(),
+            reason: e.to_string(),
+        }),
     }
 
     let found = retired.len();
@@ -2054,7 +2119,11 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
         });
     }
 
-    Keyring { keys, anomalies }
+    Keyring {
+        keys,
+        anomalies,
+        prior_key_evidence: recorded > 0,
+    }
 }
 
 // ---------------------------------------------------------------------------

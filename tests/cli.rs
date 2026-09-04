@@ -1602,14 +1602,19 @@ fn audit_key_rotate_says_why_the_key_store_lock_was_not_held() {
 /// The only surface where the empty-keyring change is observable. `verify`
 /// never gets there — it stops on the fatal anomaly before consulting the ring
 /// — so this command is what decides whether the operator learns the real
-/// cause. An unlistable directory now yields an empty ring, and the anomaly is
-/// printed **before** that emptiness is acted on; with the print after it, the
-/// investigator sees only "no audit path or HMAC secret available", which is
-/// false here: the secret is readable, the directory is not.
+/// cause. An unlistable directory yields an empty ring, and the anomaly is
+/// printed **before** that emptiness is acted on; reverse the two and the
+/// refusal below ("the warning above names the cause") points at a line that
+/// has not been printed yet.
+///
+/// #484 extended it: the line that used to follow the warning — "no audit path
+/// or HMAC secret available", false here because the secret is readable and
+/// only the directory is not — is asserted absent, and the cause the store
+/// actually hit is asserted present.
 ///
 /// Has to run through the binary. The ordering is a difference in what reaches
-/// stderr, and both orders return `None` — an in-process assertion on the
-/// return value would stay green through the mutation.
+/// stderr, and both orders refuse — an in-process assertion on the return value
+/// would stay green through the mutation.
 #[cfg(unix)]
 #[test]
 fn audit_hash_cwd_reports_an_unlistable_key_directory() {
@@ -1617,14 +1622,39 @@ fn audit_hash_cwd_reports_an_unlistable_key_directory() {
 
     let (home, secret_dir) = seed_rotatable_home("audit-hashcwd-unlistable");
     fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o300)).unwrap();
+    // #484: the assertions below now include a *negative* (the withdrawn fixed
+    // line must not appear), and a negative passes vacuously wherever the
+    // fixture stops working — which under root is exactly what 0o300 does.
+    // Prove the listing fails from the same uid the child will run as, or fail
+    // here rather than pass on nothing.
+    let listing_failed = fs::read_dir(&secret_dir).is_err();
 
     let output = run_in(&home, &["audit", "hash-cwd", "/tmp"]);
     let restored = fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700));
 
+    assert!(
+        listing_failed,
+        "fixture precondition: 0o300 must make the listing fail (it does not under root)"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("cannot list"),
         "the operator must be told the directory could not be listed: {stderr}"
+    );
+    // #484: the cause line names this cause and no other, and the fixed line
+    // that blamed a missing path or secret — both fine here — is gone.
+    assert!(
+        stderr.contains("no usable HMAC key"),
+        "the refusal must point at the warning that names the cause: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no audit path or HMAC secret available"),
+        "the withdrawn line claims two causes that are both false here: {stderr}"
+    );
+    assert!(
+        stderr.contains("make that directory listable again"),
+        "the fatal anomaly's repair must travel with the refusal (gate open \
+         under clean_ai_env): {stderr}"
     );
     // Both halves of the outcome, not just the message. Without these the test
     // stays green if `hash_cwd_candidates` starts returning an empty list and
@@ -1641,6 +1671,156 @@ fn audit_hash_cwd_reports_an_unlistable_key_directory() {
         String::from_utf8_lossy(&output.stdout)
     );
     restored.unwrap();
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #484: a symlink planted on the secret path is a reported anomaly, not a
+/// store that "holds nothing". Before this change the failed read was
+/// swallowed and the empty ring classified as never-initialized — the
+/// forensic command describing an attack shape as a fresh install.
+///
+/// A symlink rather than a permission bit so the fixture holds under root.
+#[cfg(unix)]
+#[test]
+fn audit_hash_cwd_reports_a_symlinked_secret_not_a_fresh_store() {
+    let (home, secret_dir) = seed_rotatable_home("audit-hashcwd-symlink");
+    fs::remove_file(secret_dir.join("audit-secret")).unwrap();
+    std::os::unix::fs::symlink(
+        secret_dir.join("elsewhere"),
+        secret_dir.join("audit-secret"),
+    )
+    .unwrap();
+
+    let output = run_in(&home, &["audit", "hash-cwd", "/tmp"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("cannot read the active key"),
+        "the swallowed read must now be reported: {stderr}"
+    );
+    assert!(
+        stderr.contains("no usable HMAC key"),
+        "and the refusal must point at that report: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no HMAC key exists yet"),
+        "an unreachable key must not read as never-created: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no audit path or HMAC secret available"),
+        "the withdrawn line is false here — the path resolved and a file exists: {stderr}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #484: the state the old fixed line was half-right about — nothing has ever
+/// been created — now gets its own sentence, including what creates the key.
+#[test]
+fn audit_hash_cwd_names_the_never_created_state() {
+    let home = unique_dir("audit-hashcwd-fresh");
+    fs::create_dir_all(&home).unwrap();
+
+    let output = run_in(&home, &["audit", "hash-cwd", "/tmp"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("no HMAC key exists yet"),
+        "the actual state, named: {stderr}"
+    );
+    assert!(
+        stderr.contains("the first time a guarded command writes an audit entry"),
+        "and what will change it — the operator action the old line never gave: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot resolve audit path"),
+        "the path resolved fine — that cause did not happen: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no usable HMAC key"),
+        "nothing is unusable — nothing exists: {stderr}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #484: an unusable `HOME` is the one cause the old line was allowed to
+/// blame on the path — and the only one that may say so now.
+///
+/// `HOME` is emptied on its own: `run_in` would derive `XDG_CONFIG_HOME` from
+/// it too, and a relative config path resolves against the test's cwd — the
+/// isolation `run_in`'s own doc comment exists to state.
+#[test]
+fn audit_hash_cwd_names_an_unresolvable_audit_path() {
+    let home = unique_dir("audit-hashcwd-no-home");
+    fs::create_dir_all(&home).unwrap();
+
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let output = cmd
+        .args(["audit", "hash-cwd", "/tmp"])
+        .env("HOME", "")
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("failed to run audit hash-cwd");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("cannot resolve audit path — HOME is unset, empty, or relative"),
+        "the environment is the cause, named: {stderr}"
+    );
+    assert!(
+        !stderr.contains("HMAC key"),
+        "no claim about keys may ride along — none was checked: {stderr}"
+    );
+    assert!(
+        stderr.contains("set audit.path explicitly in config.toml"),
+        "the one cause an operator fixes directly must carry its route: {stderr}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// #484 R1 (P1): with auditing off, the refusal must not tell the operator to
+/// run a guarded command — `AuditLogger::build` returns before it would create
+/// a key, so that instruction never comes true.
+#[test]
+fn audit_hash_cwd_names_a_disabled_audit_rather_than_a_fresh_store() {
+    let home = unique_dir("audit-hashcwd-disabled");
+    let config_dir = home.join(".config").join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "[audit]\nenabled = false\n").unwrap();
+    // A config omamori refuses to read is a config that does not disable
+    // anything — it falls back to the built-in defaults, where auditing is on.
+    // Without this the fixture tests the fresh-store arm under a name that
+    // says otherwise.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let output = run_in(&home, &["audit", "hash-cwd", "/tmp"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stderr.contains("Built-in default rules are active"),
+        "fixture precondition: the config has to be the one in force: {stderr}"
+    );
+    assert!(
+        stderr.contains("auditing is disabled"),
+        "the config is the reason there is no key: {stderr}"
+    );
+    assert!(
+        !stderr.contains("guarded command"),
+        "and no guarded command will change that while it stays off: {stderr}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
 
     let _ = fs::remove_dir_all(&home);
 }
