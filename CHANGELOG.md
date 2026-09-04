@@ -6,6 +6,8 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-09-04
+
 ### Fixed
 - **`audit hash-cwd` names the cause it actually hit when there is nothing to hash against.** ([#484](https://github.com/yottayoshida/omamori/issues/484))
 
