@@ -145,12 +145,59 @@ pub fn hmac_cwd(secret: Option<&[u8; 32]>, cwd: &OsStr) -> String {
 /// investigator's hand-typed candidate — typically NOT resolved — needs
 /// both forms tried, or a real match is silently missed.
 ///
-/// Returns `None` if no HMAC key (active or retired) is available.
+/// Returns `None` if no HMAC key (active or retired) is available. The
+/// classification of *why* lives in [`hash_cwd_candidates_classified`]; this
+/// wrapper is the `Option` shape 1.0 froze.
 pub fn hash_cwd_candidates(
     audit_config: &super::AuditConfig,
     candidate: &std::path::Path,
 ) -> Option<Vec<(String, &'static str, String)>> {
-    let audit_path = super::resolved_audit_path(audit_config)?;
+    hash_cwd_candidates_classified(audit_config, candidate).ok()
+}
+
+/// Why there is nothing to hash against, for the one consumer that has to say
+/// so accurately (#484: the CLI's fixed line was false for most of these).
+///
+/// `pub(crate)` on purpose. The public surface keeps the `Option` shape 1.0
+/// froze; this classification can be promoted to `pub` later without breaking
+/// anyone, and the reverse move cannot.
+#[derive(Debug)]
+pub(crate) enum HashCwdUnavailable {
+    /// `resolved_audit_path` returned `None`: no absolute override and `HOME`
+    /// is unset, empty, or relative.
+    AuditPathUnresolved,
+    /// The store holds no key and `[audit] enabled = false`, so no guarded
+    /// command will make one — `AuditLogger::build` returns `None` before
+    /// reaching the key. Distinguished from [`Self::NoKeyYet`] because that
+    /// arm's sentence points at an action (run a guarded command) which does
+    /// nothing while auditing is off. Only the *empty* store is classified
+    /// this way: a store keyed while auditing was on still answers, since its
+    /// candidates are what an investigator greps the existing log with.
+    AuditDisabled,
+    /// The ring is empty and the loader reported at least one anomaly on
+    /// stderr — the cause is in that report. `remedy` is the fatal anomaly's
+    /// repair when one exists; a ring emptied by non-fatal anomalies alone
+    /// (e.g. every retired key unreadable, active key absent) carries none.
+    KeyStoreUnusable { remedy: Option<String> },
+    /// The ring is empty with nothing to report, but the epoch record says a
+    /// key was handed out: the keys this store once had are gone, not
+    /// never-created.
+    KeyFilesMissing,
+    /// Nothing on disk shows a key ever existed. The first guarded command
+    /// that writes an audit entry creates one (`load_or_create_secret`).
+    NoKeyYet,
+}
+
+/// [`hash_cwd_candidates`] with the cause of an empty answer. Same stderr
+/// behaviour — anomaly reporting stays inside [`Keyring::report_and_usable`],
+/// in the same position (#477's ordering).
+pub(crate) fn hash_cwd_candidates_classified(
+    audit_config: &super::AuditConfig,
+    candidate: &std::path::Path,
+) -> Result<Vec<(String, &'static str, String)>, HashCwdUnavailable> {
+    let Some(audit_path) = super::resolved_audit_path(audit_config) else {
+        return Err(HashCwdUnavailable::AuditPathUnresolved);
+    };
     let secret_path = super::secret::secret_path_for(&audit_path);
     let ring = super::secret::load_keyring(&secret_path);
 
@@ -163,7 +210,17 @@ pub fn hash_cwd_candidates(
     // #477: one call, so that reporting cannot end up behind the emptiness
     // check. See `Keyring::report_and_usable`.
     if !ring.report_and_usable() {
-        return None;
+        return Err(if !ring.anomalies().is_empty() {
+            HashCwdUnavailable::KeyStoreUnusable {
+                remedy: ring.fatal_anomaly().and_then(|a| a.remedy()),
+            }
+        } else if ring.prior_key_evidence() {
+            HashCwdUnavailable::KeyFilesMissing
+        } else if !audit_config.enabled {
+            HashCwdUnavailable::AuditDisabled
+        } else {
+            HashCwdUnavailable::NoKeyYet
+        });
     }
 
     // `Keyring` is backed by a `BTreeMap`, so iteration is already in key_id
@@ -185,7 +242,7 @@ pub fn hash_cwd_candidates(
             out.push((key_id.clone(), *label, hmac_cwd(Some(secret), form)));
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Best-effort ppid lookup. `getppid()` is documented as always succeeding
@@ -598,6 +655,158 @@ mod tests {
             out.is_none(),
             "an unlistable directory must not produce candidates under a guessed epoch"
         );
+        restored.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #484: the four `Err` classifications, one fixture each. The `Option`
+    /// tests above pin the public wrapper; these pin which cause the CLI gets
+    /// to name. Each fixture asserts its *neighbour's* variant does not come
+    /// out, so an implementation collapsing arms cannot pass all of them.
+    #[test]
+    fn classified_reports_no_key_yet_only_for_a_store_with_no_evidence() {
+        let dir = hash_cwd_test_dir("classified-fresh");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+
+        let fresh = hash_cwd_candidates_classified(&config, &dir);
+        assert!(
+            matches!(fresh, Err(HashCwdUnavailable::NoKeyYet)),
+            "nothing on disk — the store was never initialized"
+        );
+
+        // The same empty ring with an epoch record is a different fact: keys
+        // existed and are gone. Saying "no key exists yet" over it is the
+        // false-cause defect this change removes.
+        std::fs::write(dir.join("audit-secret.epoch"), "2").unwrap();
+        let outlived = hash_cwd_candidates_classified(&config, &dir);
+        assert!(
+            matches!(outlived, Err(HashCwdUnavailable::KeyFilesMissing)),
+            "the record shows epoch 2 — this must not classify as NoKeyYet"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #484 R1 (P1): with `[audit] enabled = false` an empty store is a
+    /// different fact from a fresh one — `AuditLogger::build` returns before
+    /// touching the key, so no guarded command will ever create it and the
+    /// `NoKeyYet` sentence would name an action that does nothing.
+    ///
+    /// The second half is the control, and it is what keeps this from being a
+    /// gate on the whole command: a store that *has* keys still answers while
+    /// auditing is off. Those candidates are what an investigator greps a log
+    /// written before it was turned off.
+    #[test]
+    fn classified_separates_a_disabled_audit_from_a_fresh_store() {
+        let dir = hash_cwd_test_dir("classified-disabled");
+        let disabled = AuditConfig {
+            enabled: false,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+
+        assert!(
+            matches!(
+                hash_cwd_candidates_classified(&disabled, &dir),
+                Err(HashCwdUnavailable::AuditDisabled)
+            ),
+            "no key and auditing off — the reason none will appear is the config"
+        );
+
+        // Give the store a key (needs `enabled` to construct the logger), then
+        // ask again with auditing off.
+        let enabled = AuditConfig {
+            enabled: true,
+            ..disabled.clone()
+        };
+        AuditLogger::from_config_for_test(&enabled).expect("logger constructs");
+        assert!(
+            hash_cwd_candidates_classified(&disabled, &dir).is_ok(),
+            "a keyed store must keep answering while auditing is off — the log it \
+             signed is still on disk and still worth grepping"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #484: a symlink planted on the secret path is an unusable store with a
+    /// reported anomaly — not `NoKeyYet`, which is what the swallowed read
+    /// used to produce. No remedy: the anomaly is non-fatal, and what to do
+    /// about a possible attack is not a one-line repair.
+    #[cfg(unix)]
+    #[test]
+    fn classified_reports_a_symlinked_secret_as_store_unusable() {
+        let dir = hash_cwd_test_dir("classified-symlink");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        std::os::unix::fs::symlink(dir.join("elsewhere"), dir.join("audit-secret")).unwrap();
+
+        let out = hash_cwd_candidates_classified(&config, &dir);
+        assert!(
+            matches!(
+                out,
+                Err(HashCwdUnavailable::KeyStoreUnusable { remedy: None })
+            ),
+            "an unreachable key is not an uninitialized store"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #484: the fatal-anomaly path carries the anomaly's own repair through
+    /// to the CLI. Same fixture discipline as the `Option` test above it,
+    /// plus the precondition the root caveat requires: `0o300` stops nothing
+    /// for root, and the new claim here is a *negative* (which variant did
+    /// not come out) — so the fixture has to prove the listing actually
+    /// failed, or fail itself.
+    #[cfg(unix)]
+    #[test]
+    fn classified_reports_an_unlistable_directory_with_its_remedy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = hash_cwd_test_dir("classified-unlistable");
+        let config = AuditConfig {
+            enabled: true,
+            path: Some(dir.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        AuditLogger::from_config_for_test(&config).expect("logger constructs");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let listing_failed = std::fs::read_dir(&dir).is_err();
+        let out = hash_cwd_candidates_classified(&config, &dir);
+        let restored = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+
+        assert!(
+            listing_failed,
+            "fixture precondition: 0o300 must make the listing fail — it does not \
+             under root, and this test must fail there rather than pass vacuously"
+        );
+        match out {
+            Err(HashCwdUnavailable::KeyStoreUnusable {
+                remedy: Some(remedy),
+            }) => {
+                assert!(
+                    remedy.contains("listable"),
+                    "the fatal anomaly's repair travels with the cause: {remedy}"
+                );
+            }
+            other => {
+                panic!("an unlistable directory is an unusable store with a remedy, got {other:?}")
+            }
+        }
         restored.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);

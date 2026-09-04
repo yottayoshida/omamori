@@ -6,6 +6,13 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **`audit hash-cwd` names the cause it actually hit when there is nothing to hash against.** ([#484](https://github.com/yottayoshida/omamori/issues/484))
+
+  The command answered every empty outcome with one fixed line — "no audit path or HMAC secret available" — which is false for most of the states that reach it: on an unlistable key directory both halves are false ([#477](https://github.com/yottayoshida/omamori/issues/477) put the accurate warning above it, but this line still followed). The refusal now names one of five causes: an audit path that cannot resolve (`HOME` unset, empty, or relative); auditing turned off in config, where the store holds no key and no command will create one; a store where no HMAC key has ever been created *and auditing is on*, with what creates one (the first guarded command that writes an audit entry); a store whose epoch record shows a key existed but where no key file remains; or a key store whose warning above names the fault — with the fatal anomaly's repair riding the same repair gate as `verify`'s ([#527](https://github.com/yottayoshida/omamori/issues/527)).
+
+  Underneath it, `load_keyring` no longer swallows a failed read of the *active* key. A symlink planted on the path, unreadable permissions, or a malformed file now registers an anomaly naming the active key, the way the retired slots have since [#457](https://github.com/yottayoshida/omamori/issues/457) — instead of leaving an empty ring with nothing said, which let the forensic command describe a possible attack in progress as a store holding nothing. `NotFound` stays quiet: absence is every fresh install, not a fault ([#478](https://github.com/yottayoshida/omamori/issues/478)'s absent/unreachable distinction, applied to the reader). The new anomaly reaches `hash-cwd` alone in every state a single run can observe: `verify` resolves the secret itself and replaces the ring with an empty one once it records an unusable store, so nothing it prints changes (the exception is a key that becomes unreadable *between* those two reads, which no state on disk produces on its own). The public `hash_cwd_candidates` signature and the exit code (1) are also unchanged.
+
 ## [1.0.6] - 2026-08-28
 
 ### Fixed
