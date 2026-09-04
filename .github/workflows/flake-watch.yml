@@ -41,7 +41,7 @@ on:
       runs:
         description: 'How many times to run the suite'
         required: false
-        default: '20'
+        default: '200'
 
 env:
   CARGO_TERM_COLOR: always
@@ -64,9 +64,14 @@ jobs:
     name: Repeat suite
     runs-on: ubuntu-latest
     needs: action-pin-check
-    # 20 runs at roughly a minute each, plus the build. The cap is well above
-    # that so a slow runner reports a result instead of being cancelled with
-    # its evidence unuploaded.
+    # Measured on this runner: the build takes ~30s and the whole suite
+    # executes in ~4s (1444 lib tests in 2.6s), so 200 runs is about a quarter
+    # of an hour. The cap is well above that so a slower runner reports a
+    # result instead of being cancelled with its evidence unuploaded.
+    #
+    # 200 rather than a couple of dozen because the point is to decide
+    # something: at the reported 3-5% rate, 20 runs miss the event about half
+    # the time, and 200 miss it under one time in 400.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -117,7 +122,7 @@ jobs:
         env:
           # Not interpolated into the script body: `${{ }}` is textual
           # substitution, and this value is operator-supplied.
-          REQUESTED_RUNS: ${{ github.event.inputs.runs || '20' }}
+          REQUESTED_RUNS: ${{ github.event.inputs.runs || '200' }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
@@ -138,6 +143,11 @@ jobs:
           mkdir -p flake-logs
           failed=0
           completed=0
+          observed_tests=0
+          # Well under the ~1737 the suite currently runs, so ordinary growth
+          # or a few #[ignore]s do not trip it. It only has to separate "the
+          # suite ran" from "it did not".
+          MIN_TESTS_PER_RUN=1000
           # Bounded by time as well as by count. A suite run has been measured
           # at both ~1 minute and ~9 minutes depending on the machine, and a
           # loop that only counts would be cancelled on the slow end — taking
@@ -158,6 +168,22 @@ jobs:
             # and running bare would discard exactly that evidence.
             if ./scripts/test-isolation-canary.sh -- cargo test --locked \
                  > "flake-logs/run-$i.log" 2>&1; then
+              # Proof of work. A passing run deletes its own log, so without
+              # this a green job cannot tell "ran the suite N times" from "ran
+              # nothing N times" — the same confusion between a clean result
+              # and an absent one that this job exists to stop reporting.
+              # Verified by hand once already: a 9-second two-run leg looked
+              # impossible until another job's log showed the suite really does
+              # execute in ~4s here.
+              passed=$(awk '/test result: ok\./ {
+                  for (f = 1; f <= NF; f++) if ($f == "passed;") s += $(f - 1)
+                } END { print s + 0 }' "flake-logs/run-$i.log")
+              if [ "$passed" -lt "$MIN_TESTS_PER_RUN" ]; then
+                echo "run $i reported only $passed passing tests (floor $MIN_TESTS_PER_RUN)"
+                echo "a run that executed nothing is not evidence of no flake"
+                exit 1
+              fi
+              observed_tests="$passed"
               rm -f "flake-logs/run-$i.log"
             else
               failed=$((failed + 1))
@@ -180,6 +206,7 @@ jobs:
           done
           echo "## Flake watch: $failed of $completed completed runs failed (requested $requested)" \
             >> "$GITHUB_STEP_SUMMARY"
+          echo "Each passing run executed $observed_tests tests." >> "$GITHUB_STEP_SUMMARY"
           # Measuring nothing must not read as measuring no failures. A loop
           # that never entered, or one the deadline cut to a couple of runs,
           # has not observed a 3-5% event and may not report green on that
