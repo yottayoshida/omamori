@@ -326,6 +326,7 @@ pub(crate) fn resolve_structural_block(
     reason: &unwrap::BlockReason,
     provider: &str,
     dry_run: bool,
+    diag: &mut Vec<String>,
 ) -> HookCheckResult {
     let wrapper_kind = block_reason_wrapper_kind(reason);
 
@@ -340,11 +341,17 @@ pub(crate) fn resolve_structural_block(
         return block();
     }
 
+    // What this routing reports goes onto `diag`, not stderr (ADR-0013): a
+    // `--json-error` block carries it inside its one JSON object, and every
+    // other outcome prints it in this same order.
+
     // Lazy config load — first disk I/O for this code path.
     let load_result = match load_config(None) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("omamori warning: config load failed ({e}), blocking structural command");
+            diag.push(format!(
+                "omamori warning: config load failed ({e}), blocking structural command"
+            ));
             return block();
         }
     };
@@ -354,7 +361,10 @@ pub(crate) fn resolve_structural_block(
     // Degraded config (corrupt TOML, insecure permissions) with default
     // Materialize: the user's actual intent is unknown, so fail-closed.
     if load_result.degraded && action == config::StructuralAction::Materialize {
-        eprintln!("omamori warning: config is degraded, blocking structural command for safety");
+        diag.push(
+            "omamori warning: config is degraded, blocking structural command for safety"
+                .to_string(),
+        );
         return block();
     }
 
@@ -375,18 +385,22 @@ pub(crate) fn resolve_structural_block(
     // space so the upcoming write_staging_file() succeeds.  Runs regardless of
     // write outcome and before any early-return (strict-mode block).
     // Reserve one slot (saturating_sub) so post-write count ≤ max_files.
-    try_prune_staging(
+    let pruned = try_prune_staging(
         load_result.config.structural.retention_days,
         load_result.config.structural.max_files.saturating_sub(1),
     );
+    if pruned > 0 {
+        diag.push(format!("omamori: pruned {pruned} staging file(s)"));
+    }
 
     let staging_path = match write_staging_file(command) {
         Ok(p) => Some(p.to_string_lossy().into_owned()),
         Err(e) => {
-            eprintln!("omamori warning: staging file write failed: {e}");
+            diag.push(format!("omamori warning: staging file write failed: {e}"));
             if load_result.config.audit.strict {
-                eprintln!(
+                diag.push(
                     "omamori error: audit strict mode — blocking because staging write is required"
+                        .to_string(),
                 );
                 return block();
             }
@@ -401,6 +415,7 @@ pub(crate) fn resolve_structural_block(
         wrapper_kind,
         staging_path.as_deref(),
         &load_result.config,
+        diag,
     );
 
     HookCheckResult::AllowMaterialize {
@@ -458,16 +473,30 @@ fn match_invocations_against_rules(
 /// SECURITY (T8): The `Config::default()` fallback on `load_config` failure
 /// is intentional fail-safe behavior, not fail-open.
 pub(crate) fn check_command_for_hook(command: &str) -> HookCheckResult {
-    check_command_for_hook_inner(command, "unknown", false)
+    let mut diag = Vec::new();
+    let result = check_command_for_hook_inner(command, "unknown", false, &mut diag);
+    crate::audit::print_warnings(&diag);
+    result
 }
 
 /// Dry-run variant: classifies the command without writing staging files or
 /// audit log entries. Used by `omamori explain` to avoid side effects.
 pub(crate) fn check_command_for_hook_dry_run(command: &str) -> HookCheckResult {
-    check_command_for_hook_inner(command, "unknown", true)
+    let mut diag = Vec::new();
+    let result = check_command_for_hook_inner(command, "unknown", true, &mut diag);
+    crate::audit::print_warnings(&diag);
+    result
 }
 
-fn check_command_for_hook_inner(command: &str, provider: &str, dry_run: bool) -> HookCheckResult {
+/// `diag` collects what the structural policy routing reports on the way
+/// (ADR-0013). The two wrappers above print it as soon as this returns, which
+/// is where it used to appear; `run_hook_check_command` decides per outcome.
+fn check_command_for_hook_inner(
+    command: &str,
+    provider: &str,
+    dry_run: bool,
+    diag: &mut Vec<String>,
+) -> HookCheckResult {
     // Phase 1B
     if let Err(verdict) = check_phase_1b(command) {
         return verdict;
@@ -476,7 +505,7 @@ fn check_command_for_hook_inner(command: &str, provider: &str, dry_run: bool) ->
     // Phase 2A: structural check + policy routing
     match unwrap::parse_command_string(command) {
         unwrap::ParseResult::Block(reason) => {
-            resolve_structural_block(command, &reason, provider, dry_run)
+            resolve_structural_block(command, &reason, provider, dry_run, diag)
         }
         unwrap::ParseResult::Commands(invocations) => {
             // Phase 2B: rule matching (lazy config load)
@@ -587,6 +616,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                     None,
                     None,
                     HINT_INPUT_VALIDATION,
+                    &[],
                 );
                 return Ok(2);
             }
@@ -613,6 +643,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                     None,
                     None,
                     HINT_INPUT_VALIDATION,
+                    &[],
                 );
                 return Ok(2);
             }
@@ -649,6 +680,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                         verdict.matched_pattern(),
                         None,
                         verdict.hint(),
+                        &[],
                     );
                     return Ok(2);
                 }
@@ -689,7 +721,26 @@ fn run_hook_check_command(
     verbose: bool,
     json_error: bool,
 ) -> Result<i32, AppError> {
-    match check_command_for_hook_inner(command, provider, false) {
+    // What the check reports on the way — structural policy routing, staging,
+    // the materialize audit — is collected rather than printed (ADR-0013). A
+    // `--json-error` block carries it inside its one JSON object; every other
+    // outcome prints it here, first, in the order it was produced, which is
+    // where it used to appear. (Nothing is collected before a break-glass
+    // verdict: the structural routing returns before rule matching.)
+    let mut diag = Vec::new();
+    let result = check_command_for_hook_inner(command, provider, false, &mut diag);
+    let json_block = json_error
+        && matches!(
+            result,
+            HookCheckResult::BlockMeta { .. }
+                | HookCheckResult::BlockRule { .. }
+                | HookCheckResult::BlockStructural { .. }
+        );
+    if !json_block {
+        crate::audit::print_warnings(&diag);
+        diag.clear();
+    }
+    match result {
         HookCheckResult::Allow => {
             print_hook_check_allow_response("omamori: no dangerous pattern detected");
             Ok(0)
@@ -698,16 +749,23 @@ fn run_hook_check_command(
             rule_name,
             expires_at,
         } => {
-            eprintln!(
+            // A failed bypass audit under `[audit] strict = true` turns this
+            // allow into a block, and under `--json-error` every deny path
+            // emits one JSON object (SECURITY.md). So what this branch reports
+            // is collected (ADR-0013) and travels inside that object; every
+            // other outcome prints it, in the same order, before the allow
+            // response.
+            let mut lines = vec![format!(
                 "omamori hook: break-glass bypass active for '{rule_name}' — allowing (expires {expires_at})"
-            );
+            )];
             // Audit the bypass — in strict mode, audit failure blocks the command
             if let Some(logger) = crate::config::load_config(None).ok().and_then(|r| {
                 // #527: the verdict follows the configuration this load
-                // produced — building the logger can print a key-store
+                // produced — building the logger can raise a key-store
                 // warning, and that warning carries a repair.
-                let allow_repair = crate::detector::repair_gate_reporting(&r.config.detectors);
-                AuditLogger::from_config(&r.config.audit, allow_repair)
+                let allow_repair =
+                    crate::detector::repair_gate_collect(&r.config.detectors, &mut lines);
+                AuditLogger::from_config_collect(&r.config.audit, allow_repair, &mut lines)
             }) {
                 // Layer 2 provenance is out of scope for #420 — pass None
                 // deliberately (see create_bypass_event's doc comment).
@@ -722,16 +780,33 @@ fn run_hook_check_command(
                 let strict = crate::config::load_config(None)
                     .map(|r| r.config.audit.strict)
                     .unwrap_or(false);
-                if let Err(e) = logger.append(event) {
-                    eprintln!("omamori warning: failed to audit-log break-glass bypass: {e}");
+                if let Err(e) = logger.append_collect(event, &mut lines) {
+                    lines.push(format!(
+                        "omamori warning: failed to audit-log break-glass bypass: {e}"
+                    ));
                     if strict {
-                        eprintln!(
+                        lines.push(
                             "omamori error: audit strict mode — blocking because bypass audit is required"
+                                .to_string(),
                         );
+                        if json_error {
+                            emit_json_error(
+                                "layer2:rule",
+                                &rule_name,
+                                "omamori hook: blocked — the break-glass bypass for this rule could not be audited, and [audit] strict = true requires it",
+                                None,
+                                None,
+                                &format!("run `omamori explain -- {command}` for details"),
+                                &lines,
+                            );
+                        } else {
+                            crate::audit::print_warnings(&lines);
+                        }
                         return Ok(2);
                     }
                 }
             }
+            crate::audit::print_warnings(&lines);
             print_hook_check_allow_response(
                 "omamori: break-glass bypass active — allowing command",
             );
@@ -754,14 +829,23 @@ fn run_hook_check_command(
             // deny narrative even if the user's terminal is being scraped by
             // an AI agent that crashes between the two writes. Append is
             // best-effort with respect to the decision (SEC-7) — failure
-            // surfaces a stderr warning but the block stays.
+            // surfaces a warning but the block stays.
             //
-            // PR1b R3 [P2]: in --json-error mode, skip audit entirely.
-            // AuditLogger::from_config can emit secret-loading warnings to
-            // stderr that we cannot fully suppress at append time, so we
-            // trade the audit row for a clean single-JSON contract.
-            // Documented in SECURITY.md "hook-check --json-error" trade-off.
+            // #494: `--json-error` records the row too. PR1b R3 used to skip
+            // it here, because the audit layer printed its own warnings and
+            // a line ahead of the JSON object broke the one-object contract.
+            // The layer now hands them back (ADR-0013) and they travel inside
+            // the object, so neither the row nor the contract is given up.
             if json_error {
+                audit_log_hook_block_collect(
+                    command,
+                    provider,
+                    None,
+                    None,
+                    "layer2:meta-pattern".to_string(),
+                    None,
+                    &mut diag,
+                );
                 emit_json_error(
                     "layer2:meta-pattern",
                     reason,
@@ -769,6 +853,7 @@ fn run_hook_check_command(
                     matched_pattern,
                     matched_position.as_ref(),
                     &format!("run `omamori explain -- {command}` for details"),
+                    &diag,
                 );
             } else {
                 audit_log_hook_block(
@@ -802,6 +887,15 @@ fn run_hook_check_command(
             matched_position,
         } => {
             if json_error {
+                audit_log_hook_block_collect(
+                    command,
+                    provider,
+                    Some(&rule_name),
+                    unwrap_chain.clone(),
+                    "layer2:rule".to_string(),
+                    None,
+                    &mut diag,
+                );
                 emit_json_error(
                     "layer2:rule",
                     &rule_name,
@@ -809,6 +903,7 @@ fn run_hook_check_command(
                     matched_pattern,
                     matched_position.as_ref(),
                     &format!("run `omamori explain -- {command}` for details"),
+                    &diag,
                 );
             } else {
                 audit_log_hook_block(
@@ -858,6 +953,15 @@ fn run_hook_check_command(
             let wrapper_kind = block_reason_wrapper_kind(&reason);
             let detection_layer = block_structural_detection_layer(&reason, wrapper_kind);
             if json_error {
+                audit_log_hook_block_collect(
+                    command,
+                    provider,
+                    None,
+                    None,
+                    detection_layer.clone(),
+                    wrapper_kind,
+                    &mut diag,
+                );
                 emit_json_error(
                     &detection_layer,
                     "structural",
@@ -865,6 +969,7 @@ fn run_hook_check_command(
                     matched_pattern,
                     matched_position.as_ref(),
                     &format!("run `omamori explain -- {command}` for details"),
+                    &diag,
                 );
             } else {
                 audit_log_hook_block(command, provider, None, None, detection_layer, wrapper_kind);
@@ -937,6 +1042,7 @@ fn run_hook_check_unknown_tool(
                         verdict.matched_pattern(),
                         None,
                         verdict.hint(),
+                        &[],
                     );
                     return Ok(2);
                 }
@@ -1086,19 +1192,33 @@ fn warn_audit_append_error(
     decision_kind: &str,
     audit_surface: &str,
 ) {
+    eprintln!(
+        "{}",
+        audit_append_error_message(e, context, decision_kind, audit_surface)
+    );
+}
+
+/// The line [`warn_audit_append_error`] prints, for the callers that carry it
+/// somewhere other than stderr (`--json-error`, ADR-0013).
+fn audit_append_error_message(
+    e: &std::io::Error,
+    context: &dyn std::fmt::Display,
+    decision_kind: &str,
+    audit_surface: &str,
+) -> String {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
-        eprintln!(
+        format!(
             "omamori warning: audit write denied for {context}: {e}. \
              This is expected in sandboxed environments (e.g. Codex CLI) that restrict \
              writes outside the working directory. The {decision_kind} decision is \
              unaffected — only audit recording failed. Add the audit log's parent \
              directory to your sandbox's writable paths to restore recording."
-        );
+        )
     } else {
-        eprintln!(
+        format!(
             "omamori warning: failed to record audit event for {context}: {e}. \
              The '{audit_surface}' review surface is incomplete for this event."
-        );
+        )
     }
 }
 
@@ -1219,37 +1339,39 @@ pub fn is_staging_filename(name: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
-pub fn try_prune_staging(retention_days: u32, max_files: u32) {
+/// Returns how many staging files were deleted; the caller reports it
+/// (ADR-0013 — on the hook path it travels with the other collected lines).
+pub fn try_prune_staging(retention_days: u32, max_files: u32) -> u32 {
     if retention_days == 0 && max_files == 0 {
-        return;
+        return 0;
     }
     let Some(dir) = staging_dir() else {
-        return;
+        return 0;
     };
-    try_prune_staging_in(&dir, retention_days, max_files);
+    try_prune_staging_in(&dir, retention_days, max_files)
 }
 
-pub fn try_prune_staging_in(dir: &std::path::Path, retention_days: u32, max_files: u32) {
+pub fn try_prune_staging_in(dir: &std::path::Path, retention_days: u32, max_files: u32) -> u32 {
     if retention_days == 0 && max_files == 0 {
-        return;
+        return 0;
     }
 
     let Ok(meta) = std::fs::symlink_metadata(dir) else {
-        return;
+        return 0;
     };
     if meta.file_type().is_symlink() || !meta.is_dir() {
-        return;
+        return 0;
     }
 
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return 0;
     };
     prune_staging_from(
         dir,
         entries.map(|entry| entry.map(|e| e.file_name())),
         retention_days,
         max_files,
-    );
+    )
 }
 
 /// The listing half of [`try_prune_staging_in`], taking names so a listing
@@ -1273,7 +1395,7 @@ fn prune_staging_from(
     entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
     retention_days: u32,
     max_files: u32,
-) {
+) -> u32 {
     let (names, mut complete) = match crate::util::collect_listing(entries) {
         Ok(names) => (names, true),
         Err(stop) => (stop.seen, false),
@@ -1338,9 +1460,7 @@ fn prune_staging_from(
         }
     }
 
-    if deleted > 0 {
-        eprintln!("omamori: pruned {deleted} staging file(s)");
-    }
+    deleted
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,6 +1487,7 @@ fn audit_log_materialize(
     wrapper_kind: Option<&'static str>,
     staging_path: Option<&str>,
     merged_config: &config::Config,
+    warnings: &mut Vec<String>,
 ) {
     let detection_layer = materialize_detection_layer(reason, wrapper_kind);
     debug_assert!(
@@ -1375,11 +1496,12 @@ fn audit_log_materialize(
     );
 
     // #527: verdict from the merged configuration this path already built.
-    let allow_repair = crate::detector::repair_gate_reporting(&merged_config.detectors);
-    let logger = match AuditLogger::from_config(&merged_config.audit, allow_repair) {
-        Some(l) => l,
-        None => return, // audit disabled — staging file is the primary artifact
-    };
+    let allow_repair = crate::detector::repair_gate_collect(&merged_config.detectors, warnings);
+    let logger =
+        match AuditLogger::from_config_collect(&merged_config.audit, allow_repair, warnings) {
+            Some(l) => l,
+            None => return, // audit disabled — staging file is the primary artifact
+        };
 
     let invocation = CommandInvocation::new(command.to_string(), Vec::new());
     let detectors = vec![provider.to_string()];
@@ -1395,13 +1517,13 @@ fn audit_log_materialize(
         event.unwrap_chain = Some(vec![format!("staging:{p}")]);
     }
 
-    if let Err(e) = logger.append(event) {
-        warn_audit_append_error(
+    if let Err(e) = logger.append_collect(event, warnings) {
+        warnings.push(audit_append_error_message(
             &e,
             &format_args!("{command:?}"),
             "materialize",
             "omamori audit show --action materialize",
-        );
+        ));
     }
 }
 
@@ -1459,6 +1581,32 @@ fn audit_log_hook_block(
     detection_layer_value: String,
     wrapper_kind: Option<&'static str>,
 ) {
+    let mut warnings = Vec::new();
+    audit_log_hook_block_collect(
+        command,
+        provider,
+        rule_name,
+        unwrap_chain,
+        detection_layer_value,
+        wrapper_kind,
+        &mut warnings,
+    );
+    crate::audit::print_warnings(&warnings);
+}
+
+/// [`audit_log_hook_block`], handing its warnings back instead of printing
+/// them (ADR-0013): the config-load failure, the detector and key-store
+/// warnings, the append's own, and an append that failed — in that order,
+/// which is the order text mode prints them.
+fn audit_log_hook_block_collect(
+    command: &str,
+    provider: &str,
+    rule_name: Option<&str>,
+    unwrap_chain: Option<String>,
+    detection_layer_value: String,
+    wrapper_kind: Option<&'static str>,
+    warnings: &mut Vec<String>,
+) {
     debug_assert!(
         is_valid_detection_layer(&detection_layer_value),
         "detection_layer value must come from VALID_DETECTION_LAYERS taxonomy: got {detection_layer_value:?}"
@@ -1479,24 +1627,28 @@ fn audit_log_hook_block(
     let load_result = match load_config(None) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
+            warnings.push(format!(
                 "omamori warning: could not record Layer 2 hook deny event for {command:?} \
                  — config load failed: {e}. The 'omamori audit show --action block' surface \
                  is incomplete for this event."
-            );
+            ));
             return;
         }
     };
     // #527: verdict from this load's detector set, not the built-in list.
-    let allow_repair = crate::detector::repair_gate_reporting(&load_result.config.detectors);
-    let logger =
-        match crate::audit::AuditLogger::from_config(&load_result.config.audit, allow_repair) {
-            Some(l) => l,
-            None => {
-                // Audit disabled in config — user opted out, stay quiet.
-                return;
-            }
-        };
+    let allow_repair =
+        crate::detector::repair_gate_collect(&load_result.config.detectors, warnings);
+    let logger = match crate::audit::AuditLogger::from_config_collect(
+        &load_result.config.audit,
+        allow_repair,
+        warnings,
+    ) {
+        Some(l) => l,
+        None => {
+            // Audit disabled in config — user opted out, stay quiet.
+            return;
+        }
+    };
 
     let invocation = CommandInvocation::new(command.to_string(), Vec::new());
     let detectors = vec![provider.to_string()];
@@ -1522,13 +1674,13 @@ fn audit_log_hook_block(
     // separate, later sunset of that suffix.
     event.wrapper_kind = wrapper_kind.map(str::to_string);
 
-    if let Err(e) = logger.append(event) {
-        warn_audit_append_error(
+    if let Err(e) = logger.append_collect(event, warnings) {
+        warnings.push(audit_append_error_message(
             &e,
             &format_args!("{command:?}"),
             "block",
             "omamori audit show --action block",
-        );
+        ));
     }
 }
 
@@ -2173,6 +2325,12 @@ const HINT_BASE_UNRESOLVABLE: &str = "Tell the user: omamori could not resolve t
 
 /// Emit a structured JSON error to stderr for `--json-error` mode.
 /// Schema is documented in SECURITY.md "hook-check --json-error schema".
+///
+/// `warnings` is what the block's own processing would otherwise have printed —
+/// the audit layer, the structural policy routing (ADR-0013, #494). It is an
+/// optional field, present only when non-empty: with a healthy store and
+/// configuration, absent except on the run whose append triggers the audit
+/// log's periodic prune.
 fn emit_json_error(
     layer: &str,
     rule_id: &str,
@@ -2180,8 +2338,9 @@ fn emit_json_error(
     matched_pattern: Option<&str>,
     matched_position: Option<&Range<usize>>,
     hint: &str,
+    warnings: &[String],
 ) {
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "blocked": true,
         "layer": layer,
         "rule_id": rule_id,
@@ -2193,6 +2352,11 @@ fn emit_json_error(
         })),
         "hint": hint,
     });
+    if !warnings.is_empty()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("warnings".to_string(), serde_json::json!(warnings));
+    }
     eprintln!(
         "{}",
         serde_json::to_string(&payload)
@@ -4423,6 +4587,8 @@ mod tests {
     #[serial_test::serial(home_env)]
     fn try_prune_staging_noop_when_home_unusable() {
         // Must not panic or touch the CWD; absence of a panic is the assertion.
-        with_home(Some(""), || try_prune_staging(7, 10));
+        with_home(Some(""), || {
+            try_prune_staging(7, 10);
+        });
     }
 }
