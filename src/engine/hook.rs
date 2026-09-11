@@ -1244,27 +1244,67 @@ pub fn try_prune_staging_in(dir: &std::path::Path, retention_days: u32, max_file
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    prune_staging_from(
+        dir,
+        entries.map(|entry| entry.map(|e| e.file_name())),
+        retention_days,
+        max_files,
+    );
+}
+
+/// The listing half of [`try_prune_staging_in`], taking names so a listing
+/// that stops partway is reachable from a test (#485).
+///
+/// The two passes need different things from the listing. The age pass
+/// decides each file on its own mtime, so the names read before a failing
+/// entry are still safe to act on. The count pass deletes the oldest of
+/// *what it saw* — over a listing that stopped partway, that can be a newer
+/// receipt while older ones sit unseen past the failure. It runs only on a
+/// complete listing; skipping it leaves the directory over its cap until a
+/// later prune reads all of it.
+///
+/// A listed staging file that cannot be stat'ed (anything but NotFound) stops
+/// the count pass the same way — the count would miss it. If that state
+/// persists and `retention_days = 0` leaves the age pass off, the directory
+/// stays over its cap; `omamori doctor` reports the same state as
+/// `[Staging] cannot read`, so the growth is not silent.
+fn prune_staging_from(
+    dir: &std::path::Path,
+    entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
+    retention_days: u32,
+    max_files: u32,
+) {
+    let (names, mut complete) = match crate::util::collect_listing(entries) {
+        Ok(names) => (names, true),
+        Err(stop) => (stop.seen, false),
+    };
 
     let now = std::time::SystemTime::now();
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
 
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
+    for name in names {
         let Some(name_str) = name.to_str() else {
             continue;
         };
         if !is_staging_filename(name_str) {
             continue;
         }
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
+        let path = dir.join(&name);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Already gone: another prune, or the operator.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Present but unreadable, so the count below would miss it.
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         if !meta.is_file() {
             continue;
         }
         let mtime = meta.modified().unwrap_or(now);
-        files.push((mtime, entry.path()));
+        files.push((mtime, path));
     }
 
     let mut deleted = 0u32;
@@ -1287,8 +1327,8 @@ pub fn try_prune_staging_in(dir: &std::path::Path, retention_days: u32, max_file
         });
     }
 
-    // Phase 2: count-based pruning (oldest first)
-    if max_files > 0 && files.len() > max_files as usize {
+    // Phase 2: count-based pruning (oldest first), over a complete listing only
+    if complete && max_files > 0 && files.len() > max_files as usize {
         files.sort_by_key(|(mtime, _)| *mtime);
         let excess = files.len() - max_files as usize;
         for (_, path) in files.drain(..excess) {
@@ -3885,6 +3925,126 @@ mod tests {
             let file = std::fs::File::options().write(true).open(&path).unwrap();
             file.set_times(times).unwrap();
         }
+    }
+
+    /// #485: over a listing that stopped partway, the count pass could delete
+    /// a newer receipt while an older one sits unseen past the failure. It
+    /// does not run, and nothing is deleted.
+    #[test]
+    fn prune_count_pass_skips_a_listing_that_stopped_partway() {
+        let dir = create_staging_test_dir();
+        create_staging_file(&dir, "100_1_0.txt", 3600 * 3);
+        create_staging_file(&dir, "200_1_0.txt", 3600 * 2);
+        create_staging_file(&dir, "300_1_0.txt", 3600);
+        // On disk, the oldest of all, and past the failing entry: never seen.
+        create_staging_file(&dir, "50_1_0.txt", 3600 * 4);
+        let entries = vec![
+            Ok(std::ffi::OsString::from("100_1_0.txt")),
+            Ok(std::ffi::OsString::from("200_1_0.txt")),
+            Ok(std::ffi::OsString::from("300_1_0.txt")),
+            Err(std::io::Error::other("volume detached")),
+            Ok(std::ffi::OsString::from("50_1_0.txt")),
+        ];
+
+        prune_staging_from(&dir, entries.into_iter(), 0, 2);
+
+        let survivors: Vec<bool> = ["50_1_0.txt", "100_1_0.txt", "200_1_0.txt", "300_1_0.txt"]
+            .iter()
+            .map(|n| dir.join(n).exists())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            survivors,
+            vec![true; 4],
+            "the count pass saw only part of the directory and must not delete"
+        );
+    }
+
+    /// A listed staging file that cannot be stat'ed stops the count pass too:
+    /// the count would miss it. A 300-digit name fails lstat with
+    /// ENAMETOOLONG, so this does not depend on permissions.
+    #[test]
+    fn prune_count_pass_skips_when_a_listed_file_cannot_be_stated() {
+        let dir = create_staging_test_dir();
+        create_staging_file(&dir, "100_1_0.txt", 3600 * 3);
+        create_staging_file(&dir, "200_1_0.txt", 3600 * 2);
+        create_staging_file(&dir, "300_1_0.txt", 3600);
+        let entries = vec![
+            Ok(std::ffi::OsString::from("100_1_0.txt")),
+            Ok(std::ffi::OsString::from("200_1_0.txt")),
+            Ok(std::ffi::OsString::from("300_1_0.txt")),
+            Ok(std::ffi::OsString::from(format!(
+                "{}_1_0.txt",
+                "1".repeat(300)
+            ))),
+        ];
+
+        prune_staging_from(&dir, entries.into_iter(), 0, 2);
+
+        let survivors: Vec<bool> = ["100_1_0.txt", "200_1_0.txt", "300_1_0.txt"]
+            .iter()
+            .map(|n| dir.join(n).exists())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            survivors,
+            vec![true; 3],
+            "a count that misses a file must not delete"
+        );
+    }
+
+    /// The other side: a staging name that is already gone is skipped without
+    /// stopping the count pass, and a name that is not a staging name is never
+    /// stat'ed (the 300-character one would fail with ENAMETOOLONG). The count
+    /// pass runs and deletes the oldest file beyond the cap.
+    #[test]
+    fn prune_count_pass_still_runs_past_a_gone_name_and_other_names() {
+        let dir = create_staging_test_dir();
+        create_staging_file(&dir, "100_1_0.txt", 3600 * 3);
+        create_staging_file(&dir, "200_1_0.txt", 3600 * 2);
+        create_staging_file(&dir, "300_1_0.txt", 3600);
+        let entries = vec![
+            Ok(std::ffi::OsString::from("100_1_0.txt")),
+            Ok(std::ffi::OsString::from("200_1_0.txt")),
+            Ok(std::ffi::OsString::from("300_1_0.txt")),
+            Ok(std::ffi::OsString::from("400_1_0.txt")),
+            Ok(std::ffi::OsString::from("x".repeat(300))),
+        ];
+
+        prune_staging_from(&dir, entries.into_iter(), 0, 2);
+
+        let state: Vec<bool> = ["100_1_0.txt", "200_1_0.txt", "300_1_0.txt"]
+            .iter()
+            .map(|n| dir.join(n).exists())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            state,
+            vec![false, true, true],
+            "the oldest file beyond the cap of 2 is pruned"
+        );
+    }
+
+    /// The age pass still runs over what was seen: each file is decided on
+    /// its own mtime, which a truncated listing does not change.
+    #[test]
+    fn prune_age_pass_still_runs_over_a_listing_that_stopped_partway() {
+        let dir = create_staging_test_dir();
+        create_staging_file(&dir, "100_1_0.txt", 86400 * 10);
+        create_staging_file(&dir, "200_1_0.txt", 0);
+        let entries = vec![
+            Ok(std::ffi::OsString::from("100_1_0.txt")),
+            Ok(std::ffi::OsString::from("200_1_0.txt")),
+            Err(std::io::Error::other("volume detached")),
+        ];
+
+        prune_staging_from(&dir, entries.into_iter(), 7, 0);
+
+        let old_gone = !dir.join("100_1_0.txt").exists();
+        let fresh_kept = dir.join("200_1_0.txt").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(old_gone, "an expired file that was seen is still pruned");
+        assert!(fresh_kept, "a fresh file is kept");
     }
 
     #[test]

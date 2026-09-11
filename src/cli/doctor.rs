@@ -619,37 +619,123 @@ struct StagingInfo {
     oldest_days_ago: Option<i64>,
 }
 
-fn gather_staging_info() -> StagingInfo {
-    let Some(dir) = crate::engine::hook::staging_dir() else {
-        return StagingInfo::default();
-    };
+/// Why the staging directory could not be read in full (#485).
+///
+/// Before, these cases came back as an empty `StagingInfo` — or, for a
+/// listing that stopped partway or a staging file whose stat failed, as a
+/// short count — and the section printed `[Staging] empty` or that count: a
+/// positive statement about a directory nobody managed to read in full, which
+/// also kept the `max_files` warning from firing on the count it never got.
+///
+/// `kind` is what `--json` reports: one fixed word with no path in it, the way
+/// the audit report keeps its machine-readable fields path-free
+/// (`audit/report.rs`, SECURITY.md). `message` is the human line and names the
+/// path.
+struct StagingUnreadable {
+    kind: &'static str,
+    message: String,
+}
 
-    let Ok(meta) = std::fs::symlink_metadata(&dir) else {
-        return StagingInfo::default();
-    };
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return StagingInfo::default();
+impl StagingUnreadable {
+    fn new(kind: &'static str, message: String) -> Self {
+        Self { kind, message }
     }
+}
 
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return StagingInfo::default();
+fn gather_staging_info() -> Result<StagingInfo, StagingUnreadable> {
+    staging_info_for(crate::engine::hook::staging_dir().as_deref())
+}
+
+/// `None` is a HOME that is unset, empty or relative. `doctor --base-dir`
+/// reaches this section without one, and with no directory there is nothing
+/// that was read — "empty" would be a claim about nothing.
+fn staging_info_for(dir: Option<&Path>) -> Result<StagingInfo, StagingUnreadable> {
+    match dir {
+        Some(dir) => staging_info_at(dir),
+        None => Err(StagingUnreadable::new(
+            "home_unresolved",
+            "the staging directory cannot be resolved (HOME is unset, empty or relative)"
+                .to_string(),
+        )),
+    }
+}
+
+fn staging_info_at(dir: &Path) -> Result<StagingInfo, StagingUnreadable> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        // Nothing has been staged yet — every install before its first
+        // materialized command. The reading `scan_key_dir` gives a key
+        // directory that does not exist yet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StagingInfo::default());
+        }
+        Err(e) => {
+            return Err(StagingUnreadable::new(
+                "unreadable",
+                format!("{}: {e}", dir.display()),
+            ));
+        }
     };
+    if meta.file_type().is_symlink() {
+        return Err(StagingUnreadable::new(
+            "symlink",
+            format!("{} is a symlink", dir.display()),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(StagingUnreadable::new(
+            "not_directory",
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| {
+        StagingUnreadable::new("unlistable", format!("cannot list {}: {e}", dir.display()))
+    })?;
+    staging_info_from(dir, entries.map(|entry| entry.map(|e| e.file_name())))
+}
+
+/// The listing half of [`staging_info_at`], taking names so a listing that
+/// stops partway is reachable from a test (see `util::collect_listing`).
+fn staging_info_from(
+    dir: &Path,
+    entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
+) -> Result<StagingInfo, StagingUnreadable> {
+    let names = crate::util::collect_listing(entries).map_err(|stop| {
+        StagingUnreadable::new(
+            "listing_stopped",
+            format!(
+                "the listing of {} stopped after {} entries: {}",
+                dir.display(),
+                stop.seen.len(),
+                stop.err
+            ),
+        )
+    })?;
 
     let now = std::time::SystemTime::now();
     let mut count = 0u64;
     let mut bytes = 0u64;
     let mut oldest_mtime: Option<std::time::SystemTime> = None;
 
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let Ok(m) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        if !m.is_file() {
+    for name in names {
+        // Named first, stat second: a file that is not a staging file says
+        // nothing about staging, whatever state it is in.
+        if !crate::engine::hook::is_staging_filename(&name.to_string_lossy()) {
             continue;
         }
-        let name = entry.file_name();
-        if !crate::engine::hook::is_staging_filename(&name.to_string_lossy()) {
+        let path = dir.join(&name);
+        let m = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            // Pruned between the listing and this stat.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(StagingUnreadable::new(
+                    "entry_unreadable",
+                    format!("{}: {e}", path.display()),
+                ));
+            }
+        };
+        if !m.is_file() {
             continue;
         }
         count += 1;
@@ -667,11 +753,11 @@ fn gather_staging_info() -> StagingInfo {
         Some(i64::from(today_jd - mt_jd))
     });
 
-    StagingInfo {
+    Ok(StagingInfo {
         file_count: count,
         total_bytes: bytes,
         oldest_days_ago,
-    }
+    })
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -685,7 +771,17 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn print_staging_section(o: &mut Out<'_>) {
-    let info = gather_staging_info();
+    write_staging_section(o, gather_staging_info());
+}
+
+fn write_staging_section(o: &mut Out<'_>, info: Result<StagingInfo, StagingUnreadable>) {
+    let info = match info {
+        Ok(info) => info,
+        Err(unreadable) => {
+            out!(o, "  [Staging] cannot read: {}", unreadable.message);
+            return;
+        }
+    };
 
     if info.file_count == 0 {
         out!(o, "  [Staging] empty");
@@ -732,9 +828,35 @@ fn print_staging_section(o: &mut Out<'_>) {
 }
 
 fn staging_json_summary() -> serde_json::Value {
-    let info = gather_staging_info();
+    staging_json_for(gather_staging_info())
+}
 
-    let Ok(load_result) = crate::config::load_config(None) else {
+fn staging_json_for(info: Result<StagingInfo, StagingUnreadable>) -> serde_json::Value {
+    let config = crate::config::load_config(None)
+        .ok()
+        .map(|r| r.config.structural);
+
+    let info = match info {
+        Ok(info) => info,
+        // #485: the counts are null rather than 0 — 0 would say the directory
+        // was seen to be empty. `status: "error"` is also what this summary
+        // reports when the config cannot be loaded (#313); there the counts
+        // are real and there is no `reason`, here they are null and `reason`
+        // names the case.
+        Err(unreadable) => {
+            return serde_json::json!({
+                "file_count": null,
+                "total_bytes": null,
+                "oldest_days_ago": null,
+                "status": "error",
+                "reason": unreadable.kind,
+                "retention_days": config.as_ref().map(|c| c.retention_days),
+                "max_files": config.as_ref().map(|c| c.max_files),
+            });
+        }
+    };
+
+    let Some(cfg) = config else {
         return serde_json::json!({
             "file_count": info.file_count,
             "total_bytes": info.total_bytes,
@@ -744,8 +866,8 @@ fn staging_json_summary() -> serde_json::Value {
             "max_files": null,
         });
     };
-    let retention_days = load_result.config.structural.retention_days;
-    let max_files = load_result.config.structural.max_files;
+    let retention_days = cfg.retention_days;
+    let max_files = cfg.max_files;
 
     let status = if info.file_count == 0 {
         "ok"
@@ -2263,9 +2385,8 @@ mod tests {
     /// closing while the extraction is being made.
     ///
     /// `gather_staging_info`'s day count is the same expression over the same
-    /// helper, but it takes no directory argument and reads the real staging
-    /// directory, so it cannot be driven to a known mtime without restructuring
-    /// it — deliberately out of this PR's scope.
+    /// helper. Since #485 it can be driven through `staging_info_at(dir)`; the
+    /// staging tests further down do that for its read failures.
     #[test]
     fn heartbeat_days_ago_future() {
         let dir = PathBuf::from(format!(
@@ -2407,7 +2528,7 @@ mod tests {
         assert!(staging.get("max_files").is_some());
         let status = staging["status"].as_str().unwrap();
         assert!(
-            ["ok", "warn"].contains(&status),
+            ["ok", "warn", "error"].contains(&status),
             "unexpected staging status: {status}"
         );
     }
@@ -2426,6 +2547,196 @@ mod tests {
     fn gather_staging_info_does_not_panic() {
         // May or may not have files depending on system state, but should not panic
         let _info = gather_staging_info();
+    }
+
+    fn staging_section_text(info: Result<StagingInfo, StagingUnreadable>) -> String {
+        let mut buf = Vec::new();
+        {
+            let o = &mut Out::new(&mut buf);
+            write_staging_section(o, info);
+        }
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Three staging names, then the entry a detached volume fails on.
+    fn listing_that_stops_after_three() -> impl Iterator<Item = std::io::Result<std::ffi::OsString>>
+    {
+        vec![
+            Ok(std::ffi::OsString::from("1_1_1.txt")),
+            Ok(std::ffi::OsString::from("2_2_2.txt")),
+            Ok(std::ffi::OsString::from("3_3_3.txt")),
+            Err(std::io::Error::other("volume detached")),
+        ]
+        .into_iter()
+    }
+
+    /// #485: a listing that stops partway is not a shorter listing, and the
+    /// section must not turn it into `empty` or a count.
+    #[test]
+    fn staging_listing_that_stops_partway_is_reported_as_unreadable() {
+        let dir = Path::new("/omamori-485-staging");
+        let text = staging_section_text(staging_info_from(dir, listing_that_stops_after_three()));
+        assert!(
+            text.contains("[Staging] cannot read:") && text.contains("stopped after 3 entries"),
+            "got {text:?}"
+        );
+        assert!(
+            !text.contains("[Staging] empty") && !text.contains("file(s)"),
+            "a partial listing must not be reported as a result: {text:?}"
+        );
+
+        let json = staging_json_for(staging_info_from(dir, listing_that_stops_after_three()));
+        assert_eq!(json["status"], "error");
+        assert!(
+            json["file_count"].is_null(),
+            "0 would claim it was seen empty: {json}"
+        );
+        assert!(json["total_bytes"].is_null());
+        assert_eq!(json["reason"], "listing_stopped");
+        assert!(
+            !json.to_string().contains("omamori-485-staging"),
+            "--json stays path-free: {json}"
+        );
+    }
+
+    /// `doctor --base-dir` reaches the section with HOME unresolvable: there is
+    /// no directory that was read, so no "empty".
+    #[test]
+    fn staging_without_a_resolvable_home_is_not_reported_empty() {
+        let text = staging_section_text(staging_info_for(None));
+        assert!(
+            text.contains("[Staging] cannot read:") && !text.contains("[Staging] empty"),
+            "{text:?}"
+        );
+        assert_eq!(
+            staging_json_for(staging_info_for(None))["reason"],
+            "home_unresolved"
+        );
+    }
+
+    /// Each way the directory itself fails to be a readable directory has its
+    /// own `reason`, and a directory that does not exist yet is still empty.
+    #[cfg(unix)]
+    #[test]
+    fn staging_directory_that_is_not_a_readable_directory_is_reported_as_unreadable() {
+        let root = std::env::temp_dir().join(format!(
+            "omamori-doctor-staging-kinds-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::write(root.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        let kind = |p: &Path| staging_info_at(p).err().map(|u| u.kind);
+        let symlink = kind(&root.join("link"));
+        let not_directory = kind(&root.join("file"));
+        // A path under a regular file fails lstat with ENOTDIR — not NotFound.
+        let unreadable = kind(&root.join("file").join("staging"));
+        let missing = staging_info_at(&root.join("absent"))
+            .ok()
+            .map(|i| i.file_count);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(symlink, Some("symlink"));
+        assert_eq!(not_directory, Some("not_directory"));
+        assert_eq!(unreadable, Some("unreadable"));
+        assert_eq!(
+            missing,
+            Some(0),
+            "a staging directory that does not exist yet is empty"
+        );
+    }
+
+    /// A staging file that is listed but cannot be stat'ed makes the count
+    /// untrustworthy. A 300-digit name fails lstat with ENAMETOOLONG — not
+    /// NotFound — without depending on permissions, so this holds under root.
+    #[test]
+    fn staging_file_that_cannot_be_stated_is_reported_as_unreadable() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-doctor-staging-stat-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1_1_1.txt"), "x").unwrap();
+        let long = format!("{}_1_1.txt", "1".repeat(300));
+        let entries = vec![
+            Ok(std::ffi::OsString::from("1_1_1.txt")),
+            Ok(std::ffi::OsString::from(long)),
+        ];
+
+        let got = staging_info_from(&dir, entries.into_iter())
+            .err()
+            .map(|u| u.kind);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(got, Some("entry_unreadable"));
+    }
+
+    /// The other side of the per-entry rules: a staging name that is gone by
+    /// the time of its stat (pruned meanwhile) is skipped, and a name that is
+    /// not a staging name is never stat'ed — so neither turns the section into
+    /// "cannot read". The 300-character non-staging name would fail lstat with
+    /// ENAMETOOLONG if it were stat'ed.
+    #[test]
+    fn staging_count_skips_a_pruned_name_and_never_stats_other_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-doctor-staging-other-side-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1_1_1.txt"), "x").unwrap();
+        let entries = vec![
+            Ok(std::ffi::OsString::from("1_1_1.txt")),
+            Ok(std::ffi::OsString::from("2_2_2.txt")),
+            Ok(std::ffi::OsString::from("x".repeat(300))),
+        ];
+
+        let got = staging_info_from(&dir, entries.into_iter())
+            .ok()
+            .map(|i| i.file_count);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(got, Some(1), "counted the one staging file that is there");
+    }
+
+    /// The production path, on a real directory: one that cannot be listed is
+    /// reported as such, and the same directory made readable again is
+    /// counted. Permissions are restored before asserting, and the test is not
+    /// skipped under root — as with `read_hwm`'s, root's listing then succeeds
+    /// and this fails instead of passing without measuring.
+    #[cfg(unix)]
+    #[test]
+    fn staging_directory_that_cannot_be_listed_is_reported_as_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("omamori-doctor-staging-485-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("1_1_1.txt"), "x").unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = staging_info_at(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let readable = staging_info_at(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let unreadable = locked
+            .err()
+            .expect("a directory that cannot be listed is not an empty one");
+        assert_eq!(unreadable.kind, "unlistable");
+        assert!(
+            unreadable.message.contains("cannot list"),
+            "{}",
+            unreadable.message
+        );
+        assert_eq!(
+            readable.ok().map(|i| i.file_count),
+            Some(1),
+            "readable again"
+        );
     }
 
     // --- Characterization tests (#392/#377): pin current --base-dir

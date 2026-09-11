@@ -288,12 +288,72 @@ pub(crate) fn system_time_utc_julian_day(t: std::time::SystemTime) -> Option<i32
 }
 
 // ---------------------------------------------------------------------------
+// Directory listings
+// ---------------------------------------------------------------------------
+
+/// A directory listing that stopped partway (#485): the names read before
+/// the failing entry, and the error it failed with.
+#[derive(Debug)]
+pub(crate) struct ListingStopped {
+    /// Names read before the error, in listing order.
+    pub(crate) seen: Vec<OsString>,
+    pub(crate) err: std::io::Error,
+}
+
+/// Collect a directory listing, failing on the first per-entry error.
+///
+/// #477 measured why a failed entry cannot simply be skipped: enumerating a
+/// 300-file directory while its volume was detached returned 151 `Ok`s and
+/// then one `Err`, and `std` sets `end_of_stream` on that error — the rest is
+/// never read. Skipping the error does not drop one name, it drops everything
+/// after it, as a result that looks complete.
+///
+/// What was seen travels with the error: a caller that decides one entry at
+/// a time (the staging prune's age pass) may still act on it, while a caller
+/// that needs the whole set (a count, "empty", the highest key epoch) must
+/// refuse. Takes an iterator rather than a directory so the failing branch is
+/// reachable from a test — no condition that produces a per-entry `Err` can
+/// be provisioned by the suite.
+pub(crate) fn collect_listing(
+    entries: impl Iterator<Item = std::io::Result<OsString>>,
+) -> Result<Vec<OsString>, ListingStopped> {
+    let mut seen = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(name) => seen.push(name),
+            Err(err) => return Err(ListingStopped { seen, err }),
+        }
+    }
+    Ok(seen)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collect_listing_returns_every_name_when_no_entry_fails() {
+        let names: Vec<OsString> = ["a", "b", "c"].into_iter().map(OsString::from).collect();
+        let got = collect_listing(names.clone().into_iter().map(Ok)).unwrap();
+        assert_eq!(got, names);
+    }
+
+    #[test]
+    fn collect_listing_stops_at_the_first_error_and_keeps_what_it_saw() {
+        let entries = vec![
+            Ok(OsString::from("a")),
+            Ok(OsString::from("b")),
+            Err(std::io::Error::other("volume detached")),
+            Ok(OsString::from("never-read")),
+        ];
+        let stop = collect_listing(entries.into_iter()).unwrap_err();
+        assert_eq!(stop.seen, vec![OsString::from("a"), OsString::from("b")]);
+        assert_eq!(stop.err.to_string(), "volume detached");
+    }
 
     /// #308: the four-step conversion exists here and nowhere else.
     ///
