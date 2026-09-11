@@ -309,19 +309,21 @@ fn ensure_hooks_current_at_with_verifier_and_exe(
 /// directly with its already-resolved `base_dir` (#373) — there is no
 /// zero-argument wrapper, for the same reason as `ensure_hooks_current_at`.
 ///
-/// Two re-sync triggers:
-/// 1. omamori entry's `x-omamori-version` field != current omamori version
-///    (set when the schema or hook semantics change between releases)
-/// 2. omamori entry's `matcher` is in legacy form (silently rejected by the
-///    current Claude Code parser — would leave Layer 2 dormant)
-///
-/// On either trigger, calls `merge_claude_settings()` to re-merge the entry
-/// in the current schema (UX R3: brew-upgrade auto-sync).
+/// Re-syncs when the omamori entry is missing, duplicated (stale
+/// accumulation), from another release (`x-omamori-version`, set when the
+/// schema or hook semantics change), in the legacy `matcher` form (silently
+/// rejected by the current Claude Code parser — it would leave Layer 2
+/// dormant), or names a script other than this install's. Each calls
+/// `merge_claude_settings()` to re-merge the entry in the current schema
+/// (UX R3: brew-upgrade auto-sync).
 ///
 /// Returns `true` only when a re-merge was performed and produced an outcome
 /// other than `AlreadyPresent`. Read errors, parse errors, and "Claude Code
 /// not installed" all return `false` — recovery is the install command's
 /// responsibility, not the shim's.
+///
+/// Nothing is re-synced while the hook script the entry would name is
+/// missing — see the check at the top of [`ensure_settings_current_for`].
 pub(crate) fn ensure_settings_current_at(base_dir: &Path) -> bool {
     let Some(claude_dir) = installer::claude_home_dir() else {
         return false; // HOME unset — Claude Code not detected
@@ -332,6 +334,25 @@ pub(crate) fn ensure_settings_current_at(base_dir: &Path) -> bool {
 /// Inner implementation that takes `claude_dir` explicitly. Test entry point.
 pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) -> bool {
     if !installer::is_real_directory(claude_dir) {
+        return false;
+    }
+    // The entry this merges names this script. Step 2
+    // (`ensure_hooks_current_at_with_verifier_and_exe`) declines to install a
+    // missing one — "Installing hooks is `omamori install`'s job" — and this
+    // step now declines to point Claude Code at one. Without it, a shim-only
+    // install (`omamori install` without `--hooks`) on a machine with Claude
+    // Code got an entry naming a file that does not exist, on the first
+    // guarded command. Found while tracing #526, where the installed shim did
+    // exactly this to the test-isolation canary's throwaway home. Only
+    // `NotFound` stops here. Anything else at that path — a dangling
+    // symlink, a directory — is still synced to, as before: Step 2 treats it
+    // as something to regenerate, though it can decline to (throttled, a dev
+    // build, a failed contract check), and deciding what the entry should
+    // name in that case is outside this check.
+    let script_path = base_dir.join("hooks/claude-pretooluse.sh");
+    if let Err(e) = std::fs::symlink_metadata(&script_path)
+        && e.kind() == std::io::ErrorKind::NotFound
+    {
         return false;
     }
     let settings_path = claude_dir.join("settings.json");
@@ -382,7 +403,6 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let matcher = e.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
-                    let expected_script = base_dir.join("hooks/claude-pretooluse.sh");
                     let path_current = installer::entry_is_omamori_managed(e, base_dir)
                         || e.get("hooks")
                             .and_then(|v| v.as_array())
@@ -391,7 +411,7 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
                             .filter_map(|h| h.get("command").and_then(|v| v.as_str()))
                             .any(|c| {
                                 let u = c.trim_matches('\'').trim_matches('"');
-                                Path::new(u) == expected_script
+                                Path::new(u) == script_path
                             });
                     version != env!("CARGO_PKG_VERSION") || matcher != "Bash" || !path_current
                 }
@@ -405,7 +425,6 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
         return false;
     }
 
-    let script_path = base_dir.join("hooks/claude-pretooluse.sh");
     match installer::merge_claude_settings(claude_dir, &script_path) {
         Ok(installer::ClaudeSettingsOutcome::AlreadyPresent) => false,
         Ok(installer::ClaudeSettingsOutcome::Skipped(reason)) => {
@@ -1412,9 +1431,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let claude_dir = dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
+        // With the hook script present, so that this reaches the missing
+        // settings.json rather than the missing-script check: that arm is
+        // what keeps the shim from creating a settings.json of its own.
+        let hooks = dir.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("claude-pretooluse.sh"), "#!/bin/sh\nexit 0\n").unwrap();
 
         let result = ensure_settings_current_for(&dir, &claude_dir);
         assert!(!result);
+        assert!(
+            !claude_dir.join("settings.json").exists(),
+            "the shim must not create a settings.json"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1541,6 +1570,16 @@ mod tests {
         let claude_dir = dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).unwrap();
 
+        // The hook script has to exist, or the missing-script check returns
+        // false first and this test stops reaching the path it has reached
+        // since #468: the read refusing the symlinked settings.json. (Despite
+        // the name, that refusal comes before the merge, so the `Skipped` arm
+        // is not reached from here — measured: making that arm return `true`
+        // leaves this test green.)
+        let hooks = dir.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("claude-pretooluse.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+
         // Symlink settings.json — merge_claude_settings will return Skipped
         let real = dir.join("real-settings.json");
         // Stale entry to trigger needs_resync
@@ -1579,6 +1618,17 @@ mod tests {
         std::fs::create_dir_all(&omamori_hooks).unwrap();
         let script = omamori_hooks.join("claude-pretooluse.sh");
         std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        // The script `ensure_settings_current_for(&dir, ..)` checks for lives
+        // at <base_dir>/hooks. Without it this returns at the missing-script
+        // check, and "no-op when current" would pass without the entry ever
+        // being judged current.
+        let base_hooks = dir.join("hooks");
+        std::fs::create_dir_all(&base_hooks).unwrap();
+        std::fs::write(
+            base_hooks.join("claude-pretooluse.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
 
         let omamori_cmd = shell_words::quote(&script.display().to_string()).into_owned();
         let current = serde_json::json!({
@@ -1682,6 +1732,81 @@ mod tests {
             None => unsafe { std::env::remove_var("HOME") },
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A shim-only install has no hook script, so it must not get a hook
+    /// entry naming one. The same `settings.json` with the script present is
+    /// `ensure_settings_resyncs_when_entry_missing`, which must still resync —
+    /// the pair is what shows the check stops only the missing-script case.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn ensure_settings_does_not_add_entry_when_hook_script_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-shim-noscript-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        // No <base_dir>/hooks/claude-pretooluse.sh: `omamori install` without `--hooks`.
+        let user_doc = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Edit",
+                    "hooks": [{ "type": "command", "command": "/usr/local/bin/userhook" }]
+                }]
+            }
+        });
+        let before = serde_json::to_string_pretty(&user_doc).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), &before).unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        let after = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!result, "no hook script: nothing to sync");
+        assert_eq!(after, before, "settings.json must be left byte-identical");
+    }
+
+    /// The other triggers take the same check: an entry from an older
+    /// release that names the (missing) script is left as it is rather than
+    /// rewritten to point at a file that still does not exist.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn ensure_settings_does_not_rewrite_stale_entry_when_hook_script_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-shim-noscript-stale-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let mut stale = installer::claude_settings_entry(&dir.join("hooks/claude-pretooluse.sh"));
+        stale["x-omamori-version"] = serde_json::json!("0.9.7");
+        let doc = serde_json::json!({ "hooks": { "PreToolUse": [stale] } });
+        let before = serde_json::to_string_pretty(&doc).unwrap();
+        std::fs::write(claude_dir.join("settings.json"), &before).unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let result = ensure_settings_current_for(&dir, &claude_dir);
+        let after = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(!result, "no hook script: a stale entry is not rewritten");
+        assert_eq!(after, before, "settings.json must be left byte-identical");
     }
 
     // --- Heartbeat ---
