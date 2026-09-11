@@ -330,6 +330,13 @@ pub(crate) fn fsync_parent(target: &Path) {
 ///   not follow symlinks) — an attacker-planted `.omamori-tmp-*` symlink is
 ///   skipped, not traversed
 /// - any symlink entry is skipped outright, never handed to `remove_file`
+///
+/// Not a fourth invariant but a limit, stated because the three above read
+/// as if the sweep were complete: `flatten()` ends it at the first entry
+/// `read_dir` fails on, and `std` reads nothing after that (#477, #485).
+/// Acceptable here and in nothing that decides from the whole set — each
+/// removal is decided on the entry's own name and age, so a truncated sweep
+/// only leaves the unseen orphans for the next write to collect.
 fn gc_stale_temps(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

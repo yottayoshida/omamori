@@ -1558,7 +1558,8 @@ fn scan_key_dir(secret_path: &Path) -> KeyDirScan {
 /// that error — so the remainder was never read. Skipping the error does not
 /// drop one entry, it drops **everything after it, silently, as a listing that
 /// looks complete**. For a store whose highest epochs sort last, that is
-/// exactly the set that matters.
+/// exactly the set that matters. The rule itself is `util::collect_listing`
+/// (#485), shared with the staging listings that had the same defect.
 pub(super) fn fold_key_dir_entries(
     parent: &Path,
     entries: impl Iterator<Item = std::io::Result<std::ffi::OsString>>,
@@ -1578,16 +1579,15 @@ pub(super) fn fold_key_dir_entries(
     // name.
     let mut pending = None;
 
-    for (seen, entry) in entries.enumerate() {
-        let file_name = match entry {
-            Ok(name) => name,
-            // Deliberately not interpreting the errno: the reachable macOS case
-            // reports EINVAL, not the EIO the issue predicted, and the two
-            // platforms take different `ReadDir::next` bodies. State the
-            // position and the error; let the operator's context supply the
-            // cause.
-            Err(e) => return unlistable(parent, Some(seen), &e),
-        };
+    // Deliberately not interpreting the errno: the reachable macOS case
+    // reports EINVAL, not the EIO the issue predicted, and the two platforms
+    // take different `ReadDir::next` bodies. State the position and the
+    // error; let the operator's context supply the cause.
+    let names = match crate::util::collect_listing(entries) {
+        Ok(names) => names,
+        Err(stop) => return unlistable(parent, Some(stop.seen.len()), &stop.err),
+    };
+    for file_name in names {
         let name = file_name.to_string_lossy();
         if name == EPOCH_RECORD_NAME {
             epoch_present = true;
