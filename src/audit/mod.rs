@@ -7,6 +7,12 @@
 //! - `verify`: Chain verification, entry display, summary for CLI
 //! - `report`: Aggregation for `omamori report` (since v0.10.0, #221)
 
+// ADR-0013: warnings raised in this module are handed back to the caller, which
+// decides where they go. The printing halves carry an `allow` with a reason; a
+// new `eprintln!` anywhere else fails CI's `cargo clippy -- -D warnings` instead
+// of silently re-breaking `hook-check --json-error`'s one-object stderr.
+#![cfg_attr(not(test), deny(clippy::print_stderr))]
+
 pub mod chain;
 mod error;
 pub mod provenance;
@@ -239,6 +245,16 @@ pub(crate) fn resolved_audit_path(config: &AuditConfig) -> Option<PathBuf> {
 // Logger
 // ---------------------------------------------------------------------------
 
+/// Print warnings this module handed back (ADR-0013) — the printing half of the
+/// return-then-print pair, for callers that carry them nowhere else.
+// reason: the one place the audit layer's collected warnings reach stderr.
+#[allow(clippy::print_stderr)]
+pub(crate) fn print_warnings(lines: &[String]) {
+    for line in lines {
+        eprintln!("{line}");
+    }
+}
+
 pub struct AuditLogger {
     pub(super) path: PathBuf,
     /// #457: the signing key and the `key_id` that names it are one value, not
@@ -279,7 +295,25 @@ impl AuditLogger {
     /// loaded, and resolving it from the built-in detector list is the defect
     /// `#527` removes (ADR-0009).
     pub fn from_config(config: &AuditConfig, allow_repair: bool) -> Option<Self> {
-        Self::build(config, secret::KeyWarnPolicy::always(allow_repair))
+        let mut warnings = Vec::new();
+        let logger = Self::from_config_collect(config, allow_repair, &mut warnings);
+        print_warnings(&warnings);
+        logger
+    }
+
+    /// [`from_config`](Self::from_config), handing the key store's warnings
+    /// back instead of printing them (ADR-0013). `hook-check --json-error`
+    /// carries them inside its one JSON object.
+    pub(crate) fn from_config_collect(
+        config: &AuditConfig,
+        allow_repair: bool,
+        warnings: &mut Vec<String>,
+    ) -> Option<Self> {
+        Self::build(
+            config,
+            secret::KeyWarnPolicy::always(allow_repair),
+            warnings,
+        )
     }
 
     /// `from_config(.., allow_repair = true)`, kept for the tests that predate
@@ -308,16 +342,27 @@ impl AuditLogger {
     /// status catch-all, for the same reason — the failure that costs something
     /// is the quiet one.
     pub(crate) fn from_config_throttled(config: &AuditConfig, allow_repair: bool) -> Option<Self> {
-        Self::build(config, secret::KeyWarnPolicy::throttled(allow_repair))
+        let mut warnings = Vec::new();
+        let logger = Self::build(
+            config,
+            secret::KeyWarnPolicy::throttled(allow_repair),
+            &mut warnings,
+        );
+        print_warnings(&warnings);
+        logger
     }
 
-    fn build(config: &AuditConfig, policy: secret::KeyWarnPolicy) -> Option<Self> {
+    fn build(
+        config: &AuditConfig,
+        policy: secret::KeyWarnPolicy,
+        warnings: &mut Vec<String>,
+    ) -> Option<Self> {
         if !config.enabled {
             return None;
         }
         let (validated, _warnings) = config.validate();
         let path = resolved_audit_path(&validated)?;
-        let signing_key = load_signing_key_with(&secret_path_for(&path), policy);
+        let signing_key = load_signing_key_with(&secret_path_for(&path), policy, warnings);
         Some(Self {
             path,
             signing_key,
@@ -376,7 +421,20 @@ impl AuditLogger {
     ///
     /// Takes ownership of the event to set chain fields (seq, prev_hash, entry_hash).
     /// Uses flock for concurrent-append safety.
-    pub fn append(&self, mut event: AuditEvent) -> Result<(), std::io::Error> {
+    pub fn append(&self, event: AuditEvent) -> Result<(), std::io::Error> {
+        let mut warnings = Vec::new();
+        let result = self.append_collect(event, &mut warnings);
+        print_warnings(&warnings);
+        result
+    }
+
+    /// [`append`](Self::append), handing its warnings back instead of printing
+    /// them (ADR-0013).
+    pub(crate) fn append_collect(
+        &self,
+        mut event: AuditEvent,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), std::io::Error> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -468,10 +526,10 @@ impl AuditLogger {
         let hwm_file = hwm_path_for(&self.path);
         let advance_hwm = match read_hwm(&hwm_file) {
             HwmState::Valid(h) if seq < h => {
-                eprintln!(
+                warnings.push(format!(
                     "omamori warning: audit log tail may have been truncated \
                      (seq {seq} < high-water-mark {h})"
-                );
+                ));
                 false
             }
             HwmState::Valid(h) => seq > h,
@@ -484,15 +542,17 @@ impl AuditLogger {
                 // used to name two causes — a symlink, or invalid content —
                 // for a state that also covers a sidecar which merely could
                 // not be read, and said both of them whichever had happened.
-                eprintln!(
+                warnings.push(format!(
                     "omamori warning: the audit high-water-mark could not be used \u{2014} \
                      {reason}. Run `omamori audit verify` to investigate."
-                );
+                ));
                 true
             }
         };
         if advance_hwm && let Err(e) = write_hwm(&hwm_file, seq) {
-            eprintln!("omamori warning: failed to update audit high-water-mark: {e}");
+            warnings.push(format!(
+                "omamori warning: failed to update audit high-water-mark: {e}"
+            ));
         }
 
         // Auto-prune under the same flock (no extra I/O when not triggered)
@@ -504,9 +564,10 @@ impl AuditLogger {
                 &self.signing_key,
                 self.retention_days,
                 Some(&self.path),
+                warnings,
             )
         {
-            eprintln!("omamori warning: audit prune failed: {e}");
+            warnings.push(format!("omamori warning: audit prune failed: {e}"));
         }
 
         // flock released on file drop

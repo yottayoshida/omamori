@@ -424,22 +424,49 @@ pub(super) fn try_prune(
     signing_key: &SigningKey,
     retention_days: u32,
     audit_path: Option<&std::path::Path>,
+    warnings: &mut Vec<String>,
 ) -> Result<u64, std::io::Error> {
-    try_prune_at(
+    try_prune_at_collect(
         file,
         signing_key,
         retention_days,
         audit_path,
         OffsetDateTime::now_utc(),
+        warnings,
     )
 }
 
+/// [`try_prune_at_collect`] with its warnings printed — the form the tests that
+/// pin a prune at a fixed `now` call.
+#[cfg(test)]
 pub(super) fn try_prune_at(
     file: &mut fs::File,
     signing_key: &SigningKey,
     retention_days: u32,
     audit_path: Option<&std::path::Path>,
     now: OffsetDateTime,
+) -> Result<u64, std::io::Error> {
+    let mut warnings = Vec::new();
+    let result = try_prune_at_collect(
+        file,
+        signing_key,
+        retention_days,
+        audit_path,
+        now,
+        &mut warnings,
+    );
+    super::print_warnings(&warnings);
+    result
+}
+
+/// The prune itself. Its warnings are pushed onto `warnings` (ADR-0013).
+fn try_prune_at_collect(
+    file: &mut fs::File,
+    signing_key: &SigningKey,
+    retention_days: u32,
+    audit_path: Option<&std::path::Path>,
+    now: OffsetDateTime,
+    warnings: &mut Vec<String>,
 ) -> Result<u64, std::io::Error> {
     use time::format_description::well_known::Rfc3339;
 
@@ -451,10 +478,11 @@ pub(super) fn try_prune_at(
     // is the lesser loss: the condition that removed the key is usually
     // recoverable, and a later prune with the key in hand does the same work.
     if signing_key.secret().is_none() {
-        eprintln!(
+        warnings.push(
             "omamori warning: audit prune skipped — no HMAC secret is available, so the prune \
              point that replaces the removed entries could not be protected. The entries were \
              left in place; the log will keep growing until the key is readable again."
+                .to_string(),
         );
         return Ok(0);
     }
@@ -595,9 +623,9 @@ pub(super) fn try_prune_at(
         match authenticated_max_seq(&lines[retain_from..], keyring) {
             Some(seq) => {
                 if let Err(e) = write_hwm(&hwm_path_for(audit_path), seq) {
-                    eprintln!(
+                    warnings.push(format!(
                         "omamori warning: failed to update audit high-water-mark after prune: {e}"
-                    );
+                    ));
                 }
             }
             None => {
@@ -614,14 +642,16 @@ pub(super) fn try_prune_at(
                     None => "no retained entry could be authenticated against the key it names"
                         .to_string(),
                 };
-                eprintln!(
+                warnings.push(format!(
                     "omamori warning: audit high-water-mark left unchanged after prune — {reason}"
-                );
+                ));
             }
         }
     }
 
-    eprintln!("omamori: pruned {prune_count} audit entries older than {retention_days}d");
+    warnings.push(format!(
+        "omamori: pruned {prune_count} audit entries older than {retention_days}d"
+    ));
     Ok(prune_count)
 }
 

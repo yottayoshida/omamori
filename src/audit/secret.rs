@@ -457,14 +457,19 @@ impl MissingActiveKey {
 /// touching anything), and the alternative is minting under a number the record
 /// does not hold. u32 gives 4.29e9 epochs; weekly rotation for two years
 /// reaches 104.
-fn claim_next_epoch(secret_path: &Path, lost: u32, policy: KeyWarnPolicy) -> Option<u32> {
+fn claim_next_epoch(
+    secret_path: &Path,
+    lost: u32,
+    policy: KeyWarnPolicy,
+    warnings: &mut Vec<String>,
+) -> Option<u32> {
     let Some(next) = lost.checked_add(1) else {
         if may_warn(policy, WARN_KIND_EPOCH_AT_LIMIT, secret_path) {
-            eprintln!(
+            warnings.push(format!(
                 "omamori warning: audit key epoch {lost} is at the representable limit, so no \
                  successor can be allocated and no replacement key was created. \
                  {ENTRIES_CARRY_NO_HMAC}"
-            );
+            ));
         }
         return None;
     };
@@ -475,7 +480,7 @@ fn claim_next_epoch(secret_path: &Path, lost: u32, policy: KeyWarnPolicy) -> Opt
         Ok(recorded) => Some(recorded),
         Err(e) => {
             if may_warn(policy, WARN_KIND_EPOCH_NOT_ADVANCED, secret_path) {
-                eprintln!(
+                warnings.push(format!(
                     // "a replacement could not be created" is the wording #478 gave
                     // this outcome, and the outcome is the same one: no key exists at
                     // the active path when this returns. Kept verbatim so the operator
@@ -498,7 +503,7 @@ fn claim_next_epoch(secret_path: &Path, lost: u32, policy: KeyWarnPolicy) -> Opt
              Creating one under an epoch the store has not recorded is what puts two keys under \
              a single id. {ENTRIES_CARRY_NO_HMAC} They stay unverifiable; clearing the condition \
              protects later ones, not those."
-                );
+                ));
             }
             None
         }
@@ -602,7 +607,10 @@ impl KeyWarnPolicy {
 /// policy parameter (#473). Every production caller now states its policy.
 #[cfg(test)]
 pub(super) fn load_signing_key(secret_path: &Path) -> SigningKey {
-    load_signing_key_with(secret_path, KeyWarnPolicy::always(true))
+    let mut warnings = Vec::new();
+    let key = load_signing_key_with(secret_path, KeyWarnPolicy::always(true), &mut warnings);
+    super::print_warnings(&warnings);
+    key
 }
 
 /// Resolve the active signing key and its `key_id` together.
@@ -613,9 +621,17 @@ pub(super) fn load_signing_key(secret_path: &Path) -> SigningKey {
 /// permanently unverifiable entry that no amount of verifier-side repair can
 /// reclassify, because the id is present and only the bytes are wrong. The two
 /// reads are now one value *and* one locked observation.
-pub(super) fn load_signing_key_with(secret_path: &Path, policy: KeyWarnPolicy) -> SigningKey {
+///
+/// Its warnings are pushed onto `warnings` rather than printed (ADR-0013): the
+/// caller decides where they go — stderr for every command but
+/// `hook-check --json-error`, which carries them inside its one JSON object.
+pub(super) fn load_signing_key_with(
+    secret_path: &Path,
+    policy: KeyWarnPolicy,
+    warnings: &mut Vec<String>,
+) -> SigningKey {
     with_key_store_lock(secret_path, false, |_lock| {
-        load_signing_key_locked(secret_path, policy)
+        load_signing_key_locked(secret_path, policy, warnings)
     })
 }
 
@@ -858,7 +874,11 @@ pub(super) fn interrupted_rotation_evidence(secret_path: &Path) -> bool {
     })
 }
 
-fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> SigningKey {
+fn load_signing_key_locked(
+    secret_path: &Path,
+    policy: KeyWarnPolicy,
+    warnings: &mut Vec<String>,
+) -> SigningKey {
     // #457 (Codex Round 2): the verifier was made fail-closed for an unlistable
     // key directory, but this side was not — and it is the side that writes.
     // With execute-but-not-read permissions the active secret is still
@@ -917,7 +937,7 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
             // the others for the window would be the sharing this change exists
             // to remove — between *kinds*, not within one.
             if may_warn(policy, WARN_KIND_KEYSTORE, secret_path) {
-                eprintln!("{}", keystore_warning(&reason, policy.allows_repair()));
+                warnings.push(keystore_warning(&reason, policy.allows_repair()));
             }
             return SigningKey {
                 id: UNRESOLVED_KEY_ID.to_string(),
@@ -976,16 +996,17 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
     // the record first is what makes the mint below name a generation the next
     // command will still name the same way.
     let epoch = match missing {
-        Some(MissingActiveKey::Unbacked(lost)) => match claim_next_epoch(secret_path, lost, policy)
-        {
-            Some(next) => next,
-            None => {
-                return SigningKey {
-                    id: UNRESOLVED_KEY_ID.to_string(),
-                    secret: None,
-                };
+        Some(MissingActiveKey::Unbacked(lost)) => {
+            match claim_next_epoch(secret_path, lost, policy, warnings) {
+                Some(next) => next,
+                None => {
+                    return SigningKey {
+                        id: UNRESOLVED_KEY_ID.to_string(),
+                        secret: None,
+                    };
+                }
             }
-        },
+        }
         _ => epoch,
     };
 
@@ -993,7 +1014,7 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
     // read — normally because this is a fresh install and it has to be created.
     let secret = match active {
         Ok(secret) => Some(secret),
-        Err(_) => load_or_create_secret(secret_path, policy),
+        Err(_) => load_or_create_secret_collect(secret_path, policy, warnings),
     };
     let id = key_id_for_epoch(epoch);
 
@@ -1058,7 +1079,7 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
         // store that just did.
         if secret.is_some() {
             if may_warn(policy, WARN_KIND_ROTATION_MINTED, secret_path) {
-                eprintln!(
+                warnings.push(format!(
                     "omamori warning: {} audit-secret now holds an \
                      active key; entries from here on are signed with it and labelled {id}{}. \
                      Do not copy a .retired file over audit-secret: that \
@@ -1066,10 +1087,10 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
                      chapter of omamori's FAQ.",
                     missing.observed(&id, max_retired),
                     missing.overlap_clause(&id)
-                );
+                ));
             }
         } else if may_warn(policy, WARN_KIND_ROTATION_UNMINTED, secret_path) {
-            eprintln!(
+            warnings.push(format!(
                 // "while this lasts", not "from here on" — the same bound the
                 // unlistable-directory warning above uses, and for the same
                 // reason. The condition is a permissions or storage fault the
@@ -1080,7 +1101,7 @@ fn load_signing_key_locked(secret_path: &Path, policy: KeyWarnPolicy) -> Signing
                  omamori's FAQ.",
                 missing.observed_without_mint(max_retired),
                 missing.consequence_without_mint(&id)
-            );
+            ));
         }
     }
 
@@ -1972,6 +1993,8 @@ impl Keyring {
     /// saying why, and the caller's message for that names a missing secret —
     /// false, when the secret is readable and only the directory is not. A
     /// caller that cannot sequence the two cannot reintroduce it.
+    // reason: `audit hash-cwd`'s own report (reached through `provenance.rs`), not on the append path (ADR-0013).
+    #[allow(clippy::print_stderr)]
     pub(super) fn report_and_usable(&self) -> bool {
         for anomaly in &self.anomalies {
             eprintln!("omamori warning: {}", anomaly.describe());
@@ -2130,7 +2153,21 @@ fn load_keyring_locked(secret_path: &Path) -> Keyring {
 // Secret I/O (symlink-safe)
 // ---------------------------------------------------------------------------
 
+/// [`load_or_create_secret_collect`] with its warnings printed — the form the
+/// tests that mint a key directly call.
+#[cfg(test)]
 pub(super) fn load_or_create_secret(path: &Path, policy: KeyWarnPolicy) -> Option<[u8; 32]> {
+    let mut warnings = Vec::new();
+    let secret = load_or_create_secret_collect(path, policy, &mut warnings);
+    super::print_warnings(&warnings);
+    secret
+}
+
+fn load_or_create_secret_collect(
+    path: &Path,
+    policy: KeyWarnPolicy,
+    warnings: &mut Vec<String>,
+) -> Option<[u8; 32]> {
     if let Ok(secret) = read_secret(path) {
         return Some(secret);
     }
@@ -2156,17 +2193,17 @@ pub(super) fn load_or_create_secret(path: &Path, policy: KeyWarnPolicy) -> Optio
                 // repeated on every guarded one for as long as the store stayed
                 // broken.
                 if may_warn(policy, WARN_KIND_SECRET_PATH_OCCUPIED, path) {
-                    eprintln!(
+                    warnings.push(format!(
                         "omamori warning: something already occupies the audit secret path \
                          and cannot be read as a key: {e}"
-                    );
+                    ));
                 }
                 None
             }
         },
         Err(e) => {
             if may_warn(policy, WARN_KIND_SECRET_UNREADABLE, path) {
-                eprintln!("omamori warning: audit secret unavailable: {e}");
+                warnings.push(format!("omamori warning: audit secret unavailable: {e}"));
             }
             None
         }
@@ -2474,6 +2511,8 @@ pub fn rotate_key(path: &Path) -> Result<RotationResult, AuditError> {
 /// probe `scan_key_dir` avoids: on a case-insensitive filesystem it answers for
 /// a name the listing did not report, and this function deletes what it is
 /// given.
+// reason: `audit key rotate`'s own report, not on the append path (ADR-0013).
+#[allow(clippy::print_stderr)]
 fn take_pending_slot(seen: Option<&Path>, lock: &KeyStoreLock) -> Result<(), AuditError> {
     let Some(path) = seen else {
         return Ok(());
@@ -2544,6 +2583,18 @@ fn rotated_store_evidence(
         seen.push(format!("a replacement is waiting in {PENDING_NAME}"));
     }
     seen.join("; ")
+}
+
+/// `audit key rotate`'s warning when it goes ahead without the key-store lock.
+// reason: `audit key rotate`'s own report, not on the append path (ADR-0013).
+#[allow(clippy::print_stderr)]
+fn warn_rotation_without_lock(reason: &dyn std::fmt::Display) {
+    eprintln!(
+        "omamori warning: proceeding without the audit key-store lock — {reason}. \
+         A reader resolving a key epoch during this rotation can pair the previous \
+         label with the new key's bytes, which `audit verify` later reports as \
+         tampering. omamori only ever puts a plain, empty file at that path."
+    );
 }
 
 fn rotate_key_locked(
@@ -2804,12 +2855,7 @@ fn rotate_key_locked(
     // can be heard; the previous wording named a concurrent reader, which is
     // one of the other two.
     if let KeyStoreLock::Unheld(reason) = lock {
-        eprintln!(
-            "omamori warning: proceeding without the audit key-store lock — {reason}. \
-             A reader resolving a key epoch during this rotation can pair the previous \
-             label with the new key's bytes, which `audit verify` later reports as \
-             tampering. omamori only ever puts a plain, empty file at that path."
-        );
+        warn_rotation_without_lock(reason);
     }
 
     // Rename active → retired

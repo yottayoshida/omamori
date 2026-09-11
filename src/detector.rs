@@ -151,10 +151,35 @@ pub fn repair_gate_reporting_with(
     detectors: &[DetectorConfig],
     env_pairs: &[(String, String)],
 ) -> bool {
+    let mut warnings = Vec::new();
+    let allow_repair = repair_gate_collect_with(detectors, env_pairs, &mut warnings);
+    crate::audit::print_warnings(&warnings);
+    allow_repair
+}
+
+/// [`repair_gate_reporting`], handing back the lines it would print instead of
+/// printing them (ADR-0013) — for `hook-check --json-error`, whose stderr is one
+/// JSON object. Same verdict, same lines.
+pub(crate) fn repair_gate_collect(
+    detectors: &[DetectorConfig],
+    warnings: &mut Vec<String>,
+) -> bool {
+    let env_pairs: Vec<(String, String)> = std::env::vars().collect();
+    repair_gate_collect_with(detectors, &env_pairs, warnings)
+}
+
+/// The shared half: one spelling of the warning line for both forms above.
+fn repair_gate_collect_with(
+    detectors: &[DetectorConfig],
+    env_pairs: &[(String, String)],
+    warnings: &mut Vec<String>,
+) -> bool {
     let gate = repair_gate(detectors, env_pairs);
-    for warning in &gate.warnings {
-        eprintln!("omamori warning: {warning}");
-    }
+    warnings.extend(
+        gate.warnings
+            .iter()
+            .map(|warning| format!("omamori warning: {warning}")),
+    );
     gate.allow_repair
 }
 

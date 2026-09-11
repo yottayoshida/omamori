@@ -185,7 +185,8 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
   "reason": "<human-readable message>",
   "matched_pattern": "<pattern string>" | null,
   "matched_position": { "start": <usize>, "end": <usize> } | null,
-  "hint": "<action guidance for AI agent>"
+  "hint": "<action guidance for AI agent>",
+  "warnings": ["<operator warning>", "..."]
 }
 ```
 
@@ -196,6 +197,7 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
 - `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`; for input validation it is `"invalid-input"`; for file protection it is `"protected-file"` when a `PROTECTED_FILE_PATTERNS` entry actually matched, or `"unresolvable-base"` (#175) when a *relative* `file_path` couldn't be evaluated at all because the process's working directory was unresolvable — see the `layer2:file-protection` row below
 - `matched_pattern`: the protected pattern token when known. `null` for structural blocks, Phase 1B token-level detections, input validation errors, and the `"unresolvable-base"` fail-close case above (no pattern was ever evaluated, so none is reported)
 - `matched_position`: byte range `[start, end)` of the match in the original command string when known; `null` when position tracking is not available for the layer
+- `warnings` (optional, #494): the lines text mode would have printed while handling the block, in the same order — operator warnings from the audit layer (a key store it cannot use, an append that failed, a high-water-mark it could not advance), from the detector configuration (an invalid detector entry in `config.toml`), from the structural policy routing (a config that failed to load or is degraded, a staging write that failed under `[audit] strict = true`), from a break-glass bypass that could not be audited, and the notes that come with them (the audit log's periodic prune, `omamori: pruned N audit entries …`; the staging prune's count). Human text that may name paths, for display rather than parsing; the same lines reach the same session through stderr in text mode. Absent when there is nothing to report — with a healthy store and configuration that is every run except the one whose append triggers the audit log's periodic prune — so output that parsed before still parses the same
 - `hint`: action guidance for the AI agent consumer. Shell-command blocks reference `omamori explain`; input validation and file protection blocks use a "Tell the user:" pattern directing the AI to inform the user and offer alternatives — the `"unresolvable-base"` case's hint explicitly says the file's protection status was never determined, not that it matched a protected pattern
 
 **Layer values**:
@@ -203,7 +205,7 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
 | Layer | Deny path |
 |-------|-----------|
 | `layer2:meta-pattern` | Phase 1B token-level detection (env tampering, config commands) |
-| `layer2:rule` | Phase 2 rule match (e.g. `rm-recursive-to-trash`) |
+| `layer2:rule` | Phase 2 rule match (e.g. `rm-recursive-to-trash`), including a rule under an active break-glass bypass that could not be audited while `[audit] strict = true` |
 | `layer2:structural` | Phase 2 structural detection (no wrapper kind) |
 | `layer2:pipe-to-shell:<wrapper>` | Phase 2 pipe-to-shell with wrapper (e.g. `env`, `bash`) |
 | `layer2:obfuscated-expansion` | Phase 2 obfuscated expansion detection |
@@ -212,9 +214,9 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
 
 **Security note — input validation errors**: `MalformedJson` and `MalformedMissingField` emit identical JSON (same layer, rule_id, reason) to minimize oracle exposure. Attackers cannot distinguish JSON parse failures from missing-field errors, preventing incremental input refinement. The reason string is static and never includes raw stdin content to prevent reflection attacks.
 
-**Trade-off — audit gap in `--json-error` mode**:
+**Audit rows in `--json-error` mode** (#494):
 
-When `--json-error` is active, the hook **skips audit log emission** for the blocked event. This trade-off keeps stderr a single parseable JSON object even in degraded audit environments (missing or unreadable audit secret, full disk, broken permissions) where `AuditLogger::from_config` would otherwise emit free-form warnings. AI agent integrations get a reliable contract; the cost is that `omamori audit show --action block` may miss events from `--json-error` invocations. Operators who need full audit coverage should not pass `--json-error`; the regular text-mode hook records the audit row even when it cannot print to stderr cleanly.
+A shell command blocked with `--json-error` is recorded in the audit chain exactly as in text mode — `layer2:meta-pattern`, `layer2:rule` and the structural layers. (A break-glass bypass blocked because its own audit failed under `[audit] strict = true` is recorded in neither mode: that failure is why it blocks.) The audit layer hands its warnings back to the hook instead of printing them ([ADR-0013](docs/adr/0013-audit-warnings-are-returned-and-the-caller-prints-them.md)), and they travel in the object's `warnings` field, so stderr stays one parseable JSON object even in degraded audit environments (missing or unreadable audit secret, full disk, broken permissions). Until #494 this mode skipped the audit row to keep that guarantee, so `omamori audit show --action block` missed its events. Deny paths that text mode does not audit either — malformed hook input, protected file operations — are unchanged.
 
 **Stability**: `blocked`, `layer`, `rule_id`, `reason`, `hint` are stable contract fields. Additional fields may be added in minor releases. AI agents should ignore unknown keys.
 
