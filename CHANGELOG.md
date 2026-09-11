@@ -6,6 +6,9 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **The test-isolation canary no longer fails on a machine that has omamori installed.** Tests that spawn `git` through `PATH` were running the installed omamori's shim, whose self-heal wrote a hook entry into the canary's throwaway `~/.claude/settings.json` — so `./scripts/test-isolation-canary.sh -- cargo test --locked` exited 1 locally while CI stayed green. The canary now removes omamori's own shim directories from `PATH` for the run, and its self-test proves both that a shim directory is removed and that a look-alike is not. Its final line also stops blaming a test when only a real file changed — another process on the host can do that — and says so instead. ([#526](https://github.com/yottayoshida/omamori/issues/526))
+
 ## [1.0.7] - 2026-09-04
 
 ### Fixed

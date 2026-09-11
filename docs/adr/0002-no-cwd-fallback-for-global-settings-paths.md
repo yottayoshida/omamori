@@ -183,3 +183,42 @@ against the current code, is *also* no longer accurate: `staging_dir()` already 
 `context::data_dir()` (fail-close, `None` on unusable `HOME`) rather than a CWD fallback,
 per its own doc comment. That drift predates #373 and is out of this PR's scope to chase down;
 noted here rather than left for a reader to trip over.
+
+### Follow-up (#526): the canary also removes omamori's own shim dirs from `PATH`
+
+The canary isolated where tests *write* (`HOME`/`XDG_*`) but not which binaries they *run*. On a
+host with omamori installed, `$HOME/.omamori/shim` is on `PATH` and its `git`/`rm`/… are
+symlinks to the installed omamori. `src/context.rs`'s tests spawn `git` through `PATH` — so does
+the production code they exercise — which runs the installed omamori as a shim, and its self-heal
+(`run_shim` Step 2c) merged a hook entry into the throwaway `.claude/settings.json`. Measured on
+`main` (`4a9815c`): the sentinel went 37 → 350 bytes, only the `--lib` test binary wrote, only
+`context::` tests triggered it, and with the shim dir removed from `PATH` the full `--lib` run left
+the sentinel untouched. CI runners have no shim, so the canary only ever went red locally, and a
+red that is not about any test is the fastest way to teach people to ignore it.
+
+The canary now removes every `PATH` entry that is an omamori shim dir — an absolute path named
+`shim`, one of the shimmed command names in which is a symlink whose target is named `omamori` —
+for the whole run, which also sends its
+own cleanup to the real `rm` rather than to the installed shim's trash action. Rejected: making
+tests call `git` by absolute path (the production code they call uses `PATH` too, and per-test
+discipline is what this ADR already rejected), and a production switch that disables self-heal
+under test (the test-only branch this ADR already rejected). Clearing `PATH` down to system
+directories was also rejected — it breaks rustup- and Homebrew-managed `cargo`, the same class as
+the `CARGO_HOME` pin above.
+
+What the red was pointing at is recorded separately: the shim's Step 2c inserts a hook entry even
+when the hook script it points at does not exist, which is a product defect in its own right and
+is fixed on its own.
+
+Three limitations follow, and the script header lists them. Only omamori's shim dirs are
+removed, so any other tool on the host's `PATH` that writes under `$HOME` is still the host's
+doing. That includes omamori itself reached through a hand-made link in a directory not named
+`shim` (say `~/bin/git -> omamori`): the binary decides to act as a shim from `argv[0]` alone, so
+its self-heal still runs and the canary still blames a test. `omamori install` and `setup` never
+create that shape, and requiring the name is what keeps a `~/bin` with one such link from being
+removed from `PATH` wholesale. And
+removing them from the canary's own `PATH` does nothing for processes outside it: an omamori shim
+run by another session can still re-merge the *real* `settings.json` during a run (after an
+upgrade, say). A real-file change cannot be told apart from a test that bypassed `HOME`/`XDG_*`,
+so the canary now attributes a failure to a test only when a throwaway sentinel changed, and says
+"a real file changed" otherwise.
