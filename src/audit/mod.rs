@@ -446,8 +446,9 @@ impl AuditLogger {
         flock_exclusive(&file)?;
 
         // Read chain state under lock (another process may have appended since our open).
-        // #177 B1 step 3: when the last valid JSON line within read_chain_state's tail
-        // window declares an unsupported chain_version, we can't safely resume seq
+        // #177 B1 step 3: when the log's last chain entry (#465: the last line carrying a
+        // `chain_version`, however much non-chain content follows it) declares
+        // an unsupported chain_version, we can't safely resume seq
         // numbering or chain prev_hash onto it — refuse to append. This returns Err,
         // like every other append failure (disk full,
         // permissions, secret unavailable) — QA Phase 8 finding F-001: the two call
@@ -459,7 +460,7 @@ impl AuditLogger {
         // site's existing Err handling already treats a non-strict Err as a warning,
         // not a block — Err doesn't change that, it only makes strict mode able to
         // see this case at all.
-        let (seq, prev_hash) = match read_chain_state(&mut file, self.signing_key.secret()) {
+        let (seq, prev_hash) = match read_chain_state(&mut file, self.signing_key.secret())? {
             ChainTailState::UnsupportedVersion { chain_version } => {
                 return Err(std::io::Error::other(format!(
                     "audit log tail declares chain_version {chain_version}, which this \
@@ -481,6 +482,20 @@ impl AuditLogger {
                      necessarily tampering \u{2014} counting a chain up to this number is \
                      not physically reachable, so the tail line or something before it did \
                      not come from omamori's own counting)"
+                )));
+            }
+            // #465: the scan's limit. Refusing here, rather than restarting
+            // from genesis, is what keeps a padded log from forking; bounding
+            // the scan is what keeps it from holding `hook-check` past the
+            // host's timeout (see `ChainTailState::NoEntryWithinLimit`).
+            ChainTailState::NoEntryWithinLimit { limit } => {
+                return Err(std::io::Error::other(format!(
+                    "the last {} MiB of the audit log hold no chain entry \u{2014} \
+                     refusing to append (this event was not recorded; not necessarily \
+                     tampering \u{2014} what follows the last chain entry is not \
+                     something omamori writes, or is one line longer than that; run \
+                     omamori audit verify)",
+                    limit / (1024 * 1024)
                 )));
             }
             ChainTailState::Fresh { genesis } => (0, genesis),
@@ -1869,10 +1884,12 @@ mod tests {
     }
 
     /// Codex review R1 P1: the refusal has to be decided from `seq` before
-    /// `entry_hash`'s shape is looked at. A malformed entry is answered by
-    /// restarting from genesis — which numbers the next entry `0` — so this
-    /// shape reached the very outcome the refusal exists to prevent while
-    /// never passing through the increment. The wrap was not the only road to
+    /// `entry_hash`'s shape is looked at. Through `1.1.0` a malformed entry was
+    /// answered by restarting from genesis — which numbers the next entry `0` —
+    /// so this shape reached the very outcome the refusal exists to prevent
+    /// while never passing through the increment. #465 replaced that restart
+    /// with reading the line past, and the order still decides the verdict.
+    /// The wrap was not the only road to
     /// `seq: 0`; the fork was the other.
     #[test]
     fn append_refuses_at_the_seq_limit_even_when_the_tail_entry_hash_is_malformed() {
@@ -1913,17 +1930,32 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Control for the test above: the same malformed `entry_hash` on a tail
-    /// that is *not* at the limit still restarts the chain from genesis. This
-    /// pins that the fix reordered one decision rather than turning every
-    /// malformed tail into a refusal — which would be a much larger behavior
-    /// change than #456 asks for, and would break the pre-existing
-    /// corruption-recovery path.
+    /// Control for the test above, rewritten by #465. It used to pin that a
+    /// malformed `entry_hash` on a tail below the limit restarted the chain
+    /// from genesis — "the pre-existing corruption-recovery path". That path
+    /// was the fork #465 closes: omamori never writes an empty `entry_hash`
+    /// (an entry it could not sign carries `NO_HMAC_SECRET`), so a line shaped
+    /// like this came from something else, and restarting behind it let one
+    /// planted line lift the unknown-version refusal — and, with no attacker
+    /// at all, turned a genuine long entry outside the old 64 KB window into
+    /// a chain `verify` reported as broken. There is no recovery-by-restart
+    /// path for a damaged tail any more: the damaged line is read past and the
+    /// chain continues from the last real entry.
+    ///
+    /// `verify`'s verdict on this store does not move. The planted line is a
+    /// full `AuditEvent` whose hash does not recompute, so `verify` fails
+    /// closed on it exactly as it did when a seq-0 restart followed it. What
+    /// #456 pinned also still holds: the seq-limit refusal above fires on the
+    /// number before the hash shape is consulted.
     #[test]
-    fn a_malformed_tail_below_the_limit_still_restarts_from_genesis() {
+    fn a_malformed_chain_shaped_tail_is_read_past_not_restarted_from() {
         let dir = test_dir("append-malformed-hash-below-limit");
         let logger = test_logger(&dir);
         logger.append(make_event("cmd0")).unwrap();
+        let real_tail_hash = read_events(&logger.path)[0]["entry_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let mut content = fs::read_to_string(&logger.path).unwrap();
         content.push_str(
@@ -1934,15 +1966,200 @@ mod tests {
 
         logger
             .append(make_event("cmd1-should-be-recorded"))
-            .expect("a malformed tail below the limit keeps the pre-existing behavior");
+            .expect("a malformed chain-shaped tail is read past, not refused");
 
         let events = read_events(&logger.path);
         let last = events.last().unwrap();
         assert_eq!(last["command"], "cmd1-should-be-recorded");
         assert_eq!(
             last["seq"].as_u64(),
-            Some(0),
-            "the pre-existing answer to a malformed tail is a fresh chain at seq 0"
+            Some(1),
+            "#465: the chain continues from the last real entry, not from genesis"
+        );
+        assert_eq!(
+            last["prev_hash"].as_str(),
+            Some(real_tail_hash.as_str()),
+            "the new entry links to the real tail, behind the planted line"
+        );
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at,
+            Some(7),
+            "verify fails closed on the planted line (reported at the seq it states), as it did before #465"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #465, the falsifiable check for the latch: an unknown-version tail
+    /// followed by a foreign JSON line and 9 MiB of non-JSON. Each of those
+    /// alone lifted the refusal on the old code — `{"pad":1}` reached the
+    /// `Fresh` arm through "no `chain_version`", and the padding pushed the
+    /// planted line out of the 64 KB window. Now both are read past and the
+    /// planted line is what append stops at.
+    #[test]
+    fn append_refuses_behind_an_unknown_version_tail_however_much_non_chain_content_follows() {
+        let dir = test_dir("append-465-latch");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_unknown_version_line(&logger.path, 1);
+        let mut file =
+            std::io::BufWriter::new(OpenOptions::new().append(true).open(&logger.path).unwrap());
+        writeln!(file, r#"{{"pad":1}}"#).unwrap();
+        writeln!(file, "{}", "p".repeat(4 * 1024 * 1024)).unwrap();
+        for _ in 0..(5 * 1024 * 1024 / 8) {
+            writeln!(file, "pad!!!!").unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let before = fs::read(&logger.path).unwrap();
+
+        let result = logger.append(make_event("cmd1-should-not-be-recorded"));
+        let err = result
+            .expect_err("the unknown-version refusal must survive whatever follows it")
+            .to_string();
+        assert!(
+            err.contains("chain_version 999") && err.contains("refusing to append"),
+            "the refusal names the planted version: {err}"
+        );
+        assert_eq!(
+            fs::read(&logger.path).unwrap(),
+            before,
+            "a refused append leaves the file byte-for-byte unchanged"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #465, the falsifiable check for "no window, no fork": a genuine entry
+    /// whose `command` is 20 MiB — two orders of magnitude past the old 64 KB
+    /// window — followed by 6 MiB of non-JSON and a chain-shaped line omamori
+    /// never writes. The next append must link to the 20 MiB entry. On the
+    /// old code the window held no chain entry, so this forked at seq 0 and
+    /// `verify` reported a broken chain on a log nobody had touched.
+    #[test]
+    fn append_links_to_a_huge_real_entry_behind_junk_and_a_malformed_line() {
+        let dir = test_dir("append-465-huge-entry");
+        let logger = test_logger(&dir);
+        let big = "c".repeat(20 * 1024 * 1024);
+        logger.append(make_event(&big)).unwrap();
+        let real_tail_hash = read_events(&logger.path)[0]["entry_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut file =
+            std::io::BufWriter::new(OpenOptions::new().append(true).open(&logger.path).unwrap());
+        writeln!(file, "{}", "j".repeat(4 * 1024 * 1024)).unwrap();
+        for _ in 0..(2 * 1024 * 1024 / 8) {
+            writeln!(file, "junk!!!").unwrap();
+        }
+        writeln!(
+            file,
+            r#"{{"chain_version":{CHAIN_VERSION},"seq":7,"entry_hash":""}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        logger
+            .append(make_event("cmd1"))
+            .expect("the real tail is behind the junk and must be found");
+        let events = read_events(&logger.path);
+        let last = events.last().unwrap();
+        assert_eq!(last["command"], "cmd1");
+        assert_eq!(last["seq"].as_u64(), Some(1), "linked, not restarted");
+        assert_eq!(
+            last["prev_hash"].as_str(),
+            Some(real_tail_hash.as_str()),
+            "the new entry links to the 20 MiB entry"
+        );
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.broken_at, None,
+            "the chain is whole: the junk is torn, not a break"
+        );
+        assert_eq!(result.chain_entries, 2);
+        assert!(
+            result.torn_lines >= 2,
+            "the junk and the malformed line are counted as torn, got {}",
+            result.torn_lines
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #465: the scan stops at `TAIL_SCAN_LIMIT`. Non-chain content longer
+    /// than that behind the last real entry is refused, not read past without
+    /// end and not restarted from — the file is left byte-for-byte unchanged.
+    /// The control is `append_links_to_a_huge_real_entry_behind_junk_and_a_malformed_line`,
+    /// where the same kinds of content, inside the limit, are read past.
+    #[test]
+    fn append_refuses_when_no_chain_entry_starts_within_the_scan_limit() {
+        let dir = test_dir("append-465-limit");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        let mut file =
+            std::io::BufWriter::new(OpenOptions::new().append(true).open(&logger.path).unwrap());
+        let line = "l".repeat(1024 * 1024 - 1);
+        let lines = chain::TAIL_SCAN_LIMIT / (1024 * 1024) + 1;
+        for _ in 0..lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+        let before = fs::read(&logger.path).unwrap();
+
+        let err = logger
+            .append(make_event("cmd1-should-not-be-recorded"))
+            .expect_err("no chain entry within the limit must refuse, not fork")
+            .to_string();
+        assert!(
+            err.contains("hold no chain entry") && err.contains("refusing to append"),
+            "{err}"
+        );
+        assert_eq!(
+            fs::read(&logger.path).unwrap(),
+            before,
+            "a refused append leaves the file byte-for-byte unchanged"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #465, mirroring `try_audit_append_strict_blocks_on_unknown_chain_version_tail`:
+    /// the refusal must still reach strict mode through the same seam when
+    /// non-chain content follows the planted line.
+    #[test]
+    fn try_audit_append_strict_blocks_when_non_chain_content_follows_an_unknown_version_tail() {
+        let dir = test_dir("try-audit-append-465-latch");
+        let logger = test_logger(&dir);
+        logger.append(make_event("cmd0")).unwrap();
+        append_unknown_version_line(&logger.path, 1);
+        let mut file =
+            std::io::BufWriter::new(OpenOptions::new().append(true).open(&logger.path).unwrap());
+        writeln!(file, r#"{{"pad":1}}"#).unwrap();
+        writeln!(file, "{}", "p".repeat(1024 * 1024)).unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        let strict_logger = AuditLogger {
+            path: logger.path.clone(),
+            signing_key: SigningKey::for_test(logger.key_id(), logger.secret_ref().copied()),
+            retention_days: logger.retention_days,
+        };
+        let event = strict_logger.create_event(
+            &CommandInvocation::new("cmd1".to_string(), vec![]),
+            None,
+            &[],
+            &ActionOutcome::PassedThrough { exit_code: 0 },
+            None,
+        );
+        assert_eq!(
+            crate::engine::shim::try_audit_append(&strict_logger, event, true),
+            Some(1),
+            "strict mode must block: non-chain content after the planted line does not lift the refusal"
         );
 
         let _ = fs::remove_dir_all(&dir);
