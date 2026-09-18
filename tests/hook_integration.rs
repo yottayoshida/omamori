@@ -2972,6 +2972,17 @@ fn an_unlistable_key_directory_is_neither_called_tampering_nor_passed_over() {
         verify_said.contains("cannot list") && doctor_said.contains("cannot list"),
         "and the cause has to be named on both surfaces: {verify_said} / {doctor_said}"
     );
+    // #474: and `doctor`'s first line has to send the reader down here. The
+    // headline is computed from the integrity checks alone, so before this the
+    // top of a store in exactly this state could read `Protection status: OK`
+    // with the lines above it twenty rows below. Asserted on the unfiltered
+    // output, because the filter above keeps only the audit lines — the point
+    // of the note is that it sits with the headline, not with them.
+    let doctor_all = strip(format!("{doctor_out}{doctor_err}"));
+    assert!(
+        doctor_all.contains("Risk signals below need attention."),
+        "doctor must point at the risk signals from the top: {doctor_all}"
+    );
     assert!(
         doctor_said.contains("chain: cannot verify"),
         "doctor must carry the risk signal: {doctor_said}"

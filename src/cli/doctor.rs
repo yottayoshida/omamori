@@ -109,6 +109,22 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
         "OK"
     };
     out!(o, "Protection status: {status_word}");
+    // #474: the headline is computed from the integrity checks alone, and the
+    // risk signals below are display-only — so a store whose audit log cannot
+    // be verified printed `OK` at the top, `chain: cannot verify` twenty lines
+    // down, and exited 0. The word is left alone: three documents assert a
+    // healthy run by matching `Protection status: OK` (ACCEPTANCE_TEST.md's
+    // D-1, docs/evaluation-kit.md, the evaluation issue template) and appending
+    // to it would make those assertions pass in both states. What is added is a
+    // pointer, so a reader who stops at the first line is told to keep going.
+    //
+    // The exit code is untouched, deliberately: `doctor`'s three values are
+    // frozen by docs/CONTRACT.md, and #474 files the exit-code asymmetry as a
+    // separate question.
+    let signals = collect_risk_signals();
+    if signals.as_ref().is_some_and(risk_signals_need_attention) {
+        out!(o, "  Risk signals below need attention.");
+    }
     out!(o);
 
     let sections = group_by_section(items);
@@ -156,7 +172,9 @@ fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {
     }
 
     // Section 4: Recent risk signals (from audit aggregation)
-    print_risk_signals_section(o, ai_env);
+    if let Some(signals) = &signals {
+        print_risk_signals_section(o, ai_env, signals);
+    }
 
     // Section 5: Break-glass status
     print_break_glass_section(o, ai_env);
@@ -285,23 +303,23 @@ fn probe_write(probe_path: &std::path::Path) -> bool {
 /// Whether the risk-signals section has nothing to say.
 ///
 /// Split out of `print_risk_signals_section` for the reason `remedy_line` is
-/// split out of `print_remedy` (#527): the enclosing function builds its own
-/// `report` from the loaded config, so a test can reach the printing but never
-/// the decision. What this predicate decides is when a security tool is
-/// allowed to say `quiet`, and that is the one thing in the section worth
-/// pinning directly — every signal added to the printing below has to be added
-/// here too, and the failure of forgetting is silence over a fault.
+/// split out of `print_remedy` (#527): the printing and the decision are
+/// reachable separately, so a test can pin what decides silence without
+/// rendering a section. And that is the one thing here worth pinning directly —
+/// every signal added to the printing below has to be added here too, and the
+/// failure of forgetting is silence over a fault.
 ///
 /// #471 item 3 is where that failure happened once already, in this exact
-/// condition. #506's `key_store_failure` clause changes nothing today (it is
-/// only ever set alongside a `chain_status` that `needs_attention()` covers)
-/// and is kept because the clause it sits in is the one that decides silence.
-/// #483's `never_protected_entries` and #461's `pruned_findings` are the two
-/// that genuinely do **not** reach `chain_status`: both leave the links
-/// intact, so `needs_attention()` is false while `audit verify` still has
-/// something to report. #461's is the sharper case — a prune removes the very
-/// entries its record describes, so on a pruned log every other clause here is
-/// quiet by construction and this one is the only thing left to speak.
+/// condition. Three clauses are kept although nothing reaches them alone
+/// today, because this is where silence is decided and an argument about
+/// another function is not the same as the condition being written down:
+/// #506's `key_store_failure` and #470's `structural_break_at` only ever
+/// accompany a `chain_status` that `needs_attention()` covers, and #483's
+/// `never_protected_entries` is zeroed by `aggregate_report` unless one of
+/// those same statuses took the slot. #461's `pruned_findings` is the one that
+/// genuinely stands alone — a prune removes the very entries its record
+/// describes, so on a pruned log every other clause here is quiet by
+/// construction and this one is the only thing left to speak.
 fn risk_signals_are_quiet(report: &ReportAggregate, audit_unwritable: bool) -> bool {
     report.total_blocks == 0
         && report.unknown_tool_fail_opens == 0
@@ -310,6 +328,13 @@ fn risk_signals_are_quiet(report: &ReportAggregate, audit_unwritable: bool) -> b
         // match, so a new variant cannot be silently treated as healthy (#457).
         && !report.chain_status.needs_attention()
         && !report.hwm_tampered
+        // #470's finding, added here by #474. It only ever accompanies a halt,
+        // and every halt reaches a `chain_status` the clause above already
+        // covers — so this changes nothing today, and is kept for the reason
+        // `key_store_failure` below is: the clause it sits in is the one that
+        // decides silence, and an argument about another function is not the
+        // same as the condition being here.
+        && report.structural_break_at.is_none()
         && report.keyring_warnings.is_empty()
         && report.key_store_failure.is_none()
         && report.never_protected_entries == 0
@@ -317,21 +342,86 @@ fn risk_signals_are_quiet(report: &ReportAggregate, audit_unwritable: bool) -> b
         && !audit_unwritable
 }
 
-fn print_risk_signals_section(o: &mut Out<'_>, ai_env: bool) {
-    let Ok(load_result) = crate::config::load_config(None) else {
-        return;
-    };
-    let report = aggregate_report(&load_result.config.audit, 30);
+/// What this section will say, read once.
+///
+/// #474: the headline above it needs the same answer, and reading the log a
+/// second time to get it is how the two come to disagree — one entry written
+/// between the reads is enough, and a headline contradicting the section twenty
+/// lines below is the defect this change exists to remove. `None` is the state
+/// where the section prints nothing at all (the config could not be loaded), so
+/// the headline says nothing about it either rather than pointing at a section
+/// that is not there.
+struct RiskSignals {
+    report: ReportAggregate,
+    audit_unwritable: bool,
+}
 
-    let has_blocks = report.total_blocks > 0;
-    let has_unknown = report.unknown_tool_fail_opens > 0;
+fn collect_risk_signals() -> Option<RiskSignals> {
+    let load_result = crate::config::load_config(None).ok()?;
+    let report = aggregate_report(&load_result.config.audit, 30);
     let audit_unwritable = load_result.config.audit.enabled
         && matches!(
             audit_path_is_writable(&load_result.config.audit),
             Some(false) | None
         );
+    Some(RiskSignals {
+        report,
+        audit_unwritable,
+    })
+}
 
-    if risk_signals_are_quiet(&report, audit_unwritable) {
+/// Whether the section holds something an operator has to act on.
+///
+/// #474: narrower than [`risk_signals_are_quiet`] on purpose, and the
+/// difference is the point. That predicate decides when the section may print
+/// `quiet`, so it counts everything the section prints — including the blocks
+/// omamori made and what a prune recorded, which are omamori working rather
+/// than anything wrong. A headline note driven by those would light up on every
+/// machine that is guarding anything (the README's own sample shows 42 blocks
+/// in seven days), and the state worth pointing at would be lost inside it.
+///
+/// So: the chain's own verdict, the states that say it could not be checked,
+/// a damaged keyring, a log that cannot be written — and what a prune recorded
+/// about the range it removed.
+///
+/// That last one was outside this predicate in the first draft, filed with the
+/// blocks as "omamori working". Review caught both halves of why that is wrong.
+/// A prune writes the record **only** when the removed range held something the
+/// verifier would have complained about (#461: a prune that finds nothing
+/// writes what the previous release wrote), and on a pruned log every other
+/// clause here is quiet by construction — the entries the record describes are
+/// the ones that are gone — so it can be the only signal there is. Some of what
+/// it says is an instruction, not history: a record this build cannot read asks
+/// the operator to upgrade.
+///
+/// `total_blocks` and `unknown_tool_fail_opens` stay out. Blocks are omamori
+/// doing its job; the README's own sample shows 42 in seven days, and a
+/// headline note driven by them would never be off. Fail-opens are the
+/// operational noise README documents as expected from unrecognised tools, and
+/// the section already carries the count and the command to review them.
+fn risk_signals_need_attention(signals: &RiskSignals) -> bool {
+    let report = &signals.report;
+    report.chain_status.needs_attention()
+        || report.hwm_tampered
+        || report.structural_break_at.is_some()
+        || !report.keyring_warnings.is_empty()
+        || report.key_store_failure.is_some()
+        || report.never_protected_entries > 0
+        || report.pruned_findings.is_some()
+        || signals.audit_unwritable
+}
+
+fn print_risk_signals_section(o: &mut Out<'_>, ai_env: bool, signals: &RiskSignals) {
+    let RiskSignals {
+        report,
+        audit_unwritable,
+    } = signals;
+    let audit_unwritable = *audit_unwritable;
+
+    let has_blocks = report.total_blocks > 0;
+    let has_unknown = report.unknown_tool_fail_opens > 0;
+
+    if risk_signals_are_quiet(report, audit_unwritable) {
         out!(o, "  [Risk signals] Last 30 days: quiet");
         return;
     }
@@ -500,13 +590,11 @@ fn print_risk_signals_section(o: &mut Out<'_>, ai_env: bool) {
     // the halt owns that slot, and this is a second thing true of the same log.
     // Both branches: a seq is not a path.
     //
-    // Deliberately **not** added to `risk_signals_are_quiet`. That predicate
-    // decides when this section may say `quiet`, and every signal printed here
-    // has to be represented in it — except one that cannot be the only signal.
-    // This finding is set only on a halted run, and every halt reaches a
-    // `chain_status` that `needs_attention()` already covers, so the section is
-    // loud before this line is reached. If a halt ever stops moving
-    // `chain_status`, this needs a clause there.
+    // #474 added the matching clause to `risk_signals_are_quiet`. #470 had
+    // left it out on the argument that a halt always reaches a
+    // `chain_status` that `needs_attention()` covers — true, and still true,
+    // but that predicate is where silence is decided, and an argument about
+    // another function is not the same as the condition being written down.
     if let Some(seq) = report.structural_break_at {
         if ai_env {
             out!(
@@ -1433,9 +1521,9 @@ fn remediation_hint(rem: &Remediation, ai_env: bool) -> String {
 ///
 /// **Fails closed.** A config that cannot be read means "assume an agent is
 /// reading", not "assume a human is". The sibling helpers here fail *open* on
-/// the same error — `print_risk_signals_section` returns and prints nothing —
-/// and that is right for them: a section that cannot be computed is better
-/// omitted. The direction differs because the stakes do. Omitting a diagnostic
+/// the same error — `collect_risk_signals` returns `None` and the section is
+/// skipped (#474 moved the read there from the section itself) — and that is
+/// right for them: a section that cannot be computed is better omitted. The direction differs because the stakes do. Omitting a diagnostic
 /// costs information; printing a repair recipe into an agent's session is the
 /// thing SEC-R5 exists to prevent.
 ///
@@ -1599,6 +1687,145 @@ fn remediation_to_str(rem: &Remediation) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #474: the headline's pointer fires on a fault and stays quiet on work.
+    ///
+    /// The two predicates in this file answer different questions and the test
+    /// keeps them apart: `risk_signals_are_quiet` decides whether the section
+    /// prints anything (so blocks and prune records count), while
+    /// `risk_signals_need_attention` decides whether the *headline* points down
+    /// (so they must not). Driving both from the same inputs is the point —
+    /// reusing the first for the headline was the first draft, and it would
+    /// have lit the pointer on every machine that has ever blocked a command.
+    #[test]
+    fn the_headline_pointer_separates_faults_from_ordinary_work() {
+        let signals = |report: ReportAggregate, audit_unwritable: bool| RiskSignals {
+            report,
+            audit_unwritable,
+        };
+
+        // Nothing at all: no section, no pointer.
+        let quiet = signals(ReportAggregate::default(), false);
+        assert!(risk_signals_are_quiet(
+            &quiet.report,
+            quiet.audit_unwritable
+        ));
+        assert!(!risk_signals_need_attention(&quiet));
+
+        // omamori working: the section speaks, the headline does not.
+        for (name, report) in [
+            (
+                "blocks",
+                ReportAggregate {
+                    total_blocks: 42,
+                    ..Default::default()
+                },
+            ),
+            (
+                "unknown-tool fail-opens",
+                ReportAggregate {
+                    unknown_tool_fail_opens: 3,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let s = signals(report, false);
+            assert!(
+                !risk_signals_are_quiet(&s.report, s.audit_unwritable),
+                "{name}: the section has something to print"
+            );
+            assert!(
+                !risk_signals_need_attention(&s),
+                "{name}: but it is omamori working, not a fault — the headline stays silent"
+            );
+        }
+
+        // Faults: both speak.
+        for (name, report, unwritable) in [
+            (
+                "cannot verify",
+                ReportAggregate {
+                    chain_status: ChainStatus::KeyUnavailable {
+                        at_seq: 3,
+                        key_id: "key-3".to_string(),
+                    },
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "structural break",
+                ReportAggregate {
+                    structural_break_at: Some(9),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "unprotected entries",
+                ReportAggregate {
+                    never_protected_entries: 2,
+                    ..Default::default()
+                },
+                false,
+            ),
+            ("audit log unwritable", ReportAggregate::default(), true),
+            (
+                "keyring warning",
+                ReportAggregate {
+                    keyring_warnings: vec!["audit keyring: cannot read key-2".to_string()],
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "key store failure",
+                ReportAggregate {
+                    key_store_failure: Some(crate::audit::KeyStoreFailure {
+                        kind: "directory_unreadable",
+                        reason: "audit keyring: cannot list the key directory".to_string(),
+                        remedy: "To fix: make that directory listable again, then re-run."
+                            .to_string(),
+                    }),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "unusable high-water-mark",
+                ReportAggregate {
+                    hwm_tampered: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            // #461: a prune writes this record only when the range it removed
+            // held something unverifiable, and on a pruned log it can be the
+            // only signal left — the entries it describes are the ones that
+            // went. Some of what it says is an instruction, not history.
+            (
+                "prune findings",
+                ReportAggregate {
+                    pruned_findings: Some(crate::audit::retention::PrunedFindings {
+                        unverifiable: 1,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                false,
+            ),
+        ] {
+            let s = signals(report, unwritable);
+            assert!(
+                !risk_signals_are_quiet(&s.report, s.audit_unwritable),
+                "{name}: the section must speak"
+            );
+            assert!(
+                risk_signals_need_attention(&s),
+                "{name}: and the headline must point at it"
+            );
+        }
+    }
 
     /// #461: on a pruned log every other clause in `risk_signals_are_quiet` is
     /// quiet by construction — the entries the record describes are precisely
