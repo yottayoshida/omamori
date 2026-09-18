@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-18
+
+**Summary**: the audit log's own reading of itself — where `append()` picks up the chain, what `verify` still checks after it stops, and what `doctor`'s first line says about the rest of its output.
+
 ### Fixed
 - **`omamori doctor` points at its risk signals from the headline when they hold something to act on.** ([#474](https://github.com/yottayoshida/omamori/issues/474))
 
