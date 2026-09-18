@@ -108,6 +108,54 @@ fn print_hwm_write_note(write: &audit::HwmWrite, existed: MarkExisted) {
     }
 }
 
+/// #470: the structural finding, printed wherever a halted run reports.
+///
+/// Separate from the halt's own sentences because it is a different claim about
+/// a different thing: the halt says authentication stopped, this says the lines
+/// past it do not chain onto each other as recorded.
+///
+/// Three outcomes, three different things to print. A break is named. A run
+/// that could compare nothing says so, because a scan that never ran must not
+/// read as one that ran and found the region whole. A run that compared and
+/// found it whole says **nothing**: what it looked at is unauthenticated, so a
+/// clean result asserts nothing worth an operator's attention.
+fn structural_break_note(result: &audit::VerifyResult) -> Option<String> {
+    // Every caller below is reachable without a halt — `print_halted_hwm_notes`
+    // is shared with the unprotected-entry arm (#483), which walks the whole
+    // log and checks every link. Saying "nothing past the halt was compared"
+    // there names a halt that did not happen, about checks that did (review,
+    // P1). The scan only ever runs during a halt, so this is its gate too.
+    if !result.halted() {
+        return None;
+    }
+    match result.structural_break_at {
+        Some(seq) => Some(format!(
+            "  Entry #{seq} does not follow the line before it \u{2014} its seq or prev_hash \
+             breaks the chain as recorded ({} pair(s) compared past the halt).\n  These lines \
+             were never authenticated, so this is not proof of tampering and a clean result \
+             would not have been proof of anything either: whoever can write the log can write \
+             these fields. A break left in them is evidence someone did not.",
+            result.structural_pairs_compared
+        )),
+        // Out of scope at a future-format halt, so nothing to say about it.
+        None if result.unknown_version_at.is_some() => None,
+        None if result.structural_pairs_compared == 0 => Some(
+            "  No two readable entries past the halt could be compared, so nothing was \
+             checked about how the remaining lines follow one another."
+                .to_string(),
+        ),
+        // Compared, and consistent. Said out loud it would read as an
+        // assurance, and an unauthenticated region cannot give one.
+        None => None,
+    }
+}
+
+fn print_structural_break_note(result: &audit::VerifyResult) {
+    if let Some(note) = structural_break_note(result) {
+        eprintln!("{note}");
+    }
+}
+
 /// What the high-water-mark machinery did while verification was stopped —
 /// printed by both halted arms, after each has explained its own reason.
 ///
@@ -138,6 +186,7 @@ fn print_hwm_write_note(write: &audit::HwmWrite, existed: MarkExisted) {
 /// outcome in practice — but that is a fact about the caller, and stating it
 /// from the caller is how the sentence on the success path came to be false.
 fn print_halted_hwm_notes(result: &audit::VerifyResult) {
+    print_structural_break_note(result);
     if let Some(reason) = &result.hwm_unusable {
         // #491: the reason is quoted. This used to name two causes — a symlink,
         // or invalid content — for a state that also covers a sidecar which
@@ -284,6 +333,12 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                         "omamori audit verify: audit log tail may have been truncated \
                          (chain ends before high-water-mark)."
                     );
+                    // #470: before the two halted arms below, so the finding
+                    // reaches the exit-3 path too. `print_halted_hwm_notes`
+                    // covers exit 2 and exit 4; this block is the third place a
+                    // halted run reports from, and leaving it out would let a
+                    // deleted tail hide the break that came with it.
+                    print_structural_break_note(&result);
                     // #506: the store-level halt is reported first and on its
                     // own, because it is not "verification *also* stopped at an
                     // entry" — it stopped before the first line, so there is no
@@ -1387,6 +1442,77 @@ mod tests {
     /// together used a symmetric 2+2 count that a swapped format argument
     /// (`v1`/`v2` labels transposed) would not have caught. Deliberately
     /// asymmetric here for that reason.
+    /// #470: what the structural finding says, per state.
+    ///
+    /// Four states, and the one that matters most is the fourth: this note is
+    /// printed from `print_halted_hwm_notes`, which the unprotected-entry arm
+    /// (#483) also calls on a run that never halted and checked every link.
+    /// The first version of this said "nothing past the halt was compared"
+    /// there — a halt that did not happen, about checks that did (review, P1).
+    #[test]
+    fn structural_break_note_speaks_only_for_a_halted_run() {
+        // A break, named, with the count of pairs behind it.
+        let broken = audit::VerifyResult {
+            key_unavailable_at: Some(6),
+            structural_break_at: Some(9),
+            structural_pairs_compared: 3,
+            ..Default::default()
+        };
+        let note = structural_break_note(&broken).expect("a break must be reported");
+        assert!(
+            note.contains("Entry #9 does not follow the line before it")
+                && note.contains("3 pair(s)"),
+            "{note}"
+        );
+        assert!(
+            note.contains("not proof of tampering"),
+            "the one-sidedness has to travel with the finding: {note}"
+        );
+
+        // Halted, but nothing comparable: said out loud, because silence here
+        // would read as "compared and found whole".
+        let nothing_compared = audit::VerifyResult {
+            key_unavailable_at: Some(6),
+            structural_pairs_compared: 0,
+            ..Default::default()
+        };
+        assert!(
+            structural_break_note(&nothing_compared)
+                .expect("a run that compared nothing says so")
+                .contains("No two readable entries"),
+        );
+
+        // Halted, compared, consistent: nothing to say — the region is
+        // unauthenticated, so a clean result is not an assurance.
+        let clean = audit::VerifyResult {
+            key_unavailable_at: Some(6),
+            structural_pairs_compared: 4,
+            ..Default::default()
+        };
+        assert_eq!(structural_break_note(&clean), None);
+
+        // A future-format halt is out of scope, and says nothing either way.
+        let future = audit::VerifyResult {
+            unknown_version_at: Some(3),
+            structural_pairs_compared: 0,
+            ..Default::default()
+        };
+        assert_eq!(structural_break_note(&future), None);
+
+        // Not halted at all — the shared caller's other arm. Nothing here is
+        // about a halt, and the walk checked every link itself.
+        let unprotected = audit::VerifyResult {
+            never_protected_entries: 2,
+            structural_pairs_compared: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            structural_break_note(&unprotected),
+            None,
+            "a run that did not halt must not be told anything about a halt"
+        );
+    }
+
     #[test]
     fn format_verify_success_message_shows_mixed_version_breakdown() {
         let result = audit::VerifyResult {

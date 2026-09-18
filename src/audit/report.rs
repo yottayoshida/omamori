@@ -220,6 +220,15 @@ pub struct ReportAggregate {
     /// paths.
     #[serde(skip)]
     pub keyring_warnings: Vec<String>,
+    /// #470: the `seq`/`prev_hash` break a halted run found in the lines past
+    /// the halt, if any.
+    ///
+    /// Not part of the JSON output (SEC-R2: exactly 8 fields), same as
+    /// `hwm_tampered` — `doctor` renders it, and `audit verify` prints it from
+    /// `VerifyResult` directly. A count, not a path, so the reason is SEC-R2
+    /// alone.
+    #[serde(skip)]
+    pub structural_break_at: Option<u64>,
     /// #506: the key material could not be used at all, **and** `chain_status`
     /// is carrying something else.
     ///
@@ -282,6 +291,7 @@ impl Default for ReportAggregate {
             chain_status: ChainStatus::Unavailable,
             unknown_tool_fail_opens: 0,
             hwm_tampered: false,
+            structural_break_at: None,
             keyring_warnings: Vec::new(),
             key_store_failure: None,
             never_protected_entries: 0,
@@ -398,6 +408,10 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
             // tampered") was already the honest disjunction, which is why it is
             // the one surface this change leaves alone.
             result.hwm_tampered = verify_result.hwm_unusable.is_some();
+            // #470: unconditional, like the two below — the structural finding
+            // never competes for the `chain_status` slot. It is only ever set
+            // on a halted run, and the halt already owns that slot.
+            result.structural_break_at = verify_result.structural_break_at;
             // #483: unconditional, unlike `key_store_failure` below. It never
             // competes for the `chain_status` slot — an unprotected entry does
             // not stop the walk, so the status is whatever the links turned out

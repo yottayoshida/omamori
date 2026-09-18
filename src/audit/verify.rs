@@ -243,6 +243,29 @@ pub struct VerifyResult {
     /// "compared, and the chain was long enough" from "there was no end to
     /// compare with".
     pub hwm_compared: bool,
+    /// #470: where the first `seq`/`prev_hash` break past a key-related halt is,
+    /// if there is one.
+    ///
+    /// **Not `broken_at`.** That field is a verdict about entries this run
+    /// authenticated; this one is about lines it could not. Nothing here is
+    /// signed: the `seq`, `prev_hash` and `entry_hash` of every line in the
+    /// halted region can be written by anyone who can write the log. So the
+    /// finding is one-sided — a break is evidence someone left one behind,
+    /// while the absence of one asserts nothing at all. The same asymmetry the
+    /// high-water-mark comparison already runs on, and the reason this is
+    /// reported beside the halt rather than as part of it.
+    ///
+    /// The value is the `seq` stated by the *right* line of the first
+    /// disagreeing pair, which is where `broken_at` points for the same shape
+    /// in the authenticated region.
+    pub structural_break_at: Option<u64>,
+    /// #470: how many adjacent pairs the scan above actually compared.
+    ///
+    /// `0` means it could not run — no halt, a halt at a future-format entry
+    /// (out of scope), or a region with fewer than two readable chain entries
+    /// in it. Recorded for the reason `hwm_compared` is (#506): silence from a
+    /// check that never ran must not read as a check that found nothing.
+    pub structural_pairs_compared: u64,
     /// #177 B1 step 2: seq of the first entry whose `chain_version` this
     /// binary doesn't recognize. `None` means every entry encountered was
     /// either verifiable or legacy. Distinct from `broken_at` — this is not
@@ -614,6 +637,116 @@ struct ChainVersionSeqPeek {
     seq: Option<u64>,
 }
 
+/// #470: the three recorded fields the structural scan compares, in one
+/// struct on purpose.
+///
+/// Elsewhere in this file a typed peek names one field at a time, because a
+/// typed struct fails as a whole and a wrong-typed field would take another
+/// field's decision down with it (#556, and the same coupling #465 removed from
+/// the append side). Here whole-struct failure *is* the answer: a line missing
+/// any of the three, or stating one with the wrong JSON type, is not something
+/// omamori wrote, and the scan's rule for such a line is to stop comparing
+/// across it. One parse, one answer.
+#[derive(serde::Deserialize)]
+struct StructuralPeek {
+    /// Named so a line from a format this binary does not know is declined
+    /// wherever it sits, not only when the walk halted on one. A store whose
+    /// key material failed never reaches the version dispatch at all (#506),
+    /// so the halt-site gate alone would leave a whole future-format log being
+    /// compared field by field — the thing SECURITY.md says this scan stays
+    /// out of.
+    chain_version: Option<u32>,
+    seq: Option<u64>,
+    prev_hash: Option<BoundedHash>,
+    entry_hash: Option<BoundedHash>,
+}
+
+/// A hash field, refused rather than copied when it is longer than
+/// [`MAX_STRUCTURAL_HASH`].
+///
+/// The length (in bytes) is checked in the visitor, against the slice serde
+/// hands it rather than a copy this scan made. A value carrying escapes is
+/// unescaped into serde's own scratch buffer first, so "nothing is copied" is
+/// true only of the common case; what holds either way is the bound on what
+/// this scan *keeps* — and it keeps nothing over 128 bytes. A
+/// plain `String` here would allocate the whole of it first and drop it after
+/// — measurable on the 50 MB line this file's other peeks are shaped to avoid
+/// (see the raw-JSON fallback's note on `serde_json::Value`).
+struct BoundedHash(String);
+
+impl<'de> serde::Deserialize<'de> for BoundedHash {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = BoundedHash;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a hash of at most {MAX_STRUCTURAL_HASH} characters")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.len() > MAX_STRUCTURAL_HASH {
+                    return Err(E::invalid_length(v.len(), &self));
+                }
+                Ok(BoundedHash(v.to_string()))
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
+/// What the scan carries from one comparable line to the next: what the next
+/// line has to state to continue the chain as recorded.
+struct StructuralAnchor {
+    /// The `seq` the next comparable line must state. `None` when the previous
+    /// one was numbered `u64::MAX` and no successor exists (#456's boundary).
+    next_seq: Option<u64>,
+    /// The value the next line's `prev_hash` must name.
+    entry_hash: String,
+}
+
+/// One line of the halted region, as recorded. Nothing here is authenticated.
+struct StructuralLine {
+    seq: u64,
+    prev_hash: String,
+    entry_hash: String,
+}
+
+/// Read one line of the halted region, or decline it.
+///
+/// `None` means "do not compare across this line": it is not JSON, not an
+/// object omamori would have written, states a field of the wrong type, states
+/// `seq: 0` (a prune point, or a chain restarted mid-file through `1.1.0`), or
+/// carries a hash longer than this scan will hold ([`MAX_STRUCTURAL_HASH`]).
+fn structural_line(trimmed: &str) -> Option<StructuralLine> {
+    let peek: StructuralPeek = serde_json::from_str(trimmed).ok()?;
+    if !is_supported_chain_version(peek.chain_version?) {
+        return None;
+    }
+    let line = StructuralLine {
+        seq: peek.seq?,
+        prev_hash: peek.prev_hash?.0,
+        entry_hash: peek.entry_hash?.0,
+    };
+    if line.seq == 0 {
+        return None;
+    }
+    Some(line)
+}
+
+/// The longest `prev_hash`/`entry_hash` the scan will hold on to.
+///
+/// omamori writes 64 hex characters, or the 14-character `NO_HMAC_SECRET`
+/// sentinel for an entry it could not sign. The cap is not a check on the
+/// value — it bounds what a hostile line can make this scan allocate. The
+/// region is unbounded in both line count and line length, and the sibling
+/// peeks in this file name no `String` field at all for that reason: serde
+/// skips what a struct does not name, so a 50 MB field costs nothing unless
+/// something asks for it (the measured amplification of *not* skipping is
+/// recorded at the raw-JSON fallback below). This scan has to ask for two, and
+/// carries one of them to the next line, so it declines anything longer.
+pub(super) const MAX_STRUCTURAL_HASH: usize = 128;
+
 /// #470: `seq` alone, for lines past a halt, where nothing else about them is
 /// being decided. Sharing `ChainVersionSeqPeek` here would have thrown away a
 /// perfectly readable `seq` whenever the same line's `chain_version` had the
@@ -908,6 +1041,10 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // written in. `Some` iff the previous line was a prune point, which also
     // replaces the separate `last_was_prune` flag.
     let mut prev_prune: Option<PruneBind> = None;
+    // #470: the left side of the next structural comparison — the last line the
+    // scan was willing to compare from. Seeded at the halt (see the two gates
+    // below), then carried line to line.
+    let mut structural_anchor: Option<StructuralAnchor> = None;
 
     for line in reader.lines() {
         // #471: a read that fails partway through is not "there is no log"
@@ -953,6 +1090,42 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 && peek.seq.is_some()
             {
                 last_structural_seq = peek.seq;
+            }
+            // #470 (second half): `seq` continuity and `prev_hash` linkage need
+            // no key either, and the halt says nothing about whether lines are
+            // missing between the ones that remain. Scoped to a halt the *key*
+            // caused: at a future-format entry the meaning of these fields is
+            // exactly what this binary does not know, so comparing them there
+            // would report breaks on genuine logs — which is the objection
+            // SECURITY.md raised against doing any of this, and it survives
+            // here alone.
+            if result.unknown_version_at.is_none() {
+                match structural_line(trimmed) {
+                    // Not a line omamori wrote, or one this scan declines to
+                    // hold: drop the anchor rather than compare across it. A
+                    // torn line, a legacy-shaped one, a field of the wrong
+                    // type, an oversized hash — and `seq: 0`, which is what a
+                    // prune point states (`retention.rs`) and what an append
+                    // through 1.1.0 wrote when it restarted a chain mid-file.
+                    // Comparing across any of them reports a break on a store
+                    // nobody touched. The cost is that planting one line
+                    // suppresses the comparison over that point; the scan is
+                    // evidence of a leftover break, not a barrier.
+                    None => structural_anchor = None,
+                    Some(line) => {
+                        if let Some(prev) = structural_anchor.take() {
+                            result.structural_pairs_compared += 1;
+                            if Some(line.seq) != prev.next_seq || line.prev_hash != prev.entry_hash
+                            {
+                                result.structural_break_at.get_or_insert(line.seq);
+                            }
+                        }
+                        structural_anchor = Some(StructuralAnchor {
+                            next_seq: line.seq.checked_add(1),
+                            entry_hash: line.entry_hash,
+                        });
+                    }
+                }
             }
             continue;
         }
@@ -1170,6 +1343,55 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // actually true: this entry cannot be verified. Everything after
             // it inherits that — the prev_hash chain runs through an entry
             // whose authenticity is unknown.
+            // #470 (second half): seed the structural scan's left side with
+            // what the walk had authenticated up to here, so the halting entry
+            // itself is compared. That pair is the one a deletion *ending* at
+            // the halt shows up in — delete a run of entries and rename the
+            // `key_id` of the one after them, and every later line is
+            // internally consistent while the region's first line is not.
+            //
+            // Two gates, both conditions the authenticated path applies to the
+            // same comparison a few lines below:
+            //
+            // * `prev_prune.is_none()` — after a prune point the chain does not
+            //   continue: the retained entry keeps its original `seq` and
+            //   `prev_hash`, and the normal path skips both checks for exactly
+            //   that reason. Comparing here would report a break on every
+            //   pruned store whose retired key is gone.
+            // * `entries_walked() > 0` — before the first entry there is
+            //   nothing to compare against. `expected_prev` is still the empty
+            //   string it was initialised with, and the genesis anchor is
+            //   computed from the head entry's own key, which is the key this
+            //   store does not have.
+            //
+            // A store whose key material failed before the loop (#506) reaches
+            // neither branch and starts with no anchor, which is right: it has
+            // authenticated nothing to anchor to.
+            // The halting entry is read on exactly the same terms as every
+            // other line of the region — a line this reader declines is neither
+            // compared nor anchored from. Reading `event` directly here instead
+            // looked equivalent and was not: `event.seq.unwrap_or(0)` a few
+            // lines above turns an entry that states no `seq` into entry #0,
+            // and the pair would then report a break against the head of the
+            // log while `mark_key_unavailable_tail` reports the same line by
+            // its position. One line, two numbers (review, P1).
+            structural_anchor = match structural_line(trimmed) {
+                Some(line) => {
+                    // Two gates, both conditions the authenticated path applies
+                    // to this same comparison a few lines below.
+                    if prev_prune.is_none() && result.entries_walked() > 0 {
+                        result.structural_pairs_compared += 1;
+                        if Some(line.seq) != expected_seq || line.prev_hash != expected_prev {
+                            result.structural_break_at.get_or_insert(line.seq);
+                        }
+                    }
+                    Some(StructuralAnchor {
+                        next_seq: line.seq.checked_add(1),
+                        entry_hash: line.entry_hash,
+                    })
+                }
+                None => None,
+            };
             mark_key_unavailable_tail(
                 &mut result,
                 &mut last_structural_seq,

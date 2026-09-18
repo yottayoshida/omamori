@@ -282,6 +282,10 @@ mod tests {
             chain_status: ChainStatus::Intact,
             unknown_tool_fail_opens: 1,
             hwm_tampered: false,
+            // #470: `Some`, for the reason every other `skip`ped field here is
+            // non-empty — a field tested only while it is `None` says nothing
+            // about what serializes once it is set.
+            structural_break_at: Some(41),
             // #471: non-empty on purpose. This test counts the JSON fields
             // (SEC-R2: exactly 8), and a field that is `skip`ped only while it
             // happens to be empty would pass here and leak in production.

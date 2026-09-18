@@ -3481,6 +3481,475 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // #470 (second half): the checks that need no key keep running past a
+    // key-related halt — `seq` continuity and `prev_hash` linkage, reported
+    // beside the halt rather than as part of it.
+    // -----------------------------------------------------------------------
+
+    /// Ten entries, a halt planted at `halt_index`, and whatever edit the case
+    /// needs applied to the lines after it. Returns the store directory.
+    ///
+    /// Separate from `halted_store` above: that one is six entries shaped for
+    /// the tail-truncation grid, and these cases need a region several lines
+    /// long *after* the halt so that pairs inside it can be compared.
+    fn halted_region_store(name: &str, halt_index: usize, edit: impl Fn(&Path)) -> PathBuf {
+        let dir = test_dir(name);
+        let _ = test_logger(&dir); // secret file only
+        let path = dir.join("audit.jsonl");
+        let entries: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("cmd{i}"), format!("2026-01-01T00:00:0{i}Z")))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(c, t)| (c.as_str(), t.as_str()))
+            .collect();
+        write_chain_entries(&path, &TEST_SECRET, &refs, CHAIN_VERSION);
+        write_hwm(&hwm_path_for(&path), 9).unwrap();
+        plant_unresolvable_key_id(&path, halt_index);
+        edit(&path);
+        dir
+    }
+
+    /// Rewrites one field of the line at `index`, leaving every other byte of
+    /// the file alone.
+    fn set_field(path: &Path, index: usize, field: &str, value: serde_json::Value) {
+        let content = fs::read_to_string(path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        let mut event: serde_json::Value = serde_json::from_str(&lines[index]).unwrap();
+        event[field] = value;
+        lines[index] = serde_json::to_string(&event).unwrap();
+        fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    /// Removes the line at `index`.
+    fn remove_line(path: &Path, index: usize) {
+        let content = fs::read_to_string(path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        lines.remove(index);
+        fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    /// Inserts a raw line before `index`.
+    fn insert_line(path: &Path, index: usize, raw: &str) {
+        let content = fs::read_to_string(path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        lines.insert(index, raw.to_string());
+        fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    /// Falsifiable check 1: four shapes of a break that this reports and the
+    /// previous release did not.
+    ///
+    /// Each cell kills a different wrong implementation, which is why they are
+    /// not one case:
+    ///
+    /// * `deleted` — a line removed from inside the region. Both fields break.
+    /// * `rewritten-hash` — one line's `entry_hash` changed. `seq` stays
+    ///   continuous, so an implementation comparing only `seq` passes it.
+    /// * `renumbered` — one line's `seq` changed. The `prev_hash` chain is
+    ///   untouched, so an implementation comparing only `prev_hash` passes it.
+    /// * `deleted-before-the-halt` — the entries immediately before the halting
+    ///   one removed. Everything inside the region is consistent and the tail
+    ///   is whole, so only the seeded first pair (the halting entry against the
+    ///   last authenticated one) can see it.
+    #[test]
+    fn verify_reports_a_structural_break_past_a_key_halt() {
+        for (name, halt_index, edit, expected_seq, expected_pairs) in [
+            (
+                "deleted",
+                6usize,
+                Box::new(|p: &Path| remove_line(p, 8)) as Box<dyn Fn(&Path)>,
+                9,
+                3,
+            ),
+            (
+                "rewritten-hash",
+                6,
+                Box::new(|p: &Path| {
+                    set_field(p, 7, "entry_hash", serde_json::json!("f".repeat(64)))
+                }),
+                8,
+                4,
+            ),
+            (
+                "renumbered",
+                6,
+                Box::new(|p: &Path| set_field(p, 8, "seq", serde_json::json!(42))),
+                42,
+                4,
+            ),
+            (
+                "deleted-before-the-halt",
+                6,
+                Box::new(|p: &Path| {
+                    for _ in 0..3 {
+                        remove_line(p, 3);
+                    }
+                }),
+                6,
+                4,
+            ),
+        ] {
+            let dir = halted_region_store(&format!("verify-470b-{name}"), halt_index, edit);
+            let result = verify_chain(&verify_config(&dir)).unwrap();
+
+            assert!(
+                result.key_unavailable_at.is_some(),
+                "{name}: the planted key_id must halt verification, or the cell proves nothing"
+            );
+            assert!(
+                result.broken_at.is_none(),
+                "{name}: an unauthenticated region is not a broken chain"
+            );
+            assert_eq!(
+                result.structural_break_at,
+                Some(expected_seq),
+                "{name}: the finding names the right-hand line of the first disagreeing \
+                 pair, got pairs_compared={}",
+                result.structural_pairs_compared
+            );
+            assert_eq!(
+                result.structural_pairs_compared, expected_pairs,
+                "{name}: the scan compares every pair the region offers rather than stopping \
+                 at the first break"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Falsifiable check 2: six stores nobody tampered with, and one where the
+    /// only edit is the planted `key_id`. None may report a break.
+    ///
+    /// `prune-then-halt` and `pruned-store-unreadable-keys` are the two cells
+    /// the `seq == 0` rule exists for: a prune point states `seq: 0` and a
+    /// `prev_hash` that anchors to the prune genesis, so comparing across it
+    /// reports a break on a store whose only history is a prune. The second
+    /// puts that prune point *inside* the region (the key store fails before
+    /// the loop, so every line is in the region), which is the only shape that
+    /// reaches the rule at all.
+    #[test]
+    fn verify_reports_no_structural_break_on_a_store_nobody_touched() {
+        for (name, halt_at) in [
+            ("head", HaltAt::Head),
+            ("middle", HaltAt::Middle),
+            ("tail", HaltAt::Tail),
+        ] {
+            let dir = halted_store(&format!("verify-470b-clean-{name}"), halt_at, false);
+            let result = verify_chain(&verify_config(&dir)).unwrap();
+            assert!(result.key_unavailable_at.is_some(), "{name}: sanity");
+            assert_eq!(
+                result.structural_break_at, None,
+                "{name}: nothing was removed or rewritten"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // A line the scan declines to read, dropped into the region: the pairs
+        // it would have joined are not compared, and nothing is reported.
+        for (name, raw) in [
+            ("torn", r#"{"timestamp":"2026-01-0"#),
+            (
+                "legacy",
+                r#"{"timestamp":"2026-01-01T00:00:09Z","provider":"test","command":"old","action":"passthrough","result":"passthrough","target_count":0,"target_hash":"legacy"}"#,
+            ),
+            (
+                "seq-wrong-type",
+                r#"{"chain_version":2,"seq":"eight","prev_hash":"x","entry_hash":"y"}"#,
+            ),
+            (
+                "oversized-hash",
+                r#"{"chain_version":2,"seq":8,"prev_hash":"x","entry_hash":"PLACEHOLDER"}"#,
+            ),
+        ] {
+            let line = raw.replace("PLACEHOLDER", &"a".repeat(verify::MAX_STRUCTURAL_HASH + 1));
+            let dir =
+                halted_region_store(&format!("verify-470b-skip-{name}"), 6, move |p: &Path| {
+                    insert_line(p, 8, &line)
+                });
+            let result = verify_chain(&verify_config(&dir)).unwrap();
+            assert_eq!(
+                result.structural_break_at, None,
+                "{name}: a line the scan declines must suspend the comparison, not break it"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Falsifiable check 2, the prune cell — kept apart because building it
+    /// needs a real prune rather than a hand-written line.
+    ///
+    /// A prune point states `seq: 0` and a `prev_hash` anchored to the prune
+    /// genesis, while the entry retained behind it keeps its original number.
+    /// The authenticated path skips both checks across that boundary for this
+    /// reason; the scan has to as well, or every pruned store whose retired key
+    /// is gone reports a break nobody caused.
+    #[test]
+    fn verify_reports_no_structural_break_across_a_prune_point() {
+        let dir = test_dir("verify-470b-prune");
+        let _ = test_logger(&dir); // secret file only
+        let path = dir.join("audit.jsonl");
+        // Two entries old enough to prune, and enough recent ones to clear
+        // `MIN_RETAIN_ENTRIES` — the prune declines to run on a short log.
+        let mut entries: Vec<(String, String)> = vec![
+            ("old0".to_string(), "2026-01-01T00:00:00Z".to_string()),
+            ("old1".to_string(), "2026-01-01T00:00:01Z".to_string()),
+        ];
+        entries.extend((0..retention::MIN_RETAIN_ENTRIES).map(|i| {
+            (
+                format!("keep{i}"),
+                format!("2026-04-04T11:{:02}:{:02}Z", i / 60, i % 60),
+            )
+        }));
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(c, ts)| (c.as_str(), ts.as_str()))
+            .collect();
+        write_chain_entries(&path, &TEST_SECRET, &refs, CHAIN_VERSION);
+        let pruned = prune_reaching_the_hwm(&path, &test_signing_key());
+        assert_eq!(pruned, 2, "sanity: the two old entries must have gone");
+
+        // Line 0 is now the prune point; line 1 is the first retained entry.
+        // Halt on it, so the prune boundary sits inside the scanned region.
+        plant_unresolvable_key_id(&path, 1);
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.key_unavailable_at.is_some(), "sanity: it halted");
+        assert_eq!(
+            result.structural_break_at, None,
+            "a prune point does not continue the chain: the retained entry keeps its own \
+             seq and prev_hash"
+        );
+
+        // The same store, with the halt moved *before* the prune point: the
+        // key material itself becomes unreadable, so verification stops before
+        // the first line (#506) and the whole file — prune point included — is
+        // the region. This is the only shape that reaches the `seq == 0` rule,
+        // and without it the pair (prune point, first retained entry) reads as
+        // a break on a store whose only history is a prune.
+        let record = dir.join("audit-secret.epoch");
+        fs::write(&record, "not-a-number").unwrap();
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.key_store_failure.is_some(),
+            "sanity: the unreadable epoch record must stop verification before the loop"
+        );
+        assert_eq!(
+            result.structural_break_at, None,
+            "the prune point is inside the region here, and it does not continue the chain"
+        );
+        assert!(
+            result.structural_pairs_compared > 0,
+            "the region is the whole file, so pairs must have been compared: got {}",
+            result.structural_pairs_compared
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #470 review (P1): the future-format rule is per line, not per halt.
+    ///
+    /// A store whose key material cannot be read halts before the first line
+    /// (#506), so the walk never reaches the version dispatch — every line,
+    /// whatever format it declares, is in the region. If the scope rule only
+    /// applied at the halting entry, a log written by a newer omamori would be
+    /// compared field by field here, which is the state SECURITY.md says this
+    /// scan stays out of.
+    #[test]
+    fn a_future_format_line_inside_the_region_is_not_compared() {
+        let dir = test_dir("verify-470b-future-in-region");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        // Three future-format lines whose seq jumps: nothing to compare, so
+        // nothing to report, even though the numbers do not follow.
+        for seq in [7u64, 9, 11] {
+            append_chain_version_line(
+                &path,
+                999,
+                Some(seq),
+                "future",
+                "passthrough",
+                "passthrough",
+            );
+        }
+        // The key store fails before the loop, so the whole file is the region.
+        fs::write(dir.join("audit-secret.epoch"), "not-a-number").unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.key_store_failure.is_some(),
+            "sanity: verification must stop before the first line"
+        );
+        assert_eq!(
+            result.structural_break_at, None,
+            "a future format's fields are not this binary's to compare, wherever they sit"
+        );
+        assert_eq!(result.structural_pairs_compared, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #470 review (P1): a halting entry the reader declines is not compared
+    /// from either — and in particular is not reported as entry #0.
+    ///
+    /// `event.seq.unwrap_or(0)` is what the walk uses to *position* an entry
+    /// that states no `seq`; using it as the finding's number would name the
+    /// head of the log for a line that sits at the end of it.
+    #[test]
+    fn a_halting_entry_that_states_no_seq_is_not_reported_as_entry_zero() {
+        let dir = test_dir("verify-470b-halt-without-seq");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+            ],
+            CHAIN_VERSION,
+        );
+        // A chain-shaped line with an unresolvable key and no `seq` at all.
+        append_chain_version_line(
+            &path,
+            CHAIN_VERSION,
+            None,
+            "planted",
+            "passthrough",
+            "passthrough",
+        );
+        set_field(&path, 2, "key_id", serde_json::json!("key-7"));
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.key_unavailable_at.is_some(), "sanity: it halted");
+        assert_eq!(
+            result.structural_break_at, None,
+            "a line the reader declines is not the left side of a comparison"
+        );
+        assert_eq!(result.structural_pairs_compared, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #470 review (P1): the finding reaches `doctor` through `aggregate_report`.
+    #[test]
+    fn the_structural_finding_reaches_the_report_aggregate() {
+        let dir = halted_region_store("verify-470b-aggregate", 6, |p: &Path| remove_line(p, 8));
+        let report = aggregate_report(&verify_config(&dir), 30);
+        assert_eq!(
+            report.structural_break_at,
+            Some(9),
+            "doctor renders this field; nothing else carries the finding there"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Falsifiable check 3: the scan stays out of a future-format halt.
+    ///
+    /// The same deletion that check 1 reports is invisible here on purpose: at
+    /// an entry whose `chain_version` this binary does not know, what `seq` and
+    /// `prev_hash` mean is exactly what it does not know either, and SECURITY.md
+    /// keeps that region out of scope for this reason.
+    #[test]
+    fn verify_leaves_a_future_format_halt_alone() {
+        let dir = test_dir("verify-470b-unknown-version");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[
+                ("cmd0", "2026-01-01T00:00:00Z"),
+                ("cmd1", "2026-01-01T00:00:01Z"),
+                ("cmd2", "2026-01-01T00:00:02Z"),
+            ],
+            CHAIN_VERSION,
+        );
+        append_unknown_version_line(&path, 3);
+        append_chain_version_line(
+            &path,
+            CHAIN_VERSION,
+            Some(9),
+            "planted",
+            "passthrough",
+            "passthrough",
+        );
+
+        // Two *supported* lines behind the future-format one, with a seq jump
+        // between them. Without the halt-site gate they form a comparable pair
+        // and the jump is a break; with it, the scan never starts. Review
+        // caught that the first version of this fixture passed for a different
+        // reason — one comparable line cannot make a pair, so the gate was not
+        // what was being tested.
+        for seq in [20u64, 40] {
+            append_chain_version_line(
+                &path,
+                CHAIN_VERSION,
+                Some(seq),
+                "planted",
+                "passthrough",
+                "passthrough",
+            );
+        }
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.unknown_version_at,
+            Some(3),
+            "sanity: it halted there"
+        );
+        assert_eq!(
+            result.structural_break_at, None,
+            "a future format's fields are not this binary's to compare, and neither are the \
+             lines behind it — this binary cannot place them relative to a format it does not \
+             know"
+        );
+        assert_eq!(
+            result.structural_pairs_compared, 0,
+            "and no pair may be counted either"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The count says which silence it is: a run that compared nothing must not
+    /// look like one that compared and found the region whole.
+    ///
+    /// Two shapes, because the halt's position decides whether there is a pair
+    /// at all. A halt on the last line still has one — the seeded pair against
+    /// the entry before it — while a halt on the *only* line has none: nothing
+    /// authenticated precedes it and nothing follows it.
+    #[test]
+    fn the_pair_count_says_whether_the_scan_could_run() {
+        let dir = halted_store("verify-470b-tail-halt", HaltAt::Tail, false);
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.key_unavailable_at.is_some(), "sanity");
+        assert_eq!(result.structural_break_at, None);
+        assert_eq!(
+            result.structural_pairs_compared, 1,
+            "the halting entry is still compared against the last authenticated one"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let dir = test_dir("verify-470b-lone-halt");
+        let _ = test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        write_chain_entries(
+            &path,
+            &TEST_SECRET,
+            &[("only", "2026-01-01T00:00:00Z")],
+            CHAIN_VERSION,
+        );
+        plant_unresolvable_key_id(&path, 0);
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.key_unavailable_at.is_some(), "sanity");
+        assert_eq!(result.structural_break_at, None);
+        assert_eq!(
+            result.structural_pairs_compared, 0,
+            "nothing authenticated precedes the halt and nothing follows it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// C-1, third surface: the same store has to produce the same verdict
     /// through `aggregate_report`, which is also what `doctor` renders. A fix
     /// applied to the CLI's exit branch alone would leave `--json` consumers

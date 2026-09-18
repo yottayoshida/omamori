@@ -496,6 +496,32 @@ fn print_risk_signals_section(o: &mut Out<'_>, ai_env: bool) {
             );
         }
     }
+    // #470: beside `chain_status` for the same reason as the arms around it —
+    // the halt owns that slot, and this is a second thing true of the same log.
+    // Both branches: a seq is not a path.
+    //
+    // Deliberately **not** added to `risk_signals_are_quiet`. That predicate
+    // decides when this section may say `quiet`, and every signal printed here
+    // has to be represented in it — except one that cannot be the only signal.
+    // This finding is set only on a halted run, and every halt reaches a
+    // `chain_status` that `needs_attention()` already covers, so the section is
+    // loud before this line is reached. If a halt ever stops moving
+    // `chain_status`, this needs a clause there.
+    if let Some(seq) = report.structural_break_at {
+        if ai_env {
+            out!(
+                o,
+                "    chain: entry #{seq} does not follow the line before it (unauthenticated \
+                 region)"
+            );
+        } else {
+            out!(
+                o,
+                "    chain: entry #{seq} does not follow the line before it — run omamori \
+                 audit verify"
+            );
+        }
+    }
     // #483: beside `chain_status` rather than inside it — the links are intact
     // and the coverage is not, the same shape `keyring_warnings` has. Counted on
     // both branches: the count is the whole signal, and it carries no path.
