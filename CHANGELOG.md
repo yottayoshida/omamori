@@ -6,6 +6,15 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **`append()` picks up the audit chain at the log's last chain entry, and no longer restarts it behind content it could not read.** ([#465](https://github.com/yottayoshida/omamori/issues/465))
+
+  The tail search used to stop at a 64 KB window and treat anything it could not read as a chain entry as "no chain here", restarting the chain from genesis at `seq 0`. Four shapes reached that: no parseable line in the window, a line without `chain_version`, a chain-shaped line without `seq`, and one with an empty `entry_hash`. The first is the padding #465 describes — non-JSON appended behind a planted unrecognized-`chain_version` entry pushed it out of the window and let appends resume; the other three took one planted line each (`{"pad":1}` was enough). And with no attacker at all, a genuine entry longer than the window at the tail — the hook path records the whole command text, and the longest line on a real four-month log is 46 KB — made the next append fork at `seq 0` and `omamori audit verify` report a chain nobody had touched as broken.
+
+  The search now walks backwards from the end of the file one line at a time, reads past every line that does not carry a `chain_version`, and stops at the first that does. It covers the last 64 MiB: when no chain entry starts within them, `append()` refuses instead of restarting, and only a log with no chain entry anywhere, shorter than that, starts one from genesis. The existing refusals (an unrecognized `chain_version`, a `seq` at the limit) now hold whatever follows the line they fire on, so under `[audit] strict = true` a padded store blocks where it used to allow. The limit is there because reading past content costs time `hook-check` spends before it can print a deny: measured on a release build, 63 MiB of two-byte lines is read past in 1.3 s, 1 GiB is refused in 1.3 s, and memory stays near 5 MB. A read that fails partway is now an append failure, not a fresh chain.
+
+  **Two logs that appended before now refuse**: one whose last 64 MiB hold no chain entry (including a single entry longer than that, which omamori writes only if `hook-check` is fed that much input), and one from before chain tracking (v0.7.0) holding more than 64 MiB of legacy entries and nothing else. Moving the trailing content, or the old log, aside restores appends. **Not changed**: `append()` still does not authenticate the entry it links to, so one well-formed planted line can still lift a refusal — SECURITY.md → Forward-Unknown Chain Versions records that — and `verify`'s verdict on every affected store is what it was. [ADR-0014](docs/adr/0014-append-chains-only-onto-the-last-chain-entry.md) records the alternatives.
+
 ## [1.1.0] - 2026-09-11
 
 ### Fixed

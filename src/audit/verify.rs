@@ -980,8 +980,8 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // misreport a real subsequent entry (chaining from this
                 // one's unverified hash) as broken_at.
                 // Security review (#177 B1): peeking via serde_json::Value here
-                // (unlike chain.rs's read_chain_state, whose tail-window read is
-                // already capped at 64 KB) materializes a full DOM for whatever
+                // (chain.rs's read_chain_state peeks each candidate line through
+                // typed structs for the same reason, inside #465's 64 MiB scan) materializes a full DOM for whatever
                 // this *unbounded* per-line scan reads — measured ~5.7x memory
                 // and ~25x CPU amplification on a single hostile ~50MB line vs.
                 // the typed AuditEvent parse path it substitutes for. A typed
