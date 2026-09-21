@@ -7420,6 +7420,52 @@ fn an_unlistable_key_directory_reaches_report_json_and_doctor() {
     drop_store(&home, &data);
 }
 
+/// #556: an entry declaring a `chain_version` this build does not recognize is
+/// reported as unverifiable — exit 4 here, where no high-water mark is set, and
+/// the same on `report` and `doctor` — whatever type its `seq`
+/// has. Through 1.2.0 a `seq` that did not read as an unsigned integer made `verify` count the
+/// line as torn and answer "no entries to verify" (exit 0), `report --json`
+/// say `intact`, and `doctor` print nothing about the chain, while `append`
+/// refused to write behind the same line.
+#[test]
+#[cfg(unix)]
+fn an_unrecognized_chain_version_is_reported_whatever_its_seq_holds() {
+    let (home, data) = seed_store_for_verify("556-seq-not-a-number", "key", 0o700);
+    fs::write(
+        data.join("audit.jsonl"),
+        "{\"chain_version\":999,\"seq\":\"seven\",\"entry_hash\":\"x\"}\n",
+    )
+    .unwrap();
+
+    let verify = verify_in(&home);
+    assert_eq!(
+        verify.status.code(),
+        Some(4),
+        "exit 4, as SECURITY.md's Forward-Unknown Chain Versions promises: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let report = run_in(&home, &["report", "--json"]);
+    let stdout = String::from_utf8_lossy(&report.stdout);
+    assert!(
+        stdout.contains("\"status\": \"unverifiable\""),
+        "report --json surfaces it the same way: {stdout}"
+    );
+
+    let doctor = run_in(&home, &["doctor"]);
+    let doctor_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(
+        doctor_out.contains("chain: unverifiable"),
+        "and so does doctor: {doctor_out}"
+    );
+
+    drop_store(&home, &data);
+}
+
 // ---------------------------------------------------------------------------
 // #542: doctor reports a shim pointing at another install, and does not
 // silently re-point it

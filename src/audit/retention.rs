@@ -10,8 +10,8 @@ use time::OffsetDateTime;
 
 use super::AuditEvent;
 use super::chain::{
-    CHAIN_VERSION, NO_HMAC_SECRET, RecomputedHash, compute_entry_hash,
-    compute_entry_hash_for_write, hmac_bytes, is_supported_chain_version, parse_chain_version,
+    CHAIN_VERSION, NO_HMAC_SECRET, RecomputedHash, VersionPeek, compute_entry_hash,
+    compute_entry_hash_for_write, hmac_bytes, is_supported_chain_version, parse_line,
     prune_genesis_hash,
 };
 use super::secret::{Keyring, SigningKey, UNRESOLVED_KEY_ID, load_keyring, secret_path_for};
@@ -253,7 +253,10 @@ pub(super) fn decode_findings(rule_id: Option<&str>) -> Option<PrunedFindings> {
 /// judging structure through an entry whose authenticity is unknown. The
 /// state itself is deliberately **not** counted — restoring the key resolves
 /// it, so recording it would state a fault that may no longer exist.
-fn scan_pruned_range(
+///
+/// `pub(super)` so the audit tests can hold it to the same line-by-line answer
+/// `verify_chain` and `append` give (#556).
+pub(super) fn scan_pruned_range(
     range: &[&str],
     starts_after_prune_point: bool,
     keyring: Option<&Keyring>,
@@ -276,15 +279,23 @@ fn scan_pruned_range(
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue; // torn line
-        };
-
-        // The version peek comes off the raw value and runs first, exactly as
-        // in `verify_chain`: a future format might not parse as an
+        // The version peek runs first and is the one `verify_chain` and
+        // `append` use (#556): a future format might not parse as an
         // `AuditEvent` at all, and it must still be recognised as a version
-        // this build does not know rather than dismissed as a torn line.
-        if let Some(version) = parse_chain_version(&raw)
+        // this build does not know rather than dismissed as a torn line. This
+        // scan used to peek a `serde_json::Value` instead, which disagreed with
+        // the verifier's typed read in both directions — a `chain_version`
+        // given twice counted here and not there, and a line holding a number
+        // out of range (`1e400`) counted there and not here. A line the peek
+        // cannot read — not a JSON object, or a `chain_version` of the wrong
+        // type or given twice — is torn, as the verifier counts it.
+        let Ok(VersionPeek {
+            chain_version: declared_version,
+        }) = parse_line::<VersionPeek>(trimmed)
+        else {
+            continue;
+        };
+        if let Some(version) = declared_version
             && !is_supported_chain_version(version)
         {
             // Same precedence `verify_chain` uses — the version gate runs
@@ -297,19 +308,17 @@ fn scan_pruned_range(
             findings.unverifiable = 1;
             break;
         }
-        let Ok(event) = serde_json::from_str::<AuditEvent>(trimmed) else {
+        let Ok(event) = parse_line::<AuditEvent>(trimmed) else {
             // Not typeable and not a version this build knows about: torn, in
             // the same sense `verify_chain` means it, which counts such a line
             // and walks on without moving its link expectation.
             continue;
         };
 
-        // Legacy is decided from the typed value, not from the raw peek. The
-        // two disagree on a `chain_version` that is present but malformed —
-        // `"garbage"`, or a value past `u32` — which `parse_chain_version`
-        // reports as absent while `verify_chain` reaches it as a line it
-        // could not type, and counts as torn. Deciding here keeps a single
-        // corrupt field from ending the scan as a splice.
+        // Legacy: no `chain_version` at all. A malformed one — `"garbage"`, or
+        // a value past `u32` — never gets here: the peek above could not read
+        // it and the line was counted torn, as `verify_chain` counts it, so a
+        // single corrupt field cannot end the scan as a splice.
         if event.chain_version.is_none() {
             // Pre-chain history at the head of a log; a fail-closed break
             // anywhere after it. The verifier stops there, so the scan does
@@ -386,7 +395,7 @@ fn carry_forward_findings(line: &str, keyring: Option<&Keyring>) -> PrunedFindin
         prior_lost: 1,
         ..PrunedFindings::default()
     };
-    let Ok(event) = serde_json::from_str::<AuditEvent>(line.trim()) else {
+    let Ok(event) = parse_line::<AuditEvent>(line.trim()) else {
         return lost;
     };
     if !is_prune_point(&event) {
@@ -685,7 +694,7 @@ fn authenticated_max_seq(retained: &[&str], keyring: &Keyring) -> Option<u64> {
     // could not anchor the mark in any case.
     let mut candidates: Vec<(u64, AuditEvent)> = retained
         .iter()
-        .filter_map(|line| serde_json::from_str::<AuditEvent>(line.trim()).ok())
+        .filter_map(|line| parse_line::<AuditEvent>(line.trim()).ok())
         .filter(|event| !is_prune_point(event))
         .filter_map(|event| event.seq.map(|seq| (seq, event)))
         .collect();

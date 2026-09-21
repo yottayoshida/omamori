@@ -20,11 +20,13 @@ pub(super) const GENESIS_SEED: &[u8] = b"omamori-genesis-v1";
 pub(super) const PRUNE_GENESIS_SEED: &[u8] = b"omamori-prune-v1";
 
 /// Every `chain_version` this binary can recompute a hash for. Shared by
-/// `read_chain_state` (append-side tail check) and `verify_chain`'s
-/// raw-JSON fallback peek (`verify.rs`) — before #177 B3 these two each
-/// independently compared against the single `CHAIN_VERSION` constant, so
-/// bumping it to `2` without this shared set would have required editing
-/// both in lockstep with no compiler check that neither was missed.
+/// `read_chain_state` (append-side tail check), `verify_chain`'s version
+/// dispatch (`verify.rs`) and the prune scan (`retention.rs`) — before #177 B3
+/// the first two each independently compared against the single
+/// `CHAIN_VERSION` constant, so bumping it to `2` without this shared set
+/// would have required editing both in lockstep with no compiler check that
+/// neither was missed. All three read the version itself through
+/// [`VersionPeek`] (#556).
 ///
 /// `compute_entry_hash`'s `match` below is a THIRD place that must agree
 /// with this array — its arms are literal (`Some(1) => hash_v1`, not
@@ -343,22 +345,6 @@ pub(super) enum ChainTailState {
     NoEntryWithinLimit { limit: u64 },
 }
 
-/// Extract `chain_version` from a raw JSON value as a plausible `u32`.
-/// `None` covers both "no `chain_version` key at all" (legacy entry) and
-/// "present but not a valid `u32`" (corruption) — callers that need to
-/// distinguish those two treat `None` as legacy/corrupt either way, so one
-/// shared coercion is enough. `#177 B1` factored it out of `read_chain_state`
-/// and `verify_chain`'s raw-JSON fallback (an entry whose *shape* a future
-/// `chain_version` might break `AuditEvent`'s Deserialize for) after both
-/// reimplemented it. Since #465 the append-side scan peeks with its own typed
-/// structs, so the callers left are that fallback and `retention.rs`'s prune
-/// scan.
-pub(super) fn parse_chain_version(raw: &serde_json::Value) -> Option<u32> {
-    raw.get("chain_version")
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u32::try_from(v).ok())
-}
-
 /// Where an append should resume from: the state of the log's **last chain
 /// entry**, however much non-chain content follows it.
 ///
@@ -396,8 +382,9 @@ pub(super) fn parse_chain_version(raw: &serde_json::Value) -> Option<u32> {
 /// the chunk in hand is parsed from that chunk, with no further I/O; only a
 /// line longer than what the chunk holds is streamed from the file through a
 /// bounded reader. A typed peek skips the fields it does not name rather than
-/// allocating them (the same reasoning `verify_chain`'s raw-JSON fallback
-/// records for its own peek), so the only value a line leaves behind is the
+/// allocating them (the same reasoning `verify_chain`'s version dispatch
+/// records for the peeks it shares with this scan), so the only value a line
+/// leaves behind is the
 /// `entry_hash` of the entry the scan stops at — 64 hex characters on
 /// anything omamori wrote, and whatever length someone else put there.
 ///
@@ -487,21 +474,80 @@ pub(super) fn read_chain_state_bounded(
 /// `entry_hash` take (or whether it has them). Peeking all three at once would
 /// let such a line fail the peek, be read past, and fork the chain behind it —
 /// the hole the refusal exists to close.
+///
+/// #556: `append`, `verify_chain` and the prune scan all decide whether a line
+/// declares a chain version this build does not recognize through this peek,
+/// before they read the line as an `AuditEvent`, so they cannot disagree about
+/// a line the way they did through 1.2.0 — `verify_chain` read
+/// `chain_version` and `seq` through one struct, and a `seq` of the wrong type
+/// made it count as torn a line this scan refused to write behind.
 #[derive(serde::Deserialize)]
-struct VersionPeek {
-    chain_version: Option<u32>,
+pub(super) struct VersionPeek {
+    pub(super) chain_version: Option<u32>,
 }
 
-/// Stage two: `seq` alone, read only after stage one found a supported
-/// version. Alone for the reason [`VersionPeek`] is alone, one field further
-/// in: #456 decides whether a successor exists from `seq` and *before*
-/// `entry_hash`'s shape, and a typed struct naming both fields fails as a
-/// whole — an `entry_hash` of the wrong JSON type took the `seq` decision down
-/// with it, so a tail at `u64::MAX` was read past instead of refused (#465
-/// review, P1).
+/// Read one audit-log line as `T`, provided the line is a JSON object.
+///
+/// #556: every reader of `audit.jsonl` that types a line goes through here —
+/// or through [`ObjectOnly`] directly, for the append scan's streamed lines —
+/// so a line `verify_chain` counts as torn is never one `audit show`, `report`
+/// or the prune scan reads as an event. The one exception is the loop in
+/// `try_prune_at_collect` that finds where the retained range starts: it reads
+/// `timestamp`, `command` and `entry_hash` off a `serde_json::Value`, whose
+/// `get` is `None` on anything but an object, so an array is not a keeper there
+/// either. A derived `Deserialize` also accepts a JSON array,
+/// positionally: `[999]` read as `chain_version: 999`, and a whole entry
+/// written as an array read as that entry. omamori never writes an array, and
+/// through 1.2.0 the readers disagreed about them — `append` refused behind
+/// `[999]` while `verify_chain` counted it torn.
+pub(super) fn parse_line<T: serde::de::DeserializeOwned>(line: &str) -> serde_json::Result<T> {
+    serde_json::from_str::<ObjectOnly<T>>(line).map(|ObjectOnly(value)| value)
+}
+
+/// `T`, deserialized only from a JSON object. See [`parse_line`].
+///
+/// `T`'s own `Deserialize` still does the reading — a derived one keeps
+/// refusing duplicate keys, skipping fields it does not name without
+/// materializing them, and reading an absent `Option` as `None`. This only
+/// decides which JSON values reach it: serde_json answers `deserialize_map`
+/// with a type error for anything but `{`, where `deserialize_struct` (what a
+/// derive calls) also accepts `[`.
+pub(super) struct ObjectOnly<T>(pub(super) T);
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for ObjectOnly<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+            type Value = ObjectOnly<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ObjectOnly)
+            }
+        }
+        deserializer.deserialize_map(ObjectVisitor(std::marker::PhantomData))
+    }
+}
+
+/// Stage two: `seq` alone, read only after stage one found a version. Alone
+/// for the reason [`VersionPeek`] is alone, one field further in: #456 decides
+/// whether a successor exists from `seq` and *before* `entry_hash`'s shape,
+/// and a typed struct naming both fields fails as a whole — an `entry_hash` of
+/// the wrong JSON type took the `seq` decision down with it, so a tail at
+/// `u64::MAX` was read past instead of refused (#465 review, P1).
+///
+/// `verify_chain` reads it for the position of an unrecognized-version entry
+/// (#556) and for the end the lines past a halt state (#470). A `seq` that
+/// does not read as a `u64` is `None` there too: no position is stated.
 #[derive(serde::Deserialize)]
-struct SeqPeek {
-    seq: Option<u64>,
+pub(super) struct SeqPeek {
+    pub(super) seq: Option<u64>,
 }
 
 /// Stage three: `entry_hash` alone, read only once a successor number exists.
@@ -580,15 +626,18 @@ fn peek<T: serde::de::DeserializeOwned>(
     file: &mut fs::File,
     line: &Line<'_>,
 ) -> io::Result<Option<T>> {
+    // `ObjectOnly`, like every other reader of the log (see `parse_line`).
     let parsed = match *line {
-        Line::Buffered(bytes) => serde_json::from_slice(bytes),
+        Line::Buffered(bytes) => serde_json::from_slice::<ObjectOnly<T>>(bytes),
         Line::OnDisk { start, end } => {
             file.seek(SeekFrom::Start(start))?;
-            serde_json::from_reader(BufReader::new(file.by_ref().take(end - start)))
+            serde_json::from_reader::<_, ObjectOnly<T>>(BufReader::new(
+                file.by_ref().take(end - start),
+            ))
         }
     };
     match parsed {
-        Ok(value) => Ok(Some(value)),
+        Ok(ObjectOnly(value)) => Ok(Some(value)),
         Err(e) => match e.io_error_kind() {
             Some(kind) => Err(io::Error::new(kind, e)),
             None => Ok(None),

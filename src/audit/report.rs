@@ -15,6 +15,7 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use super::chain::parse_line;
 use super::error::AuditError;
 use super::retention::PrunedFindings;
 use super::secret::open_read_nofollow;
@@ -555,7 +556,7 @@ fn aggregate_events(path: &Path, days: u32) -> Option<EventStats> {
             continue;
         }
 
-        let event: AuditEvent = match serde_json::from_str(trimmed) {
+        let event: AuditEvent = match parse_line(trimmed) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -845,6 +846,51 @@ mod tests {
         assert_eq!(stats.total_blocks, 2);
         assert_eq!(*stats.by_layer.get("layer1").unwrap_or(&0), 1);
         assert_eq!(*stats.by_layer.get("layer2").unwrap_or(&0), 1);
+    }
+
+    /// #556: a JSON array is not an event to any reader of the log. A derived
+    /// `Deserialize` takes one positionally, so through 1.2.0 this array was
+    /// counted as a block here — while `verify` had to judge it, and since
+    /// #556 counts it as torn. A reader that shows a line `verify` did not
+    /// judge is how an unverified event reaches an operator.
+    #[test]
+    fn test_json_array_line_not_counted() {
+        let ts = (OffsetDateTime::now_utc() - time::Duration::minutes(10))
+            .format(&Rfc3339)
+            .unwrap();
+        let positional = serde_json::json!([
+            ts,
+            "claude-code",
+            "test",
+            null,
+            "block",
+            "done",
+            0,
+            "",
+            "layer1",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+        ])
+        .to_string();
+        let lines = vec![
+            make_event_line("block", "claude-code", Some("layer1"), 20),
+            positional,
+        ];
+        let path = write_temp_audit(&lines, "array");
+        let stats = aggregate_events(&path, 1).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(stats.total_blocks, 1, "only the object line is an event");
     }
 
     #[test]
