@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-21
+
+**Summary**: `append()`, `audit verify` and the prune scan now agree on which audit-log lines declare a chain version this build does not recognize — a line that stops `append()` from recording no longer leaves `verify`, `report` and `doctor` saying the log is intact.
+
 ### Fixed
 - **`audit verify` stops at an entry from an unrecognized `chain_version` whatever type its `seq` has, and `append()`, `verify` and the prune scan now decide that the same way.** ([#556](https://github.com/yottayoshida/omamori/issues/556))
 
