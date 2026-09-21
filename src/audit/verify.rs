@@ -3,8 +3,8 @@
 use std::io::{BufRead, Write};
 
 use super::chain::{
-    NO_HMAC_SECRET, RecomputedHash, compute_entry_hash, genesis_hash, hmac_bytes,
-    is_supported_chain_version, prune_genesis_hash,
+    NO_HMAC_SECRET, RecomputedHash, SeqPeek, VersionPeek, compute_entry_hash, genesis_hash,
+    hmac_bytes, is_supported_chain_version, parse_line, prune_genesis_hash,
 };
 use super::retention::{PrunedFindings, decode_findings, is_prune_point};
 use super::secret::{
@@ -512,11 +512,13 @@ pub enum AppendOutlook {
 // ---------------------------------------------------------------------------
 
 /// Records the point where an entry's `chain_version` became unverifiable and
-/// switches `result` into a terminal state. Shared by both places
-/// `verify_chain` can discover this — the fast path (a successfully-parsed
-/// `AuditEvent` whose `chain_version` field is unsupported) and the raw-JSON
-/// fallback (an entry whose *shape* a future `chain_version` changed enough
-/// that `AuditEvent` can't even parse it).
+/// switches `result` into a terminal state. Called from the version dispatch,
+/// which reads `chain_version` before the line is parsed as an `AuditEvent`
+/// (#556), and from the hash dispatch's `UnsupportedVersion` arm, the safety
+/// net for a version `SUPPORTED_CHAIN_VERSIONS` admits but `compute_entry_hash`
+/// has no hasher for. Through 1.2.0 the first of those was two sites — one for
+/// a parsed `AuditEvent`, one for a line whose shape a future `chain_version`
+/// changed enough that `AuditEvent` could not parse it.
 ///
 /// #457: this used to say "`unknown_version_at.is_some()` *is* that state",
 /// which stopped being true the moment a second terminal state existed.
@@ -621,29 +623,14 @@ fn epoch_of(key_id: &str) -> Option<u32> {
     key_id.strip_prefix("key-")?.parse().ok()
 }
 
-/// Minimal typed peek for the raw-JSON fallback (an entry whose full
-/// `AuditEvent` parse already failed). Any JSON key not named here —
-/// including an attacker-controlled arbitrarily large one — is skipped by
-/// serde during deserialization rather than allocated, unlike a
-/// `serde_json::Value` peek of the same line (see the fallback's comment
-/// for the measured cost of that). Both fields are `Option` so a missing
-/// or wrong-shaped `seq` degrades to the `expected_seq` fallback rather
-/// than failing the whole peek — a type-mismatched `chain_version`
-/// (rather than missing) still fails the peek, same as a
-/// `serde_json::Value` peek would have failed to extract a `u32` from it.
-#[derive(serde::Deserialize)]
-struct ChainVersionSeqPeek {
-    chain_version: Option<u32>,
-    seq: Option<u64>,
-}
-
 /// #470: the three recorded fields the structural scan compares, in one
 /// struct on purpose.
 ///
-/// Elsewhere in this file a typed peek names one field at a time, because a
-/// typed struct fails as a whole and a wrong-typed field would take another
-/// field's decision down with it (#556, and the same coupling #465 removed from
-/// the append side). Here whole-struct failure *is* the answer: a line missing
+/// The other typed peeks this file uses (`chain.rs`'s `VersionPeek` and
+/// `SeqPeek`) name one field each, because a typed struct fails as a whole and
+/// a wrong-typed field would take another field's decision down with it (#556,
+/// and the same coupling #465 removed from the append side). Here whole-struct
+/// failure *is* the answer: a line missing
 /// any of the three, or stating one with the wrong JSON type, is not something
 /// omamori wrote, and the scan's rule for such a line is to stop comparing
 /// across it. One parse, one answer.
@@ -671,7 +658,7 @@ struct StructuralPeek {
 /// this scan *keeps* — and it keeps nothing over 128 bytes. A
 /// plain `String` here would allocate the whole of it first and drop it after
 /// — measurable on the 50 MB line this file's other peeks are shaped to avoid
-/// (see the raw-JSON fallback's note on `serde_json::Value`).
+/// (see the version dispatch's note on `serde_json::Value` in `verify_chain`).
 struct BoundedHash(String);
 
 impl<'de> serde::Deserialize<'de> for BoundedHash {
@@ -719,7 +706,7 @@ struct StructuralLine {
 /// `seq: 0` (a prune point, or a chain restarted mid-file through `1.1.0`), or
 /// carries a hash longer than this scan will hold ([`MAX_STRUCTURAL_HASH`]).
 fn structural_line(trimmed: &str) -> Option<StructuralLine> {
-    let peek: StructuralPeek = serde_json::from_str(trimmed).ok()?;
+    let peek: StructuralPeek = parse_line(trimmed).ok()?;
     if !is_supported_chain_version(peek.chain_version?) {
         return None;
     }
@@ -743,20 +730,9 @@ fn structural_line(trimmed: &str) -> Option<StructuralLine> {
 /// peeks in this file name no `String` field at all for that reason: serde
 /// skips what a struct does not name, so a 50 MB field costs nothing unless
 /// something asks for it (the measured amplification of *not* skipping is
-/// recorded at the raw-JSON fallback below). This scan has to ask for two, and
+/// recorded at the version dispatch in `verify_chain`). This scan has to ask for two, and
 /// carries one of them to the next line, so it declines anything longer.
 pub(super) const MAX_STRUCTURAL_HASH: usize = 128;
-
-/// #470: `seq` alone, for lines past a halt, where nothing else about them is
-/// being decided. Sharing `ChainVersionSeqPeek` here would have thrown away a
-/// perfectly readable `seq` whenever the same line's `chain_version` had the
-/// wrong JSON type — that peek fails as a whole in that case, by design, and
-/// after a halt that would leave the file's end stuck at the halting line and
-/// report truncation on a log nothing was removed from (Codex R1, P2).
-#[derive(serde::Deserialize)]
-struct SeqPeek {
-    seq: Option<u64>,
-}
 
 /// Is this a store nothing has ever been written to?
 ///
@@ -1073,12 +1049,17 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // editing one `key_id` must not thereby also get the tail deleted
             // unreported.
             //
-            // A typed peek, like the torn-line path's: it names one field, so
+            // A typed peek, like the version dispatch's: it names one field, so
             // serde skips the rest of a hostile line without materializing it
             // (the measured amplification a `serde_json::Value` peek would cost
             // is spelled out at that call site). A line that states no seq —
-            // torn, legacy-shaped, or a future format that renamed the field —
-            // simply does not move the end.
+            // torn, legacy-shaped, a future format that renamed the field, or
+            // a `seq` that does not read as a `u64` — simply does not move the
+            // end. Read on its own rather than together with `chain_version`:
+            // a struct naming both fails as a whole when either has the wrong
+            // JSON type, which would throw away a readable `seq` and leave the
+            // end stuck at the halting line, reporting truncation on a log
+            // nothing was removed from (Codex R1, P2).
             //
             // **The last stated seq, not the largest.** A max lets one planted
             // line anywhere in the remainder stand in for the file's end, so
@@ -1086,7 +1067,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // than a rewrite of the surviving tail. Taking the last one keeps
             // the claim the docs make: the attacker has to renumber the line
             // the file actually ends on (Codex R1, P1).
-            if let Ok(peek) = serde_json::from_str::<SeqPeek>(trimmed)
+            if let Ok(peek) = parse_line::<SeqPeek>(trimmed)
                 && peek.seq.is_some()
             {
                 last_structural_seq = peek.seq;
@@ -1139,46 +1120,71 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         // and the reasoning lives in one place.
         let reported_position = expected_seq.unwrap_or(u64::MAX);
 
-        let event: AuditEvent = match serde_json::from_str(trimmed) {
+        // The version dispatch, decided before the line is read as an
+        // `AuditEvent` and by the same peek `append` and the prune scan use
+        // (#556). Through 1.2.0 it ran in two places: after a successful
+        // `AuditEvent` parse, and in a raw-JSON fallback for a line that
+        // failed one, which read `chain_version` and `seq` through one typed
+        // struct. A `seq` of the wrong type failed that struct as a whole, so
+        // the line counted as torn — verification went on, `report` said
+        // `intact` — while `append` refused to write behind the same line.
+        //
+        // Codex Round 1 (#177 B1): a future chain_version might pair with a
+        // JSON shape this binary's AuditEvent can't deserialize at all, and it
+        // must still read as "unverifiable", not "torn". Torn-line handling
+        // resumes verification against the pre-entry expected_prev/
+        // expected_seq for whatever comes next, which would misreport a real
+        // subsequent entry (chaining from this one's unverified hash) as
+        // broken_at.
+        // #457 (Codex Round 1 P1): version support is decided *before* the key
+        // lookup. An entry from a future chain format that also names a key we
+        // do not hold must report "upgrade omamori" (exit 4), not "restore the
+        // key" (exit 2) — restoring the key would not make this binary able to
+        // hash the entry.
+        // Security review (#177 B1): a `serde_json::Value` peek here would
+        // materialize a full DOM for whatever this *unbounded* per-line scan
+        // reads — measured ~5.7x memory and ~25x CPU amplification on a
+        // single hostile ~50MB line vs. the typed AuditEvent parse. The typed
+        // peeks name one field each and skip the rest without allocating it.
+        //
+        // A line `VersionPeek` cannot read — not a JSON object, or a
+        // `chain_version` of the wrong type or given twice — is torn. That
+        // includes a whole entry written as a JSON array, which a derived
+        // `AuditEvent` would otherwise have accepted positionally.
+        let Ok(VersionPeek {
+            chain_version: declared_version,
+        }) = parse_line::<VersionPeek>(trimmed)
+        else {
+            result.torn_lines += 1;
+            continue;
+        };
+        if let Some(chain_version) = declared_version
+            && !is_supported_chain_version(chain_version)
+        {
+            // Nothing about the line is trustworthy structural signal,
+            // including its own `seq` — it is read only for the position to
+            // report, and a `seq` that does not read as a `u64` states none.
+            let stated_seq = parse_line::<SeqPeek>(trimmed)
+                .ok()
+                .and_then(|peek| peek.seq);
+            mark_unverifiable_tail(
+                &mut result,
+                &mut last_structural_seq,
+                stated_seq,
+                reported_position,
+                chain_version,
+            );
+            continue;
+        }
+
+        let event: AuditEvent = match parse_line(trimmed) {
             Ok(e) => e,
+            // #177 B3: a genuinely corrupted *supported*-version entry (or a
+            // version-less line that is not a whole legacy entry) is torn, not
+            // "unrecognized version" — that would tell an operator to upgrade
+            // omamori when the real problem is file corruption on an
+            // already-current binary.
             Err(_) => {
-                // Codex Round 1 (#177 B1): a future chain_version might pair
-                // with a JSON shape this binary's AuditEvent can't
-                // deserialize at all. Before assuming genuine corruption
-                // (torn line), peek the raw JSON for chain_version — if
-                // it's present and unrecognized, this must read as
-                // "unverifiable", not "torn". Torn-line handling resumes
-                // verification against the pre-entry expected_prev/
-                // expected_seq for whatever comes next, which would
-                // misreport a real subsequent entry (chaining from this
-                // one's unverified hash) as broken_at.
-                // Security review (#177 B1): peeking via serde_json::Value here
-                // (chain.rs's read_chain_state peeks each candidate line through
-                // typed structs for the same reason, inside #465's 64 MiB scan) materializes a full DOM for whatever
-                // this *unbounded* per-line scan reads — measured ~5.7x memory
-                // and ~25x CPU amplification on a single hostile ~50MB line vs.
-                // the typed AuditEvent parse path it substitutes for. A typed
-                // peek struct lets serde skip any field it doesn't name
-                // (including large ones) without allocating it.
-                // #177 B3: a genuinely corrupted *supported*-version entry
-                // (fails AuditEvent::deserialize but chain_version peeks as
-                // 1 or 2) must fall through to torn_lines below, not be
-                // misreported as "unrecognized version" — that would tell
-                // an operator to upgrade omamori when the real problem is
-                // file corruption on an already-current binary.
-                if let Ok(peek) = serde_json::from_str::<ChainVersionSeqPeek>(trimmed)
-                    && let Some(chain_version) = peek.chain_version
-                    && !is_supported_chain_version(chain_version)
-                {
-                    mark_unverifiable_tail(
-                        &mut result,
-                        &mut last_structural_seq,
-                        peek.seq,
-                        reported_position,
-                        chain_version,
-                    );
-                    continue;
-                }
                 result.torn_lines += 1;
                 continue;
             }
@@ -1213,29 +1219,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         let is_prune = is_prune_point(&event);
 
         // --- entry_hash HMAC verification (multi-key: lookup by key_id).
-        // Also the version dispatch point: an entry whose chain_version
-        // this binary doesn't recognize can't be authenticated at all, so
-        // nothing about it — including its own seq/prev_hash — is
-        // trustworthy structural signal. Check this before the prev_hash
-        // check below, not after. ---
-        // #457 (Codex Round 1 P1): version support is decided *before* the key
-        // lookup. An entry from a future chain format that also names a key we
-        // do not hold must report "upgrade omamori" (exit 4), not "restore the
-        // key" (exit 2) — restoring the key would not make this binary able to
-        // hash the entry. Resolving the key first inverted that precedence for
-        // any future entry whose shape still parses as an `AuditEvent`.
-        if let Some(version) = event.chain_version
-            && !is_supported_chain_version(version)
-        {
-            mark_unverifiable_tail(
-                &mut result,
-                &mut last_structural_seq,
-                event.seq,
-                reported_position,
-                version,
-            );
-            continue;
-        }
+        // The version dispatch that used to sit here runs before the parse
+        // now (#556), so every line that reaches this point declares a version
+        // this binary hashes — or none, and was handled as legacy above. ---
 
         // `unwrap_or("default")` stays: a missing `key_id` field means an
         // entry from before the field existed, and `"default"` is the id that
@@ -1417,7 +1403,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 // not trusted. Codex Round 1 test-adversarial review:
                 // report expected_seq (not the generic `seq` default of
                 // 0 above) when this entry's own `seq` field is missing —
-                // matches the raw-JSON fallback path below and avoids a
+                // matches the version dispatch before the parse and avoids a
                 // misleading "at entry #0" report for an unrecognized-
                 // version entry appearing deep in an otherwise-verified
                 // chain.
@@ -1726,7 +1712,7 @@ pub fn show_entries(
         if trimmed.is_empty() {
             continue;
         }
-        let event: AuditEvent = match serde_json::from_str(trimmed) {
+        let event: AuditEvent = match parse_line(trimmed) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -1986,7 +1972,7 @@ pub fn count_unknown_tool_fail_opens_within(config: &AuditConfig, days: u32) -> 
         if trimmed.is_empty() {
             continue;
         }
-        let event: AuditEvent = match serde_json::from_str(trimmed) {
+        let event: AuditEvent = match parse_line(trimmed) {
             Ok(e) => e,
             Err(_) => continue,
         };

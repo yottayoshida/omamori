@@ -1485,10 +1485,10 @@ mod tests {
     }
 
     /// #177 B3 (Codex Round 1 P1): shape-enumeration release blocker T-08
-    /// (`verify_chain`'s raw-JSON fallback peek must not misreport a
+    /// (`verify_chain`'s version peek must not misreport a
     /// genuinely corrupted but *supported*-version entry as "unrecognized
-    /// version"). Corrupts `pid`'s type (not `chain_version`/`seq`, which
-    /// the fallback peek itself reads) on a v1 entry — `AuditEvent`
+    /// version"). Corrupts `pid`'s type (not `chain_version`, which
+    /// the version peek itself reads) on a v1 entry — `AuditEvent`
     /// deserialization fails entirely, but the peek still succeeds and
     /// finds `chain_version: 1`, a supported value, so this must fall
     /// through to `torn_lines`, not get classified as an unrecognized
@@ -3165,8 +3165,10 @@ mod tests {
     /// compatible) unknown-version entry with no `seq` field previously
     /// reported `unknown_version_at = Some(0)` (the generic `seq` default),
     /// misleadingly pointing at entry #0 regardless of how deep in the
-    /// chain it actually appeared. Must report `expected_seq` instead,
-    /// matching the raw-JSON fallback path's behavior.
+    /// chain it actually appeared. Must report `expected_seq` instead.
+    /// Since #556 the version is dispatched before the line is parsed as an
+    /// `AuditEvent`, so this shape and one that does not parse share a path;
+    /// the test stays as the pin on the position.
     #[test]
     fn verify_unknown_chain_version_missing_seq_reports_expected_seq() {
         let dir = test_dir("verify-unknown-version-missing-seq");
@@ -3184,6 +3186,288 @@ mod tests {
             Some(2),
             "must report expected_seq (2 real entries verified so far), not 0"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #556: an `AuditEvent` spelled as a JSON array, its fields in declaration
+    /// order — the shape a derived `Deserialize` accepts positionally. Only the
+    /// fields the #556 tests vary are parameters.
+    fn positional_event(command: &str, chain_version: Option<u32>) -> String {
+        serde_json::json!([
+            "2026-01-01T00:00:00Z", // timestamp
+            "test",                 // provider
+            command,
+            null,         // rule_id
+            "block",      // action
+            "blocked",    // result
+            0,            // target_count
+            "irrelevant", // target_hash
+            null,         // detection_layer
+            null,         // unwrap_chain
+            null,         // raw_input_hash
+            chain_version,
+            7,            // seq
+            "irrelevant", // prev_hash
+            "default",    // key_id
+            "irrelevant", // entry_hash
+            null,         // pid
+            null,         // ppid
+            null,         // parent_process
+            null,         // cwd_hash
+            null          // wrapper_kind
+        ])
+        .to_string()
+    }
+
+    /// #556: whether a line declares a `chain_version` this build does not
+    /// recognize is one question, and `append`, `verify_chain` and the prune
+    /// scan must each give the answer written next to the line — not merely
+    /// the same answer as one another, which three readers sharing one wrong
+    /// decoder would also give.
+    ///
+    /// Through 1.2.0 they answered it three ways. `verify_chain` read
+    /// `chain_version` and `seq` through one typed struct, so a `seq` of the
+    /// wrong type counted the line as torn while `append` refused behind it:
+    /// events stopped being recorded and `verify`, `report` and `doctor` said
+    /// nothing. The prune scan read a `serde_json::Value`, which disagrees
+    /// with a typed read on duplicate keys and on numbers out of range. And
+    /// derived structs accept a JSON array positionally, so `[999]` was a
+    /// future entry to `append` and a torn line to the other two.
+    ///
+    /// `N` real entries precede each line, and `N` is not 7, so a reader that
+    /// reports `N` for `"seq": 7` (never reading `seq`) fails the position
+    /// check rather than passing by coincidence.
+    #[test]
+    fn every_reader_gives_the_same_answer_on_which_lines_declare_an_unknown_chain_version() {
+        const N: u64 = 2;
+        // (label, line, where an unknown-version entry is reported — None when
+        // the line is not one)
+        let cases: Vec<(&str, String, Option<u64>)> = vec![
+            (
+                "seq is a string",
+                r#"{"chain_version":999,"seq":"seven","entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is negative",
+                r#"{"chain_version":999,"seq":-1,"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is a fraction",
+                r#"{"chain_version":999,"seq":1.5,"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is an object",
+                r#"{"chain_version":999,"seq":{},"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is an array",
+                r#"{"chain_version":999,"seq":[],"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is a bool",
+                r#"{"chain_version":999,"seq":true,"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is past u64",
+                r#"{"chain_version":999,"seq":18446744073709551616,"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is duplicated",
+                r#"{"chain_version":999,"seq":7,"seq":8,"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is absent",
+                r#"{"chain_version":999,"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is null",
+                r#"{"chain_version":999,"seq":null,"entry_hash":"x"}"#.into(),
+                Some(N),
+            ),
+            (
+                "seq is a number",
+                r#"{"chain_version":999,"seq":7,"entry_hash":"x"}"#.into(),
+                Some(7),
+            ),
+            (
+                "an unnamed number is out of range",
+                r#"{"chain_version":999,"seq":7,"x":1e400}"#.into(),
+                Some(7),
+            ),
+            ("an array of one", "[999]".into(), None),
+            ("an array of two", "[999,7]".into(), None),
+            ("a number", "999".into(), None),
+            ("null", "null".into(), None),
+            (
+                "a whole entry as an array, unknown version",
+                positional_event("cmd", Some(999)),
+                None,
+            ),
+            (
+                "a whole entry as an array, supported version",
+                positional_event("cmd", Some(2)),
+                None,
+            ),
+            (
+                "chain_version is a string",
+                r#"{"chain_version":"999","seq":7,"entry_hash":"x"}"#.into(),
+                None,
+            ),
+            (
+                "chain_version is past u32",
+                r#"{"chain_version":4294967296,"seq":7,"entry_hash":"x"}"#.into(),
+                None,
+            ),
+            (
+                "chain_version is duplicated, unknown last",
+                r#"{"chain_version":1,"chain_version":999,"seq":7}"#.into(),
+                None,
+            ),
+            (
+                "chain_version is duplicated, unknown first",
+                r#"{"chain_version":999,"chain_version":1,"seq":7}"#.into(),
+                None,
+            ),
+            // #177 B3 T-08: plain corruption on a version this build hashes is
+            // torn, never "upgrade omamori".
+            (
+                "supported version, seq is a string",
+                r#"{"chain_version":2,"seq":"seven","entry_hash":"x"}"#.into(),
+                None,
+            ),
+        ];
+
+        // Every case runs before anything fails, so a regression reports the
+        // whole pattern of disagreement rather than its first line.
+        let mut wrong: Vec<String> = Vec::new();
+        for (i, (label, line, expected)) in cases.iter().enumerate() {
+            let dir = test_dir(&format!("556-readers-agree-{i}"));
+            let logger = test_logger(&dir);
+            for n in 0..N {
+                logger.append(make_event(&format!("cmd{n}"))).unwrap();
+            }
+            let mut content = fs::read_to_string(&logger.path).unwrap();
+            content.push_str(line);
+            content.push('\n');
+            fs::write(&logger.path, content).unwrap();
+
+            let result = verify_chain(&verify_config(&dir)).unwrap();
+            let verify_ok = result.unknown_version_at == *expected
+                && match expected {
+                    Some(_) => {
+                        result.unknown_chain_version == Some(999)
+                            && result.unverified_entries_after == 1
+                            && result.torn_lines == 0
+                    }
+                    // Not an entry of any kind: counted as torn, and not a
+                    // break either — a whole entry written as an array was
+                    // verified positionally through 1.2.0 and must not be now.
+                    None => {
+                        result.unknown_chain_version.is_none()
+                            && result.torn_lines == 1
+                            && result.broken_at.is_none()
+                    }
+                };
+            if !verify_ok {
+                wrong.push(format!(
+                    "{label}: verify_chain reported {:?} (version {:?}, {} after, {} torn), expected {expected:?}",
+                    result.unknown_version_at,
+                    result.unknown_chain_version,
+                    result.unverified_entries_after,
+                    result.torn_lines
+                ));
+            }
+
+            // A refusal for any other reason must not pass as agreement, and
+            // neither may a failure on a line that should be read past.
+            match (expected, logger.append(make_event("after"))) {
+                (Some(_), Err(e)) if e.to_string().contains("chain_version 999") => {}
+                (None, Ok(())) => {}
+                (_, got) => wrong.push(format!(
+                    "{label}: append gave {got:?}, expected {expected:?}"
+                )),
+            }
+
+            let findings = retention::scan_pruned_range(&[line.as_str()], false, None);
+            if (findings.unverifiable == 1) != expected.is_some() {
+                wrong.push(format!(
+                    "{label}: prune scan counted unverifiable={}, expected {expected:?}",
+                    findings.unverifiable
+                ));
+            }
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreement(s):\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// #556 (review, P0): a line is an event to every reader of the log or to
+    /// none. `verify_chain` counts a JSON array as torn; if `audit show` still
+    /// read it positionally — as a derived `Deserialize` does — an array spliced
+    /// into the chain would be displayed as a block event nobody verified. Through
+    /// 1.2.0 both read it positionally, and `verify_chain` failed closed on a
+    /// legacy-shaped one as a splice; what must not happen is the two parting
+    /// ways.
+    #[test]
+    fn a_json_array_is_an_event_to_no_reader() {
+        let dir = test_dir("556-array-no-reader");
+        let logger = test_logger(&dir);
+        for n in 0..3 {
+            logger.append(make_event(&format!("cmd{n}"))).unwrap();
+        }
+        // A block event spelled as an array, with no `chain_version`.
+        let spliced = positional_event("planted-array", None);
+        let content = fs::read_to_string(&logger.path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        fs::write(
+            &logger.path,
+            format!("{}\n{spliced}\n{}\n{}\n", lines[0], lines[1], lines[2]),
+        )
+        .unwrap();
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert_eq!(
+            result.torn_lines, 1,
+            "verify_chain counts the array as torn"
+        );
+        assert_eq!(result.chain_entries, 3);
+        assert!(result.broken_at.is_none());
+
+        let opts = ShowOptions {
+            last: None,
+            rule: None,
+            provider: None,
+            json: true,
+            action: None,
+            relaxed_only: false,
+        };
+        let mut buf = Vec::new();
+        show_entries(&verify_config(&dir), &opts, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("planted-array"),
+            "audit show must not display a line verify_chain did not judge as an event:\n{output}"
+        );
+        assert_eq!(
+            output.lines().count(),
+            3,
+            "the three real entries:\n{output}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 

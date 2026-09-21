@@ -6,6 +6,15 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **`audit verify` stops at an entry from an unrecognized `chain_version` whatever type its `seq` has, and `append()`, `verify` and the prune scan now decide that the same way.** ([#556](https://github.com/yottayoshida/omamori/issues/556))
+
+  An entry whose `chain_version` this build does not recognize and whose `seq` did not read as an unsigned integer — `"seven"`, `-1` — counted as a torn line: `audit verify` reported the log intact (exit 0), `report --json` said `intact` and `doctor` said nothing, while `append()` refused to write behind the same line. Every later event went unrecorded, and nothing an operator watches said so. `verify` read `chain_version` and `seq` through one typed struct, and a `seq` of the wrong type failed it as a whole. It now halts at such a line — exit 4, or exit 3 when #470's comparison finds the tail removed — as SECURITY.md has always said it would.
+
+  `append()`'s tail scan, `verify`, and the scan a prune runs over what it removes now decide whether a line declares a chain version through one peek that reads `chain_version` alone. They had disagreed in both directions: `append()` refused behind `[999]`, which `verify` counted as torn; `verify` reported `[999,7]` as exit 4; the prune scan counted a line naming `chain_version` twice and missed one holding a number out of range. And every reader of the log — `audit show` and `report` included — now reads only JSON objects. A derived `Deserialize` takes a JSON array positionally, so an array spelling out a whole entry was verified, shown and counted like one; it is now torn to `verify` and nothing to the rest, so a line `verify` counts as torn is never one `audit show` displays or `report` counts.
+
+  **Verdicts move for byte-identical stores**, all toward what the documents say; `docs/CONTRACT.md`'s revision log lists them. Three move to a weaker exit code. A store whose tail was removed and which ends on such a line reported the truncation (exit 3) only because the line was misread, and now reports exit 4 — what a line with no `seq` at all has produced since #470. And two JSON-array shapes are now torn lines (exit 0) where they were judged as entries: a legacy-shaped array spliced into the chain failed closed (exit 1), and an array whose `chain_version` position held an unrecognized version — `[999,7]`, or a whole future entry spelled positionally — reported exit 4. Neither is shown by `audit show` or counted by `report` any more, so what they spelled reaches no surface. SECURITY.md's section on truncation detection across a halt now states that route and its condition: the comparison needs a line at or after the halt stating a `seq` that reads as an unsigned 64-bit integer.
+
 ## [1.2.0] - 2026-09-18
 
 **Summary**: the audit log's own reading of itself — where `append()` picks up the chain, what `verify` still checks after it stops, and what `doctor`'s first line says about the rest of its output.
