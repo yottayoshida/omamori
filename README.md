@@ -72,7 +72,7 @@ Run `./scripts/verify-claims.sh` to reproduce the machine-checkable rows. Which 
 - [Security](SECURITY.md) — threat model, bypass corpus, and [reporting a vulnerability](SECURITY.md#reporting-a-vulnerability)
 - [Using omamori with a sandbox](docs/reference-architecture.md)
 - [30-day evaluation kit](docs/evaluation-kit.md) — a checklist and feedback template
-- [Field notes](docs/dogfood/README.md) — what omamori caught in daily use
+- [Field notes](docs/field-notes.md) — what omamori caught in daily use
 - [Contributing](CONTRIBUTING.md)
 
 ## License
