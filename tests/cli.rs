@@ -6534,7 +6534,7 @@ fn config_add_rejects_bad_destination_before_writing() {
 /// #391 V-001: the flip side of `config_add_rejects_bad_destination_before_writing`'s
 /// "system-nonexistent" case — a destination that does not exist yet but is
 /// **not** under a blocked prefix must still be accepted at add-time. This is
-/// the shape of the README's `move-to` example (a quarantine directory the
+/// the shape of docs/configuration.md's `move-to` example (a quarantine directory the
 /// user is expected to create on first use, not pre-provision). Deliberately
 /// does NOT pre-create the directory (unlike
 /// `config_add_move_to_with_valid_destination_and_match_all_fires_in_explain`),
