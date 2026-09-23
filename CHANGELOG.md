@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-23
+
+**Summary**: `git reset --hard` now stashes the repository it resets. A reset pointed elsewhere with `-C`, `--git-dir`, `--work-tree` or `GIT_DIR` used to stash the directory it was run from — moving that repository's uncommitted work out of sight — and leave the repository actually being reset unprotected.
+
 ### Fixed
 - **`git reset --hard` now stashes the repository it resets, not the directory it was run from.** `git -C <dir> reset --hard`, `--git-dir` / `--work-tree`, and `GIT_DIR` / `GIT_WORK_TREE` all point the reset somewhere else, and stash-then-exec ran `git stash` in the process cwd regardless. Run from inside another repository, that moved the cwd repository's uncommitted and untracked work into its stash, where nothing said it had gone, and left the repository actually being reset unstashed, so its changes were lost. The "no changes, so log-only" downgrade judged the cwd too: a clean cwd let such a reset run with no stash at all. Found when cargo-deny, updating its advisory database with `git -C <db> reset --hard`, stashed a project directory's Cargo.lock change. The stash now carries the invocation's own `-C` / `--git-dir` / `--work-tree` options in order and inherits the same `GIT_*` variables as the reset; the downgrade is not applied when any global option or any of `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` is present.
 
