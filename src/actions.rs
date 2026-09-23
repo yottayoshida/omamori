@@ -71,7 +71,11 @@ pub trait ExecOps {
     fn passthrough(&mut self, invocation: &CommandInvocation) -> io::Result<i32>;
     fn move_to_trash(&mut self, targets: &[String]) -> Result<(), String>;
     fn move_to_dir(&mut self, targets: &[String], destination: &Path) -> Result<usize, String>;
-    fn git_stash(&mut self) -> Result<(), String>;
+    /// Stash the repository the command acts on. `repo_selectors` are the
+    /// invocation's own `-C` / `--git-dir` / `--work-tree` options, in order
+    /// ([`CommandInvocation::git_global_options`]), so the stash lands where
+    /// the command will.
+    fn git_stash(&mut self, repo_selectors: &[String]) -> Result<(), String>;
 }
 
 /// Maximum number of exclusive-create retries for the staging subdirectory
@@ -282,14 +286,17 @@ impl ExecOps for SystemOps {
         Ok(moved)
     }
 
-    fn git_stash(&mut self) -> Result<(), String> {
+    fn git_stash(&mut self, repo_selectors: &[String]) -> Result<(), String> {
         use std::io::Write;
         use std::process::Stdio;
 
         // Remove AI detector env vars so the internal git call does not
         // trigger omamori's own protection (self-interference prevention).
+        // GIT_DIR / GIT_WORK_TREE are left in place on purpose: the command
+        // this stash precedes inherits them too, so both act on one repo.
         let mut cmd = Command::new("git");
-        cmd.arg("stash")
+        cmd.args(repo_selectors)
+            .arg("stash")
             .arg("push")
             .arg("--include-untracked")
             .stdout(Stdio::piped())
@@ -365,17 +372,30 @@ impl<T: ExecOps> ActionExecutor<T> {
                     }
                 }
             }
-            ActionKind::StashThenExec => match self.ops.git_stash() {
-                Ok(()) => {
-                    let exit_code = self.ops.passthrough(invocation)?;
-                    ActionOutcome::ExecutedAfterStash { exit_code, message }
+            ActionKind::StashThenExec => {
+                let globals = invocation.git_global_options();
+                if let Some(option) = globals.unsupported {
+                    ActionOutcome::Blocked {
+                        message: format!(
+                            "omamori blocked `git {}`: {}. Run it without `{option}`",
+                            invocation.args.join(" "),
+                            crate::rules::unfollowable_option_reason(&option)
+                        ),
+                    }
+                } else {
+                    match self.ops.git_stash(&globals.repo_selectors) {
+                        Ok(()) => {
+                            let exit_code = self.ops.passthrough(invocation)?;
+                            ActionOutcome::ExecutedAfterStash { exit_code, message }
+                        }
+                        Err(error) => ActionOutcome::Failed {
+                            message: format!(
+                                "omamori could not create a git stash before execution: {error}"
+                            ),
+                        },
+                    }
                 }
-                Err(error) => ActionOutcome::Failed {
-                    message: format!(
-                        "omamori could not create a git stash before execution: {error}"
-                    ),
-                },
-            },
+            }
             ActionKind::MoveTo => {
                 let destination = match &rule.destination {
                     Some(dest) => PathBuf::from(dest),
@@ -436,6 +456,8 @@ mod tests {
         trash_error: Option<String>,
         move_to_dir_error: Option<String>,
         stash_error: Option<String>,
+        stash_calls: usize,
+        last_stash_selectors: Vec<String>,
         last_trash_targets: Vec<String>,
         last_move_targets: Vec<String>,
         last_move_destination: Option<PathBuf>,
@@ -464,12 +486,21 @@ mod tests {
             }
         }
 
-        fn git_stash(&mut self) -> Result<(), String> {
+        fn git_stash(&mut self, repo_selectors: &[String]) -> Result<(), String> {
+            self.stash_calls += 1;
+            self.last_stash_selectors = repo_selectors.to_vec();
             match &self.stash_error {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
             }
         }
+    }
+
+    fn git(args: &[&str]) -> CommandInvocation {
+        CommandInvocation::new(
+            "git".to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        )
     }
 
     fn rule(action: ActionKind, command: &str) -> RuleConfig {
@@ -510,6 +541,51 @@ mod tests {
             .execute(&invocation, &rule(ActionKind::StashThenExec, "git"))
             .unwrap();
         assert!(matches!(outcome, ActionOutcome::ExecutedAfterStash { .. }));
+    }
+
+    #[test]
+    fn stash_then_exec_stashes_the_repository_the_command_names() {
+        let mut executor = ActionExecutor::new(FakeOps::default());
+        let invocation = git(&["--git-dir=/b/.git", "--work-tree", "/b", "reset", "--hard"]);
+        let outcome = executor
+            .execute(&invocation, &rule(ActionKind::StashThenExec, "git"))
+            .unwrap();
+        assert!(matches!(outcome, ActionOutcome::ExecutedAfterStash { .. }));
+        assert_eq!(
+            executor.ops.last_stash_selectors,
+            ["--git-dir=/b/.git", "--work-tree", "/b"]
+        );
+        assert_eq!(executor.ops.passthrough_calls, 1);
+    }
+
+    #[test]
+    fn stash_then_exec_lets_a_flag_that_keeps_the_target_through() {
+        let mut executor = ActionExecutor::new(FakeOps::default());
+        let invocation = git(&["--no-pager", "reset", "--hard"]);
+        let outcome = executor
+            .execute(&invocation, &rule(ActionKind::StashThenExec, "git"))
+            .unwrap();
+        assert!(
+            matches!(outcome, ActionOutcome::ExecutedAfterStash { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(executor.ops.stash_calls, 1);
+        assert!(executor.ops.last_stash_selectors.is_empty());
+    }
+
+    #[test]
+    fn stash_then_exec_blocks_when_a_global_option_can_move_the_target() {
+        let mut executor = ActionExecutor::new(FakeOps::default());
+        let invocation = git(&["-c", "core.worktree=/b", "reset", "--hard"]);
+        let outcome = executor
+            .execute(&invocation, &rule(ActionKind::StashThenExec, "git"))
+            .unwrap();
+        match outcome {
+            ActionOutcome::Blocked { message } => assert!(message.contains("`-c`"), "{message}"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        assert_eq!(executor.ops.stash_calls, 0);
+        assert_eq!(executor.ops.passthrough_calls, 0);
     }
 
     #[test]

@@ -15,16 +15,136 @@ impl CommandInvocation {
     /// Respects the POSIX `--` separator: everything after `--` is a target,
     /// regardless of whether it starts with `-`.
     pub fn target_args(&self) -> Vec<&str> {
-        if let Some(sep) = self.args.iter().position(|a| a == "--") {
-            self.args[(sep + 1)..].iter().map(String::as_str).collect()
-        } else {
-            self.args
-                .iter()
-                .filter(|a| !a.starts_with('-'))
-                .map(String::as_str)
-                .collect()
-        }
+        non_flag_args(&self.args)
     }
+
+    /// The paths a command's effect is confined to, for path-based (Tier 1)
+    /// context evaluation. Same as [`Self::target_args`] except for `git`,
+    /// where a non-flag argument is often not a path at all: the value of a
+    /// global option (`-C node_modules/pkg` names a repository, it does not
+    /// delete one), the subcommand, a ref (`git reset --hard build`,
+    /// `git push --force origin build`) or an option's value
+    /// (`git clean -e node_modules`). So for `git` only `clean` has path
+    /// targets — it is the one git command a path confines — and only when
+    /// no global option is present (which repository it acts on is then not
+    /// a path rule's call): the non-flag arguments after `clean`, skipping
+    /// the values of `-e` / `--exclude`.
+    pub fn path_targets(&self) -> Vec<&str> {
+        if self.program != "git" {
+            return self.target_args();
+        }
+        if self.args.first().map(String::as_str) != Some("clean") {
+            return Vec::new();
+        }
+        let rest = &self.args[1..];
+        if let Some(sep) = rest.iter().position(|a| a == "--") {
+            return rest[(sep + 1)..].iter().map(String::as_str).collect();
+        }
+        let mut targets = Vec::new();
+        let mut args = rest.iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-e" | "--exclude" => {
+                    args.next();
+                }
+                a if a.starts_with('-') => {}
+                a => targets.push(a),
+            }
+        }
+        targets
+    }
+
+    /// Read the global options a `git` invocation carries before its
+    /// subcommand, which is where git decides which repository and work tree
+    /// the command acts on. `git -C <dir> reset --hard` resets `<dir>`, not the
+    /// process cwd, so anything omamori does to "the repository" first — the
+    /// stash of stash-then-exec — has to be pointed at the same place.
+    pub fn git_global_options(&self) -> GitGlobalOptions {
+        let mut options = GitGlobalOptions::default();
+        if self.program != "git" {
+            return options;
+        }
+        let mut args = self.args.iter();
+        while let Some(arg) = args.next() {
+            if !arg.starts_with('-') {
+                break; // the subcommand
+            }
+            match arg.as_str() {
+                "-C" | "--git-dir" | "--work-tree" => match args.next() {
+                    Some(value) => {
+                        options.repo_selectors.push(arg.clone());
+                        options.repo_selectors.push(value.clone());
+                    }
+                    None => {
+                        options.unsupported = Some(arg.clone());
+                        break;
+                    }
+                },
+                a if a.starts_with("--git-dir=") || a.starts_with("--work-tree=") => {
+                    options.repo_selectors.push(arg.clone());
+                }
+                a if GIT_GLOBAL_FLAGS_THAT_KEEP_THE_TARGET.contains(&a) => {}
+                _ => {
+                    options.unsupported = Some(arg.clone());
+                    break;
+                }
+            }
+        }
+        options
+    }
+}
+
+/// Everything after a POSIX `--`, or else every argument not starting with `-`.
+fn non_flag_args(args: &[String]) -> Vec<&str> {
+    if let Some(sep) = args.iter().position(|a| a == "--") {
+        args[(sep + 1)..].iter().map(String::as_str).collect()
+    } else {
+        args.iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// git(1) global options that touch none of the repository, work tree,
+/// index, config or executable location a command acts on. Anything else
+/// before the subcommand (`-c`, `--config-env`, `--bare`, `--namespace`,
+/// `--exec-path`, `--attr-source`, ...) can move where it lands, so omamori
+/// cannot tell which repository to stash.
+const GIT_GLOBAL_FLAGS_THAT_KEEP_THE_TARGET: &[&str] = &[
+    "--no-pager",
+    "-P",
+    "-p",
+    "--paginate",
+    "--no-optional-locks",
+    "--no-advice",
+    "--no-replace-objects",
+    "--no-lazy-fetch",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+];
+
+/// Why a git command carrying `option` is blocked rather than stashed. One
+/// sentence for the executor that blocks it and `omamori explain` that
+/// reports it, so the two cannot drift apart.
+pub fn unfollowable_option_reason(option: &str) -> String {
+    format!(
+        "`{option}` can change which repository this acts on, so omamori cannot stash that repository first"
+    )
+}
+
+/// Result of [`CommandInvocation::git_global_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitGlobalOptions {
+    /// `-C <dir>`, `--git-dir <dir>` / `--git-dir=<dir>`, `--work-tree ...`,
+    /// each with its value, in the order written. Order matters: a relative
+    /// `-C` or `--git-dir` resolves against the `-C` before it.
+    pub repo_selectors: Vec<String>,
+    /// The first global option that is neither a repository selector nor on
+    /// [`GIT_GLOBAL_FLAGS_THAT_KEEP_THE_TARGET`].
+    pub unsupported: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,6 +360,68 @@ fn rule_matches(rule: &RuleConfig, invocation: &CommandInvocation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(args: &[&str]) -> CommandInvocation {
+        CommandInvocation::new(
+            "git".to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn git_global_options_keep_repo_selectors_in_order_and_stop_at_the_subcommand() {
+        let options = git(&[
+            "-C",
+            "x",
+            "--no-pager",
+            "-C",
+            "y",
+            "--git-dir=g",
+            "--work-tree",
+            "w",
+            "reset",
+            "--hard",
+            "-C",
+            "not-a-global-option",
+        ])
+        .git_global_options();
+        assert_eq!(
+            options.repo_selectors,
+            ["-C", "x", "-C", "y", "--git-dir=g", "--work-tree", "w"]
+        );
+        assert_eq!(options.unsupported, None);
+    }
+
+    #[test]
+    fn git_global_options_name_the_first_option_that_can_move_the_target() {
+        for (args, unsupported) in [
+            (&["-c", "core.worktree=/b", "reset", "--hard"][..], "-c"),
+            (&["-C", "x", "--bare", "reset", "--hard"][..], "--bare"),
+            (&["--namespace", "n", "reset", "--hard"][..], "--namespace"),
+            (
+                &["--config-env=a=b", "reset", "--hard"][..],
+                "--config-env=a=b",
+            ),
+            // A selector with its value missing is not a selector.
+            (&["-C"][..], "-C"),
+        ] {
+            assert_eq!(
+                git(args).git_global_options().unsupported.as_deref(),
+                Some(unsupported),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_global_options_are_empty_for_a_plain_invocation_and_for_other_programs() {
+        assert_eq!(
+            git(&["reset", "--hard"]).git_global_options(),
+            GitGlobalOptions::default()
+        );
+        let rm = CommandInvocation::new("rm".to_string(), vec!["-C".to_string(), "x".to_string()]);
+        assert_eq!(rm.git_global_options(), GitGlobalOptions::default());
+    }
 
     /// /code-review R1 (Reuse) finding: `from_cli_str` matches on `&str`
     /// with a catch-all `_ => None`, unlike `as_str`/`defense_level`/

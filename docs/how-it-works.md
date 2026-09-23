@@ -7,7 +7,7 @@ What it blocks, which tools it covers, how the layers fit together, and what it 
 | Command | Pattern | Action |
 |---------|---------|--------|
 | `rm` | `-r`, `-rf`, `-fr`, `--recursive` | **trash** — move to macOS Trash |
-| `git` | `reset --hard` | **stash-then-exec** — `git stash` first |
+| `git` | `reset --hard` | **stash-then-exec** — `git stash` first, in the repository the reset acts on (`-C`, `--git-dir`, `--work-tree`, `GIT_DIR` included); **block** if another global option such as `-c` could move it |
 | `git` | `push --force`, `push -f` | **block** |
 | `git` | `clean -f`, `clean --force` | **block** |
 | `chmod` | `777` | **block** |

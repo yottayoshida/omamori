@@ -189,11 +189,31 @@ fn evaluate_layer1(
         rule.action.as_str()
     };
 
+    // The executor refuses a stash-then-exec git command whose global
+    // options could move it somewhere the stash would not follow
+    // (`ActionExecutor::execute`); say so here rather than report a stash.
+    let unfollowable = if effective_action == "stash-then-exec" {
+        invocation.git_global_options().unsupported
+    } else {
+        None
+    };
+    let effective_action = if unfollowable.is_some() {
+        "block"
+    } else {
+        effective_action
+    };
+
     let blocked = effective_action == "block";
-    let detail = rule
-        .message
-        .clone()
-        .unwrap_or_else(|| format!("matched rule: {}", rule.name));
+    let detail = match &unfollowable {
+        Some(option) => format!(
+            "{}; omamori blocks it",
+            crate::rules::unfollowable_option_reason(option)
+        ),
+        None => rule
+            .message
+            .clone()
+            .unwrap_or_else(|| format!("matched rule: {}", rule.name)),
+    };
 
     Layer1Result {
         blocked,
@@ -383,6 +403,26 @@ mod tests {
         assert!(!result.blocked);
         assert!(result.matched_rule.is_none());
         assert_eq!(result.action, "allow");
+    }
+
+    #[test]
+    fn layer1_reports_block_for_a_git_reset_whose_global_option_the_stash_cannot_follow() {
+        let parts: Vec<String> = ["git", "-c", "core.worktree=/b", "reset", "--hard"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let result = evaluate_layer1(&parts, None, Some(std::path::Path::new("/test-base")));
+        assert_eq!(result.action, "block", "{}", result.detail);
+        assert!(result.blocked);
+        assert!(result.detail.contains("`-c`"), "{}", result.detail);
+
+        // Control: without the option the same rule still reports a stash.
+        let parts: Vec<String> = ["git", "reset", "--hard"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let result = evaluate_layer1(&parts, None, Some(std::path::Path::new("/test-base")));
+        assert_eq!(result.action, "stash-then-exec", "{}", result.detail);
     }
 
     #[test]

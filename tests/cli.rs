@@ -7848,3 +7848,253 @@ fn doctor_fix_completes_its_repair_when_the_reader_goes_away() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+// ---------------------------------------------------------------------------
+// stash-then-exec follows the repository the command acts on
+// ---------------------------------------------------------------------------
+
+/// Give `cmd` a HOME of its own, no user or system git config, a fixed
+/// identity, and no inherited `GIT_DIR` / `GIT_WORK_TREE`.
+fn isolate_git<'a>(cmd: &'a mut Command, home: &std::path::Path) -> &'a mut Command {
+    cmd.env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+}
+
+/// Run `git` for fixture setup with no user or system config in play.
+fn fixture_git(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> String {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir);
+    let output = isolate_git(&mut cmd, home).output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A repo with one commit of `f.txt` = "base", then `f.txt` rewritten to
+/// `change` when given (an uncommitted change).
+fn fixture_repo(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    name: &str,
+    change: Option<&str>,
+) -> PathBuf {
+    let dir = root.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fixture_git(&dir, home, &["init", "-q"]);
+    fs::write(dir.join("f.txt"), "base\n").unwrap();
+    fixture_git(&dir, home, &["add", "f.txt"]);
+    fixture_git(&dir, home, &["commit", "-q", "-m", "base"]);
+    if let Some(change) = change {
+        fs::write(dir.join("f.txt"), format!("{change}\n")).unwrap();
+    }
+    dir
+}
+
+fn stash_count(dir: &std::path::Path, home: &std::path::Path) -> usize {
+    fixture_git(dir, home, &["stash", "list"]).lines().count()
+}
+
+/// `omamori exec -- git <args>` from `cwd`, as an AI session would run it,
+/// with HOME / config / audit isolated under `home`.
+fn exec_git_as_ai(
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, String)],
+) -> std::process::Output {
+    // Drop any installed omamori shim directory from PATH: with HOME
+    // redirected, omamori would not recognise the developer's real
+    // `~/.omamori/shim` as its own and would resolve `git` to it.
+    let path = std::env::var("PATH").unwrap_or_default();
+    let path: Vec<&str> = path
+        .split(':')
+        .filter(|entry| !entry.contains("/.omamori/shim"))
+        .collect();
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.env("PATH", path.join(":"))
+        .arg("exec")
+        .arg("--")
+        .arg("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("CLAUDECODE", "1")
+        .env("XDG_CONFIG_HOME", home.join(".config"));
+    isolate_git(&mut cmd, home);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().unwrap()
+}
+
+/// `git -C B reset --hard` (and the `--git-dir`/`--work-tree` spelling)
+/// issued from inside another repo A: the stash has to hold B's change, and
+/// A — which the command never touches — has to be left exactly as it was.
+/// Before this fix omamori stashed A (moving A's work out of sight) and let
+/// the reset destroy B's change; cargo-deny resetting its advisory-db from a
+/// project directory hit this on 2026-09-23.
+#[test]
+fn stash_then_exec_stashes_the_repository_a_global_option_names() {
+    for i in 0..2 {
+        let root = unique_dir(&format!("stash-target-{i}"));
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        let a = fixture_repo(&root, &home, "a", Some("A-change"));
+        let b = fixture_repo(&root, &home, "b", Some("B-change"));
+        let args = if i == 0 {
+            vec![
+                "-C".to_string(),
+                b.display().to_string(),
+                "reset".into(),
+                "--hard".into(),
+            ]
+        } else {
+            vec![
+                format!("--git-dir={}", b.join(".git").display()),
+                "--work-tree".into(),
+                b.display().to_string(),
+                "reset".into(),
+                "--hard".into(),
+            ]
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+        let output = exec_git_as_ai(&a, &home, &args, &[]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "form {i}: {stderr}");
+
+        assert_eq!(
+            fs::read_to_string(a.join("f.txt")).unwrap(),
+            "A-change\n",
+            "form {i}: A's work was moved"
+        );
+        assert_eq!(stash_count(&a, &home), 0, "form {i}: A was stashed");
+        assert_eq!(
+            fs::read_to_string(b.join("f.txt")).unwrap(),
+            "base\n",
+            "form {i}: B was not reset"
+        );
+        assert_eq!(stash_count(&b, &home), 1, "form {i}: B was not stashed");
+        let stashed = fixture_git(&b, &home, &["stash", "show", "-p"]);
+        assert!(
+            stashed.contains("+B-change"),
+            "form {i}: B's stash lacks B's change: {stashed}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// `GIT_DIR` / `GIT_WORK_TREE` point the reset at B while the cwd repo A is
+/// clean. The clean cwd used to downgrade the reset to log-only (no stash),
+/// and the reset then destroyed B's change.
+#[test]
+fn stash_then_exec_stashes_the_repository_git_dir_names_even_when_the_cwd_is_clean() {
+    let root = unique_dir("stash-target-env");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let a = fixture_repo(&root, &home, "a", None);
+    let b = fixture_repo(&root, &home, "b", Some("B-change"));
+
+    let output = exec_git_as_ai(
+        &a,
+        &home,
+        &["reset", "--hard"],
+        &[
+            ("GIT_DIR", b.join(".git").display().to_string()),
+            ("GIT_WORK_TREE", b.display().to_string()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    assert_eq!(
+        fs::read_to_string(b.join("f.txt")).unwrap(),
+        "base\n",
+        "B was not reset"
+    );
+    assert_eq!(
+        stash_count(&b, &home),
+        1,
+        "B's change was not stashed: {stderr}"
+    );
+    let stashed = fixture_git(&b, &home, &["stash", "show", "-p"]);
+    assert!(stashed.contains("+B-change"), "{stashed}");
+    assert_eq!(stash_count(&a, &home), 0);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Run from a directory that is not a repository, `git -C B reset --hard`
+/// used to fail on a `git stash` in that directory and refuse. The stash now
+/// goes to B, so the reset runs and B's change is kept in B's stash.
+#[test]
+fn stash_then_exec_works_from_a_directory_that_is_not_a_repository() {
+    let root = unique_dir("stash-target-norepo");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let plain = root.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let b = fixture_repo(&root, &home, "b", Some("B-change"));
+
+    let output = exec_git_as_ai(
+        &plain,
+        &home,
+        &["-C", &b.display().to_string(), "reset", "--hard"],
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(fs::read_to_string(b.join("f.txt")).unwrap(), "base\n");
+    assert_eq!(stash_count(&b, &home), 1, "{stderr}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// With `[context]` configured, the `-C` value `.../node_modules/b` used to be
+/// read as a path to delete, matched the built-in regenerable list, and
+/// downgraded the reset to log-only: no stash, B's change lost. The path
+/// rules no longer read git option values (or reset's arguments) as targets.
+#[test]
+fn stash_then_exec_is_not_downgraded_by_a_regenerable_looking_repository_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_dir("stash-target-regen");
+    let home = root.join("home");
+    let config_dir = home.join(".config").join("omamori");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("config.toml");
+    fs::write(&config, "[context]\n").unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let a = fixture_repo(&root, &home, "a", Some("A-change"));
+    fs::create_dir_all(root.join("node_modules")).unwrap();
+    let b = fixture_repo(&root.join("node_modules"), &home, "b", Some("B-change"));
+
+    let output = exec_git_as_ai(
+        &a,
+        &home,
+        &["-C", &b.display().to_string(), "reset", "--hard"],
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("regenerable"), "{stderr}");
+    assert_eq!(
+        stash_count(&b, &home),
+        1,
+        "B's change was not stashed: {stderr}"
+    );
+    assert_eq!(stash_count(&a, &home), 0);
+    assert_eq!(fs::read_to_string(a.join("f.txt")).unwrap(), "A-change\n");
+
+    let _ = fs::remove_dir_all(&root);
+}
