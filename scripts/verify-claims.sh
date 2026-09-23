@@ -21,9 +21,10 @@
 #       claim with zero existing machine enforcement -- a dependency
 #       allowlist tripwire (M2) and a hook-decision-path source-token
 #       tripwire (M3) close that gap.
-#   M4: the honest-limitation prose for claims 2/3/4 (documented in README's
-#       "How these are checked" section) has not been silently deleted.
-#   M5: the named cargo tests that "How these are checked" cites as backing
+#   M4: the honest-limitation prose for claims 2/3/4 (README's "Where CI
+#       cannot reach" list) has not been silently deleted.
+#   M5: the named cargo tests that "How these are checked"
+#       (docs/verifying-claims.md) cites as backing
 #       claims 1/2/3/5's behavioral regressions still exist and are not
 #       `#[ignore]`d -- without this, that prose's claim would itself be
 #       unverified.
@@ -115,8 +116,9 @@ assert_exact_count() {
 #
 # Table cells are markdown pipe-delimited; the region is bounded by
 # `<!-- claims:start -->` / `<!-- claims:end -->` markers so this parser
-# cannot confuse the Claims table with README's other pipe-table ("What It
-# Blocks"). No existing doc-sync invariant parses a table cell-by-cell --
+# cannot confuse the Claims table with any other pipe-table README grows
+# (it carried a "What It Blocks" table until that moved to
+# docs/how-it-works.md). No existing doc-sync invariant parses a table cell-by-cell --
 # this is genuinely new ground, confirmed during shape enumeration.
 verify_claims_map() {
     local target_readme="$1"
@@ -380,14 +382,14 @@ verify_source_tripwire() {
 
 # ---------- M4: honest-limitation prose has not been silently deleted ----------
 #
-# README's "How these are checked" section carries three limitation
+# README's "Where CI cannot reach" list carries three limitation
 # statements this script cannot itself verify by running code (claim 2's
 # Cursor exclusion, claim 3's real-HOME-only exclusion, claim 4's
 # negative-claim framing). If a future edit deletes one, the README would
 # silently overclaim what is CI-enforced. Matched phrases are deliberately
 # distinctive substrings of the actual limitation sentence, not a bare
 # keyword like "Cursor" -- README mentions Cursor in several unrelated
-# places (Tool Compatibility table, sandbox section), so a bare-keyword
+# places (the demo caption, the tool-support line), so a bare-keyword
 # match would stay green even if the claim-2 limitation sentence itself
 # were deleted (Codex R1 P1 finding).
 verify_exclusion_prose() {
@@ -414,7 +416,8 @@ verify_exclusion_prose() {
 
 # ---------- M5: named-test rot guard (claims 1/2/3/5 lean on these by name) ----------
 #
-# "How these are checked" cites specific named cargo tests as the CI
+# "How these are checked" (docs/verifying-claims.md) cites specific named
+# cargo tests as the CI
 # enforcement behind claims 1/2/3/5 (this script deliberately does not
 # re-prove their behavior -- see the top-of-file comment). That citation is
 # itself an unverified claim unless something pins the named tests still
@@ -578,8 +581,8 @@ use reqwest;
     cp "$readme" "$tmpdir/README-noexclusion.md"
     # Delete only the line carrying the distinctive claim-2 limitation
     # phrase, not every line containing "Cursor" -- README mentions Cursor
-    # in several unrelated places (Tool Compatibility table, sandbox
-    # section), and a self-test that scrubs all of them would not prove
+    # in several unrelated places (the demo caption, the tool-support
+    # line), and a self-test that scrubs all of them would not prove
     # M4 catches deletion of *this specific* limitation sentence.
     sed -i.bak '/stderr-only and do not reach the audit chain/d' "$tmpdir/README-noexclusion.md"
     rm -f "$tmpdir/README-noexclusion.md.bak"

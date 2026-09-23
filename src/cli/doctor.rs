@@ -377,7 +377,7 @@ fn collect_risk_signals() -> Option<RiskSignals> {
 /// `quiet`, so it counts everything the section prints — including the blocks
 /// omamori made and what a prune recorded, which are omamori working rather
 /// than anything wrong. A headline note driven by those would light up on every
-/// machine that is guarding anything (the README's own sample shows 42 blocks
+/// machine that is guarding anything (docs/how-it-works.md's sample shows 42 blocks
 /// in seven days), and the state worth pointing at would be lost inside it.
 ///
 /// So: the chain's own verdict, the states that say it could not be checked,
@@ -395,9 +395,9 @@ fn collect_risk_signals() -> Option<RiskSignals> {
 /// the operator to upgrade.
 ///
 /// `total_blocks` and `unknown_tool_fail_opens` stay out. Blocks are omamori
-/// doing its job; the README's own sample shows 42 in seven days, and a
+/// doing its job; docs/how-it-works.md's sample shows 42 in seven days, and a
 /// headline note driven by them would never be off. Fail-opens are the
-/// operational noise README documents as expected from unrecognised tools, and
+/// operational noise docs/how-it-works.md documents as expected from unrecognised tools, and
 /// the section already carries the count and the command to review them.
 fn risk_signals_need_attention(signals: &RiskSignals) -> bool {
     let report = &signals.report;

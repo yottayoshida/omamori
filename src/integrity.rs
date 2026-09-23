@@ -868,7 +868,7 @@ fn detect_shim_install_drift(target: &Path, running_exe: &ResolvedExe) -> ShimIn
 /// `doctor --fix`'s install repair re-links every shim at
 /// `current_exe()` (`run_install_repair`), which would silently discard a
 /// target the operator pinned with `install --source` — the one documented way
-/// to make that provenance judgement yourself (README, Troubleshooting).
+/// to make that provenance judgement yourself (docs/troubleshooting.md).
 /// Which install should be in force is a decision, not a repair.
 ///
 /// Nothing here establishes *what* the target is. The three branches that

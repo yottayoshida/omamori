@@ -6,36 +6,43 @@
 [![License](https://img.shields.io/crates/l/omamori)](LICENSE-MIT)
 
 > Deterministic semantic guard for AI CLI tools. Blocks covered destructive commands and self-disablement attempts, with tamper-evident audit trails.
->
-> Fast local checks — no model calls, no daemon, no network dependency.
 
-omamori is not a sandbox or a permission classifier. It is a local deterministic semantic guard for AI-triggered shell commands: it blocks covered destructive command classes before execution, blocks AI-driven self-disablement attempts, and runs alongside sandbox isolation and provider-level permission systems.
+Fast local checks — no model calls, no daemon, no network dependency. **macOS only.** Commands you type in a plain terminal pass through untouched; omamori acts only when an AI tool environment is detected. It is not a sandbox: run it alongside one ([how the two fit together](docs/reference-architecture.md)).
 
-**macOS only** — terminal commands are passed through unless an AI tool environment is detected. See [Tool Compatibility](#tool-compatibility) for supported AI tools and coverage.
+Since **1.0**, three surfaces are frozen until a major version: which command classes are blocked or redirected, the CLI's subcommands and documented exit codes, and the audit chain's verifiability across upgrades. The `config.toml` schema and the Rust library API are not frozen. The full statement is [docs/CONTRACT.md](docs/CONTRACT.md).
 
-**1.0** — three surfaces are frozen from this release: which command classes are blocked or redirected, the CLI's subcommands and the meaning of its documented exit codes, and the audit chain's verifiability across upgrades. Breaking any of them takes a major version. Two things are deliberately **not** frozen and are named as such: the `config.toml` schema, and the Rust library API (this release changes several `audit::*` types — see the CHANGELOG). The full statement, including what is *not* guaranteed, is [docs/CONTRACT.md](docs/CONTRACT.md).
+## Demo
 
 ![omamori demo](demo.svg)
 
-## Quick Start
+A Claude Code session. Codex CLI and Cursor get the same `block` / `log-only` / `trash` behavior when detected.
+
+## Quick start
 
 ```bash
-# Install (macOS)
 brew install yottayoshida/tap/omamori
-
-# One-command setup: shims + hooks + shell PATH + verify
 omamori setup
 ```
 
-That's it. `setup` installs shims and hooks, appends `$HOME/.omamori/shim` to your shell profile, and runs `omamori doctor` — all in one step. Works with Claude Code Auto mode, no extra config needed.
+`setup` installs the shims and hooks, adds `$HOME/.omamori/shim` to your shell profile, and runs `omamori doctor`. It is safe to re-run after upgrades. Preview with `--dry-run`; use `--non-interactive` in CI and scripts.
 
-> **Already installed?** `omamori setup` is idempotent — safe to re-run after upgrades.
-> For non-interactive environments (CI, scripts): `omamori setup --non-interactive`.
-> Preview without changes: `omamori setup --dry-run`.
+To see what omamori would do with a command, without running it:
 
-## Verifiable Claims
+```bash
+omamori explain -- rm -rf src/
+```
 
-What omamori claims, and how to verify each one. The **CI** column is a job id in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) that turns red on a regression, or a documented reason it cannot ([see below](#how-these-are-checked)):
+## What it does
+
+- **Blocks destructive commands before they run.** `rm -rf` goes to the macOS Trash, `git reset --hard` stashes first, and `git push --force`, `git clean -f`, `chmod 777`, `find -delete` and `rsync --delete` are blocked. Hooks also block obfuscated and dynamically generated forms such as `$'rm'` and `bash -c "$(cmd)"`.
+- **Stops the agent from switching it off.** `config disable`, `uninstall`, PATH overrides and environment-variable tampering are blocked while an AI tool is detected. Built-in rules cannot be disabled from `config.toml`.
+- **Keeps a record you can check.** Hook denies from Claude Code and Codex go into an HMAC-signed, hash-chained audit log that `omamori audit verify` checks, and `omamori doctor` checks that every defense layer is still installed.
+
+Claude Code is supported at Tier 1, Codex CLI and Cursor at Tier 2; other tools get the PATH shim only ([tool compatibility](docs/how-it-works.md#tool-compatibility)).
+
+## Verifiable claims
+
+What omamori claims, and how to verify each one. The **CI** column is a job id in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) that turns red on a regression, or a documented reason it cannot ([see how these are checked](docs/verifying-claims.md#how-these-are-checked)):
 
 <!-- claims:start -->
 | Claim | Verify yourself | CI | G-N |
@@ -47,361 +54,27 @@ What omamori claims, and how to verify each one. The **CI** column is a job id i
 | AI-driven self-disablement attempts are blocked in supported tool paths | `CLAUDECODE=1 omamori config disable rm-recursive-to-trash` (expect: blocked) | test | G-5 |
 <!-- claims:end -->
 
-Bypass classes outside this coverage scope remain possible — this is inherent to the PATH-shim and static-analysis approach. See [SECURITY.md](SECURITY.md) for the full bypass corpus and defense boundary — also published as a machine-readable JSON projection for tooling at [docs/defense-boundary.json](docs/defense-boundary.json).
-
-For the frozen set of guarantees, non-guarantees, supported tier, and breaking-change policy, see [docs/CONTRACT.md](docs/CONTRACT.md).
-
-### How these are checked
-
-Reproduce the machine-checkable rows locally with one command: `./scripts/verify-claims.sh` (claim 4's dependency and source tripwires, offline and deterministic) plus `./scripts/pre-pr-check.sh` (the full local claims/invariants pass, including the `omamori test` corpus behind claims 1/3/5). `omamori test` itself is a point-in-time check — it confirms the covered rules are present and evaluating as expected the moment you run it; the guarantee that a rule-matching *regression* turns CI red is enforced separately, by the `test` job's cargo test suite, plus claim 4's dedicated tripwire — not by re-running `omamori test` against a deliberately broken rule.
-
-<details>
-<summary>Which cargo tests back claim 1</summary>
-
-`policy_test.rs`, plus `property_tests.rs`'s `COVERED_DESTRUCTIVE_RULES` corpus for classes outside `omamori test`'s own set (e.g. `chmod-777-block` / `git-clean-force-block`).
-
-</details>
-
-Three claims carry an honest limitation instead of an unqualified "CI-enforced":
-
-- **Claim 2** covers **Claude Code / Codex `hook-check` Layer 2 deny events only**. Cursor's Layer 2 denies are stderr-only and do not reach the audit chain — see [SECURITY.md → Forensic semantics](SECURITY.md#forensic-semantics-v098). `omamori audit verify` on an empty log exits `0`; that is "nothing to verify," not "nothing was missed" — the write-side coverage (that the audit chain actually gets appended to, on every path that reaches it) is pinned by one cargo test per `HookCheckResult` variant that reaches the audit chain. A log that is *not* empty but whose entries were written while the key store could not be read is a different case and exits `2`: those entries carry no HMAC, so they are recorded but uncheckable, and the exit code says so rather than counting them as verified.
-
-  <details>
-  <summary>Which cargo tests back claim 2</summary>
-
-  `hook_deny_blockmeta_creates_audit_entry` / `hook_deny_blockrule_creates_audit_entry` / `hook_deny_blockstructural_creates_audit_entry` for the three deny variants, plus `hook_materialize_pipe_to_shell_creates_audit_entry` for the one allow-but-observable variant (`action="materialize"`).
-
-  </details>
-- **Claim 3**: the detection logic and an isolated install (`--base-dir`) are CI-tested. Verifying a **real user's `$HOME`** and shell profile — the actual installed state on your machine — is something only you can do, by running `omamori doctor` yourself; that is not a gap CI can close.
-- **Claim 4** is a negative claim ("no network dependency, no model call") and has no single push-button command that proves an absence — this is the one claim in the table with no existing behavioral test to lean on, so `claims-check` adds a dependency allowlist (every `Cargo.lock` crate name must be pre-approved — a new network-client crate fails CI) and a source tripwire (no network-API identifier in the hook-decision-path source) as the machine-enforced evidence. CI running offline is corroborating, not sufficient on its own.
-
-Core-policy immutability (claim 5) has two layers, and this row's "AI-driven" wording refers specifically to the second one. The always-on layer needs no AI environment to trigger: writing `enabled = false` for a core rule directly in `config.toml` is ignored, and the CLI's own `omamori config disable <core-rule>` is rejected too, citing a "core safety rule" — a human typing the same command sees the identical rejection. The layer this claim is actually about is separate: any `config disable` / `config enable` / `override disable` attempt is blocked outright while an AI environment is detected, before the core-rule check above even runs — a deliberate human-only escape hatch (`override disable` is the only supported path to change core policy, and it's part of what gets blocked). Run `CLAUDECODE=1 omamori config disable rm-recursive-to-trash` yourself to see that layer directly: setting `CLAUDECODE=1` simulates an AI-tool environment, and the rejection now cites the detected AI tool (`claude-code`), not the core-rule id; drop the env var and you'll see the always-on "core safety rule" rejection instead. See [SECURITY.md → Core Policy Immutability](SECURITY.md#core-policy-immutability-v050).
-
-G-6 (failure inside the guard fails closed, observably) has no README row — it is a structural property with no single verify command; see [docs/CONTRACT.md → G-6](docs/CONTRACT.md#g-6-failure-inside-the-guard-fails-closed-observably).
-
-## What It Blocks
-
-| Command | Pattern | Action |
-|---------|---------|--------|
-| `rm` | `-r`, `-rf`, `-fr`, `--recursive` | **trash** — move to macOS Trash |
-| `git` | `reset --hard` | **stash-then-exec** — `git stash` first |
-| `git` | `push --force`, `push -f` | **block** |
-| `git` | `clean -f`, `clean --force` | **block** |
-| `chmod` | `777` | **block** |
-| `find` | `-delete`, `--delete` | **block** |
-| `rsync` | `--delete` + 7 variants | **block** |
-
-<details>
-<summary>rsync blocked variants</summary>
-
-`--delete`, `--del`, `--delete-before`, `--delete-during`, `--delete-after`, `--delete-excluded`, `--delete-delay`, `--remove-source-files`
-
-</details>
-
-Layer 2 hooks defend against evasion patterns via builtin rules. Structural patterns are handled in two ways:
-
-| Category | Examples | Default action |
-|----------|----------|----------------|
-| Extractable | pipe-to-shell (`curl … \| bash`), parse edge cases | **allow** with audit-logged staging file |
-| Opaque | dynamic generation (`bash -c "$(cmd)"`), shell obfuscation (`$'rm'`, `{rm,-rf,/}`), oversized input | **block** |
-
-Environment-variable tampering, PATH override attempts, and self-modification commands (`config disable`, `uninstall`, etc.) are always blocked. See [SECURITY.md](SECURITY.md) for the full structural pattern taxonomy.
-
-> Extractable structural patterns are allowed by default, with an audit trail. To hard-block all structural patterns instead, set `[structural] action = "block"` in config.toml.
-
-All rules are customizable via TOML config. See [Configuration](#configuration) below.
-
-## Tool Compatibility
-
-| Tool | Status | Coverage | Notes |
-|------|--------|----------|-------|
-| Claude Code | Supported (Tier 1) | Layer 1 + Layer 2 | PreToolUse hook installed automatically. Auto Mode compatible. |
-| Codex CLI | Supported (Tier 2) | Layer 1 + Layer 2 | Hooks and config auto-configured during install. |
-| Cursor | Supported (Tier 2) | Layer 1 + Layer 2 | Re-merge generated hook snippet after upgrade. |
-| Gemini CLI, Cline, others | Community | Layer 1 only | Not E2E tested. |
-| Any tool setting `AI_GUARD=1` | Fallback | Layer 1 only | Generic opt-in detection. |
-
-> The demo image above is a Claude Code capture; the same `block` / `log-only` / `trash` behavior applies on Codex CLI and Cursor when their env vars are detected.
-
-See [docs/CONTRACT.md → Supported tier](docs/CONTRACT.md#supported-tier) for what Tier 1 (contractually guaranteed) versus Tier 2 (expected to work, no continuous verification) means.
-
-### Platforms
-
-macOS only at runtime — shim paths and Trash integration are macOS-specific. CI verifies contributors' PRs on **macOS + Ubuntu** (`#[cfg(unix)]` regressions caught before merge). Windows is not supported.
-
-### How omamori handles new / renamed tools
-
-omamori routes by **payload shape** (`tool_input.command` / `cmd` / `file_path` / `path` / `url`), not by tool name. A renamed AI tool carrying a `command` field still reaches the full pipeline; unrecognised shapes still allow but emit `unknown_tool_fail_open` audit events. Review with `omamori audit unknown` or check `omamori doctor`'s 30-day count line.
-
-For the full shape catalogue, scope, known operational noise (legitimate tools like `Glob` / `Task` landing in fail-open), and the strict-mode trade-off, see [SECURITY.md → Hook Coverage](SECURITY.md#hook-coverage-layer-2).
-
-## How It Works
-
-```
-AI CLI tool → CLAUDECODE=1 → rm -rf src/
-                                ↓
-                          [omamori shim]
-                                ↓
-                        blocked (protected path)
-
-Terminal → rm -rf src/
-                ↓
-          [/usr/bin/rm]
-                ↓
-          deleted normally
-```
-
-### Defense layers
-
-| Capability | What it does | Verified by |
-|------------|--------------|-------------|
-| **Layer 1 — PATH shim** | Intercepts destructive commands (`rm`, `git`, `chmod`, `find`, `rsync`) by name when an AI env var is detected | `omamori test`, CI |
-| **Layer 2 — Hooks** | Catches evasion patterns: shell wrappers, pipe-to-shell, dynamic generation, PATH override bypass | Hook integration tests |
-| **Self-defense** | Blocks self-modification commands (`config disable`, `uninstall`, etc.), hook/config editing, env-var unsetting while AI-detected | Acceptance test suite |
-| **Audit chain** | HMAC-SHA256 signed, hash-chained tamper-evident JSONL log at `~/.local/share/omamori/audit.jsonl` — also records successful `config disable/enable/add` mutations, not just command decisions | `omamori audit verify` |
-| **Integrity monitoring** | Verifies shims, hooks, config, core policy, PATH order. Detects subtle hook body rewrites | `omamori doctor`, `omamori status` |
-| **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, Claude Code settings.json | Hook integration tests |
-| **Auto-sync** | Detects version mismatch after `brew upgrade` and auto-regenerates hook files | Smoke test |
-
-Core policy: built-in rules (15 at 1.0, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](#cli-reference).
-
-**Performance**: hook check completes in well under 0.1ms in the benchmark harness — typically ~1 µs to block and ~57 µs to allow. Subprocess startup by the AI tool dominates total cost. See `benches/` and [#124](https://github.com/yottayoshida/omamori/issues/124) for methodology.
-
-### Verifiability
-
-`doctor` groups installation checks into Layer 1, Layer 2, and Integrity, then adds recent risk signals from the audit report.
-
-<!-- update output samples when doctor/report format changes -->
-```
-$ omamori doctor
-Protection status: OK
-
-  [Layer 1] PATH shims 6/6
-    last active: today
-  [Layer 2] Hook defense 5/5
-  [Integrity] Config & baseline 3/3
-  [Risk signals] Last 30 days: quiet
-
-  run `omamori doctor --verbose` for full details
-
-$ omamori report --last 7d
-omamori report — last 7 days
-
-  Block events: 42
-    by layer: layer2: 42
-    by provider: claude-code: 38, codex: 4
-  Audit log: intact
-```
-
-## Field Notes
-
-omamori is dogfooded daily on the developer's own setup. Recent observed cases:
-
-### 2026-04-23: Codex CLI tried to read `config.toml` during MCP re-auth
-
-When Codex CLI ran `mcp login notion`, it first attempted `rg` / `sed` against `~/.codex/config.toml` to find the auth setting. omamori hooks blocked both reads ("blocked attempt to edit Codex config"). Codex then tried to use `omamori explain -- ...` as an oracle to probe protection — also blocked by oracle-attack prevention. Codex pivoted to `codex mcp --help` → `codex mcp login notion` and completed OAuth via the browser. No protection bypassed; user-side hint preserved for after-the-fact verification.
-
-Full transcript: [`docs/dogfood/2026-04-23-codex-notion-mcp-reauth.md`](docs/dogfood/2026-04-23-codex-notion-mcp-reauth.md).
-
-These are honest snapshots of a single developer's environment, not benchmark claims.
-
-## Configuration
-
-### Context-aware actions
-
-omamori can adjust actions based on what the command targets:
-
-| Command | Without context | With context |
-|---------|----------------|-------------|
-| `rm -rf target/` | trash | **log-only** (regenerable) |
-| `rm -rf src/` | trash | **block** (protected) |
-| `git reset --hard` (no changes) | stash-then-exec | **log-only** (git-aware) |
-
-**Enabled by default.** Built-in lists for regenerable (`target/`, `node_modules/`, etc.) and protected (`src/`, `.git/`, `.env`, etc.) paths are active out of the box. To customize, add a `[context]` section to `~/.config/omamori/config.toml`:
-
-```toml
-[context]
-# Specifying a list replaces the built-in defaults (not appends).
-# regenerable_paths = ["target/", "node_modules/", "my-cache/"]
-# protected_paths = ["src/", "lib/", ".git/", ".env", ".ssh/", "secrets/"]
-```
-
-> **Note**: specifying `regenerable_paths` or `protected_paths` **replaces** the built-in defaults (not appends). Include the built-in entries you want to keep.
-
-Security features: symlink defense via `canonicalize()`, path traversal normalization, NEVER_REGENERABLE hardcoded list, fail-close on errors.
-
-### Rule configuration
-
-Built-in rules are always inherited. Only write the rules you want to change:
-
-```bash
-omamori config list                          # show all rules
-omamori config add my-rule --command rm --action block --match-any -rf  # scaffold a custom rule
-omamori config disable my-rule               # disable it
-omamori config enable my-rule                # re-enable it
-omamori override disable git-push-force-block  # disable a built-in (core rules use override, not config disable)
-omamori test                                 # verify policy
-```
-
-Or edit `~/.config/omamori/config.toml` directly. Config is auto-created by `omamori setup` (or `install --hooks`). See `omamori init --stdout` for the full template.
-
-<details>
-<summary>Configuration examples</summary>
-
-**Disable a custom rule** (built-ins ignore `enabled = false` here — see below):
-```toml
-[[rules]]
-name = "my-rule"
-enabled = false
-```
-
-**Disable a built-in rule** (core rules can only be disabled via `[overrides]`, equivalent to `omamori override disable <rule-name>`):
-```toml
-[overrides]
-git-push-force-block = false
-```
-
-**Move files to a custom directory**:
-```toml
-[[rules]]
-name = "rm-to-backup"
-command = "rm"
-action = "move-to"
-destination = "/Users/you/.omamori-quarantine/"  # under your home directory, not /tmp
-match_any = ["-r", "-rf", "-fr", "--recursive"]
-```
-
-**Override an existing rule**:
-```toml
-[[rules]]
-name = "rm-recursive-to-trash"
-action = "move-to"
-destination = "/Users/you/.omamori-quarantine/"  # under your home directory, not /tmp
-```
-
-**Enable audit retention** (prunes entries older than N days):
-```toml
-[audit]
-retention_days = 90  # 0 = keep all (default). Minimum 7 days.
-```
-
-**Enable strict mode** (block shim-intercepted commands when HMAC secret is unavailable):
-```toml
-[audit]
-strict = true  # default: false. Hook-only commands (ls, cat, etc.) are not affected.
-```
-
-**Control structural block behavior** (materialize vs hard-block):
-```toml
-[structural]
-action = "block"     # default: "materialize". Set to "block" to hard-block all structural patterns.
-retention_days = 7   # auto-prune staging files older than N days. 0 = disabled.
-max_files = 500      # cap on staging file count; oldest deleted first. 0 = disabled.
-```
-
-**Notes**: config requires `chmod 600`. Destinations must be absolute paths on the same volume. System directories and symlinks are rejected.
-
-</details>
-
-## CLI Reference
-
-```
-omamori setup [--dry-run] [--non-interactive] [--source PATH]  # One-command install + shell profile + verify
-omamori install [--hooks] [--source PATH]  # Install shims + hooks (no shell profile)
-omamori doctor [--fix] [--verbose] [--json]  # Diagnose and auto-repair installation (exit 0/1/2)
-                                         # A line under the headline points at the risk signals when they hold something to act on
-omamori explain [--json] -- <cmd...>     # Show what would happen to a command and why
-omamori test [--config PATH]             # Verify policy rules
-omamori status [--refresh]               # Health check all defense layers (exit 0/1/2)
-omamori exec [--config PATH] -- CMD      # Run command through policy engine
-
-omamori report [--last 7d] [--json] [--verbose]  # Aggregate audit summary (1d–90d)
-
-omamori audit verify                     # Verify hash chain integrity (exit 0/1/2/3/4)
-omamori audit show [--last N] [--json]   # View recent audit entries (default: last 20)
-omamori audit show --all                 # View all entries
-omamori audit show --rule <name>         # Filter by rule (substring match)
-omamori audit show --provider <name>     # Filter by provider
-omamori audit show --relaxed             # Filter to relaxed allows (legacy data-context flag; pre-v0.10.4 logs only)
-
-omamori config list                      # Show rules with status
-omamori config add <name> --command <cmd> --action <block|trash|stash|log-only|move-to> [--match-any <token>]... [--match-all <token>]... [--destination <abs-path>] [--message <text>]  # Scaffold a custom rule
-omamori config disable <rule>            # Disable a rule
-omamori config enable <rule>             # Re-enable a rule
-omamori config validate [PATH]           # Validate config (exit 0/1/2)
-omamori override disable <rule>          # Override a core safety rule
-omamori override enable <rule>           # Restore a core safety rule
-
-omamori break-glass --rule <id> [--duration <dur>]  # Time-limited bypass for false positives
-omamori break-glass --status             # Show active bypasses
-omamori break-glass --clear [--rule <id>]  # Revoke bypass(es)
-
-omamori init [--force] [--stdout]        # Create/reset config
-omamori uninstall                        # Remove shims + hooks
-omamori hook-check [--provider NAME] [--json-error]  # Hook detection engine (used internally by hooks)
-omamori cursor-hook                      # Cursor hook handler
-omamori --version                        # Show version
-```
-
-## Troubleshooting
-
-Stuck on something else — a false positive, a temporary bypass, "why was this blocked?", or a staging-file message? Start with the [FAQ](docs/FAQ.md). This section covers the hook-error class of problems specifically.
-
-### Claude Code blocks every Bash command with a "hook error" / "No such file or directory"
-
-This means the hook script registered in `~/.claude/settings.json` points at a path that no longer exists (e.g. a Homebrew Cellar path from a removed version, or a build directory that was cleaned up). omamori's hooks are fail-close by design, so a missing hook script blocks everything rather than silently allowing it.
-
-**Fix**: in a plain terminal (not through an AI agent), run:
-
-```bash
-omamori install --hooks
-```
-
-This regenerates the hook script at the canonical path and re-merges the entry into `~/.claude/settings.json`. `omamori doctor --fix` diagnoses the same class of problem in more detail.
-
-**Why a plain terminal, specifically**: the "hook error" you're seeing blocks *every* Bash command through Claude Code — including one where you ask the AI agent to run `omamori install --hooks` itself. That command would go through the exact same broken hook and fail the same way, so an AI agent cannot fix this from inside its own Bash tool no matter what it tries (verified in #355). The hook wrapper itself now prints this same guidance to stderr when it can't reach `hook-check` at all (a broken/missing exec path, not a policy decision) — if you see that message, it's confirming the same thing this section describes.
-
-If the above doesn't fix it, check for a **project-level** `.claude/settings.json` (in the repository you're working in, not `~/.claude/settings.json`). A `PreToolUse` entry tagged `x-omamori-version` there can also point at a stale path — remove that entry manually, since `omamori install --hooks` only manages the user-level `~/.claude/settings.json`.
-
-### Claude Code blocks every Bash command with a hook error that isn't "No such file or directory"
-
-Unlike the missing-path case above, the hook's registered path can exist but still be the wrong binary — for example, if you're developing omamori itself and run `cargo build`/`cargo test` in the repo, the shim's background self-repair could (rarely) resolve its own executable to a stale build artifact and bake that path into the hook script (#349).
-
-omamori verifies that a resolved path actually satisfies the hook's contract before writing it anywhere (#349), *and* refuses to persist a path that looks like a `cargo build`/`cargo test` artifact in the first place — `target/debug/...`, `target/release/...`, or the `cargo build --target <triple>` cross-compile layout — even when that binary would otherwise pass verification (#354). Both the background self-repair (triggered automatically on version/hash mismatch) and `omamori install --hooks`/`omamori setup` silently keep the existing hook / fail loudly (respectively) rather than pinning a path the next build can delete or replace out from under you. `omamori doctor` also detects a hook whose on-disk path no longer passes verification, even if the file's content otherwise looks up to date.
-
-**Fix**: same as above — run `omamori install --hooks` in a plain terminal. If it fails, the error message names the broken path; make sure `omamori` on your `PATH` resolves to a stable install (Homebrew-linked or `~/.cargo/bin`), not a `target/debug`/`target/release` build directory, then retry. If you're intentionally developing omamori itself and want to pin a dev build anyway, pass `--source` explicitly: `omamori install --hooks --source <path>` or `omamori setup --source <path>` — this is the one case where you're making the provenance judgment the check otherwise makes automatically.
-
-### Contributing to omamori: `cargo test` and your real `~/.claude` / `~/.codex`
-
-omamori's test suite pins `HOME` to a throwaway directory for every subprocess/in-process test that touches settings merge (#210). If you add a new test that calls `install`/`uninstall` or spawns the `omamori` binary, inject an isolated `HOME` (see existing tests in `tests/integration.rs`) — otherwise the test can merge a dead hook path into your real `~/.claude/settings.json` or `~/.codex/hooks.json`.
-
-## Scope and Limitations
-
-### Sandbox complementarity
-
-omamori operates at the **semantic layer** — it understands *what* a command does (Layer 1: shim, Layer 2: hooks). A filesystem sandbox operates at the **OS boundary** — it restricts *where* processes can read and write. These are complementary:
-
-- omamori catches `rm -rf src/` before it runs (semantic: "dangerous command").
-- A sandbox prevents damage if something slips through (boundary: "this process cannot write outside `/tmp`").
-
-For defense in depth, combine omamori with your AI tool's sandbox (Codex CLI sandbox (default-on), Claude Code `/sandbox`, Cursor agent sandbox) or [nono](https://github.com/always-further/nono). For the responsibility boundary between the two layers, concrete examples of what each catches, and recommended per-tool setup order, see [docs/reference-architecture.md](docs/reference-architecture.md).
-
-### Structural limitations
-
-These are inherent to the PATH shim approach:
-
-- **Full-path execution** (`/bin/rm`) bypasses the shim — mitigated by Layer 2 hooks.
-- **`sudo`** changes PATH — omamori blocks when it detects elevated execution.
-- **Interpreter commands** (`python -c "shutil.rmtree(...)"`) — not detected. [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools.
-- **Obfuscated commands** (base64, runtime variable indirection) — runtime-evaluated forms cannot be detected by static analysis. Static shell expansion at command verb position (`$'rm'`, `{rm,-rf,/}`) is caught.
-- **AI self-bypass** — `config disable` / `uninstall` / `break-glass` are blocked; direct file editing blocked by hooks (Claude Code only). For human-initiated false positive recovery, use `omamori break-glass --rule <id>` (time-limited, audit-logged).
-
-For what omamori **does not** catch — by design or by structural limit — and for the full security model and bypass corpus, see [SECURITY.md](SECURITY.md).
-
-## Contributing & License
-
-Bug reports and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, the SHA-pin policy, and the local pre-PR gate (`./scripts/pre-pr-check.sh`). For security vulnerabilities, see [SECURITY.md → Reporting a Vulnerability](SECURITY.md#reporting-a-vulnerability) instead of filing a public issue. Releases are reproducible: `Cargo.lock` is tracked, every CI `cargo` invocation runs with `--locked`, and every GitHub Action `uses:` ref is pinned to a 40-char SHA (Dependabot keeps them current). See [SECURITY.md](SECURITY.md#ai-assisted-contribution-invariants-v093) for the five invariants that govern AI-assisted contributions.
-
-Running omamori day-to-day and want to send back structured feedback? See [docs/evaluation-kit.md](docs/evaluation-kit.md) for a self-contained 30-day checklist and feedback template — a partial report from stopping early is a valid, useful submission too.
+Where CI cannot reach:
+
+- **Claim 2** covers Claude Code and Codex hook denies only. Cursor's Layer 2 denies are stderr-only and do not reach the audit chain.
+- **Claim 3**: CI tests the detection logic on an isolated install. Checking a real user's `$HOME` and shell profile is something only you can do, with `omamori doctor`.
+- **Claim 4** is a negative claim, and there is no single push-button command that proves an absence. CI enforces it with a dependency allowlist and a source tripwire instead.
+
+Run `./scripts/verify-claims.sh` to reproduce the machine-checkable rows. Which tests back each claim, claim 5's two layers, and G-6 are in [docs/verifying-claims.md](docs/verifying-claims.md). Bypass classes outside this scope remain possible: see [SECURITY.md](SECURITY.md) for the bypass corpus and defense boundary, also published as [docs/defense-boundary.json](docs/defense-boundary.json).
+
+## Docs
+
+- [How omamori works](docs/how-it-works.md) — what it blocks, supported tools, defense layers, performance, and what it does not catch
+- [Configuration](docs/configuration.md) — context-aware actions, custom rules, audit retention, strict mode
+- [CLI reference](docs/cli.md)
+- [Troubleshooting](docs/troubleshooting.md) for hook errors, and the [FAQ](docs/FAQ.md) for everything else
+- [Contract](docs/CONTRACT.md) — what 1.0 guarantees and what it does not
+- [Security](SECURITY.md) — threat model, bypass corpus, and [reporting a vulnerability](SECURITY.md#reporting-a-vulnerability)
+- [Using omamori with a sandbox](docs/reference-architecture.md)
+- [30-day evaluation kit](docs/evaluation-kit.md) — a checklist and feedback template
+- [Field notes](docs/dogfood/README.md) — what omamori caught in daily use
+- [Contributing](CONTRIBUTING.md)
+
+## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.

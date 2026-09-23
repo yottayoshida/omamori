@@ -12,7 +12,7 @@ Practical answers for the situations omamori users hit most often. Start here wh
 | "What is this staging file / 'materialized' message?" | [What is a staging file?](#what-is-a-staging-file--what-does-materialized-mean) |
 | "`omamori audit verify` says the chain is broken" | [omamori audit verify says the chain is broken](#omamori-audit-verify-says-the-chain-is-broken) |
 | "Would omamori catch X?" | [Does omamori protect against X?](#does-omamori-protect-against-x) |
-| "Claude Code blocks *every* command with a hook error" | [README → Troubleshooting](../README.md#troubleshooting) (different problem class: a broken hook path, not a policy decision) |
+| "Claude Code blocks *every* command with a hook error" | [Troubleshooting](troubleshooting.md) (different problem class: a broken hook path, not a policy decision) |
 
 ---
 
@@ -127,7 +127,7 @@ If you'd rather hard-block structural patterns than collect receipts:
 action = "block"     # default: "materialize"
 ```
 
-Named-rule matches (`rm -rf` etc.) are unaffected by this setting — those always follow their rule's action. Details on the `[structural]` config section: [README.md → Rule configuration](../README.md#rule-configuration).
+Named-rule matches (`rm -rf` etc.) are unaffected by this setting — those always follow their rule's action. Details on the `[structural]` config section: [Configuration → Rule configuration](configuration.md#rule-configuration).
 
 ---
 

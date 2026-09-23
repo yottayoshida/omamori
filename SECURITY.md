@@ -24,7 +24,7 @@ Found a way to bypass a guarantee this document claims omamori provides, or a wa
 
 **In scope**: a bypass of a guarantee documented in the [Defense Boundary Matrix](#defense-boundary-matrix-v0101) or the README's [Verifiable Claims](README.md#verifiable-claims) table; a way to circumvent omamori's self-defense.
 
-**Out of scope**: anything already documented as a known-limit ([Structural Limits](#structural-limits), [Bypass Corpus Testing → Known limitations](#known-limitations-known_limit)) or a structural limit inherent to the PATH-shim + static-analysis approach (see README → [Scope and Limitations](README.md#scope-and-limitations)). These are welcome as regular GitHub issues, not private reports.
+**Out of scope**: anything already documented as a known-limit ([Structural Limits](#structural-limits), [Bypass Corpus Testing → Known limitations](#known-limitations-known_limit)) or a structural limit inherent to the PATH-shim + static-analysis approach (see [How omamori works → Scope and Limitations](docs/how-it-works.md#scope-and-limitations)). These are welcome as regular GitHub issues, not private reports.
 
 A report that leads to a fix follows the [Known-bypass-becomes-row rule](#known-bypass-becomes-row-rule): a new Defense Boundary Matrix row, a corpus test, and — if applicable — a new known-limit entry.
 
