@@ -10,7 +10,7 @@ omamori can adjust actions based on what the command targets:
 |---------|----------------|-------------|
 | `rm -rf target/` | trash | **log-only** (regenerable) |
 | `rm -rf src/` | trash | **block** (protected) |
-| `git reset --hard` (no changes) | stash-then-exec | **log-only** (git-aware) |
+| `git reset --hard` (no changes) | stash-then-exec | **log-only** (git-aware; not applied when the command picks its repository with a global option or a `GIT_*` variable) |
 
 **Enabled by default.** Built-in lists for regenerable (`target/`, `node_modules/`, etc.) and protected (`src/`, `.git/`, `.env`, etc.) paths are active out of the box. To customize, add a `[context]` section to `~/.config/omamori/config.toml`:
 

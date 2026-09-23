@@ -412,7 +412,7 @@ pub fn evaluate_context(
     config: &ContextConfig,
     base: Option<&Path>,
 ) -> ContextEvaluation {
-    let targets = invocation.target_args();
+    let targets = invocation.path_targets();
 
     // `#460`: the `/` fallback for an unresolvable CWD used to live in
     // `process_base_or_root` and applied unconditionally. It is only sound for
@@ -549,7 +549,9 @@ fn git_status_porcelain(
     use std::time::Duration;
 
     let mut cmd = Command::new("git");
-    cmd.args(["status", "--porcelain"])
+    // `--untracked-files=normal` overrides a repo's `status.showUntrackedFiles=no`,
+    // which would otherwise hide the untracked files `git clean` deletes.
+    cmd.args(["status", "--porcelain", "--untracked-files=normal"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     prepare_git_command(&mut cmd, detector_env_keys, cwd, injected_env);
@@ -581,6 +583,26 @@ fn git_status_porcelain(
             Err(format!("git status timed out after {}ms", timeout_ms))
         }
     }
+}
+
+/// Whether the command may act on a repository other than the one
+/// `git status` would report on here.
+///
+/// `git status` below runs in the cwd with [`GIT_SPOOFABLE_ENV_VARS`] removed
+/// (T4), but the command itself follows its own global options (`-C`,
+/// `--git-dir`, ...) and inherits those variables. When either is present the
+/// "no changes, so log-only" downgrade would judge one repository and let the
+/// command destroy another, so it is not applied. Deliberately does not read
+/// what the options say: any global option at all is enough, so a misread
+/// option can only keep the stash, never skip it.
+fn command_may_act_elsewhere(
+    invocation: &CommandInvocation,
+    injected_env: &[(&str, &str)],
+) -> bool {
+    invocation.args.first().is_some_and(|a| a.starts_with('-'))
+        || GIT_SPOOFABLE_ENV_VARS
+            .iter()
+            .any(|key| env::var_os(key).is_some() || injected_env.iter().any(|(k, _)| k == key))
 }
 
 /// Check if we're inside a git repository.
@@ -619,6 +641,13 @@ fn evaluate_git_context_in_dir(
         return None;
     }
 
+    if command_may_act_elsewhere(invocation, injected_env) {
+        return Some(ContextEvaluation {
+            action_override: None,
+            reason: "the command selects its repository with a global option or a GIT_* variable; skipping git-aware evaluation".to_string(),
+        });
+    }
+
     // Not inside a git repo → skip (avoid false positives)
     if !is_inside_git_repo(detector_env_keys, cwd, injected_env) {
         return Some(ContextEvaluation {
@@ -650,6 +679,16 @@ fn evaluate_git_context_in_dir(
     // git clean with force flag: check for untracked files
     let expanded_args = crate::rules::expand_short_flags(&invocation.args);
     let has_force = expanded_args.iter().any(|a| a == "-f" || a == "--force");
+    // `git status --porcelain` does not list ignored files, so "no untracked
+    // files" says nothing about what `-x` / `-X` would delete (`.env`, ...).
+    let removes_ignored = expanded_args.iter().any(|a| a == "-x" || a == "-X");
+    if args.contains(&"clean") && has_force && removes_ignored {
+        return Some(ContextEvaluation {
+            action_override: None,
+            reason: "git clean -x/-X also removes ignored files; keeping original action"
+                .to_string(),
+        });
+    }
     if args.contains(&"clean") && has_force {
         return match git_status_porcelain(detector_env_keys, config.timeout_ms, cwd, injected_env) {
             Ok(output) => {
@@ -1090,6 +1129,59 @@ mod tests {
         base
     }
 
+    #[test]
+    fn evaluate_context_reads_no_git_option_value_or_reset_ref_as_a_target() {
+        // `git -C node_modules reset --hard` resets the repository at
+        // node_modules; it does not delete a path called node_modules. Reading
+        // the `-C` value as a target downgraded the reset to log-only through
+        // the regenerable list, so it ran with no stash. `reset --hard` is
+        // never confined to a path argument, so no argument of it is a target.
+        let base = test_base();
+        let reset = RuleConfig::new(
+            "git-reset-hard-stash",
+            "git",
+            ActionKind::StashThenExec,
+            vec!["reset".to_string(), "--hard".to_string()],
+            Vec::new(),
+            None,
+        );
+        for args in [
+            &["-C", "node_modules", "reset", "--hard"][..],
+            &["--work-tree", "target", "reset", "--hard"][..],
+            &["-C", "src", "reset", "--hard"][..],
+            &["reset", "--hard", "target"][..],
+            // A ref that shares a regenerable directory's name, and an
+            // option's value: neither is a path the command deletes.
+            &["push", "--force", "origin", "target"][..],
+            &["clean", "-fd", "-e", "node_modules"][..],
+        ] {
+            let eval = evaluate_context(&git_invocation(args), &reset, &test_config(), Some(&base));
+            assert_eq!(eval.action_override, None, "{args:?}: {}", eval.reason);
+        }
+
+        // Control: a clean confined to a path is still judged by that path.
+        let clean = RuleConfig::new(
+            "git-clean-force-block",
+            "git",
+            ActionKind::Block,
+            vec!["clean".to_string()],
+            vec!["-f".to_string()],
+            None,
+        );
+        let eval = evaluate_context(
+            &git_invocation(&["clean", "-fd", "node_modules"]),
+            &clean,
+            &test_config(),
+            Some(&base),
+        );
+        assert_eq!(
+            eval.action_override,
+            Some(ActionKind::LogOnly),
+            "{}",
+            eval.reason
+        );
+    }
+
     // --- #460: an unresolvable base ---
 
     fn rm_rf(target: &str) -> CommandInvocation {
@@ -1455,6 +1547,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn committed_repo() -> PathBuf {
+        let dir = create_git_repo();
+        std::fs::write(dir.join("dummy.txt"), "init").unwrap();
+        for args in [&["add", "."][..], &["commit", "-m", "init"][..]] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+        }
+        dir
+    }
+
+    fn git_invocation(args: &[&str]) -> CommandInvocation {
+        CommandInvocation::new(
+            "git".to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn git_context_does_not_downgrade_when_a_global_option_selects_the_repository() {
+        // The cwd repo is clean, which is what used to downgrade
+        // `git -C <elsewhere> reset --hard` to log-only while it reset
+        // <elsewhere> unstashed. Any global option is enough, read or not.
+        let dir = committed_repo();
+        for args in [
+            &["-C", "/elsewhere", "reset", "--hard"][..],
+            &["--git-dir=/elsewhere/.git", "reset", "--hard"][..],
+            &["--no-pager", "reset", "--hard"][..],
+        ] {
+            let eval = evaluate_git_context_in_dir(
+                &git_invocation(args),
+                &git_config(),
+                &[],
+                Some(&dir),
+                &[],
+            )
+            .expect("git commands are evaluated");
+            assert_eq!(eval.action_override, None, "{args:?}: {}", eval.reason);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_context_sees_untracked_files_a_repo_config_hides_from_status() {
+        // `status.showUntrackedFiles=no` makes plain `git status --porcelain`
+        // print no `??` lines, which read as "nothing for clean to delete".
+        let dir = committed_repo();
+        std::process::Command::new("git")
+            .args(["config", "status.showUntrackedFiles", "no"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        std::fs::write(dir.join("untracked.txt"), "work").unwrap();
+        let eval = evaluate_git_context_in_dir(
+            &git_invocation(&["clean", "-fd"]),
+            &git_config(),
+            &[],
+            Some(&dir),
+            &[],
+        )
+        .expect("git commands are evaluated");
+        assert_eq!(eval.action_override, None, "{}", eval.reason);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_context_does_not_downgrade_clean_that_removes_ignored_files() {
+        // `git status --porcelain` lists no ignored files, so a repo with no
+        // untracked files can still lose `.env` to `git clean -x`.
+        let dir = committed_repo();
+        for args in [&["clean", "-fdx"][..], &["clean", "-f", "-X"][..]] {
+            let eval = evaluate_git_context_in_dir(
+                &git_invocation(args),
+                &git_config(),
+                &[],
+                Some(&dir),
+                &[],
+            )
+            .expect("git commands are evaluated");
+            assert_eq!(eval.action_override, None, "{args:?}: {}", eval.reason);
+        }
+        // Control: without -x/-X the same clean repo still downgrades.
+        let eval = evaluate_git_context_in_dir(
+            &git_invocation(&["clean", "-fd"]),
+            &git_config(),
+            &[],
+            Some(&dir),
+            &[],
+        )
+        .expect("git commands are evaluated");
+        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn git_context_clean_repo_downgrades_to_log_only() {
         let dir = create_git_repo();
@@ -1545,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn git_context_sanitizes_git_dir_env() {
+    fn git_context_does_not_downgrade_when_git_dir_is_set() {
         let dir = create_git_repo();
 
         // Create initial commit so repo is clean
@@ -1564,8 +1754,10 @@ mod tests {
             .status()
             .unwrap();
 
-        // GIT_DIR spoof: point to a non-existent dir.
-        // evaluate_git_context should remove GIT_DIR before calling git.
+        // The cwd repo is clean, but `git reset --hard` inherits GIT_DIR and
+        // acts on that repository, which `git status` here (GIT_DIR removed,
+        // T4) never looked at. Downgrading on this cwd's cleanliness is what
+        // let a reset destroy another repository's changes unstashed.
         let inv = CommandInvocation::new(
             "git".to_string(),
             vec!["reset".to_string(), "--hard".to_string()],
@@ -1578,17 +1770,15 @@ mod tests {
             &[("GIT_DIR", "/nonexistent/.git")],
         );
 
-        // Should still work correctly (env var sanitized)
-        assert!(result.is_some());
-        let eval = result.unwrap();
-        // Clean repo → LogOnly (proves GIT_DIR was sanitized, not followed)
-        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+        let eval = result.expect("git commands are evaluated");
+        assert_eq!(eval.action_override, None, "{}", eval.reason);
+        assert!(eval.reason.contains("GIT_* variable"), "{}", eval.reason);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn git_context_sanitizes_git_work_tree_env() {
+    fn git_context_does_not_downgrade_when_git_work_tree_is_set() {
         let dir = create_git_repo();
 
         // Create initial commit so repo is clean
@@ -1607,8 +1797,8 @@ mod tests {
             .status()
             .unwrap();
 
-        // GIT_WORK_TREE spoof: point to a non-existent dir.
-        // evaluate_git_context should remove GIT_WORK_TREE before calling git.
+        // Same as GIT_DIR: the reset follows GIT_WORK_TREE, the status check
+        // does not, so the cwd's cleanliness says nothing about it.
         let inv = CommandInvocation::new(
             "git".to_string(),
             vec!["reset".to_string(), "--hard".to_string()],
@@ -1621,11 +1811,9 @@ mod tests {
             &[("GIT_WORK_TREE", "/nonexistent/fake")],
         );
 
-        // Should still work correctly (env var sanitized)
-        assert!(result.is_some());
-        let eval = result.unwrap();
-        // Clean repo → LogOnly (proves GIT_WORK_TREE was sanitized, not followed)
-        assert_eq!(eval.action_override, Some(ActionKind::LogOnly));
+        let eval = result.expect("git commands are evaluated");
+        assert_eq!(eval.action_override, None, "{}", eval.reason);
+        assert!(eval.reason.contains("GIT_* variable"), "{}", eval.reason);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1697,7 +1885,10 @@ mod tests {
 
         let inv = super::CommandInvocation::new(
             "git".to_string(),
-            vec!["clean".to_string(), "-fdx".to_string()],
+            // `-fd`, not `-fdx`: with -x/-X the downgrade is refused, because
+            // `git status --porcelain` cannot see the ignored files it deletes
+            // (git_context_does_not_downgrade_clean_that_removes_ignored_files).
+            vec!["clean".to_string(), "-fd".to_string()],
         );
         let result = evaluate_git_context_in_dir(&inv, &git_config(), &[], Some(&dir), &[]);
         assert!(result.is_some());
