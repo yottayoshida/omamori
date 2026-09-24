@@ -238,18 +238,3 @@ jobs:
         run: ./scripts/verify-claims.sh
       - name: Prove the claim-4 tripwires detect an injected violation
         run: ./scripts/verify-claims.sh --self-test
-
-  # Synthetic fixture: verifies JevFuzz Action wiring, not Omamori behavior.
-  jevfuzz-action-smoke:
-    name: JevFuzz Action smoke
-    runs-on: ubuntu-latest
-    needs: action-pin-check
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          persist-credentials: false
-      - uses: yottayoshida/jevfuzz@6ec5acbf16801620fdef6b646d082def91b4dfee
-        with:
-          command: plan
-          target: .jevfuzz/campaign.json
