@@ -368,17 +368,17 @@ fn gc_stale_temps(dir: &Path) {
 
 /// RAII guard: removes the temp file at `path` unless [`disarm`](Self::disarm)
 /// is called first.
-struct TempGuard<'a> {
+pub(crate) struct TempGuard<'a> {
     path: &'a Path,
     armed: bool,
 }
 
 impl<'a> TempGuard<'a> {
-    fn new(path: &'a Path) -> Self {
+    pub(crate) fn new(path: &'a Path) -> Self {
         Self { path, armed: true }
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
 }

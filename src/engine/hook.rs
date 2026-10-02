@@ -1870,6 +1870,15 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
         "audit high-water-mark (in-progress write)",
     ),
     (
+        // Where a prune builds the log that replaces the one it is pruning
+        // (ADR-0016): `<audit log>.prune-tmp`. No `.jsonl` in the suffix —
+        // `audit.path` is configurable, and the file is named after whatever
+        // the log is called.
+        ".prune-tmp",
+        MatchKind::FilenameSuffix,
+        "audit log (prune in progress)",
+    ),
+    (
         ".local/share/omamori",
         MatchKind::Subpath,
         "omamori data directory",
@@ -3012,6 +3021,28 @@ mod tests {
             .expect("audit.jsonl.hwm under a custom (non-data-dir) audit path must stay protected");
         assert_eq!(pattern, ".jsonl.hwm");
         assert_eq!(kind, MatchKind::FilenameSuffix);
+    }
+
+    /// ADR-0016: the file a prune builds its result in is named after the
+    /// log, and `audit.path` can put the log anywhere under any name.
+    #[test]
+    fn protected_file_path_prune_tmp_matches_whatever_the_log_is_called() {
+        for path in [
+            "/home/user/.local/share/omamori/audit.jsonl.prune-tmp",
+            "/custom/audit-dir/audit.jsonl.prune-tmp",
+            "/custom/audit-dir/trail.log.prune-tmp",
+        ] {
+            let (pattern, kind, _) =
+                is_protected_file_path(path).unwrap_or_else(|| panic!("{path} must be protected"));
+            if !path.contains(".local/share/omamori") {
+                assert_eq!(pattern, ".prune-tmp", "{path}");
+                assert_eq!(kind, MatchKind::FilenameSuffix, "{path}");
+            }
+        }
+        assert!(
+            is_protected_file_path("/custom/audit-dir/trail.log").is_none(),
+            "the control: the suffix is what matched"
+        );
     }
 
     #[test]

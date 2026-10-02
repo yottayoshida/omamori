@@ -8,10 +8,10 @@ use super::chain::{
 };
 use super::retention::{PrunedFindings, decode_findings, is_prune_point};
 use super::secret::{
-    KeyStoreOutlook, Keyring, UNRESOLVED_KEY_ID, UnprotectedReason, classify_secret_failure,
-    expected_key_file, flock_shared, interrupted_rotation_evidence, is_symlink_attack,
+    KeyStoreOutlook, Keyring, LockedLogError, LogLock, UNRESOLVED_KEY_ID, UnprotectedReason,
+    classify_secret_failure, expected_key_file, interrupted_rotation_evidence, is_symlink_attack,
     is_writer_emitted_key_id, key_store_outlook, load_keyring, open_audit_existing_rw,
-    open_read_nofollow, read_secret, secret_path_for,
+    open_log_locked, open_read_nofollow, read_secret, secret_path_for,
 };
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, HwmUnusable, hwm_path_for, read_hwm, write_hwm};
@@ -940,7 +940,21 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // `open_read_nofollow` routes ELOOP through `symlink_attack_error`, so the
     // attack shape is recognisable here without inspecting the message for
     // anything but that one prefix.
-    let file = open_read_nofollow(&path).map_err(|e| {
+    //
+    // The lock is taken in the same step, and the file it is taken on checked
+    // against the path afterwards (ADR-0016): a prune replaces the log by
+    // rename, and a walk over the file it replaced would be compared against a
+    // high-water-mark that appends to the new one keep raising.
+    let file = open_log_locked(&path, LogLock::Shared).map_err(|e| {
+        let e = match e {
+            LockedLogError::Open(e) => e,
+            LockedLogError::Lock(e) => {
+                return AuditError::StoreInaccessible {
+                    kind: "log_lock",
+                    reason: e.to_string(),
+                };
+            }
+        };
         // #506: when the key store already failed, it is the better answer for
         // a store where the log cannot be opened either — one directory
         // permission causes both. See `KeyStoreFailure::into_error`.
@@ -966,10 +980,6 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
                 reason: e.to_string(),
             },
         }
-    })?;
-    flock_shared(&file).map_err(|e| AuditError::StoreInaccessible {
-        kind: "log_lock",
-        reason: e.to_string(),
     })?;
 
     let reader = std::io::BufReader::new(&file);
