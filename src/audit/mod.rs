@@ -3220,8 +3220,8 @@ mod tests {
     }
 
     /// #556: whether a line declares a `chain_version` this build does not
-    /// recognize is one question, and `append`, `verify_chain` and the prune
-    /// scan must each give the answer written next to the line — not merely
+    /// recognize is one question, and `append`, `verify_chain` and a prune's
+    /// record must each give the answer written next to the line — not merely
     /// the same answer as one another, which three readers sharing one wrong
     /// decoder would also give.
     ///
@@ -3233,6 +3233,11 @@ mod tests {
     /// with a typed read on duplicate keys and on numbers out of range. And
     /// derived structs accept a JSON array positionally, so `[999]` was a
     /// future entry to `append` and a torn line to the other two.
+    ///
+    /// Since #539 the prune has no reader of its own: it walks the range with
+    /// the verifier's loop. What is still its own, and what the third check
+    /// here holds to the written answer, is the step from that walk's outcome
+    /// to the record.
     ///
     /// `N` real entries precede each line, and `N` is not 7, so a reader that
     /// reports `N` for `"seq": 7` (never reading `seq`) fails the position
@@ -3397,10 +3402,11 @@ mod tests {
                 )),
             }
 
-            let findings = retention::scan_pruned_range(&[line.as_str()], false, None);
+            let findings =
+                retention::findings_for_removed_range(&[line.as_str()], None, false, None);
             if (findings.unverifiable == 1) != expected.is_some() {
                 wrong.push(format!(
-                    "{label}: prune scan counted unverifiable={}, expected {expected:?}",
+                    "{label}: the prune record counted unverifiable={}, expected {expected:?}",
                     findings.unverifiable
                 ));
             }
@@ -5949,7 +5955,17 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(&mut file, &signing_key, 90, None, retention_test_now()).unwrap();
+        // `Some(&path)`, as `try_prune` passes it. With no path there is no
+        // ring to walk the removed range with, and since #539 that is not
+        // neutral: the prune point would record the range as unchecked.
+        let pruned = try_prune_at(
+            &mut file,
+            &signing_key,
+            90,
+            Some(&path),
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned, 100, "the 100 old-timestamped entries are prunable");
         drop(file);
 
@@ -9039,9 +9055,11 @@ mod tests {
 
         assert_eq!(
             second.as_deref(),
-            Some("pruned:prior_lost=1"),
+            Some("pruned:unchecked=1;prior_lost=1"),
             "a record that could not be carried must read as a record that \
-             could not be carried, not as an absence"
+             could not be carried, not as an absence — and with no ring the \
+             walk halts at the prune point, so the range behind it went \
+             unchecked and the record says that too (#539)"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -9112,15 +9130,65 @@ mod tests {
     }
 
     /// A build that quietly skipped a counter it did not recognise would
-    /// report "nothing was lost" about a range where something was.
+    /// report "nothing was lost" about a range where something was. One that
+    /// threw the legible counts away with it — which this did through 1.2.2,
+    /// under the name `decode_findings_rejects_an_unknown_key` — told the
+    /// operator to upgrade and nothing else (#539).
     #[test]
-    fn decode_findings_rejects_an_unknown_key() {
+    fn decode_findings_flags_an_unknown_key_and_keeps_what_it_read() {
         let decoded = decode_findings(Some("pruned:unverifiable=1;from_the_future=2"))
             .expect("the prefix is present, so this is a record");
-        assert!(decoded.record_unreadable);
+        assert!(
+            decoded.record_unreadable,
+            "an unknown counter must not be skipped in silence"
+        );
         assert_eq!(
-            decoded.unverifiable, 0,
-            "a partially-read record must not be reported as a complete one"
+            decoded.unverifiable, 1,
+            "the count that was legible must survive the one that was not"
+        );
+        let said = decoded.summary();
+        assert!(
+            said.contains("unrecognized chain_version") && said.contains("cannot read"),
+            "a partially-read record must not be reported as a complete one, \
+             nor as an unreadable one: {said}"
+        );
+    }
+
+    /// The other half of the same rule: with nothing legible beside it, an
+    /// unreadable record is described as unreadable — not as "nothing
+    /// unverifiable", which is a claim about a record this build did not
+    /// finish reading.
+    #[test]
+    fn a_record_with_nothing_legible_says_only_that_it_cannot_be_read() {
+        let said = decode_findings(Some("pruned:from_the_future=2"))
+            .expect("the prefix is present, so this is a record")
+            .summary();
+        assert_eq!(
+            said,
+            "a prune recorded findings in a form this build cannot read \
+             — upgrade omamori and re-run"
+        );
+    }
+
+    /// The two findings #539 and #540 added, read back and put into words.
+    /// `broken` keeps the sentence releases since 1.0.5 print for it, which
+    /// is the reason an HMAC mismatch has a key of its own.
+    #[test]
+    fn the_findings_added_for_539_and_540_decode_and_are_named() {
+        let decoded = decode_findings(Some("pruned:broken=1;hash_mismatch=1;unchecked=2"))
+            .expect("the prefix is present, so this is a record");
+        assert!(!decoded.record_unreadable);
+        assert_eq!(
+            (decoded.broken, decoded.hash_mismatch, decoded.unchecked),
+            (1, 1, 2)
+        );
+        assert_eq!(
+            decoded.summary(),
+            "a prune removed a range that did not fully verify: \
+             a break in prev_hash/seq continuity, \
+             an entry whose HMAC did not match its contents, \
+             2 ranges whose check could not be completed \
+             (treat as possible tampering)"
         );
     }
 
@@ -9267,9 +9335,724 @@ mod tests {
 
         assert_eq!(
             second.as_deref(),
-            Some("pruned:prior_lost=1"),
+            Some("pruned:hash_mismatch=1;prior_lost=1"),
             "a record is carried forward only from a prune point that \
-             authenticates under the key it names"
+             authenticates under the key it names — and a prune point whose \
+             own hash does not match is what `audit verify` reports as a \
+             break at entry #0, so the record says that as well (#540)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn remove_lines(path: &Path, range: std::ops::Range<usize>) {
+        let content = fs::read_to_string(path).unwrap();
+        let kept: Vec<&str> = content
+            .lines()
+            .enumerate()
+            .filter(|(index, _)| !range.contains(index))
+            .map(|(_, line)| line)
+            .collect();
+        fs::write(path, format!("{}\n", kept.join("\n"))).unwrap();
+    }
+
+    /// Rewrite the line at `index` into the shape omamori writes when it has
+    /// no key: both halves of #483's evidence, everything else left alone —
+    /// so its own `seq` and `prev_hash` still follow the line before it.
+    fn rewrite_as_unprotected(path: &Path, index: usize) {
+        rewrite_field_at(path, index, "key_id", serde_json::json!("unresolved"));
+        rewrite_field_at(
+            path,
+            index,
+            "entry_hash",
+            serde_json::json!("NO_HMAC_SECRET"),
+        );
+    }
+
+    /// What `verify_chain` reports about a store, in the four fields a
+    /// prune's record is drawn from: `broken_at`, `unknown_version_at`,
+    /// `key_unavailable_at`, `never_protected_entries`.
+    type Verdict = (Option<u64>, Option<u64>, Option<u64>, u64);
+
+    /// How one case in the tables below disturbs the log at `path`.
+    type Plant = Box<dyn Fn(&Path)>;
+
+    fn verdict_of(dir: &Path) -> Verdict {
+        let result = verify_chain(&verify_config(dir)).unwrap();
+        (
+            result.broken_at,
+            result.unknown_version_at,
+            result.key_unavailable_at,
+            result.never_protected_entries,
+        )
+    }
+
+    /// #539 / #540: the record a prune writes, held to what `verify_chain`
+    /// says about the same store before the prune — and each of the two to an
+    /// answer written here by hand. Comparing the record with the verifier's
+    /// output alone would compare `walk_lines` with itself: a walk that
+    /// misjudged a line would misjudge it on both sides, and the two would
+    /// agree.
+    ///
+    /// `findings_log` puts entries 0..=99 in the removed range and entry 100
+    /// first among the retained.
+    ///
+    /// On the release before this one, five of these wrote no record at all:
+    /// the rewritten entry, the head that does not anchor, the missing key,
+    /// and both shapes of the trailing edge.
+    #[test]
+    fn a_prune_records_what_verify_says_about_the_range_it_removes() {
+        let json = |value: &str| serde_json::json!(value);
+        let cases: Vec<(&str, Plant, Verdict, Option<&str>)> = vec![
+            (
+                "nothing wrong (the negative control)",
+                Box::new(|_| {}),
+                (None, None, None, 0),
+                None,
+            ),
+            (
+                "an entry rewritten in place",
+                Box::new(move |path| rewrite_field_at(path, 50, "command", json("rewritten"))),
+                (Some(50), None, None, 0),
+                Some("pruned:hash_mismatch=1"),
+            ),
+            (
+                "an entry renumbered",
+                Box::new(|path| rewrite_field_at(path, 50, "seq", serde_json::json!(999))),
+                (Some(999), None, None, 0),
+                Some("pruned:broken=1"),
+            ),
+            (
+                "a legacy line spliced in",
+                Box::new(|path| {
+                    let mut legacy = planted_line(serde_json::json!({}));
+                    legacy.as_object_mut().unwrap().remove("chain_version");
+                    splice_line_at(path, 50, &legacy);
+                }),
+                (Some(50), None, None, 0),
+                Some("pruned:legacy_splice=1"),
+            ),
+            (
+                "an unrecognized chain_version",
+                Box::new(|path| {
+                    splice_line_at(
+                        path,
+                        50,
+                        &planted_line(serde_json::json!({ "chain_version": 999 })),
+                    );
+                }),
+                // `planted_line` states `seq: 0`, and that is the position an
+                // unrecognized-version entry is reported at.
+                (None, Some(0), None, 0),
+                Some("pruned:unverifiable=1"),
+            ),
+            (
+                "an entry naming a key the ring does not hold",
+                Box::new(move |path| rewrite_field_at(path, 50, "key_id", json("key-9"))),
+                (None, None, Some(50), 0),
+                Some("pruned:unchecked=1"),
+            ),
+            (
+                "a head that does not anchor",
+                Box::new(move |path| {
+                    rewrite_field_at(path, 0, "prev_hash", json("not-the-anchor"));
+                }),
+                (Some(0), None, None, 0),
+                Some("pruned:broken=1"),
+            ),
+            (
+                "the last removed lines deleted",
+                Box::new(|path| remove_lines(path, 97..100)),
+                (Some(100), None, None, 0),
+                Some("pruned:broken=1"),
+            ),
+            (
+                "the last removed line rewritten as never protected",
+                Box::new(|path| rewrite_as_unprotected(path, 99)),
+                (Some(100), None, None, 1),
+                Some("pruned:unprotected=1;broken=1"),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (index, (label, plant, verdict, record)) in cases.iter().enumerate() {
+            let dir = test_dir(&format!("prune-findings-table-{index}"));
+            test_logger(&dir);
+            let path = findings_log(&dir);
+            plant(&path);
+
+            let said = verdict_of(&dir);
+            if said != *verdict {
+                wrong.push(format!(
+                    "{label}: before the prune verify_chain said {said:?}, expected {verdict:?}"
+                ));
+            }
+            let (pruned, wrote) = prune_and_read_record(&path, 90, Some(&path));
+            if pruned == 0 {
+                wrong.push(format!("{label}: the prune removed nothing"));
+            }
+            if wrote.as_deref() != *record {
+                wrong.push(format!(
+                    "{label}: the prune recorded {wrote:?}, expected {record:?}"
+                ));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreement(s):\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// The first retained entry is walked for one question — does it follow
+    /// the last removed line — and the answer is "yes" only when the entry
+    /// authenticates. Its `seq` and `prev_hash` say nothing while its hash
+    /// does not hold, so an entry that will not authenticate leaves the edge
+    /// unchecked, and the record says so.
+    ///
+    /// What is wrong with the entry *itself* is not what is recorded: it stays
+    /// in the log, and the verdict after the prune is the verdict before it.
+    ///
+    /// The first draft of this change recorded nothing in all three cases, and
+    /// held itself to that under the name
+    /// `what_is_wrong_with_the_first_retained_entry_itself_is_left_to_the_next_verify`
+    /// (review, P1).
+    #[test]
+    fn a_first_retained_entry_that_does_not_authenticate_leaves_the_edge_unchecked() {
+        let cases: Vec<(&str, Plant, Verdict)> = vec![
+            (
+                "rewritten in place",
+                Box::new(|path| {
+                    rewrite_field_at(path, 100, "command", serde_json::json!("rewritten"));
+                }),
+                (Some(100), None, None, 0),
+            ),
+            (
+                "names a key the ring does not hold",
+                Box::new(|path| {
+                    rewrite_field_at(path, 100, "key_id", serde_json::json!("key-9"));
+                }),
+                (None, None, Some(100), 0),
+            ),
+            (
+                "written with no HMAC",
+                Box::new(|path| rewrite_as_unprotected(path, 100)),
+                (Some(101), None, None, 1),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (index, (label, plant, verdict)) in cases.iter().enumerate() {
+            let dir = test_dir(&format!("prune-findings-retained-{index}"));
+            test_logger(&dir);
+            let path = findings_log(&dir);
+            plant(&path);
+
+            let before = verdict_of(&dir);
+            if before != *verdict {
+                wrong.push(format!(
+                    "{label}: before the prune verify_chain said {before:?}, expected {verdict:?}"
+                ));
+            }
+            let (pruned, wrote) = prune_and_read_record(&path, 90, Some(&path));
+            if pruned != 100 {
+                wrong.push(format!("{label}: the prune removed {pruned}, expected 100"));
+            }
+            if wrote.as_deref() != Some("pruned:unchecked=1") {
+                wrong.push(format!(
+                    "{label}: the prune recorded {wrote:?}, expected the edge to be unchecked \
+                     and nothing about the entry itself"
+                ));
+            }
+            // The same verdict, from the same entry, still there to be read.
+            let after = verdict_of(&dir);
+            if after != *verdict {
+                wrong.push(format!(
+                    "{label}: after the prune verify_chain said {after:?}, expected {verdict:?}"
+                ));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreement(s):\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// What the record at the trailing edge is for (review, P1). Delete the
+    /// end of the range, make the first retained entry fail to authenticate
+    /// until the prune has run, then put it back: the prune-bind was taken
+    /// from that entry's `entry_hash` field, which none of these edits touch,
+    /// and the verifier allows a gap behind a prune point — so the log
+    /// verifies clean, with three entries gone. None of it needs the key.
+    ///
+    /// The second shape never halts: the entry is rewritten to *follow* the
+    /// shortened range, so the link check passes and only its hash fails.
+    #[test]
+    fn a_deletion_at_the_end_of_the_range_cannot_be_hidden_behind_the_first_retained_entry() {
+        type Edit = Box<dyn Fn(&Path, usize)>;
+        let field = |name: &'static str, value: serde_json::Value| -> Edit {
+            Box::new(move |path, index| rewrite_field_at(path, index, name, value.clone()))
+        };
+
+        let probe_dir = test_dir("prune-findings-hidden-probe");
+        test_logger(&probe_dir);
+        let probe = findings_log(&probe_dir);
+        let hash_of_96 = entry_hash_at(&probe, 96);
+        let hash_of_99 = entry_hash_at(&probe, 99);
+        let _ = fs::remove_dir_all(&probe_dir);
+
+        let cases: Vec<(&str, Vec<Edit>, Vec<Edit>)> = vec![
+            (
+                "its key renamed",
+                vec![field("key_id", serde_json::json!("key-9"))],
+                vec![field("key_id", serde_json::json!("default"))],
+            ),
+            (
+                "its seq and prev_hash rewritten to follow what is left",
+                vec![
+                    field("seq", serde_json::json!(97)),
+                    field("prev_hash", serde_json::json!(hash_of_96)),
+                ],
+                vec![
+                    field("seq", serde_json::json!(100)),
+                    field("prev_hash", serde_json::json!(hash_of_99)),
+                ],
+            ),
+            (
+                "its chain_version raised",
+                vec![field("chain_version", serde_json::json!(999))],
+                vec![field("chain_version", serde_json::json!(2))],
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (index, (label, disturb, mend)) in cases.iter().enumerate() {
+            let dir = test_dir(&format!("prune-findings-hidden-{index}"));
+            test_logger(&dir);
+            let path = findings_log(&dir);
+
+            // Entries 97, 98 and 99 go; entry 100 is now line 97.
+            remove_lines(&path, 97..100);
+            for edit in disturb {
+                edit(&path, 97);
+            }
+            let (pruned, wrote) = prune_and_read_record(&path, 90, Some(&path));
+            if pruned != 97 {
+                wrong.push(format!("{label}: the prune removed {pruned}, expected 97"));
+            }
+            if wrote.as_deref() != Some("pruned:unchecked=1") {
+                wrong.push(format!(
+                    "{label}: the prune recorded {wrote:?}, expected \"pruned:unchecked=1\""
+                ));
+            }
+
+            // Entry 100 is line 1 now, behind the prune point. Put it back.
+            for edit in mend {
+                edit(&path, 1);
+            }
+            let result = verify_chain(&verify_config(&dir)).unwrap();
+            if result.broken_at.is_some() || result.halted() {
+                wrong.push(format!(
+                    "{label}: the mended log must verify clean, or this is not the attack: \
+                     broken_at {:?}, halted {}",
+                    result.broken_at,
+                    result.halted()
+                ));
+            }
+            if result.pruned_findings.map(|f| f.unchecked) != Some(1) {
+                wrong.push(format!(
+                    "{label}: the deletion left no trace — verify reports {:?}",
+                    result.pruned_findings
+                ));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreement(s):\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// The same attack from the other end (review, R2). The head of the chain
+    /// is deleted and one old legacy line put in its place, so that line is
+    /// all the prune finds to remove; the entry behind it has its
+    /// `chain_version` stripped until the prune has run, which makes it read
+    /// as legacy history in front of a chain that has not started. An
+    /// exception for exactly that — "the verifier judges nothing about a
+    /// legacy line before the chain" — recorded nothing here, and a hundred
+    /// entries were gone from a log that verified clean.
+    #[test]
+    fn a_deleted_head_cannot_be_hidden_behind_a_first_retained_entry_made_to_look_legacy() {
+        let dir = test_dir("prune-findings-hidden-head");
+        test_logger(&dir);
+        let path = findings_log(&dir);
+
+        // Entries 0..=99 go. Entry 100 is line 1, behind the planted line.
+        remove_lines(&path, 0..100);
+        let mut legacy = planted_line(serde_json::json!({}));
+        legacy.as_object_mut().unwrap().remove("chain_version");
+        splice_line_at(&path, 0, &legacy);
+        rewrite_field_at(&path, 1, "chain_version", serde_json::Value::Null);
+
+        let (pruned, wrote) = prune_and_read_record(&path, 90, Some(&path));
+        assert_eq!(pruned, 1, "only the planted line is old enough to go");
+        assert_eq!(
+            wrote.as_deref(),
+            Some("pruned:unchecked=1"),
+            "an entry that did not authenticate cannot vouch for what stood in front of it"
+        );
+
+        // Put entry 100 back. It is still line 1, now behind the prune point.
+        rewrite_field_at(&path, 1, "chain_version", serde_json::json!(2));
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(
+            result.broken_at.is_none() && !result.halted(),
+            "the mended log must verify clean, or this is not the attack: \
+             broken_at {:?}, halted {}",
+            result.broken_at,
+            result.halted()
+        );
+        assert_eq!(
+            result.pruned_findings.map(|f| f.unchecked),
+            Some(1),
+            "a hundred entries gone must leave a trace"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The negative control for what the walk records at a prior prune point
+    /// and at the trailing edge: an untouched log, pruned twice, writes no
+    /// record either time. The second prune walks the first one's prune
+    /// point, its bind, and its own edge, and finds nothing in any of them.
+    #[test]
+    fn two_prunes_of_an_untouched_log_record_nothing() {
+        let dir = test_dir("prune-findings-twice-clean");
+        test_logger(&dir);
+        let path = findings_log(&dir);
+
+        let first = prune_and_read_record(&path, 90, Some(&path));
+        let second = prune_and_read_record(&path, 30, Some(&path));
+
+        assert_eq!(first, (100, None));
+        assert_eq!(second, (100, None));
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted());
+        assert_eq!(result.pruned_findings, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other negative control: a store whose key was rotated. The removed
+    /// entries were signed under epoch 1 and the prune runs under epoch 2,
+    /// with the ring the binary loads — and nothing is wrong, so nothing is
+    /// recorded.
+    #[test]
+    fn a_prune_across_a_key_rotation_records_nothing_on_an_untouched_log() {
+        let dir = test_dir("prune-findings-rotation");
+        let (path, _, _) = pruned_across_rotation_fixture(&dir);
+
+        assert!(
+            read_events(&path)[0]["rule_id"].is_null(),
+            "got {:?}",
+            read_events(&path)[0]["rule_id"]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What an earlier prune recorded and what this prune finds at its own
+    /// trailing edge are added. The first draft assigned the edge's `1` over
+    /// the carried count.
+    #[test]
+    fn a_break_at_the_trailing_edge_is_added_to_what_an_earlier_prune_recorded() {
+        let dir = test_dir("prune-findings-edge-adds");
+        test_logger(&dir);
+        let path = findings_log(&dir);
+        rewrite_field_at(&path, 50, "seq", serde_json::json!(999));
+        let (_, first) = prune_and_read_record(&path, 90, Some(&path));
+        assert_eq!(first.as_deref(), Some("pruned:broken=1"));
+
+        // Line 0 is the prune point and line 1 is entry 100, so entries 197,
+        // 198 and 199 — the end of what the second prune takes — are lines
+        // 98..=100, and entry 200 is the first it keeps.
+        remove_lines(&path, 98..101);
+        let (pruned, second) = prune_and_read_record(&path, 30, Some(&path));
+
+        assert_eq!(pruned, 97);
+        assert_eq!(
+            second.as_deref(),
+            Some("pruned:broken=2"),
+            "one break carried forward, one found where the range ends"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A key directory that cannot be listed gives a ring that resolves
+    /// nothing. `verify_chain` then judges no line at all — it tallies — and a
+    /// prune must not judge more than that: walking such a ring as merely
+    /// empty, it counted an entry written with no HMAC, a finding `audit
+    /// verify` does not reach on this store (review, P2).
+    ///
+    /// The unprotected entry stands at the *head* of the log, in front of
+    /// every entry that names a key. Anywhere behind one, an empty ring halts
+    /// before reaching it and the two ways of walking agree by accident —
+    /// which is what the first version of this test measured, and why it
+    /// passed on the code it was written to fail.
+    ///
+    /// The same log is pruned twice: once with the directory listable, as the
+    /// positive control, and once without. Only the permission differs.
+    #[cfg(unix)]
+    #[test]
+    fn a_prune_with_an_unusable_keyring_judges_no_more_than_verify_does() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let store = |name: &str| {
+            let dir = test_dir(name);
+            test_logger(&dir);
+            let path = findings_log(&dir);
+            splice_line_at(
+                &path,
+                0,
+                &planted_line(serde_json::json!({
+                    "key_id": "unresolved",
+                    "entry_hash": "NO_HMAC_SECRET",
+                    "seq": 0,
+                    "prev_hash": "NO_HMAC_SECRET",
+                })),
+            );
+            (dir, path)
+        };
+
+        let (listable, path) = store("prune-findings-listable");
+        let (_, record) = prune_and_read_record(&path, 90, Some(&path));
+        assert_eq!(
+            record.as_deref(),
+            Some("pruned:unprotected=1;broken=1"),
+            "the control: with a usable ring the head entry is walked past and \
+             counted, and the entry behind it does not follow it"
+        );
+        let _ = fs::remove_dir_all(&listable);
+
+        let (dir, path) = store("prune-findings-unlistable");
+        // `0o300`: searchable and writable, not listable. The secret can
+        // still be opened by name, so this is the unlistable-directory fault
+        // and not a missing secret.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let verified = verify_chain(&verify_config(&dir));
+        let (pruned, record) = prune_and_read_record(&path, 90, Some(&path));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let verified = verified.expect("an unusable key store is a result, not an error");
+        assert!(
+            verified.key_store_failure.is_some(),
+            "the fixture must be the unusable-ring state"
+        );
+        assert_eq!(
+            (verified.never_protected_entries, verified.broken_at),
+            (0, None),
+            "verify judges nothing on this store"
+        );
+        assert_eq!(pruned, 101);
+        assert_eq!(
+            record.as_deref(),
+            Some("pruned:unchecked=1"),
+            "the range went unexamined, and that is the whole of what can be said"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The prune point at the head of the removed range is a line like any
+    /// other to the walk: it has an anchor to meet and a bind for the entry
+    /// behind it to satisfy. The scan this replaced skipped the prune point
+    /// and checked neither, so both of these were removed without a record.
+    #[test]
+    fn a_prior_prune_point_is_held_to_its_anchor_and_its_bind() {
+        let cases: Vec<(&str, Plant, Verdict, &str)> = vec![
+            (
+                // The anchor is compared before the hash, and a prune point
+                // that never authenticated has no record to hand on.
+                "the prune point does not anchor",
+                Box::new(|path| {
+                    rewrite_field_at(path, 0, "prev_hash", serde_json::json!("not-the-anchor"));
+                }),
+                (Some(0), None, None, 0),
+                "pruned:broken=1;prior_lost=1",
+            ),
+            (
+                // Entry 100 was the first retained by the first prune and is
+                // what its bind names. With it gone, entry 101 stands there.
+                // The prune point itself authenticates and carried nothing,
+                // so nothing was lost.
+                "the entry the prune point binds has been removed",
+                Box::new(|path| remove_line(path, 1)),
+                (Some(101), None, None, 0),
+                "pruned:broken=1",
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (index, (label, plant, verdict, record)) in cases.iter().enumerate() {
+            let dir = test_dir(&format!("prune-findings-prior-point-{index}"));
+            test_logger(&dir);
+            let path = findings_log(&dir);
+            let (_, first) = prune_and_read_record(&path, 90, Some(&path));
+            if first.is_some() {
+                wrong.push(format!(
+                    "{label}: the first range must be clean, got {first:?}"
+                ));
+            }
+            plant(&path);
+
+            let said = verdict_of(&dir);
+            if said != *verdict {
+                wrong.push(format!(
+                    "{label}: before the prune verify_chain said {said:?}, expected {verdict:?}"
+                ));
+            }
+            let (pruned, wrote) = prune_and_read_record(&path, 30, Some(&path));
+            if pruned == 0 {
+                wrong.push(format!("{label}: the second prune removed nothing"));
+            }
+            if wrote.as_deref() != Some(*record) {
+                wrong.push(format!(
+                    "{label}: the prune recorded {wrote:?}, expected {record:?}"
+                ));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreement(s):\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// Sign `event` as `write_chain_entries` does, after a field it hashes has
+    /// been changed by hand.
+    fn resign(event: &mut AuditEvent) {
+        event.entry_hash = None;
+        event.entry_hash =
+            Some(compute_entry_hash(Some(&TEST_SECRET), event).expect_hash("resign"));
+    }
+
+    /// Put `points` in front of the log at `path`, in order.
+    fn prepend_prune_points(path: &Path, points: &[&AuditEvent]) {
+        let mut content = String::new();
+        for point in points {
+            content.push_str(&serde_json::to_string(point).unwrap());
+            content.push('\n');
+        }
+        content.push_str(&fs::read_to_string(path).unwrap());
+        fs::write(path, content).unwrap();
+    }
+
+    /// `verify_chain` merges the records of every prune point it
+    /// authenticates rather than keeping the last one. Two can stand at the
+    /// head of one log only when a prune was interrupted, and the path had no
+    /// test (#539). The first prune point's bind names the second, the
+    /// second's names the first real entry, so both authenticate and both
+    /// binds hold.
+    #[test]
+    fn verify_merges_the_records_of_two_prune_points() {
+        let dir = test_dir("prune-findings-two-points");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        let entries: Vec<(&str, &str)> = (0..3).map(|_| ("kept", FINDINGS_NEW_TS)).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+
+        let key = test_signing_key();
+        let second = build_prune_point(
+            &key,
+            5,
+            &entry_hash_at(&path, 0),
+            PrunedFindings {
+                broken: 1,
+                ..PrunedFindings::default()
+            },
+            retention_test_now(),
+        );
+        let first = build_prune_point(
+            &key,
+            7,
+            second.entry_hash.as_deref().unwrap(),
+            PrunedFindings {
+                unverifiable: 1,
+                ..PrunedFindings::default()
+            },
+            retention_test_now(),
+        );
+        prepend_prune_points(&path, &[&first, &second]);
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        assert!(
+            result.broken_at.is_none(),
+            "the fixture must verify, or the merge below was never reached: {:?}",
+            result.broken_at
+        );
+        assert_eq!(
+            result.pruned_findings,
+            Some(PrunedFindings {
+                unverifiable: 1,
+                broken: 1,
+                ..PrunedFindings::default()
+            }),
+            "each prune point's record must be in the total"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A record holding a counter this build does not know, carried all the
+    /// way out (#539): `verify_chain` reads the legible count and flags the
+    /// rest, the sentence `audit verify` and `doctor` both print says both,
+    /// `aggregate_report` hands `doctor` the same value — and the next prune
+    /// carries the count forward and records the unread part as lost.
+    #[test]
+    fn a_record_this_build_cannot_fully_read_still_reports_what_it_read() {
+        let dir = test_dir("prune-findings-partly-read");
+        test_logger(&dir);
+        let path = findings_log(&dir);
+        let mut point = build_prune_point(
+            &test_signing_key(),
+            5,
+            &entry_hash_at(&path, 0),
+            PrunedFindings::default(),
+            OffsetDateTime::parse(FINDINGS_OLD_TS, &Rfc3339).unwrap(),
+        );
+        point.rule_id = Some("pruned:unverifiable=1;from_the_future=2".to_string());
+        resign(&mut point);
+        prepend_prune_points(&path, &[&point]);
+
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none(), "the fixture must verify");
+        let findings = result
+            .pruned_findings
+            .expect("the prune point authenticates and carries a record");
+        assert!(findings.record_unreadable);
+        assert_eq!(findings.unverifiable, 1);
+        let said = findings.summary();
+        assert!(
+            said.contains("unrecognized chain_version") && said.contains("cannot read"),
+            "both halves must reach the operator: {said}"
+        );
+        assert_eq!(
+            aggregate_report(&verify_config(&dir), 30).pruned_findings,
+            Some(findings),
+            "doctor reads the record through the report, and must get the same one"
+        );
+
+        let (pruned, record) = prune_and_read_record(&path, 90, Some(&path));
+        assert_eq!(pruned, 100);
+        assert_eq!(
+            record.as_deref(),
+            Some("pruned:unverifiable=1;prior_lost=1"),
+            "what was read is carried; what was not is a record that could \
+             not be carried, and `record_unreadable` itself is never written"
         );
         let _ = fs::remove_dir_all(&dir);
     }

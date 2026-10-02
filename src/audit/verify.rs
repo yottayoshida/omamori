@@ -771,6 +771,25 @@ enum KeyStore {
     NothingWrittenYet,
 }
 
+/// The failure a ring that cannot resolve any id stands for, if it is one.
+///
+/// A function of the ring alone so that a prune, which loads its own, starts
+/// its walk in the state `verify_chain` would be in over the same store
+/// (#539): with this set every line is tallied and none is judged. Left to
+/// walk an unusable ring as an empty one, a prune judged the lines that need
+/// no key — an entry written with no HMAC, a spliced legacy line — and
+/// recorded findings `audit verify` would not have reached.
+pub(super) fn keyring_failure(keyring: &Keyring) -> Option<KeyStoreFailure> {
+    let fatal = keyring.fatal_anomaly()?;
+    Some(KeyStoreFailure {
+        // Not a literal: `fatal_anomaly` selects two conditions and they
+        // are not the same fault. See `KeyringAnomaly::kind`.
+        kind: fatal.kind(),
+        reason: fatal.describe(),
+        remedy: fatal.remedy().unwrap_or_default(),
+    })
+}
+
 /// Resolve the keys this run can verify with, or say why it cannot.
 ///
 /// The order of the first two observations is load-bearing and predates this
@@ -818,14 +837,8 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // and report every entry as tampered — a false accusation caused by a
     // permissions problem. Nothing consults the ring once this fires.
     let keyring = load_keyring(secret_path);
-    if let Some(fatal) = keyring.fatal_anomaly() {
-        return KeyStore::Unusable(KeyStoreFailure {
-            // Not a literal: `fatal_anomaly` selects two conditions and they
-            // are not the same fault. See `KeyringAnomaly::kind`.
-            kind: fatal.kind(),
-            reason: fatal.describe(),
-            remedy: fatal.remedy().unwrap_or_default(),
-        });
+    if let Some(failure) = keyring_failure(&keyring) {
+        return KeyStore::Unusable(failure);
     }
 
     // Reached only with a listing in hand, which is what makes the secret's own
@@ -961,7 +974,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
 
     let reader = std::io::BufReader::new(&file);
 
-    let mut result = VerifyResult {
+    let result = VerifyResult {
         keyring_warnings: keyring.anomalies().iter().map(|a| a.describe()).collect(),
         // #506: set before the first line is read, so `halted()` is already true
         // when the loop starts and every line takes the tally path — including
@@ -974,62 +987,272 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         key_store_failure,
         ..Default::default()
     };
-    // #457 A3: the chain's anchor is a function of the key, so it cannot be
-    // computed up front from the active secret — a chain that started before a
-    // rotation anchors to `genesis_hash(retired key)`. It is resolved in the
-    // `chain_entries == 0` branch below, from the key the head entry names.
-    // Only used from the second chain entry onward.
-    let mut expected_prev = String::new();
-    // #456: `None` means "no successor number exists" — the previous verified
-    // entry was numbered `u64::MAX`. Held as an `Option` rather than a `u64`
-    // so the advance below can be a checked increment: a `u64` would have to
-    // wrap (or panic under `overflow-checks`) at the top of the range, and
-    // saturating instead would let a second `u64::MAX` entry satisfy the
-    // continuity check.
-    let mut expected_seq: Option<u64> = Some(0);
-    // #456: the highest seq actually verified, kept instead of deriving it
-    // from `expected_seq - 1` for the high-water-mark below. The derivation
-    // needed a `saturating_sub` to be safe, and reported `u64::MAX - 1` after
-    // verifying an entry numbered `u64::MAX` — one short, which reads as tail
-    // truncation against a mark that is correct.
-    let mut last_verified_seq: Option<u64> = None;
-    // #470: the last seq *stated* by a line at or after the one verification
-    // halted on — that line included, written by `mark_*`. Unauthenticated by
-    // construction, which is the point. `None` means no such line stated one,
-    // and no end can be named. See the high-water-mark block after the loop for
-    // what it is and is not allowed to decide.
-    let mut last_structural_seq: Option<u64> = None;
-    // #483 (review): the last seq stated by a line the walk *consumed as part of
-    // the chain* — authenticated or unprotected. It exists because those two
-    // ends stopped being the same number, and each is now used for exactly one
-    // thing: this one for the high-water-mark comparison, `last_verified_seq`
-    // for the write. Substituting either for the other reintroduces a measured
-    // defect — using this to write lowers the mark from an unauthenticated end,
-    // using `last_verified_seq` to compare reports a truncation that did not
-    // happen. Not merged with `last_structural_seq`, which means something
-    // narrower on purpose: only what lines *at or after a halt* stated, so that
-    // a halt with nothing stating a seq skips the comparison rather than
-    // comparing against the halt point (#470).
-    let mut last_walked_seq: Option<u64> = None;
-    // #457 A4: the prune-bind was written with the key active at prune time,
-    // so it has to be recomputed with *that* key — not with the key of the
-    // first retained entry, which belongs to whatever epoch that entry was
-    // written in. `Some` iff the previous line was a prune point, which also
-    // replaces the separate `last_was_prune` flag.
-    let mut prev_prune: Option<PruneBind> = None;
-    // #470: the left side of the next structural comparison — the last line the
-    // scan was willing to compare from. Seeded at the halt (see the two gates
-    // below), then carried line to line.
-    let mut structural_anchor: Option<StructuralAnchor> = None;
-
-    for line in reader.lines() {
+    let Walk {
+        mut result,
+        last_verified_seq,
+        last_structural_seq,
+        last_walked_seq,
+        ..
+    } = walk_lines(
         // #471: a read that fails partway through is not "there is no log"
         // either — the file exists and stopped being readable.
-        let line = line.map_err(|e| AuditError::StoreInaccessible {
-            kind: "log_read",
-            reason: e.to_string(),
-        })?;
-        let trimmed = line.trim();
+        reader.lines().map(|line| {
+            line.map_err(|e| AuditError::StoreInaccessible {
+                kind: "log_read",
+                reason: e.to_string(),
+            })
+        }),
+        &keyring,
+        Walk::start(result),
+    )?;
+
+    // HWM check: detect tail truncation.
+    //
+    // #470: this whole block used to be gated on `!halted()` as well. The
+    // reason behind that gate is real and still holds for half of it — a run
+    // that stopped early cannot say where the chain ends, so writing the mark
+    // from it silently lowers it and disables truncation detection from then
+    // on, with no error and no failing test. But the gate applied that reason
+    // to the *comparison* too, and the comparison needs no key. That made a
+    // two-step attack free: edit one entry's `key_id` so verification halts,
+    // then delete as much of the tail as you like. Measured on a release build
+    // before this change — exit 2, "cannot verify from entry #1", and not one
+    // word about the removal; deleting the same lines without the halt
+    // reported exit 3.
+    //
+    // The two halves are now split by what each can honestly use:
+    //
+    // * The **comparison** uses the last `seq` *stated* by a line at or after
+    //   the halt — the halting line itself, then anything past it. It is not
+    //   authenticated, so an attacker who renumbers the line the file ends on
+    //   can still hide the removal; that is strictly narrower than before,
+    //   where changing one character was enough.
+    // * The **write** still comes from `last_verified_seq`, and still only
+    //   when nothing halted. #177 B1's judgement there is unchanged: an
+    //   unauthenticated end must never become the mark, because the mark is
+    //   what every later run compares against.
+    //
+    // When nothing at or after the halt states a `seq` — a future format that
+    // renamed the field, say — there is no end to compare and the comparison
+    // is skipped, exactly as before. Substituting `last_verified_seq` there
+    // would compare the mark against the halt point instead of the file, which
+    // is the "compare against a false end" failure the old gate prevented.
+    //
+    // `broken_at` keeps its own gate: it `break`s out of the loop, so any end
+    // taken here would sit at the break rather than at the end of file, and
+    // exit 1 is already the strongest thing this command can say.
+    //
+    // #456: the mark comes from the last seq actually verified, not from
+    // `expected_seq - 1`. That derivation needed a `saturating_sub` to be safe
+    // and reported `u64::MAX - 1` after verifying an entry numbered
+    // `u64::MAX` — one short, which reads as tail truncation against a mark
+    // that is correct.
+    let structural_end = if result.halted() {
+        last_structural_seq
+    } else {
+        // #483 (review): `last_walked_seq`, not `last_verified_seq`. The two are
+        // the same number unless an unprotected entry was walked past, and where
+        // they differ the mark has already moved with that entry's append —
+        // comparing it against the last *authenticated* seq reported a deleted
+        // tail on a whole log.
+        last_walked_seq
+    };
+    if result.broken_at.is_none()
+        && let Some(structural_end) = structural_end
+    {
+        let hwm_file = hwm_path_for(&path);
+        // The only end this run is entitled to record. `None` while halted,
+        // and `None` when nothing verified — both mean "do not touch the
+        // mark", which is why the two arms below check it rather than the
+        // counter.
+        // #483 (review): `walked_past_unauthenticated`, not `halted`. An
+        // unprotected entry does not halt, but a mark written from a run that
+        // walked past one would still be an end this run could not authenticate
+        // — and a mark is what every later run compares against.
+        let writable_end = if result.walked_past_unauthenticated() {
+            None
+        } else {
+            last_verified_seq
+        };
+        match read_hwm(&hwm_file) {
+            HwmState::Valid(hwm) => {
+                // #506: the two `Valid` arms were spelled as a guarded pair, and
+                // both of them — and only them — are a comparison having
+                // happened. `audit verify` tells the operator that "the chain
+                // does reach the high-water-mark", which is a claim about a
+                // comparison, so the fact that one ran has to be recorded
+                // rather than inferred from two flags being unset.
+                result.hwm_compared = true;
+                if structural_end < hwm {
+                    result.tail_truncated = true;
+                }
+            }
+            HwmState::Missing => {
+                // Bootstrap: first verify on a chain without HWM
+                result.hwm_missing = true;
+                result.hwm_write = record_mark(&hwm_file, writable_end);
+            }
+            HwmState::Unusable(reason) => {
+                // Something is at the path and this run got no mark out of it —
+                // not a fresh install. Surface it distinctly instead of
+                // silently re-bootstrapping as if nothing happened.
+                //
+                // #470: reported during a halt too. That the sidecar is
+                // unusable is a fact about the sidecar, true or false
+                // independently of whether the log could be authenticated, and
+                // suppressing it handed an attacker a second thing one edited
+                // `key_id` bought for free. Only the re-bootstrap is withheld —
+                // so the operator-facing message must not claim the mark was
+                // reset when it was not.
+                //
+                // #490: which is what it did claim. The write below is the one
+                // that fails on the two states worth reporting, and its result
+                // used to be discarded on the line that made it.
+                result.hwm_unusable = Some(reason);
+                result.hwm_write = record_mark(&hwm_file, writable_end);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Why a walk set `broken_at`.
+///
+/// [`verify_chain`] reports every one of these as the same verdict — exit 1,
+/// "may have been tampered with" — and has no use for the difference. A
+/// prune's record does (#540): it has a word for each, and a release that
+/// reads the record must not describe a rewritten entry as a continuity
+/// break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BreakCause {
+    /// A legacy-shaped line after the chain had started.
+    LegacySplice,
+    /// The entry's `entry_hash` does not match the entry.
+    Hash,
+    /// Anything that ties one line to another: `seq`/`prev_hash` continuity,
+    /// the head's genesis or prune anchor, a prune-bind. Also what a break
+    /// with no cause set is reported as — see [`walk_lines`].
+    Link,
+}
+
+/// Where a walk stands: the verdict so far, and what the next line will be
+/// held against.
+///
+/// A value rather than locals of [`walk_lines`] so that a walk can stop at a
+/// boundary its caller cares about and go on from there. Everything the loop
+/// carries from one line to the next is here, and nothing else is.
+pub(super) struct Walk {
+    pub(super) result: VerifyResult,
+    /// #457 A3: the chain's anchor is a function of the key, so it cannot be
+    /// computed up front from the active secret — a chain that started before a
+    /// rotation anchors to `genesis_hash(retired key)`. It is resolved in
+    /// [`walk_lines`]' `entries_walked() == 0` branch, from the key the head
+    /// entry names. Only used from the second chain entry onward.
+    expected_prev: String,
+    /// #456: `None` means "no successor number exists" — the previous verified
+    /// entry was numbered `u64::MAX`. Held as an `Option` rather than a `u64`
+    /// so the advance in [`walk_lines`] can be a checked increment: a `u64`
+    /// would have to wrap (or panic under `overflow-checks`) at the top of the
+    /// range, and saturating instead would let a second `u64::MAX` entry
+    /// satisfy the continuity check.
+    expected_seq: Option<u64>,
+    /// #456: the highest seq actually verified, kept instead of deriving it
+    /// from `expected_seq - 1` for the high-water-mark in [`verify_chain`]. The
+    /// derivation needed a `saturating_sub` to be safe, and reported
+    /// `u64::MAX - 1` after verifying an entry numbered `u64::MAX` — one short,
+    /// which reads as tail truncation against a mark that is correct.
+    last_verified_seq: Option<u64>,
+    /// #470: the last seq *stated* by a line at or after the one verification
+    /// halted on — that line included, written by `mark_*`. Unauthenticated by
+    /// construction, which is the point. `None` means no such line stated one,
+    /// and no end can be named. See the high-water-mark block in
+    /// [`verify_chain`] for what it is and is not allowed to decide.
+    last_structural_seq: Option<u64>,
+    /// #483 (review): the last seq stated by a line the walk *consumed as part
+    /// of the chain* — authenticated or unprotected. It exists because those
+    /// two ends stopped being the same number, and each is now used for exactly
+    /// one thing: this one for the high-water-mark comparison,
+    /// `last_verified_seq` for the write. Substituting either for the other
+    /// reintroduces a measured defect — using this to write lowers the mark
+    /// from an unauthenticated end, using `last_verified_seq` to compare
+    /// reports a truncation that did not happen. Not merged with
+    /// `last_structural_seq`, which means something narrower on purpose: only
+    /// what lines *at or after a halt* stated, so that a halt with nothing
+    /// stating a seq skips the comparison rather than comparing against the
+    /// halt point (#470).
+    last_walked_seq: Option<u64>,
+    /// #457 A4: the prune-bind was written with the key active at prune time,
+    /// so it has to be recomputed with *that* key — not with the key of the
+    /// first retained entry, which belongs to whatever epoch that entry was
+    /// written in. `Some` iff the previous line was a prune point, which also
+    /// replaces the separate `last_was_prune` flag.
+    prev_prune: Option<PruneBind>,
+    /// #470: the left side of the next structural comparison — the last line
+    /// the scan was willing to compare from. Seeded at the halt (see the two
+    /// gates in [`walk_lines`]), then carried line to line.
+    structural_anchor: Option<StructuralAnchor>,
+    /// Why `result.broken_at` was set; `None` exactly while it is not.
+    pub(super) broke: Option<BreakCause>,
+}
+
+impl Walk {
+    /// A walk that has read nothing.
+    ///
+    /// `result` holds whatever was known before the first line: the keyring's
+    /// warnings, and a `key_store_failure`, which makes every line take the
+    /// tally path.
+    pub(super) fn start(result: VerifyResult) -> Self {
+        Self {
+            result,
+            expected_prev: String::new(),
+            expected_seq: Some(0),
+            last_verified_seq: None,
+            last_structural_seq: None,
+            last_walked_seq: None,
+            prev_prune: None,
+            structural_anchor: None,
+            broke: None,
+        }
+    }
+}
+
+/// The verifier's judgement of a run of lines, one line at a time.
+///
+/// This is the loop [`verify_chain`] runs, behind a function so that the lines
+/// need not come from a file it opened, and so that a walk can be continued:
+/// the [`Walk`] it returns goes on from where it stopped when handed back with
+/// more lines.
+///
+/// A walk begun with [`Walk::start`] must begin at the head of a log: the
+/// first chain entry is checked against a genesis or prune anchor, and a
+/// legacy entry is ordinary history only until the chain has started. Where
+/// the lines end is the caller's business — nothing here assumes the last line
+/// is the end of the file, and the high-water-mark is neither read nor
+/// written.
+///
+/// A walk whose `result.broken_at` is set has stopped for good. Handing it
+/// back would judge the next line against whatever the break left behind.
+pub(super) fn walk_lines<S: AsRef<str>, E>(
+    lines: impl Iterator<Item = Result<S, E>>,
+    keyring: &Keyring,
+    walk: Walk,
+) -> Result<Walk, E> {
+    let Walk {
+        mut result,
+        mut expected_prev,
+        mut expected_seq,
+        mut last_verified_seq,
+        mut last_structural_seq,
+        mut last_walked_seq,
+        mut prev_prune,
+        mut structural_anchor,
+        mut broke,
+    } = walk;
+
+    for line in lines {
+        let line = line?;
+        let trimmed = line.as_ref().trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -1121,8 +1344,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         let reported_position = expected_seq.unwrap_or(u64::MAX);
 
         // The version dispatch, decided before the line is read as an
-        // `AuditEvent` and by the same peek `append` and the prune scan use
-        // (#556). Through 1.2.0 it ran in two places: after a successful
+        // `AuditEvent` and by the same peek `append` uses (#556). A prune
+        // reaches it too, by running this loop over the range it removes
+        // (#539). Through 1.2.0 it ran in two places: after a successful
         // `AuditEvent` parse, and in a raw-JSON fallback for a line that
         // failed one, which read `chain_version` and `seq` through one typed
         // struct. A `seq` of the wrong type failed that struct as a whole, so
@@ -1207,6 +1431,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
             // admit legacy-shaped lines behind them.
             if result.entries_walked() > 0 {
                 result.broken_at = Some(reported_position);
+                broke = Some(BreakCause::LegacySplice);
                 break;
             }
             result.legacy_entries += 1;
@@ -1472,6 +1697,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
 
         if recomputed != recorded_hash {
             result.broken_at = Some(seq);
+            broke = Some(BreakCause::Hash);
             break;
         }
 
@@ -1555,115 +1781,25 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         }
     }
 
-    // HWM check: detect tail truncation.
-    //
-    // #470: this whole block used to be gated on `!halted()` as well. The
-    // reason behind that gate is real and still holds for half of it — a run
-    // that stopped early cannot say where the chain ends, so writing the mark
-    // from it silently lowers it and disables truncation detection from then
-    // on, with no error and no failing test. But the gate applied that reason
-    // to the *comparison* too, and the comparison needs no key. That made a
-    // two-step attack free: edit one entry's `key_id` so verification halts,
-    // then delete as much of the tail as you like. Measured on a release build
-    // before this change — exit 2, "cannot verify from entry #1", and not one
-    // word about the removal; deleting the same lines without the halt
-    // reported exit 3.
-    //
-    // The two halves are now split by what each can honestly use:
-    //
-    // * The **comparison** uses the last `seq` *stated* by a line at or after
-    //   the halt — the halting line itself, then anything past it. It is not
-    //   authenticated, so an attacker who renumbers the line the file ends on
-    //   can still hide the removal; that is strictly narrower than before,
-    //   where changing one character was enough.
-    // * The **write** still comes from `last_verified_seq`, and still only
-    //   when nothing halted. #177 B1's judgement there is unchanged: an
-    //   unauthenticated end must never become the mark, because the mark is
-    //   what every later run compares against.
-    //
-    // When nothing at or after the halt states a `seq` — a future format that
-    // renamed the field, say — there is no end to compare and the comparison
-    // is skipped, exactly as before. Substituting `last_verified_seq` there
-    // would compare the mark against the halt point instead of the file, which
-    // is the "compare against a false end" failure the old gate prevented.
-    //
-    // `broken_at` keeps its own gate: it `break`s out of the loop, so any end
-    // taken here would sit at the break rather than at the end of file, and
-    // exit 1 is already the strongest thing this command can say.
-    //
-    // #456: the mark comes from the last seq actually verified, not from
-    // `expected_seq - 1`. That derivation needed a `saturating_sub` to be safe
-    // and reported `u64::MAX - 1` after verifying an entry numbered
-    // `u64::MAX` — one short, which reads as tail truncation against a mark
-    // that is correct.
-    let structural_end = if result.halted() {
-        last_structural_seq
-    } else {
-        // #483 (review): `last_walked_seq`, not `last_verified_seq`. The two are
-        // the same number unless an unprotected entry was walked past, and where
-        // they differ the mark has already moved with that entry's append —
-        // comparing it against the last *authenticated* seq reported a deleted
-        // tail on a whole log.
-        last_walked_seq
-    };
-    if result.broken_at.is_none()
-        && let Some(structural_end) = structural_end
-    {
-        let hwm_file = hwm_path_for(&path);
-        // The only end this run is entitled to record. `None` while halted,
-        // and `None` when nothing verified — both mean "do not touch the
-        // mark", which is why the two arms below check it rather than the
-        // counter.
-        // #483 (review): `walked_past_unauthenticated`, not `halted`. An
-        // unprotected entry does not halt, but a mark written from a run that
-        // walked past one would still be an end this run could not authenticate
-        // — and a mark is what every later run compares against.
-        let writable_end = if result.walked_past_unauthenticated() {
-            None
-        } else {
-            last_verified_seq
-        };
-        match read_hwm(&hwm_file) {
-            HwmState::Valid(hwm) => {
-                // #506: the two `Valid` arms were spelled as a guarded pair, and
-                // both of them — and only them — are a comparison having
-                // happened. `audit verify` tells the operator that "the chain
-                // does reach the high-water-mark", which is a claim about a
-                // comparison, so the fact that one ran has to be recorded
-                // rather than inferred from two flags being unset.
-                result.hwm_compared = true;
-                if structural_end < hwm {
-                    result.tail_truncated = true;
-                }
-            }
-            HwmState::Missing => {
-                // Bootstrap: first verify on a chain without HWM
-                result.hwm_missing = true;
-                result.hwm_write = record_mark(&hwm_file, writable_end);
-            }
-            HwmState::Unusable(reason) => {
-                // Something is at the path and this run got no mark out of it —
-                // not a fresh install. Surface it distinctly instead of
-                // silently re-bootstrapping as if nothing happened.
-                //
-                // #470: reported during a halt too. That the sidecar is
-                // unusable is a fact about the sidecar, true or false
-                // independently of whether the log could be authenticated, and
-                // suppressing it handed an attacker a second thing one edited
-                // `key_id` bought for free. Only the re-bootstrap is withheld —
-                // so the operator-facing message must not claim the mark was
-                // reset when it was not.
-                //
-                // #490: which is what it did claim. The write below is the one
-                // that fails on the two states worth reporting, and its result
-                // used to be discarded on the line that made it.
-                result.hwm_unusable = Some(reason);
-                result.hwm_write = record_mark(&hwm_file, writable_end);
-            }
-        }
+    // Two of the breaks above name their cause. Every other one is a link of
+    // some kind, and so is one added later without a cause: `Link` is the word
+    // releases since 1.0.5 already read, so an unnamed break is described the
+    // way it always was rather than left out of the record.
+    if result.broken_at.is_some() && broke.is_none() {
+        broke = Some(BreakCause::Link);
     }
 
-    Ok(result)
+    Ok(Walk {
+        result,
+        expected_prev,
+        expected_seq,
+        last_verified_seq,
+        last_structural_seq,
+        last_walked_seq,
+        prev_prune,
+        structural_anchor,
+        broke,
+    })
 }
 
 /// Write the mark this run is entitled to, and say what happened.
