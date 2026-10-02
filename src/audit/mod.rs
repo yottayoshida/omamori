@@ -35,9 +35,9 @@ pub use verify::{
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
 use chain::{CHAIN_VERSION, ChainTailState, compute_entry_hash_for_write, read_chain_state};
 use provenance::ProcessProvenance;
-use retention::{PRUNE_CHECK_INTERVAL, try_prune};
+use retention::{PRUNE_CHECK_INTERVAL, prune_temp_path_for, try_prune};
 use secret::{
-    SigningKey, flock_exclusive, hmac_targets, load_signing_key_with, open_audit_rw,
+    LockedLogError, LogLock, SigningKey, hmac_targets, load_signing_key_with, open_log_locked,
     secret_path_for,
 };
 
@@ -440,10 +440,17 @@ impl AuditLogger {
         }
 
         // read+write+create without truncate: we read the tail for chain state, then append.
-        #[allow(clippy::suspicious_open_options)]
-        let mut file = open_audit_rw(&self.path)?;
+        // Opened and locked in one step, which also makes sure the file locked
+        // is the one the path names: a prune in another process may have
+        // replaced the log between this open and this lock (ADR-0016).
+        let mut file =
+            open_log_locked(&self.path, LogLock::Exclusive).map_err(LockedLogError::into_io)?;
 
-        flock_exclusive(&file)?;
+        // What a prune that did not finish left behind. Under the lock, and
+        // past the check above, it cannot be a prune still running — only the
+        // holder of this lock can run one. `NotFound` on every ordinary append;
+        // anything else that stands there is for the next prune to report.
+        let _ = fs::remove_file(prune_temp_path_for(&self.path));
 
         // Read chain state under lock (another process may have appended since our open).
         // #177 B1 step 3: when the log's last chain entry (#465: the last line carrying a
@@ -578,7 +585,7 @@ impl AuditLogger {
                 &mut file,
                 &self.signing_key,
                 self.retention_days,
-                Some(&self.path),
+                &self.path,
                 warnings,
             )
         {
@@ -884,7 +891,7 @@ mod tests {
     };
     use retention::{
         MIN_RETENTION_DAYS, PRUNE_COMMAND, PrunedFindings, build_prune_point, decode_findings,
-        try_prune_at,
+        try_prune_at, try_prune_at_no_ring,
     };
     use secret::{
         KeyringAnomaly, MAX_KEYRING_KEYS, UNRESOLVED_KEY_ID, create_secret, decode_hex_secret,
@@ -3402,8 +3409,12 @@ mod tests {
                 )),
             }
 
-            let findings =
-                retention::findings_for_removed_range(&[line.as_str()], None, false, None);
+            let Ok(findings) = retention::findings_for_removed_range(
+                std::iter::once(Ok::<_, std::convert::Infallible>(line.as_str())),
+                None,
+                None,
+                None,
+            );
             if (findings.unverifiable == 1) != expected.is_some() {
                 wrong.push(format!(
                     "{label}: the prune record counted unverifiable={}, expected {expected:?}",
@@ -5484,11 +5495,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(
+        let pruned = try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             90,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -5521,11 +5532,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(
+        let pruned = try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             90,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -5608,8 +5619,7 @@ mod tests {
             .open(path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned =
-            try_prune_at(&mut file, signing_key, 90, Some(path), retention_test_now()).unwrap();
+        let pruned = try_prune_at(&mut file, signing_key, 90, path, retention_test_now()).unwrap();
         drop(file);
         pruned
     }
@@ -5869,6 +5879,409 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // --- a prune publishes by rename (#568, ADR-0016) ---
+    //
+    // A prune builds the pruned log beside the real one and renames it into
+    // place. It used to write the new content over the old, from the first
+    // byte, and a write that stopped left the new content's first part
+    // followed by the old content's remainder — two chains joined where it
+    // stopped, which `audit verify` reported as broken from then on.
+
+    /// Opens and locks the log the way a second process would, and prunes it.
+    fn prune_as_another_process(path: &Path) -> Result<u64, std::io::Error> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        try_prune_at(
+            &mut file,
+            &test_signing_key(),
+            90,
+            path,
+            retention_test_now(),
+        )
+    }
+
+    fn inode_of(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    }
+
+    /// #568: a prune stopped partway through leaves the log exactly as it was.
+    /// Three points in the copy, because the rewrite in place broke the chain
+    /// at every one of them.
+    #[test]
+    fn a_prune_stopped_partway_leaves_the_log_as_it_was() {
+        let dir = test_dir("prune-rename-interrupted");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        write_hwm(&hwm_path_for(&path), PRUNE_HWM_TOP_SEQ).unwrap();
+        let before = fs::read(&path).unwrap();
+        let inode = inode_of(&path);
+        let temp = prune_temp_path_for(&path);
+
+        for percent in [10u64, 50, 90] {
+            // Of the retained part: 1100 of the 1200 lines, so 90% of the
+            // whole file is still short of all of it.
+            let limit = before.len() as u64 * percent / 100;
+            retention::COPY_FAILS_AFTER.with(|slot| slot.set(Some(limit)));
+
+            let error = prune_as_another_process(&path)
+                .expect_err("the copy was told to stop, so the prune must fail");
+            assert!(
+                error.to_string().contains("stopped (test)"),
+                "{percent}%: the prune failed for another reason: {error}"
+            );
+            assert!(
+                fs::read(&path).unwrap() == before,
+                "{percent}%: the log must be byte-for-byte what it was"
+            );
+            assert_eq!(inode_of(&path), inode, "{percent}%: and the same file");
+            assert!(
+                !temp.exists(),
+                "{percent}%: the half-built log must not be left behind"
+            );
+            let result = verify_chain(&verify_config(&dir)).unwrap();
+            assert!(
+                result.broken_at.is_none() && !result.halted() && !result.tail_truncated,
+                "{percent}%: the store must verify as it did before"
+            );
+        }
+
+        // The control: with nothing stopping it, the same prune goes through.
+        assert_eq!(prune_as_another_process(&path).unwrap(), 100);
+        assert_ne!(inode_of(&path), inode, "published by rename: a new file");
+        assert!(!temp.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What a prune leaves, beyond the entries: no temporary file, a log
+    /// readable by its owner only, and a final newline even where the log it
+    /// started from had lost its own.
+    #[test]
+    fn a_prune_leaves_one_file_private_and_newline_terminated() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("prune-rename-result");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut content = fs::read(&path).unwrap();
+        assert_eq!(content.pop(), Some(b'\n'));
+        fs::write(&path, &content).unwrap();
+
+        assert_eq!(prune_as_another_process(&path).unwrap(), 100);
+
+        let after = fs::read(&path).unwrap();
+        assert_eq!(after.last(), Some(&b'\n'), "the last line gets its newline");
+        assert_eq!(
+            read_events(&path).len(),
+            1101,
+            "the prune point and the 1100 entries kept"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the mode the mark is written with, not the one the old log had"
+        );
+        assert!(!prune_temp_path_for(&path).exists());
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pruned log belongs to whoever the log belonged to. The prune makes a
+    /// new file, and the process running it is not always the log's owner — a
+    /// command run through `sudo` is audited as root into the invoking user's
+    /// log — so a log published under the pruning process's own identity, at
+    /// `0600`, would lock its owner out.
+    ///
+    /// Without root the owner cannot be made to differ, so this holds the
+    /// same code to the half that can be: the group. A new file takes the
+    /// directory's group or the process's; the log is given another one this
+    /// user belongs to, and must still have it afterwards.
+    #[test]
+    fn a_pruned_log_keeps_the_owner_and_group_the_log_had() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = test_dir("prune-rename-owner");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let before = fs::metadata(&path).unwrap();
+
+        let mut groups = [0 as libc::gid_t; 64];
+        let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        let other = groups[..count.max(0) as usize]
+            .iter()
+            .copied()
+            .find(|&g| g != before.gid() && std::os::unix::fs::chown(&path, None, Some(g)).is_ok());
+        let Some(other) = other else {
+            eprintln!("skipped: this user belongs to no second group to give the log");
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        };
+        assert_eq!(fs::metadata(&path).unwrap().gid(), other);
+
+        assert_eq!(prune_as_another_process(&path).unwrap(), 100);
+
+        let after = fs::metadata(&path).unwrap();
+        assert_ne!(
+            after.ino(),
+            before.ino(),
+            "the prune must have published a new file"
+        );
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(
+            after.gid(),
+            other,
+            "the group the log had, not the one a new file gets"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Bytes are copied, not lines rejoined: a `\r\n` in the retained part is
+    /// still there after a prune. The rewrite in place turned it into `\n`.
+    #[test]
+    fn a_prune_copies_a_crlf_as_it_is() {
+        let dir = test_dir("prune-rename-crlf");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let mut content = fs::read(&path).unwrap();
+        assert_eq!(content.pop(), Some(b'\n'));
+        content.extend_from_slice(b"\r\n");
+        fs::write(&path, &content).unwrap();
+
+        assert_eq!(prune_as_another_process(&path).unwrap(), 100);
+
+        let after = fs::read(&path).unwrap();
+        assert!(
+            after.ends_with(b"}\r\n"),
+            "the line ending must be untouched"
+        );
+        assert_eq!(read_events(&path).len(), 1101);
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A prune with nothing old enough to remove reads the head of the log and
+    /// stops. It used to read the whole file before finding that out.
+    #[test]
+    fn a_prune_with_nothing_to_remove_reads_only_the_head() {
+        let dir = test_dir("prune-rename-reads-little");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        let entries: Vec<(&str, &str)> =
+            (0..3000).map(|_| ("new", "2026-04-04T00:00:00Z")).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(
+            size > 512 * 1024,
+            "the log must be far larger than one read"
+        );
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        flock_exclusive(&file).unwrap();
+        let pruned = try_prune_at(
+            &mut file,
+            &test_signing_key(),
+            90,
+            &path,
+            retention_test_now(),
+        )
+        .unwrap();
+        assert_eq!(pruned, 0);
+        let read = file.stream_position().unwrap();
+        assert!(
+            read <= 64 * 1024,
+            "read {read} of {size} bytes to find there was nothing to remove"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The leftover of a prune that did not finish is removed by the next
+    /// append — any append, not only one that prunes.
+    #[test]
+    fn an_append_sweeps_what_an_unfinished_prune_left() {
+        let dir = test_dir("prune-rename-sweep");
+        let logger = test_logger(&dir);
+        logger.append(make_event("first")).unwrap();
+        let temp = prune_temp_path_for(&logger.path);
+        fs::write(&temp, b"half of a log").unwrap();
+
+        logger.append(make_event("second")).unwrap();
+
+        assert!(!temp.exists(), "the append must have removed the leftover");
+        assert_eq!(read_events(&logger.path).len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Something standing under the temporary name that is not a prune's
+    /// leftover and cannot be removed as one: the prune says what it found and
+    /// does not touch the log. Appends go on as before.
+    #[test]
+    fn a_prune_names_what_stands_in_its_way() {
+        let dir = test_dir("prune-rename-blocked");
+        let logger = test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let before = fs::read(&path).unwrap();
+        let temp = prune_temp_path_for(&path);
+        fs::create_dir(&temp).unwrap();
+
+        let error = prune_as_another_process(&path).expect_err("the name is taken");
+        let message = error.to_string();
+        assert!(
+            message.contains("audit.jsonl.prune-tmp") && message.contains("a directory"),
+            "the message must say what is in the way: {message}"
+        );
+        assert!(fs::read(&path).unwrap() == before, "the log is untouched");
+
+        logger
+            .append(make_event("still recording"))
+            .expect("an append is not stopped by it");
+        assert!(temp.is_dir(), "and does not remove what is not a file");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The premise of the two tests below, and of the check they test: a line
+    /// written through a descriptor opened before a prune's rename does not
+    /// reach the log. Not a test of omamori — it holds on any implementation —
+    /// but if it ever stopped holding, those two would pass for no reason.
+    #[test]
+    fn premise_a_descriptor_from_before_the_rename_is_another_file() {
+        let dir = test_dir("prune-rename-premise");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let mut stale = OpenOptions::new().append(true).open(&path).unwrap();
+
+        assert_eq!(prune_as_another_process(&path).unwrap(), 100);
+        writeln!(stale, "written to the file that was replaced").unwrap();
+
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("written to the file that was replaced")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #568: an `append` that opened the log before another process's prune
+    /// renamed it, and took the lock after, still records its entry — in the
+    /// log the path names now.
+    ///
+    /// The prune runs where it would in that race: between this `append`'s
+    /// open and its lock. Without the check that follows the lock, the entry
+    /// goes to the replaced file and is gone; the mark is still advanced, by
+    /// path, so the store then reports a truncated tail as well.
+    #[test]
+    fn an_append_that_opened_before_a_prune_still_records() {
+        let dir = test_dir("prune-rename-append-race");
+        let logger = test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        write_hwm(&hwm_path_for(&path), PRUNE_HWM_TOP_SEQ).unwrap();
+        let inode = inode_of(&path);
+
+        let racing = path.clone();
+        secret::BETWEEN_OPEN_AND_LOCK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(prune_as_another_process(&racing).unwrap(), 100);
+            }));
+        });
+        logger.append(make_event("after the swap")).unwrap();
+
+        assert_ne!(inode_of(&path), inode, "the prune must have run in the gap");
+        let events = read_events(&path);
+        assert_eq!(events[0]["command"].as_str(), Some(PRUNE_COMMAND));
+        assert_eq!(
+            events.last().unwrap()["command"].as_str(),
+            Some("after the swap"),
+            "the entry must be in the log the path names"
+        );
+        assert_eq!(
+            events.last().unwrap()["seq"].as_u64(),
+            Some(PRUNE_HWM_TOP_SEQ + 1)
+        );
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted() && !result.tail_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #568: `audit verify` that opened the log before a prune renamed it does
+    /// not report a truncated tail that is not there.
+    ///
+    /// The file it opened is the complete log as it stood. But its lock on
+    /// that file no longer holds off appends to the new one, and it reads the
+    /// high-water-mark by path when its walk is done — so an append in between
+    /// leaves a mark above the end it walked.
+    #[test]
+    fn a_verify_that_opened_before_a_prune_does_not_report_a_cut_tail() {
+        let dir = test_dir("prune-rename-verify-race");
+        let logger = test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let hwm = hwm_path_for(&path);
+        write_hwm(&hwm, PRUNE_HWM_TOP_SEQ).unwrap();
+
+        let racing = path.clone();
+        secret::BETWEEN_OPEN_AND_LOCK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(prune_as_another_process(&racing).unwrap(), 100);
+                logger.append(make_event("while verify waited")).unwrap();
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        assert_eq!(
+            expect_hwm(&hwm),
+            PRUNE_HWM_TOP_SEQ + 1,
+            "the append in the gap must have raised the mark, or nothing was exercised"
+        );
+        assert!(
+            !result.tail_truncated,
+            "nothing was removed from the end of this log"
+        );
+        assert!(result.pruned, "and what was walked is the log as pruned");
+        assert!(result.broken_at.is_none() && !result.halted());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A log replaced every time it is opened is not written to on a guess:
+    /// the `append` fails and says why.
+    #[test]
+    fn an_append_gives_up_on_a_log_replaced_at_every_open() {
+        fn replace_at_every_open(path: PathBuf) {
+            secret::BETWEEN_OPEN_AND_LOCK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    let copy = path.with_extension("swap");
+                    fs::copy(&path, &copy).unwrap();
+                    fs::rename(&copy, &path).unwrap();
+                    replace_at_every_open(path);
+                }));
+            });
+        }
+        let dir = test_dir("prune-rename-gives-up");
+        let logger = test_logger(&dir);
+        logger.append(make_event("first")).unwrap();
+
+        replace_at_every_open(logger.path.clone());
+        let error = logger
+            .append(make_event("never lands"))
+            .expect_err("no open ever held the file the path names");
+        secret::BETWEEN_OPEN_AND_LOCK.with(|slot| slot.borrow_mut().take());
+
+        assert!(
+            error
+                .to_string()
+                .contains("replaced each time it was opened"),
+            "{error}"
+        );
+        assert_eq!(read_events(&logger.path).len(), 1, "nothing was written");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #461: with no secret the prune does not run. `hmac_bytes(None, ..)`
     /// returns the fixed string `NO_HMAC_SECRET`, so the prune point standing
     /// where the removed entries used to be would carry a `target_hash` and an
@@ -5920,11 +6333,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(
+        let pruned = try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             90,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -5948,11 +6361,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(
+        let pruned = try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             36500,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -5983,11 +6396,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(
+        let pruned = try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             90,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -6097,17 +6510,12 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        // `Some(&path)`, as `try_prune` passes it. With no path there is no
-        // ring to walk the removed range with, and since #539 that is not
-        // neutral: the prune point would record the range as unchecked.
-        let pruned = try_prune_at(
-            &mut file,
-            &signing_key,
-            90,
-            Some(&path),
-            retention_test_now(),
-        )
-        .unwrap();
+        // With the store's ring, as `try_prune` runs. Without one
+        // (`try_prune_at_no_ring`) there is nothing to walk the removed range
+        // with, and since #539 that is not neutral: the prune point would
+        // record the range as unchecked.
+        let pruned =
+            try_prune_at(&mut file, &signing_key, 90, &path, retention_test_now()).unwrap();
         assert_eq!(pruned, 100, "the 100 old-timestamped entries are prunable");
         drop(file);
 
@@ -6423,7 +6831,14 @@ mod tests {
             .open(&audit_path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(&mut file, &signing_key, 90, None, retention_test_now()).unwrap();
+        let pruned = try_prune_at_no_ring(
+            &mut file,
+            &signing_key,
+            90,
+            &audit_path,
+            retention_test_now(),
+        )
+        .unwrap();
         assert_eq!(pruned, 100);
         drop(file);
 
@@ -8791,11 +9206,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        try_prune_at(
+        try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             90,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -8848,11 +9263,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned1 = try_prune_at(
+        let pruned1 = try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             90,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -8872,11 +9287,11 @@ mod tests {
             .open(&path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned2 = try_prune_at(
+        let pruned2 = try_prune_at_no_ring(
             &mut file,
             &test_signing_key(),
             1,
-            None,
+            &path,
             retention_test_now(),
         )
         .unwrap();
@@ -8989,11 +9404,19 @@ mod tests {
             .open(path)
             .unwrap();
         flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(
+        // `audit_path` used to be where the prune loaded its ring from, and
+        // `None` meant no ring. A prune takes the log's path now whatever it
+        // loads, so the choice the callers make is spelled out here.
+        let prune = if audit_path.is_some() {
+            try_prune_at
+        } else {
+            try_prune_at_no_ring
+        };
+        let pruned = prune(
             &mut file,
             &test_signing_key(),
             retention_days,
-            audit_path,
+            path,
             retention_test_now(),
         )
         .unwrap();

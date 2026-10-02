@@ -2390,6 +2390,118 @@ pub(super) fn open_audit_rw(path: &Path) -> Result<fs::File, std::io::Error> {
     Ok(file)
 }
 
+/// Which lock [`open_log_locked`] takes — and with it how the log is opened:
+/// the writer creates it, a reader does not.
+#[derive(Clone, Copy)]
+pub(super) enum LogLock {
+    Shared,
+    Exclusive,
+}
+
+/// Why [`open_log_locked`] has no locked log to hand back. Kept apart because
+/// `verify_chain` answers the two differently: a log it could not open is
+/// reported by what was found in its place, a lock it could not take as a lock.
+#[derive(Debug)]
+pub(super) enum LockedLogError {
+    Open(std::io::Error),
+    Lock(std::io::Error),
+}
+
+impl LockedLogError {
+    pub(super) fn into_io(self) -> std::io::Error {
+        match self {
+            Self::Open(e) | Self::Lock(e) => e,
+        }
+    }
+}
+
+/// How many times [`open_log_locked`] opens the log before giving up on one
+/// that is replaced every time. A prune replaces it once per
+/// `PRUNE_CHECK_INTERVAL` appends, so a second mismatch in a row is already
+/// not a prune.
+const LOG_REOPEN_ATTEMPTS: u32 = 3;
+
+/// Opens the audit log, takes `lock` on it, and makes sure the file that was
+/// locked is still the file `path` names (ADR-0016).
+///
+/// A prune publishes its result by renaming a new file over the log. A process
+/// that opened the log before that rename and got the lock after it holds a
+/// file with no name: `flock` is on the inode, not on the path. An `append`
+/// writing there would lose its entry. A `verify_chain` reading there would
+/// read a complete log — the one the prune started from — but its shared lock
+/// would no longer hold off appends to the log `path` now names, and the
+/// high-water-mark it compares against afterwards is read by path: a mark
+/// raised meanwhile would stand above the end it walked, a false exit 3.
+///
+/// So the comparison is made *after* the lock is held, which is the only order
+/// in which it says anything: once it passes, a rename cannot follow, because a
+/// prune runs under the exclusive lock of the inode `path` names and no lock
+/// on that inode can be taken past this one. On a mismatch the log is opened
+/// again.
+///
+/// Only for callers that lock. The readers that take no lock — `audit show`,
+/// the entry counts, `report` — are not routed through here: the check means
+/// nothing without the lock, and holding one for a whole read would make every
+/// `append` in that time give up.
+pub(super) fn open_log_locked(path: &Path, lock: LogLock) -> Result<fs::File, LockedLogError> {
+    for _ in 0..LOG_REOPEN_ATTEMPTS {
+        let file = match lock {
+            LogLock::Exclusive => open_audit_rw(path),
+            LogLock::Shared => open_read_nofollow(path),
+        }
+        .map_err(LockedLogError::Open)?;
+        #[cfg(test)]
+        run_between_open_and_lock();
+        match lock {
+            LogLock::Exclusive => flock_exclusive(&file),
+            LogLock::Shared => flock_shared(&file),
+        }
+        .map_err(LockedLogError::Lock)?;
+        if names_this_file(path, &file) {
+            return Ok(file);
+        }
+    }
+    Err(LockedLogError::Lock(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "the audit log was replaced each time it was opened, so it could not be locked under \
+         its own name",
+    )))
+}
+
+/// Whether `path` still names the file `file` is. `lstat`, not `stat`: a
+/// symlink put there since is not the log. A path that names nothing, or that
+/// cannot be examined, is not this file either.
+#[cfg(unix)]
+fn names_this_file(path: &Path, file: &fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn names_this_file(_path: &Path, _file: &fs::File) -> bool {
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once, on this thread, between the next [`open_log_locked`]'s first
+    /// open and its lock — where another process's prune would land.
+    pub(super) static BETWEEN_OPEN_AND_LOCK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_between_open_and_lock() {
+    // Taken before it runs, so whatever it opens does not run it again.
+    let hook = BETWEEN_OPEN_AND_LOCK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// [`open_audit_rw`] minus `create` — asks whether an append could write to a
 /// log that **already exists**, without bringing one into being (#514).
 ///

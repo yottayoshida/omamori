@@ -1,11 +1,12 @@
 //! Audit log retention and pruning.
 //!
 //! Automatic prune is triggered every `PRUNE_CHECK_INTERVAL` entries during
-//! `AuditLogger::append()`, under the same flock.
+//! `AuditLogger::append()`, under the same flock. It builds the pruned log
+//! beside the real one and renames it into place (ADR-0016).
 
-use std::convert::Infallible;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use time::OffsetDateTime;
 
@@ -15,6 +16,7 @@ use super::chain::{
 };
 use super::secret::{Keyring, SigningKey, load_keyring, secret_path_for};
 use super::verify::{BreakCause, VerifyResult, Walk, keyring_failure, walk_lines};
+use crate::atomic_file::{TempGuard, describe_file_type, fsync_parent};
 
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
 pub(super) const MIN_RETENTION_DAYS: u32 = 7;
@@ -338,9 +340,12 @@ pub(super) fn decode_findings(rule_id: Option<&str>) -> Option<PrunedFindings> {
 /// protected no healthy store: a legacy line behind a prune point is what the
 /// verifier fails closed on at the next `audit verify` anyway.
 ///
-/// `head_names_prune` is the caller's `skip_existing_prune`: the first line
-/// carries `command: "_prune"`. It decides only whether there was a prior
-/// record to lose.
+/// `removed` is an iterator, not a slice: a prune reads the range from the
+/// file a line at a time (ADR-0016), and a read that fails is the caller's
+/// error to report.
+///
+/// `head_naming_prune` is the first line when it carries `command:
+/// "_prune"`. It decides only whether there was a prior record to lose.
 ///
 /// `keyring` is `None` only where a test prunes with no store to load a ring
 /// from. That is walked as the empty ring it is, so the first entry naming a
@@ -351,12 +356,12 @@ pub(super) fn decode_findings(rule_id: Option<&str>) -> Option<PrunedFindings> {
 ///
 /// `pub(super)` so the audit tests can hold the record to the answer written
 /// beside each line (#556).
-pub(super) fn findings_for_removed_range(
-    removed: &[&str],
+pub(super) fn findings_for_removed_range<S: AsRef<str>, E>(
+    removed: impl Iterator<Item = Result<S, E>>,
     first_retained: Option<&str>,
-    head_names_prune: bool,
+    head_naming_prune: Option<&str>,
     keyring: Option<&Keyring>,
-) -> PrunedFindings {
+) -> Result<PrunedFindings, E> {
     let empty = Keyring::empty();
     let keyring = keyring.unwrap_or(&empty);
     let start = Walk::start(VerifyResult {
@@ -364,9 +369,7 @@ pub(super) fn findings_for_removed_range(
         ..VerifyResult::default()
     });
 
-    // The lines are already in memory and cannot fail to be read, which is
-    // what `Infallible` says and what makes these two patterns irrefutable.
-    let Ok(walk) = walk_lines(removed.iter().map(Ok::<_, Infallible>), keyring, start);
+    let walk = walk_lines(removed, keyring, start)?;
     let result = &walk.result;
 
     let mut findings = PrunedFindings::default();
@@ -386,7 +389,6 @@ pub(super) fn findings_for_removed_range(
     if result.key_unavailable_at.is_some() || result.key_store_failure.is_some() {
         findings.unchecked = 1;
     }
-    let head_naming_prune = removed.first().copied().filter(|_| head_names_prune);
     findings = findings.merge(prior_record(head_naming_prune, result));
 
     // The trailing edge. Only a walk that is still judging can be continued:
@@ -397,7 +399,7 @@ pub(super) fn findings_for_removed_range(
     let still_judging = result.broken_at.is_none() && !result.halted();
     let authenticated = result.chain_entries;
     if still_judging && let Some(line) = first_retained {
-        let Ok(after) = walk_lines(std::iter::once(Ok::<_, Infallible>(line)), keyring, walk);
+        let after = walk_lines(std::iter::once(Ok::<_, E>(line)), keyring, walk)?;
         if after.broke == Some(BreakCause::Link) {
             findings.broken = findings.broken.saturating_add(1);
         } else if after.result.chain_entries == authenticated {
@@ -407,7 +409,7 @@ pub(super) fn findings_for_removed_range(
             findings.unchecked = findings.unchecked.saturating_add(1);
         }
     }
-    findings
+    Ok(findings)
 }
 
 /// The record the prune point at the head of the removed range carried,
@@ -459,21 +461,36 @@ fn prior_record(head_naming_prune: Option<&str>, result: &VerifyResult) -> Prune
     }
 }
 
-/// In-place prune of entries older than `retention_days`.
+/// Where a prune builds the log that replaces the one it is pruning
+/// (ADR-0016): beside it, under a name only a prune uses, so that whatever is
+/// found there is a prune's own leftover and can be swept without asking whose
+/// it is.
+pub(super) fn prune_temp_path_for(audit_path: &Path) -> PathBuf {
+    let mut temp = audit_path.as_os_str().to_owned();
+    temp.push(".prune-tmp");
+    PathBuf::from(temp)
+}
+
+/// Prune entries older than `retention_days`, publishing the result by rename.
 /// Called under flock_exclusive from append().
-/// Best-effort: errors are silently ignored (prune is not critical path).
+/// Best-effort: the caller turns an error into a warning (prune is not critical path).
+///
+/// `file` is the log, open and locked; `path` is the name it was opened under.
+/// When this returns having pruned, `path` names a new file and `file` is the
+/// old one, which no longer has a name — nothing may be written through it.
 pub(super) fn try_prune(
     file: &mut fs::File,
     signing_key: &SigningKey,
     retention_days: u32,
-    audit_path: Option<&std::path::Path>,
+    path: &Path,
     warnings: &mut Vec<String>,
 ) -> Result<u64, std::io::Error> {
     try_prune_at_collect(
         file,
         signing_key,
         retention_days,
-        audit_path,
+        path,
+        true,
         OffsetDateTime::now_utc(),
         warnings,
     )
@@ -486,7 +503,33 @@ pub(super) fn try_prune_at(
     file: &mut fs::File,
     signing_key: &SigningKey,
     retention_days: u32,
-    audit_path: Option<&std::path::Path>,
+    path: &Path,
+    now: OffsetDateTime,
+) -> Result<u64, std::io::Error> {
+    prune_printing(file, signing_key, retention_days, path, true, now)
+}
+
+/// [`try_prune_at`] without loading the store's keyring: the range is walked
+/// against an empty ring, so the first entry naming a key halts it. The shape
+/// the oldest prune tests were written in, when a prune took no path at all.
+#[cfg(test)]
+pub(super) fn try_prune_at_no_ring(
+    file: &mut fs::File,
+    signing_key: &SigningKey,
+    retention_days: u32,
+    path: &Path,
+    now: OffsetDateTime,
+) -> Result<u64, std::io::Error> {
+    prune_printing(file, signing_key, retention_days, path, false, now)
+}
+
+#[cfg(test)]
+fn prune_printing(
+    file: &mut fs::File,
+    signing_key: &SigningKey,
+    retention_days: u32,
+    path: &Path,
+    load_ring: bool,
     now: OffsetDateTime,
 ) -> Result<u64, std::io::Error> {
     let mut warnings = Vec::new();
@@ -494,7 +537,8 @@ pub(super) fn try_prune_at(
         file,
         signing_key,
         retention_days,
-        audit_path,
+        path,
+        load_ring,
         now,
         &mut warnings,
     );
@@ -503,16 +547,29 @@ pub(super) fn try_prune_at(
 }
 
 /// The prune itself. Its warnings are pushed onto `warnings` (ADR-0013).
+///
+/// Nothing here writes into the log (ADR-0016). The result is built in
+/// [`prune_temp_path_for`] and renamed over it, so a prune that stops — a
+/// full disk, a killed process, power — leaves the log as it was until the
+/// rename and as pruned after it. The rewrite in place this replaces left the
+/// new content's first part followed by the old content's remainder, two
+/// chains joined where the write stopped, and nothing repaired it (#568).
+///
+/// It also reads only what it has to: the head as far as the first entry it
+/// keeps, a thousand lines past that to know enough would remain, and the
+/// removed range once more for the walk. The retained part is copied without
+/// being looked at. A log with nothing old enough is left after a line or two.
+///
+/// `load_ring` is `false` only in [`try_prune_at_no_ring`].
 fn try_prune_at_collect(
     file: &mut fs::File,
     signing_key: &SigningKey,
     retention_days: u32,
-    audit_path: Option<&std::path::Path>,
+    path: &Path,
+    load_ring: bool,
     now: OffsetDateTime,
     warnings: &mut Vec<String>,
 ) -> Result<u64, std::io::Error> {
-    use time::format_description::well_known::Rfc3339;
-
     // `#461`: without a secret there is nothing to prune *with*. `hmac_bytes`
     // answers a `None` key with the fixed string `NO_HMAC_SECRET` (`chain.rs`),
     // so the prune point this would write carries a `target_hash` and an
@@ -530,113 +587,59 @@ fn try_prune_at_collect(
         return Ok(0);
     }
 
-    file.seek(SeekFrom::Start(0))?;
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
-
     let cutoff = now - time::Duration::days(i64::from(retention_days));
-
-    // Partition lines: find the first line whose timestamp >= cutoff.
-    // Also capture the first retained entry's hash (for prune-bind) in a single pass.
-    let lines: Vec<&str> = content.lines().collect();
-    let mut retain_from = 0usize;
-    let mut skip_existing_prune = 0usize;
-    let mut first_retained_hash = String::new();
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue; // torn line
-        };
-
-        // Skip existing prune_point at the start (don't count it as prunable)
-        if i == 0 && val.get("command").and_then(|v| v.as_str()) == Some(PRUNE_COMMAND) {
-            skip_existing_prune = 1;
-            continue;
-        }
-
-        let Some(ts_str) = val.get("timestamp").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Ok(ts) = OffsetDateTime::parse(ts_str, &Rfc3339) else {
-            continue;
-        };
-
-        if ts >= cutoff {
-            retain_from = i;
-            first_retained_hash = val
-                .get("entry_hash")
-                .and_then(|h| h.as_str())
-                .unwrap_or_default()
-                .to_string();
-            break;
-        }
-        retain_from = i + 1; // haven't found a keeper yet
-    }
+    let boundary = find_boundary(file, cutoff)?;
 
     // Adjust for existing prune_point: don't re-count it
-    let prune_count = retain_from.saturating_sub(skip_existing_prune) as u64;
+    let prune_count = boundary
+        .lines_before
+        .saturating_sub(usize::from(boundary.head_prune.is_some())) as u64;
     if prune_count == 0 {
         return Ok(0);
     }
 
     // Check minimum retain count
-    let retain_count = lines.len() - retain_from;
+    let (retain_count, first_retained) = retained_lines(file, boundary.offset, MIN_RETAIN_ENTRIES)?;
     if retain_count < MIN_RETAIN_ENTRIES {
         return Ok(0);
     }
 
-    // `#461`: the ring is loaded here rather than after the rewrite, because
-    // the range has to be walked — and the previous prune point's findings
-    // record authenticated — before the prune point replacing them is built.
-    // Lock order is unchanged — still one key-store acquisition,
-    // inside the log's own flock, on a path that runs once per
-    // `PRUNE_CHECK_INTERVAL` appends.
-    let keyring = audit_path.map(|path| load_keyring(&secret_path_for(path)));
+    // `#461`: the ring is loaded here, before the result is built, because the
+    // range has to be walked — and the previous prune point's findings record
+    // authenticated — before the prune point replacing them is written. Lock
+    // order is unchanged — still one key-store acquisition, inside the log's
+    // own flock, on a path that runs once per `PRUNE_CHECK_INTERVAL` appends.
+    let keyring = load_ring.then(|| load_keyring(&secret_path_for(path)));
 
     // `#461`: what the removed range would have cost the verifier. Asked
-    // before the rewrite, since afterwards those lines are gone — which is
-    // the whole defect being closed.
+    // before the log is replaced, since afterwards those lines are gone —
+    // which is the whole defect being closed.
     //
     // The range starts at line 0, prune point included. That prune point is
     // about to be discarded along with the range it covered, and the record
     // it carries would die with it — on a log pruning every
     // `PRUNE_CHECK_INTERVAL` appends, a trace with a lifetime of one prune —
     // so the walk authenticates it and the record is carried forward.
+    //
+    // Read from the file a line at a time rather than held: the range a first
+    // prune removes from a log that was never pruned is most of that log.
+    let mut log = &*file;
+    log.seek(SeekFrom::Start(0))?;
     let findings = findings_for_removed_range(
-        &lines[..retain_from],
-        lines.get(retain_from).copied(),
-        skip_existing_prune == 1,
+        BufReader::new(log.take(boundary.offset)).lines(),
+        first_retained.as_deref(),
+        boundary.head_prune.as_deref(),
         keyring.as_ref(),
-    );
+    )?;
 
     let prune_point = build_prune_point(
         signing_key,
         prune_count,
-        &first_retained_hash,
+        &boundary.first_retained_hash,
         findings,
         now,
     );
-
-    // In-place rewrite: prune_point + retained lines
-    let estimated_size = content.len(); // upper bound; retained portion is smaller
-    let mut new_content = String::with_capacity(estimated_size);
-    let prune_json =
-        serde_json::to_string(&prune_point).expect("prune_point serialization cannot fail");
-    new_content.push_str(&prune_json);
-    new_content.push('\n');
-    for line in &lines[retain_from..] {
-        new_content.push_str(line);
-        new_content.push('\n');
-    }
-
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(new_content.as_bytes())?;
-    file.set_len(new_content.len() as u64)?;
-    file.flush()?;
+    publish_pruned(file, path, &prune_point, boundary.offset)?;
 
     // The high-water-mark is not touched (#568). `append` raises it to the
     // `seq` it has just written whenever that is above the mark, this runs at
@@ -654,6 +657,251 @@ fn try_prune_at_collect(
         "omamori: pruned {prune_count} audit entries older than {retention_days}d"
     ));
     Ok(prune_count)
+}
+
+/// Where the part of a log a prune keeps begins.
+struct Boundary {
+    /// Byte offset of the first line kept.
+    offset: u64,
+    /// How many lines stand before it, an existing prune point included.
+    lines_before: usize,
+    /// The first line, when it names the prune command: a prune point already
+    /// standing at the head. Not counted among the entries pruned, and what
+    /// [`prior_record`] is asked about.
+    head_prune: Option<String>,
+    /// `entry_hash` of the first entry at or past the cutoff, for the
+    /// prune-bind. Empty when the log ended before one was found.
+    first_retained_hash: String,
+}
+
+/// Reads the log from its head as far as the first entry at or past `cutoff`.
+///
+/// The boundary is that entry when there is one. When the log ends first, it
+/// is the end of the last entry older than the cutoff — lines that carry no
+/// readable timestamp are removed only when an entry that is kept follows
+/// them, which is what the pass over the whole file this replaces did.
+fn find_boundary(file: &fs::File, cutoff: OffsetDateTime) -> std::io::Result<Boundary> {
+    use time::format_description::well_known::Rfc3339;
+
+    let mut log = file;
+    log.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(log);
+
+    let mut boundary = Boundary {
+        offset: 0,
+        lines_before: 0,
+        head_prune: None,
+        first_retained_hash: String::new(),
+    };
+    let mut line = String::new();
+    let mut end = 0u64;
+    let mut index = 0usize;
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        let start = end;
+        end += read as u64;
+        let i = index;
+        index += 1;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue; // torn line
+        };
+
+        // Skip existing prune_point at the start (don't count it as prunable)
+        if i == 0 && val.get("command").and_then(|v| v.as_str()) == Some(PRUNE_COMMAND) {
+            boundary.head_prune = Some(trimmed.to_string());
+            continue;
+        }
+
+        let Some(ts_str) = val.get("timestamp").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(ts) = OffsetDateTime::parse(ts_str, &Rfc3339) else {
+            continue;
+        };
+
+        if ts >= cutoff {
+            boundary.offset = start;
+            boundary.lines_before = i;
+            boundary.first_retained_hash = val
+                .get("entry_hash")
+                .and_then(|h| h.as_str())
+                .unwrap_or_default()
+                .to_string();
+            break;
+        }
+        // haven't found a keeper yet
+        boundary.offset = end;
+        boundary.lines_before = i + 1;
+    }
+    Ok(boundary)
+}
+
+/// Counts the lines from `offset` on, stopping at `enough`, and hands back the
+/// first of them — the entry the removed range has to be shown to lead into.
+fn retained_lines(
+    file: &fs::File,
+    offset: u64,
+    enough: usize,
+) -> std::io::Result<(usize, Option<String>)> {
+    let mut log = file;
+    log.seek(SeekFrom::Start(offset))?;
+    let mut lines = BufReader::new(log).lines();
+    let Some(first) = lines.next().transpose()? else {
+        return Ok((0, None));
+    };
+    let mut count = 1;
+    while count < enough {
+        if lines.next().transpose()?.is_none() {
+            break;
+        }
+        count += 1;
+    }
+    Ok((count, Some(first)))
+}
+
+/// Builds the pruned log beside the real one — the prune point, then
+/// everything from `offset` on — and renames it into place.
+///
+/// `sync_all`, then `rename`, then the directory: the order `write_hwm` and
+/// `atomic_file` publish in. Until the rename the log has not been touched and
+/// the temporary file is removed on the way out; after it the log is the
+/// pruned one, and the one step left changes no content.
+fn publish_pruned(
+    file: &fs::File,
+    path: &Path,
+    prune_point: &AuditEvent,
+    offset: u64,
+) -> std::io::Result<()> {
+    let temp = prune_temp_path_for(path);
+    clear_leftover(&temp)?;
+    let mut out = create_prune_temp(&temp)?;
+    let mut guard = TempGuard::new(&temp);
+    keep_owner(file, &out)?;
+
+    let mut head =
+        serde_json::to_string(prune_point).expect("prune_point serialization cannot fail");
+    head.push('\n');
+    out.write_all(head.as_bytes())?;
+
+    let mut log = file;
+    log.seek(SeekFrom::Start(offset))?;
+    copy_retained(&mut log, &mut out)?;
+    // What `append` does before it writes: a log whose last line was never
+    // finished gets its newline, so the next entry starts on its own line.
+    let mut last = [0u8; 1];
+    log.seek(SeekFrom::End(-1))?;
+    log.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        out.write_all(b"\n")?;
+    }
+
+    out.sync_all()?;
+    drop(out);
+    fs::rename(&temp, path)?;
+    guard.disarm();
+    fsync_parent(path);
+    Ok(())
+}
+
+/// Removes what a prune that did not finish left under the temporary name.
+/// Called under the log's lock, so it is not a prune still running.
+fn clear_leftover(temp: &Path) -> std::io::Result<()> {
+    let Err(e) = fs::remove_file(temp) else {
+        return Ok(());
+    };
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return Ok(());
+    }
+    // Not a leftover of ours — a prune only ever leaves a regular file — and
+    // every prune will stop here until it is gone, so say what it is.
+    let what = fs::symlink_metadata(temp)
+        .map(|meta| describe_file_type(&meta))
+        .unwrap_or("something that could not be examined");
+    Err(std::io::Error::new(
+        e.kind(),
+        format!(
+            "{} is in the way ({what}) and could not be removed: {e}",
+            temp.display()
+        ),
+    ))
+}
+
+/// `0600`, the mode `write_hwm` gives the mark, rather than the log's own: a
+/// permission someone widened would otherwise be carried across every prune.
+fn create_prune_temp(temp: &Path) -> std::io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    opts.open(temp)
+}
+
+/// Gives the pruned log the owner the log has.
+///
+/// The rewrite in place never changed who owned the log, because it never
+/// made a new file. This does, and the process making it is not always the
+/// log's owner: a command run through `sudo` is blocked and audited as root
+/// (`shim.rs`), into the invoking user's log. A prune on that append would
+/// otherwise publish a log owned by root with mode `0600`, and its owner could
+/// no longer append to it or verify it (review, P1).
+///
+/// The owner is the part that decides who can open a `0600` file, so a prune
+/// that cannot keep it does not happen. The group decides nothing at that
+/// mode and is kept where it can be.
+#[cfg(unix)]
+fn keep_owner(log: &fs::File, out: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, fchown};
+    let (was, now) = (log.metadata()?, out.metadata()?);
+    if was.uid() != now.uid() {
+        return fchown(out, Some(was.uid()), Some(was.gid())).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "the pruned log could not be given the log's owner (uid {}): {e}",
+                    was.uid()
+                ),
+            )
+        });
+    }
+    if was.gid() != now.gid() {
+        let _ = fchown(out, None, Some(was.gid()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn keep_owner(_log: &fs::File, _out: &fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Copies the rest of `log` into `out`, file to file.
+fn copy_retained(log: &mut &fs::File, out: &mut fs::File) -> std::io::Result<u64> {
+    #[cfg(test)]
+    if let Some(limit) = COPY_FAILS_AFTER.with(std::cell::Cell::take) {
+        std::io::copy(&mut log.take(limit), out)?;
+        return Err(std::io::Error::other("the copy was stopped (test)"));
+    }
+    std::io::copy(log, out)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes the next prune on this thread fail after copying this many bytes
+    /// of the retained part — a full disk, as far as the prune can tell.
+    pub(super) static COPY_FAILS_AFTER: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Build the prune point that replaces the pruned range.

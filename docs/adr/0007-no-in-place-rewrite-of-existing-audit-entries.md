@@ -30,7 +30,9 @@ reprocessed into a new shape.
 append-only at the file-descriptor level.** `retention::try_prune_at` already performs an
 in-place file rewrite — `seek(0)` + `write_all` + `set_len` (`src/audit/retention.rs:110`,
 documented as a deliberate design choice at SECURITY.md's "Design decision: In-place rewrite"
-paragraph) — to drop aged-out entries below a `prune_point` anchor. What this ADR actually
+paragraph) — to drop aged-out entries below a `prune_point` anchor. *(Since [ADR-0016](0016-a-prune-publishes-its-result-by-rename.md) a prune no longer
+rewrites in place: it copies the retained entries into a new file and renames that over the log,
+and the SECURITY.md paragraph cited here has been replaced. The guarantee below is unchanged.)* What this ADR actually
 guarantees is narrower and is the part that matters for the trap above: pruning **copies
 retained entries verbatim**, byte-for-byte, into the rewritten file — it never recomputes an
 `entry_hash`, reassigns a `chain_version`, or otherwise alters the *content* of an entry that
