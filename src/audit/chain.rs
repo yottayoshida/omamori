@@ -20,13 +20,13 @@ pub(super) const GENESIS_SEED: &[u8] = b"omamori-genesis-v1";
 pub(super) const PRUNE_GENESIS_SEED: &[u8] = b"omamori-prune-v1";
 
 /// Every `chain_version` this binary can recompute a hash for. Shared by
-/// `read_chain_state` (append-side tail check), `verify_chain`'s version
-/// dispatch (`verify.rs`) and the prune scan (`retention.rs`) — before #177 B3
-/// the first two each independently compared against the single
-/// `CHAIN_VERSION` constant, so bumping it to `2` without this shared set
-/// would have required editing both in lockstep with no compiler check that
-/// neither was missed. All three read the version itself through
-/// [`VersionPeek`] (#556).
+/// `read_chain_state` (append-side tail check) and the version dispatch in
+/// `walk_lines` (`verify.rs`) — the walk `verify_chain` runs over a log and,
+/// since #539, a prune runs over the range it removes. Before #177 B3 the
+/// two each independently compared against the single `CHAIN_VERSION`
+/// constant, so bumping it to `2` without this shared set would have required
+/// editing both in lockstep with no compiler check that neither was missed.
+/// Both read the version itself through [`VersionPeek`] (#556).
 ///
 /// `compute_entry_hash`'s `match` below is a THIRD place that must agree
 /// with this array — its arms are literal (`Some(1) => hash_v1`, not
@@ -475,12 +475,14 @@ pub(super) fn read_chain_state_bounded(
 /// let such a line fail the peek, be read past, and fork the chain behind it —
 /// the hole the refusal exists to close.
 ///
-/// #556: `append`, `verify_chain` and the prune scan all decide whether a line
-/// declares a chain version this build does not recognize through this peek,
-/// before they read the line as an `AuditEvent`, so they cannot disagree about
-/// a line the way they did through 1.2.0 — `verify_chain` read
-/// `chain_version` and `seq` through one struct, and a `seq` of the wrong type
-/// made it count as torn a line this scan refused to write behind.
+/// #556: `append` and `verify_chain` both decide whether a line declares a
+/// chain version this build does not recognize through this peek, before they
+/// read the line as an `AuditEvent`, so they cannot disagree about a line the
+/// way they did through 1.2.0 — `verify_chain` read `chain_version` and `seq`
+/// through one struct, and a `seq` of the wrong type made it count as torn a
+/// line this scan refused to write behind. A prune had a scan of its own in
+/// that agreement until #539; it now asks the verifier's walk, and has no
+/// reading of the line left to disagree with.
 #[derive(serde::Deserialize)]
 pub(super) struct VersionPeek {
     pub(super) chain_version: Option<u32>,
@@ -491,7 +493,7 @@ pub(super) struct VersionPeek {
 /// #556: every reader of `audit.jsonl` that types a line goes through here —
 /// or through [`ObjectOnly`] directly, for the append scan's streamed lines —
 /// so a line `verify_chain` counts as torn is never one `audit show`, `report`
-/// or the prune scan reads as an event. The one exception is the loop in
+/// or a prune reads as an event. The one exception is the loop in
 /// `try_prune_at_collect` that finds where the retained range starts: it reads
 /// `timestamp`, `command` and `entry_hash` off a `serde_json::Value`, whose
 /// `get` is `None` on anything but an object, so an array is not a keeper there

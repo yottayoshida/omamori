@@ -3,6 +3,7 @@
 //! Automatic prune is triggered every `PRUNE_CHECK_INTERVAL` entries during
 //! `AuditLogger::append()`, under the same flock.
 
+use std::convert::Infallible;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -10,11 +11,11 @@ use time::OffsetDateTime;
 
 use super::AuditEvent;
 use super::chain::{
-    CHAIN_VERSION, NO_HMAC_SECRET, RecomputedHash, VersionPeek, compute_entry_hash,
-    compute_entry_hash_for_write, hmac_bytes, is_supported_chain_version, parse_line,
-    prune_genesis_hash,
+    CHAIN_VERSION, RecomputedHash, compute_entry_hash, compute_entry_hash_for_write, hmac_bytes,
+    parse_line, prune_genesis_hash,
 };
-use super::secret::{Keyring, SigningKey, UNRESOLVED_KEY_ID, load_keyring, secret_path_for};
+use super::secret::{Keyring, SigningKey, load_keyring, secret_path_for};
+use super::verify::{BreakCause, VerifyResult, Walk, keyring_failure, walk_lines};
 use super::{hwm_path_for, write_hwm};
 
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
@@ -39,26 +40,26 @@ const FINDINGS_PREFIX: &str = "pruned:";
 /// reported exit 0 after it, with no trace that anything had ever been
 /// unverifiable. These counts are that trace.
 ///
-/// **These counts are not the verdict `verify_chain` reaches.** They are
-/// taken from the pruned range alone, one line at a time plus its immediate
-/// neighbour, with no key. Three limits follow, and `SECURITY.md` states
-/// them for operators:
+/// **They are the verifier's own findings, not a second opinion** (`#539`,
+/// `#540`, ADR-0015). The range is walked with [`walk_lines`] — the loop
+/// `verify_chain` runs — and what that reports is what is written down.
+/// Through 1.2.2 a separate keyless scan produced the counts, and the two
+/// described one log differently: the scan never recomputed an `entry_hash`,
+/// never checked the head against its anchor, and stopped without a word at
+/// an entry naming a key the ring did not hold.
 ///
-/// - **Narrower in reach.** A break between the range's first line and
-///   whatever preceded it is not counted, and an entry whose HMAC simply
-///   does not match its contents is not counted at all — that needs a hash
-///   per removed line, tracked separately.
-/// - **It stops where the verifier stops.** Every state `verify_chain` halts
-///   on — an unrecognised `chain_version`, a `key_id` it cannot resolve, a
-///   spliced legacy line, a broken link — ends this scan too. Past a halt
+/// Two things follow from walking as the verifier does, and `SECURITY.md`
+/// states them for operators:
+///
+/// - **It stops where the verifier stops.** A break ends the walk. Past a
+///   halt — an unrecognised `chain_version`, a key the ring does not hold —
 ///   the verifier tallies lines without judging them (`verify.rs`: "nothing
 ///   about it — including its own seq/prev_hash — is trustworthy structural
-///   signal"), so a scan that kept judging would assert findings the
-///   verifier never reached. Only `unprotected` is a true count, because it
-///   is the one state the verifier walks past and counts.
-/// - **Deliberately not a re-derivation.** Reproducing the verifier's walk
-///   here would be a second implementation of a 1.0-frozen surface, and the
-///   two would drift with nothing to catch it.
+///   signal"), so nothing behind either is counted. Only `unprotected` is a
+///   true count, because it is the one state the verifier walks past.
+/// - **A stop is one finding.** `unverifiable`, `legacy_splice`, `broken`,
+///   `hash_mismatch` and `unchecked` are each `0` or `1` for one prune. They
+///   exceed `1` only by being carried across prunes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PrunedFindings {
@@ -77,18 +78,39 @@ pub struct PrunedFindings {
     /// and because it stops there, so does this, which is why the value is
     /// `0` or `1` rather than a tally.
     pub legacy_splice: u64,
-    /// `1` when an adjacent pair inside the range failed `prev_hash`/`seq`
-    /// continuity. `0` or `1` for the same reason as `legacy_splice`: the
+    /// `1` when the walk broke on a link: an adjacent pair failing
+    /// `prev_hash`/`seq` continuity, a head that does not anchor, a prune-bind
+    /// that does not hold, or the first retained entry not following the last
+    /// removed one. `0` or `1` for the same reason as `legacy_splice`: the
     /// verifier breaks at the first one, and a single spliced line disturbs
     /// two pairs, so a tally here would describe one line as two findings.
     pub broken: u64,
+    /// `1` when a removed entry's `entry_hash` did not match its contents —
+    /// what `audit verify` reports as exit 1 and describes as possible
+    /// tampering (`#540`). A key of its own rather than part of `broken`:
+    /// releases since 1.0.5 read `broken` as "a break in prev_hash/seq
+    /// continuity" and would describe a rewritten entry that way. One they do
+    /// not know makes them say the record cannot be read, which is true.
+    pub hash_mismatch: u64,
+    /// Times a prune could not finish its check (`#539`). Either the walk
+    /// halted inside the removed range — on an entry naming a key the ring
+    /// does not hold, or because the ring could not be used at all — and
+    /// everything behind that went unexamined; or the range walked clean and
+    /// the first retained entry did not authenticate, so its link to the last
+    /// removed line could not be checked. This is not a record of the missing
+    /// key — restoring the key resolves that, and a permanent record of it
+    /// would state a fault that may no longer exist. It records that entries
+    /// were removed without the check completing, which stays true once the
+    /// key is back. Without it a range halted at its first entry and a clean
+    /// range both wrote all zeroes.
+    pub unchecked: u64,
     /// Times a prune could not carry a previous prune point's record
     /// forward, because that prune point did not authenticate against the
     /// key it names. Counted rather than silently dropped: a record that
     /// vanishes and a record that says zero must not look the same.
     pub prior_lost: u64,
-    /// A `pruned:` record was present but this build could not read it.
-    /// Read-side only — `try_prune` turns an unreadable prior record into
+    /// A `pruned:` record was present and this build could not read all of
+    /// it. Read-side only — `try_prune` turns an unreadable prior record into
     /// [`Self::prior_lost`], because from the writer's side that is what
     /// happened.
     pub record_unreadable: bool,
@@ -101,6 +123,8 @@ impl PrunedFindings {
             unprotected: self.unprotected.saturating_add(other.unprotected),
             legacy_splice: self.legacy_splice.saturating_add(other.legacy_splice),
             broken: self.broken.saturating_add(other.broken),
+            hash_mismatch: self.hash_mismatch.saturating_add(other.hash_mismatch),
+            unchecked: self.unchecked.saturating_add(other.unchecked),
             prior_lost: self.prior_lost.saturating_add(other.prior_lost),
             record_unreadable: self.record_unreadable || other.record_unreadable,
         }
@@ -113,6 +137,9 @@ impl PrunedFindings {
     /// writes the same bytes it wrote before `#461`, so a log that never hits
     /// the condition is byte-identical to one produced by the previous
     /// release. Zero-valued keys are omitted for the same reason.
+    ///
+    /// The two keys `#539`/`#540` added sit after the ones 1.0.5 wrote, so a
+    /// record holding only those reads as it always did.
     fn encode(self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         let mut push = |name: &str, n: u64| {
@@ -124,6 +151,8 @@ impl PrunedFindings {
         push("unprotected", self.unprotected);
         push("legacy_splice", self.legacy_splice);
         push("broken", self.broken);
+        push("hash_mismatch", self.hash_mismatch);
+        push("unchecked", self.unchecked);
         push("prior_lost", self.prior_lost);
         if parts.is_empty() {
             None
@@ -148,16 +177,18 @@ impl PrunedFindings {
     /// the record is counts only, so there is nothing here for one surface to
     /// redact and the other not.
     ///
-    /// No total is computed. Three of the four counters are 0-or-1 and one of
-    /// them — `broken` — describes a relationship between two lines rather
-    /// than a line, so a sum would call a single spliced entry "2 entries"
-    /// and undo the very thing keeping `broken` off a tally.
+    /// No total is computed. Most of the counters are 0-or-1 and one of them
+    /// — `broken` — describes a relationship between two lines rather than a
+    /// line, so a sum would call a single spliced entry "2 entries" and undo
+    /// the very thing keeping `broken` off a tally.
+    ///
+    /// `record_unreadable` is said *beside* whatever was read, not instead of
+    /// it (`#539`). It used to replace the whole sentence, so two prune points
+    /// merged by `verify_chain` — one legible, one not — told the operator to
+    /// upgrade and dropped the counts that had been read.
     pub fn summary(self) -> String {
-        if self.record_unreadable {
-            return "a prune recorded findings in a form this build cannot read \
-                    — upgrade omamori and re-run"
-                .to_string();
-        }
+        const UNREADABLE: &str = "recorded findings in a form this build cannot read \
+                                  — upgrade omamori and re-run";
         let mut parts: Vec<String> = Vec::new();
         if self.unverifiable > 0 {
             parts.push("an entry declaring an unrecognized chain_version".to_string());
@@ -173,6 +204,23 @@ impl PrunedFindings {
         if self.broken > 0 {
             parts.push("a break in prev_hash/seq continuity".to_string());
         }
+        if self.hash_mismatch > 0 {
+            parts.push("an entry whose HMAC did not match its contents".to_string());
+        }
+        // The wording `audit verify` uses for a halt it cannot explain away:
+        // an attacker who rewrites an entry can also rename its key, which
+        // turns what would have been `hash_mismatch` into this.
+        if self.unchecked == 1 {
+            parts.push(
+                "a range whose check could not be completed (treat as possible tampering)"
+                    .to_string(),
+            );
+        } else if self.unchecked > 1 {
+            parts.push(format!(
+                "{} ranges whose check could not be completed (treat as possible tampering)",
+                self.unchecked
+            ));
+        }
         let lost = if self.prior_lost == 1 {
             ", and 1 earlier record could not be carried forward".to_string()
         } else if self.prior_lost > 1 {
@@ -183,23 +231,42 @@ impl PrunedFindings {
         } else {
             String::new()
         };
-        if parts.is_empty() {
-            return format!("a prune reported nothing unverifiable in what it removed{lost}");
+        match (parts.is_empty(), self.record_unreadable) {
+            // Not "nothing unverifiable": part of the record went unread.
+            (true, true) => format!("a prune {UNREADABLE}{lost}"),
+            (true, false) => {
+                format!("a prune reported nothing unverifiable in what it removed{lost}")
+            }
+            (false, unreadable) => {
+                let also = if unreadable {
+                    format!("; a prune also {UNREADABLE}")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "a prune removed a range that did not fully verify: {}{lost}{also}",
+                    parts.join(", ")
+                )
+            }
         }
-        format!(
-            "a prune removed a range that did not fully verify: {}{lost}",
-            parts.join(", ")
-        )
     }
 }
 
 /// Read a prune point's findings record out of its `rule_id`.
 ///
 /// `None` means there is no record — either the field is absent, or it holds
-/// something that is not this record at all. An unknown key inside a
-/// well-formed record yields [`PrunedFindings::unreadable`] rather than being
-/// skipped: a build that quietly ignored the counter it did not recognise
-/// would report "nothing was lost" about a range where something was.
+/// something that is not this record at all.
+///
+/// A key this build does not know sets `record_unreadable` and leaves the
+/// counts it did read in place (`#539`). Both halves matter: a build that
+/// quietly skipped the counter it did not recognise would report "nothing was
+/// lost" about a range where something was, and one that threw the rest away
+/// with it — which this did through 1.2.2 — told the operator to upgrade and
+/// lost an `unverifiable=1` that was perfectly legible.
+///
+/// A part that is not `key=number`, or a key given twice, still yields
+/// [`PrunedFindings::unreadable`] and nothing else: there it is the counts
+/// themselves that cannot be trusted.
 pub(super) fn decode_findings(rule_id: Option<&str>) -> Option<PrunedFindings> {
     let raw = rule_id?.strip_prefix(FINDINGS_PREFIX)?;
     let mut findings = PrunedFindings::default();
@@ -225,203 +292,172 @@ pub(super) fn decode_findings(rule_id: Option<&str>) -> Option<PrunedFindings> {
             "unprotected" => findings.unprotected = n,
             "legacy_splice" => findings.legacy_splice = n,
             "broken" => findings.broken = n,
+            "hash_mismatch" => findings.hash_mismatch = n,
+            "unchecked" => findings.unchecked = n,
             "prior_lost" => findings.prior_lost = n,
-            _ => return Some(PrunedFindings::unreadable()),
+            _ => findings.record_unreadable = true,
         }
     }
     Some(findings)
 }
 
-/// Count the part of what `verify` would have said about the range about to
-/// be removed that can be seen from the range alone, without a key.
+/// What `audit verify` would have said about the range a prune is about to
+/// remove — found by walking it the way `audit verify` does (`#539`, `#540`).
 ///
-/// Not all of it. The range's first line is compared against nothing — the
-/// verifier checks it against a genesis or prune anchor, and this does not —
-/// and no `entry_hash` is recomputed, so a `broken_at` the verifier would
-/// have reached through either route is absent here. `PrunedFindings`'
-/// own docs carry the full list.
+/// `removed` runs from the head of the file, through the prune point already
+/// standing there if one is, to the last line being removed. That is where a
+/// walk has to start: the head is checked against a genesis or prune anchor,
+/// and a prior prune point is authenticated and its prune-bind checked, by
+/// the code that checks them in `verify_chain`.
 ///
-/// `starts_after_prune_point` is whether a prune point stands in front of the
-/// range. It decides one thing: whether a legacy entry at the range's first
-/// line is ordinary head-of-log history or a splice. `verify_chain` makes the
-/// same call from `entries_walked()`, and a prune point counts as walked
-/// there, so a range that follows one begins already-started.
+/// `first_retained` is walked too, as a continuation of the same walk, and
+/// for one question only: does it follow the last removed line. After the
+/// prune a prune point stands between the two, the verifier allows a gap
+/// there, and nothing can ask again. So the answer is one of three, and
+/// "nothing to record" is given only when the entry authenticated:
 ///
-/// `keyring` is here to reproduce one halt, not to authenticate anything: an
-/// entry naming a key the ring does not hold is where `verify_chain` stops
-/// (`mark_key_unavailable_tail`), and a scan that walked past it would keep
-/// judging structure through an entry whose authenticity is unknown. The
-/// state itself is deliberately **not** counted — restoring the key resolves
-/// it, so recording it would state a fault that may no longer exist.
+/// - it authenticated, which covers its `seq` and `prev_hash`, and the link
+///   holds: nothing is recorded;
+/// - the link does not hold: `broken`;
+/// - it did not authenticate — the walk halted on its key or its version, its
+///   HMAC does not match, it carries none, or it is not an entry at all — so
+///   the link could not be checked: `unchecked`. An entry's `seq` and
+///   `prev_hash` say nothing while its hash does not hold. Recording nothing
+///   here let a deletion at the end of the range be hidden by making this one
+///   entry fail to authenticate until the prune had run and then putting it
+///   back (review, P1).
 ///
-/// `pub(super)` so the audit tests can hold it to the same line-by-line answer
-/// `verify_chain` and `append` give (#556).
-pub(super) fn scan_pruned_range(
-    range: &[&str],
-    starts_after_prune_point: bool,
+/// What is wrong with that entry *itself* is still not what is recorded: it
+/// stays in the log, and the next `audit verify` reports it for as long as it
+/// is true.
+///
+/// There is no exception for a legacy line. One was written — "a legacy line
+/// there, before any chain has started, is ordinary history, and the verifier
+/// judges nothing about it" — and it was the same hole again (review, R2):
+/// delete the head of a chain, put one old legacy line in its place, strip
+/// `chain_version` from the next entry until the prune has run, and that
+/// entry is counted as legacy and nothing is written. And the exception
+/// protected no healthy store: a legacy line behind a prune point is what the
+/// verifier fails closed on at the next `audit verify` anyway.
+///
+/// `head_names_prune` is the caller's `skip_existing_prune`: the first line
+/// carries `command: "_prune"`. It decides only whether there was a prior
+/// record to lose.
+///
+/// `keyring` is `None` only where a test prunes with no store to load a ring
+/// from. That is walked as the empty ring it is, so the first entry naming a
+/// key halts it. A ring that cannot resolve any id — an unlistable key
+/// directory, an unreadable epoch record — starts the walk the way
+/// `verify_chain` starts over the same store, already halted: see
+/// [`keyring_failure`].
+///
+/// `pub(super)` so the audit tests can hold the record to the answer written
+/// beside each line (#556).
+pub(super) fn findings_for_removed_range(
+    removed: &[&str],
+    first_retained: Option<&str>,
+    head_names_prune: bool,
     keyring: Option<&Keyring>,
 ) -> PrunedFindings {
+    let empty = Keyring::empty();
+    let keyring = keyring.unwrap_or(&empty);
+    let start = Walk::start(VerifyResult {
+        key_store_failure: keyring_failure(keyring),
+        ..VerifyResult::default()
+    });
+
+    // The lines are already in memory and cannot fail to be read, which is
+    // what `Infallible` says and what makes these two patterns irrefutable.
+    let Ok(walk) = walk_lines(removed.iter().map(Ok::<_, Infallible>), keyring, start);
+    let result = &walk.result;
+
     let mut findings = PrunedFindings::default();
-    // A flag, not a tally: the only question asked of it is whether the chain
-    // had started, which is the same question `verify_chain` asks its
-    // `entries_walked()` count. Counting here would invite a reader to treat
-    // the number as a finding.
-    let mut walked = starts_after_prune_point;
-    // The previous *chain* line's `(seq, entry_hash)`. Torn lines and lines
-    // this build cannot hash leave it alone, matching `verify_chain`: it
-    // counts them and walks on without moving the link it expects next, so
-    // the following entry is compared against the last line that could hold
-    // an expectation.
-    let mut prev: Option<(u64, String)> = None;
+    if result.unknown_version_at.is_some() {
+        findings.unverifiable = 1;
+    }
+    findings.unprotected = result.never_protected_entries;
+    match walk.broke {
+        Some(BreakCause::LegacySplice) => findings.legacy_splice = 1,
+        Some(BreakCause::Hash) => findings.hash_mismatch = 1,
+        Some(BreakCause::Link) => findings.broken = 1,
+        None => {}
+    }
+    // Either way a key is why the walk stopped: one entry named a key the
+    // ring does not hold, or the ring could resolve nothing and the walk
+    // began halted.
+    if result.key_unavailable_at.is_some() || result.key_store_failure.is_some() {
+        findings.unchecked = 1;
+    }
+    let head_naming_prune = removed.first().copied().filter(|_| head_names_prune);
+    findings = findings.merge(prior_record(head_naming_prune, result));
 
-    for line in range {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    // The trailing edge. Only a walk that is still judging can be continued:
+    // a break has stopped for good, and past a halt the next line would only
+    // be tallied. Either of those has already put something in the record.
+    //
+    // Added to what the prior record carried, not assigned over it.
+    let still_judging = result.broken_at.is_none() && !result.halted();
+    let authenticated = result.chain_entries;
+    if still_judging && let Some(line) = first_retained {
+        let Ok(after) = walk_lines(std::iter::once(Ok::<_, Infallible>(line)), keyring, walk);
+        if after.broke == Some(BreakCause::Link) {
+            findings.broken = findings.broken.saturating_add(1);
+        } else if after.result.chain_entries == authenticated {
+            // `chain_entries` moves only past the `entry_hash` comparison, so
+            // this is every way of not authenticating at once — and the one
+            // test that cannot be passed by editing the line.
+            findings.unchecked = findings.unchecked.saturating_add(1);
         }
-        // The version peek runs first and is the one `verify_chain` and
-        // `append` use (#556): a future format might not parse as an
-        // `AuditEvent` at all, and it must still be recognised as a version
-        // this build does not know rather than dismissed as a torn line. This
-        // scan used to peek a `serde_json::Value` instead, which disagreed with
-        // the verifier's typed read in both directions — a `chain_version`
-        // given twice counted here and not there, and a line holding a number
-        // out of range (`1e400`) counted there and not here. A line the peek
-        // cannot read — not a JSON object, or a `chain_version` of the wrong
-        // type or given twice — is torn, as the verifier counts it.
-        let Ok(VersionPeek {
-            chain_version: declared_version,
-        }) = parse_line::<VersionPeek>(trimmed)
-        else {
-            continue;
-        };
-        if let Some(version) = declared_version
-            && !is_supported_chain_version(version)
-        {
-            // Same precedence `verify_chain` uses — the version gate runs
-            // before the key lookup — and the same stop. Nothing about this
-            // line is trustworthy structural signal, including its own `seq`
-            // and `prev_hash`, so judging the lines after it would produce
-            // findings the verifier never reaches: past this point it only
-            // tallies. A genuine future-format block whose successors link
-            // to it correctly would otherwise be recorded as a break.
-            findings.unverifiable = 1;
-            break;
-        }
-        let Ok(event) = parse_line::<AuditEvent>(trimmed) else {
-            // Not typeable and not a version this build knows about: torn, in
-            // the same sense `verify_chain` means it, which counts such a line
-            // and walks on without moving its link expectation.
-            continue;
-        };
-
-        // Legacy: no `chain_version` at all. A malformed one — `"garbage"`, or
-        // a value past `u32` — never gets here: the peek above could not read
-        // it and the line was counted torn, as `verify_chain` counts it, so a
-        // single corrupt field cannot end the scan as a splice.
-        if event.chain_version.is_none() {
-            // Pre-chain history at the head of a log; a fail-closed break
-            // anywhere after it. The verifier stops there, so the scan does
-            // too, and the value is 0 or 1 rather than a tally.
-            if walked {
-                findings.legacy_splice = 1;
-                break;
-            }
-            continue;
-        }
-
-        let seq = event.seq.unwrap_or(0);
-        let entry_hash = event.entry_hash.clone().unwrap_or_default();
-        let key_id = event.key_id.as_deref().unwrap_or("default");
-
-        // `#483`'s two-piece evidence, both halves required. `entry_hash`
-        // alone would take an entry whose hash was destroyed — evidence of
-        // tampering — and file it as "was never protected".
-        let unprotected =
-            key_id == UNRESOLVED_KEY_ID && entry_hash == NO_HMAC_SECRET && !is_prune_point(&event);
-
-        // The key lookup, in the position `verify_chain` puts it: after the
-        // version gate, before the link check. An entry naming a key the ring
-        // does not hold halts the verifier unless #483's evidence says the
-        // entry was written unprotected, and the scan halts with it — every
-        // line after it runs through an entry whose authenticity is unknown.
-        if !unprotected && keyring.is_none_or(|ring| ring.get(key_id).is_none()) {
-            break;
-        }
-
-        // Continuity is checked before the entry is classified, and it is
-        // checked on unprotected entries too. `verify_chain` does the same
-        // (`#483`): that entry's `prev_hash` holds the previous entry's real
-        // hash whoever wrote the line, so checking it is what makes a
-        // two-field forgery break the chain instead of passing as a coverage
-        // gap. Classifying first and skipping the link would reopen exactly
-        // that door here.
-        if let Some((prev_seq, prev_hash)) = &prev {
-            let links = event.prev_hash.as_deref() == Some(prev_hash.as_str());
-            let follows = prev_seq.checked_add(1) == Some(seq);
-            if !links || !follows {
-                // One, and stop — the same shape as the splice above.
-                // `verify_chain` sets `broken_at` and breaks, so counting
-                // every disturbed pair would report a single spliced line as
-                // two findings (its own broken link, and the next entry's
-                // link to it) and disagree with the verifier about the log it
-                // is describing.
-                findings.broken = 1;
-                break;
-            }
-        }
-        if unprotected {
-            findings.unprotected = findings.unprotected.saturating_add(1);
-        }
-        walked = true;
-        // The next line's `prev_hash` names this line's hash field, sentinel
-        // and all — the same advance `verify_chain` makes for an unprotected
-        // entry, and what turns a forged pair into a break one line later.
-        prev = Some((seq, entry_hash));
     }
     findings
 }
 
-/// Carry a previous prune point's record forward, after authenticating it.
+/// The record the prune point at the head of the removed range carried,
+/// brought forward — or `prior_lost` when there was one to bring and it could
+/// not be.
 ///
 /// The record is tamper-evidence *about* the log held *in* the log, so it is
 /// read only from an entry that authenticates against the key its own
 /// `key_id` names — the same rule the post-prune high-water-mark follows
-/// since `#461`'s first half. Every way of failing to get there produces
-/// `prior_lost`, so a record that could not be carried is visible as a
-/// record that could not be carried, rather than as an absence.
-fn carry_forward_findings(line: &str, keyring: Option<&Keyring>) -> PrunedFindings {
+/// since `#461`'s first half. That check is the walk's: `pruned_findings` is
+/// filled past the prune point's own `entry_hash` comparison, and `pruned` is
+/// set there too. Every way of failing to get there produces `prior_lost`, so
+/// a record that could not be carried is visible as a record that could not
+/// be carried, rather than as an absence.
+fn prior_record(head_naming_prune: Option<&str>, result: &VerifyResult) -> PrunedFindings {
     let lost = PrunedFindings {
         prior_lost: 1,
         ..PrunedFindings::default()
     };
-    let Ok(event) = parse_line::<AuditEvent>(line.trim()) else {
-        return lost;
-    };
-    if !is_prune_point(&event) {
-        // Not a prune point at all, so there is no prior record to carry and
-        // nothing was lost.
+    if let Some(prior) = result.pruned_findings {
+        return if prior.record_unreadable {
+            // What this build could read is carried; the part it could not is,
+            // from the writer's side, a record it could not carry. The flag
+            // itself is read-side only and is never written.
+            PrunedFindings {
+                record_unreadable: false,
+                ..prior
+            }
+            .merge(lost)
+        } else {
+            prior
+        };
+    }
+    if result.pruned {
+        // Authenticated, and carrying nothing.
         return PrunedFindings::default();
     }
-    let Some(keyring) = keyring else {
-        return lost;
+    // Nothing at the head authenticated as a prune point. Whether that lost a
+    // record depends on whether a prune point was there to hold one —
+    // `is_prune_point`'s three fields, not `command` alone: an ordinary entry
+    // for a command that happens to be named `_prune` is not one, has no
+    // record, and loses nothing.
+    let Some(head) = head_naming_prune else {
+        return PrunedFindings::default();
     };
-    let key_id = event.key_id.as_deref().unwrap_or("default");
-    let Some(secret) = keyring.get(key_id) else {
-        return lost;
-    };
-    let RecomputedHash::Hash(recomputed) = compute_entry_hash(Some(secret), &event) else {
-        return lost;
-    };
-    if event.entry_hash.as_deref() != Some(recomputed.as_str()) {
-        return lost;
-    }
-    match decode_findings(event.rule_id.as_deref()) {
-        // A record this build cannot read is, from the writer's side, a
-        // record it could not carry.
-        Some(findings) if findings.record_unreadable => lost,
-        Some(findings) => findings,
-        None => PrunedFindings::default(),
+    match parse_line::<AuditEvent>(head.trim()) {
+        Ok(event) if !is_prune_point(&event) => PrunedFindings::default(),
+        _ => lost,
     }
 }
 
@@ -556,29 +592,28 @@ fn try_prune_at_collect(
     }
 
     // `#461`: the ring is loaded here rather than after the rewrite, because
-    // the previous prune point's findings record has to be authenticated
-    // before it can be read, and that has to happen before the prune point
-    // replacing it is built. The post-prune high-water-mark below reuses this
+    // the range has to be walked — and the previous prune point's findings
+    // record authenticated — before the prune point replacing them is built. The post-prune high-water-mark below reuses this
     // same ring. Lock order is unchanged — still one key-store acquisition,
     // inside the log's own flock, on a path that runs once per
     // `PRUNE_CHECK_INTERVAL` appends.
     let keyring = audit_path.map(|path| load_keyring(&secret_path_for(path)));
 
-    // `#461`: what the removed range would have cost the verifier. Counted
+    // `#461`: what the removed range would have cost the verifier. Asked
     // before the rewrite, since afterwards those lines are gone — which is
     // the whole defect being closed.
-    let mut findings = scan_pruned_range(
-        &lines[skip_existing_prune..retain_from],
+    //
+    // The range starts at line 0, prune point included. That prune point is
+    // about to be discarded along with the range it covered, and the record
+    // it carries would die with it — on a log pruning every
+    // `PRUNE_CHECK_INTERVAL` appends, a trace with a lifetime of one prune —
+    // so the walk authenticates it and the record is carried forward.
+    let findings = findings_for_removed_range(
+        &lines[..retain_from],
+        lines.get(retain_from).copied(),
         skip_existing_prune == 1,
         keyring.as_ref(),
     );
-    if skip_existing_prune == 1 {
-        // The prune point standing at line 0 is about to be discarded along
-        // with the range it covered. Without this, the record it carries dies
-        // with it, and on a log pruning every `PRUNE_CHECK_INTERVAL` appends
-        // that is a trace with a lifetime of one prune.
-        findings = findings.merge(carry_forward_findings(lines[0], keyring.as_ref()));
-    }
 
     let prune_point = build_prune_point(
         signing_key,

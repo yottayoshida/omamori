@@ -771,6 +771,25 @@ enum KeyStore {
     NothingWrittenYet,
 }
 
+/// The failure a ring that cannot resolve any id stands for, if it is one.
+///
+/// A function of the ring alone so that a prune, which loads its own, starts
+/// its walk in the state `verify_chain` would be in over the same store
+/// (#539): with this set every line is tallied and none is judged. Left to
+/// walk an unusable ring as an empty one, a prune judged the lines that need
+/// no key — an entry written with no HMAC, a spliced legacy line — and
+/// recorded findings `audit verify` would not have reached.
+pub(super) fn keyring_failure(keyring: &Keyring) -> Option<KeyStoreFailure> {
+    let fatal = keyring.fatal_anomaly()?;
+    Some(KeyStoreFailure {
+        // Not a literal: `fatal_anomaly` selects two conditions and they
+        // are not the same fault. See `KeyringAnomaly::kind`.
+        kind: fatal.kind(),
+        reason: fatal.describe(),
+        remedy: fatal.remedy().unwrap_or_default(),
+    })
+}
+
 /// Resolve the keys this run can verify with, or say why it cannot.
 ///
 /// The order of the first two observations is load-bearing and predates this
@@ -818,14 +837,8 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // and report every entry as tampered — a false accusation caused by a
     // permissions problem. Nothing consults the ring once this fires.
     let keyring = load_keyring(secret_path);
-    if let Some(fatal) = keyring.fatal_anomaly() {
-        return KeyStore::Unusable(KeyStoreFailure {
-            // Not a literal: `fatal_anomaly` selects two conditions and they
-            // are not the same fault. See `KeyringAnomaly::kind`.
-            kind: fatal.kind(),
-            reason: fatal.describe(),
-            remedy: fatal.remedy().unwrap_or_default(),
-        });
+    if let Some(failure) = keyring_failure(&keyring) {
+        return KeyStore::Unusable(failure);
     }
 
     // Reached only with a listing in hand, which is what makes the secret's own
@@ -1104,6 +1117,25 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     Ok(result)
 }
 
+/// Why a walk set `broken_at`.
+///
+/// [`verify_chain`] reports every one of these as the same verdict — exit 1,
+/// "may have been tampered with" — and has no use for the difference. A
+/// prune's record does (#540): it has a word for each, and a release that
+/// reads the record must not describe a rewritten entry as a continuity
+/// break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BreakCause {
+    /// A legacy-shaped line after the chain had started.
+    LegacySplice,
+    /// The entry's `entry_hash` does not match the entry.
+    Hash,
+    /// Anything that ties one line to another: `seq`/`prev_hash` continuity,
+    /// the head's genesis or prune anchor, a prune-bind. Also what a break
+    /// with no cause set is reported as — see [`walk_lines`].
+    Link,
+}
+
 /// Where a walk stands: the verdict so far, and what the next line will be
 /// held against.
 ///
@@ -1160,6 +1192,8 @@ pub(super) struct Walk {
     /// the scan was willing to compare from. Seeded at the halt (see the two
     /// gates in [`walk_lines`]), then carried line to line.
     structural_anchor: Option<StructuralAnchor>,
+    /// Why `result.broken_at` was set; `None` exactly while it is not.
+    pub(super) broke: Option<BreakCause>,
 }
 
 impl Walk {
@@ -1178,6 +1212,7 @@ impl Walk {
             last_walked_seq: None,
             prev_prune: None,
             structural_anchor: None,
+            broke: None,
         }
     }
 }
@@ -1212,6 +1247,7 @@ pub(super) fn walk_lines<S: AsRef<str>, E>(
         mut last_walked_seq,
         mut prev_prune,
         mut structural_anchor,
+        mut broke,
     } = walk;
 
     for line in lines {
@@ -1308,8 +1344,9 @@ pub(super) fn walk_lines<S: AsRef<str>, E>(
         let reported_position = expected_seq.unwrap_or(u64::MAX);
 
         // The version dispatch, decided before the line is read as an
-        // `AuditEvent` and by the same peek `append` and the prune scan use
-        // (#556). Through 1.2.0 it ran in two places: after a successful
+        // `AuditEvent` and by the same peek `append` uses (#556). A prune
+        // reaches it too, by running this loop over the range it removes
+        // (#539). Through 1.2.0 it ran in two places: after a successful
         // `AuditEvent` parse, and in a raw-JSON fallback for a line that
         // failed one, which read `chain_version` and `seq` through one typed
         // struct. A `seq` of the wrong type failed that struct as a whole, so
@@ -1394,6 +1431,7 @@ pub(super) fn walk_lines<S: AsRef<str>, E>(
             // admit legacy-shaped lines behind them.
             if result.entries_walked() > 0 {
                 result.broken_at = Some(reported_position);
+                broke = Some(BreakCause::LegacySplice);
                 break;
             }
             result.legacy_entries += 1;
@@ -1659,6 +1697,7 @@ pub(super) fn walk_lines<S: AsRef<str>, E>(
 
         if recomputed != recorded_hash {
             result.broken_at = Some(seq);
+            broke = Some(BreakCause::Hash);
             break;
         }
 
@@ -1742,6 +1781,14 @@ pub(super) fn walk_lines<S: AsRef<str>, E>(
         }
     }
 
+    // Two of the breaks above name their cause. Every other one is a link of
+    // some kind, and so is one added later without a cause: `Link` is the word
+    // releases since 1.0.5 already read, so an unnamed break is described the
+    // way it always was rather than left out of the record.
+    if result.broken_at.is_some() && broke.is_none() {
+        broke = Some(BreakCause::Link);
+    }
+
     Ok(Walk {
         result,
         expected_prev,
@@ -1751,6 +1798,7 @@ pub(super) fn walk_lines<S: AsRef<str>, E>(
         last_walked_seq,
         prev_prune,
         structural_anchor,
+        broke,
     })
 }
 

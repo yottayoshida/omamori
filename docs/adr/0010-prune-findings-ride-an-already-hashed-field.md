@@ -1,6 +1,8 @@
 # ADR-0010: A prune's findings ride an already-hashed field, not a new one
 
-- **Status**: Accepted
+- **Status**: Accepted — amended by [ADR-0015](0015-prune-findings-come-from-the-verifiers-own-walk.md),
+  which supersedes the third Consequence below and part of the second. The Decision — the record
+  rides `rule_id`, with no `chain_version` bump — stands.
 - **Date**: 2026-08-16
 - **Plan**: `.claude/plans/2026-08-16-omamori-461-prune-unverifiable-trace.md`
 
