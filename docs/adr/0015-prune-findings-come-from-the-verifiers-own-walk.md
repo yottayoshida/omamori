@@ -1,6 +1,8 @@
 # ADR-0015: A prune's findings come from the verifier's own walk
 
-- **Status**: Accepted
+- **Status**: Accepted — the consequence "the prune holds the log's flock for longer" no longer
+  holds: since [ADR-0017](0017-a-prune-copies-outside-the-logs-lock.md) the walk runs before the
+  prune takes that lock.
 - **Date**: 2026-10-02
 - **Plan**: `.claude/plans/2026-10-02-omamori-539-540-prune-record-from-verifier-walk.md`
 - **Supersedes**: two Consequences of [ADR-0010](0010-prune-findings-ride-an-already-hashed-field.md)

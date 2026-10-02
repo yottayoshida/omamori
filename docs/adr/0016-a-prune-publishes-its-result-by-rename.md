@@ -1,6 +1,12 @@
 # ADR-0016: A prune publishes its result by rename, not in place
 
-- **Status**: Accepted
+- **Status**: Accepted — Decision 5 (the leftover is swept by the next `append`), and with it
+  the consequences that every append pays an `unlink` and that a remnant lasts until the next
+  append, and the consequence that the time under the lock does not change, are superseded by
+  ADR-0017; so is the reason Decision 2 gives for removing a leftover ("under the lock, nothing
+  else is writing it" — the lock that shows it is now the one on the directory). See
+  [ADR-0017](0017-a-prune-copies-outside-the-logs-lock.md), which also takes up the alternative
+  "copy outside the lock" that this ADR set aside.
 - **Date**: 2026-10-02
 - **Plan**: `.claude/plans/2026-10-02-omamori-568b-prune-publishes-by-rename.md`
 - **Supersedes**: the *Design decision* paragraph of SECURITY.md → Audit Retention ("In-place
