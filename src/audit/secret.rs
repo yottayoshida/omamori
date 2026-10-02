@@ -85,6 +85,28 @@ pub(super) fn flock_exclusive(file: &fs::File) -> Result<(), std::io::Error> {
     flock_bounded(file, true)
 }
 
+/// One attempt at an exclusive lock, without waiting: `Ok(false)` when someone
+/// else holds it. For a lock whose being held is itself the answer — a prune
+/// finding another prune already running (ADR-0017).
+#[cfg(unix)]
+pub(super) fn try_flock_exclusive(file: &fs::File) -> Result<bool, std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(not(unix))]
+pub(super) fn try_flock_exclusive(_file: &fs::File) -> Result<bool, std::io::Error> {
+    Ok(true)
+}
+
 #[cfg(not(unix))]
 pub(super) fn flock_exclusive(_file: &fs::File) -> Result<(), std::io::Error> {
     Ok(())
@@ -2435,7 +2457,7 @@ const LOG_REOPEN_ATTEMPTS: u32 = 3;
 ///
 /// So the comparison is made *after* the lock is held, which is the only order
 /// in which it says anything: once it passes, a rename cannot follow, because a
-/// prune runs under the exclusive lock of the inode `path` names and no lock
+/// prune renames under the exclusive lock of the inode `path` names and no lock
 /// on that inode can be taken past this one. On a mismatch the log is opened
 /// again.
 ///
@@ -2472,7 +2494,7 @@ pub(super) fn open_log_locked(path: &Path, lock: LogLock) -> Result<fs::File, Lo
 /// symlink put there since is not the log. A path that names nothing, or that
 /// cannot be examined, is not this file either.
 #[cfg(unix)]
-fn names_this_file(path: &Path, file: &fs::File) -> bool {
+pub(super) fn names_this_file(path: &Path, file: &fs::File) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (file.metadata(), fs::symlink_metadata(path)) {
         (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
@@ -2481,7 +2503,7 @@ fn names_this_file(path: &Path, file: &fs::File) -> bool {
 }
 
 #[cfg(not(unix))]
-fn names_this_file(_path: &Path, _file: &fs::File) -> bool {
+pub(super) fn names_this_file(_path: &Path, _file: &fs::File) -> bool {
     true
 }
 

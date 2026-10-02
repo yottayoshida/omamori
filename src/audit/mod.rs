@@ -35,7 +35,7 @@ pub use verify::{
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
 use chain::{CHAIN_VERSION, ChainTailState, compute_entry_hash_for_write, read_chain_state};
 use provenance::ProcessProvenance;
-use retention::{PRUNE_CHECK_INTERVAL, prune_temp_path_for, try_prune};
+use retention::{PRUNE_CHECK_INTERVAL, sweep_leftover, try_prune};
 use secret::{
     LockedLogError, LogLock, SigningKey, hmac_targets, load_signing_key_with, open_log_locked,
     secret_path_for,
@@ -446,12 +446,6 @@ impl AuditLogger {
         let mut file =
             open_log_locked(&self.path, LogLock::Exclusive).map_err(LockedLogError::into_io)?;
 
-        // What a prune that did not finish left behind. Under the lock, and
-        // past the check above, it cannot be a prune still running — only the
-        // holder of this lock can run one. `NotFound` on every ordinary append;
-        // anything else that stands there is for the next prune to report.
-        let _ = fs::remove_file(prune_temp_path_for(&self.path));
-
         // Read chain state under lock (another process may have appended since our open).
         // #177 B1 step 3: when the log's last chain entry (#465: the last line carrying a
         // `chain_version`, however much non-chain content follows it) declares
@@ -577,22 +571,26 @@ impl AuditLogger {
             ));
         }
 
-        // Auto-prune under the same flock (no extra I/O when not triggered)
-        if self.retention_days > 0
-            && seq > 0
-            && seq % PRUNE_CHECK_INTERVAL == 0
-            && let Err(e) = try_prune(
-                &mut file,
-                &self.signing_key,
-                self.retention_days,
-                &self.path,
-                warnings,
-            )
-        {
-            warnings.push(format!("omamori warning: audit prune failed: {e}"));
+        // The entry is written and the mark is where it should be: the lock
+        // goes here, before the prune, not after it (ADR-0017). A prune copies
+        // most of the log, and held under this lock that copy made every
+        // `append` arriving meanwhile give up and leave no entry. It takes the
+        // lock itself, at its end, for as long as a rename needs.
+        drop(file);
+
+        // Auto-prune (no extra I/O when not triggered)
+        if seq > 0 && seq % PRUNE_CHECK_INTERVAL == 0 {
+            if self.retention_days == 0 {
+                // Retention is off, but an unfinished prune from when it was on
+                // may have left its temporary file. Swept on the same schedule.
+                sweep_leftover(&self.path);
+            } else if let Err(e) =
+                try_prune(&self.signing_key, self.retention_days, &self.path, warnings)
+            {
+                warnings.push(format!("omamori warning: audit prune failed: {e}"));
+            }
         }
 
-        // flock released on file drop
         Ok(())
     }
 }
@@ -891,7 +889,7 @@ mod tests {
     };
     use retention::{
         MIN_RETENTION_DAYS, PRUNE_COMMAND, PrunedFindings, build_prune_point, decode_findings,
-        try_prune_at, try_prune_at_no_ring,
+        prune_temp_path_for, try_prune_at, try_prune_at_no_ring,
     };
     use secret::{
         KeyringAnomaly, MAX_KEYRING_KEYS, UNRESOLVED_KEY_ID, create_secret, decode_hex_secret,
@@ -5794,7 +5792,7 @@ mod tests {
     }
 
     /// The same thing through the only door production has. `append` is what
-    /// calls the prune, at its end and under its own lock, and it is `append`
+    /// calls the prune, once its own entry is written, and it is `append`
     /// that advances the mark — or declines to, when the number it just wrote
     /// is below the mark and it warns that the tail may have been cut.
     #[test]
@@ -6080,22 +6078,13 @@ mod tests {
             "the log must be far larger than one read"
         );
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        flock_exclusive(&file).unwrap();
-        let pruned = try_prune_at(
-            &mut file,
-            &test_signing_key(),
-            90,
-            &path,
-            retention_test_now(),
-        )
-        .unwrap();
-        assert_eq!(pruned, 0);
-        let read = file.stream_position().unwrap();
+        retention::HEAD_READ.with(|slot| slot.set(None));
+        let (result, _) =
+            retention::prune_collecting(&test_signing_key(), 90, &path, true, retention_test_now());
+        assert_eq!(result.unwrap(), 0);
+        let read = retention::HEAD_READ
+            .with(std::cell::Cell::get)
+            .expect("the prune must have got as far as looking for the boundary");
         assert!(
             read <= 64 * 1024,
             "read {read} of {size} bytes to find there was nothing to remove"
@@ -6103,20 +6092,314 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The leftover of a prune that did not finish is removed by the next
-    /// append — any append, not only one that prunes.
-    #[test]
-    fn an_append_sweeps_what_an_unfinished_prune_left() {
-        let dir = test_dir("prune-rename-sweep");
+    // --- a prune copies outside the log's lock (#568, ADR-0017) ---
+    //
+    // The copy is the long part of a prune, and it used to run under the lock
+    // `append` holds: every append that arrived meanwhile gave up after half a
+    // second and left no entry. The log's lock is now taken only to publish.
+    // What makes that sound is that the log grows at its end and nowhere else,
+    // so these tests are about its end: what is appended while a prune copies,
+    // and after it has copied, must come through once and whole.
+
+    fn the_prune(path: &Path) -> (Result<u64, std::io::Error>, Vec<String>) {
+        retention::prune_collecting(&test_signing_key(), 90, path, true, retention_test_now())
+    }
+
+    fn arm(hook: &'static std::thread::LocalKey<retention::TestHook>, f: impl FnOnce() + 'static) {
+        hook.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+    }
+
+    /// The store the tests below prune: [`prune_hwm_fixture`] with its mark in
+    /// place, and a logger that appends to it.
+    fn store_with_a_logger(name: &str) -> (PathBuf, PathBuf, AuditLogger) {
+        let dir = test_dir(name);
         let logger = test_logger(&dir);
-        logger.append(make_event("first")).unwrap();
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        write_hwm(&hwm_path_for(&path), PRUNE_HWM_TOP_SEQ).unwrap();
+        (dir, path, logger)
+    }
+
+    /// Entries appended *while the prune is copying* are in the pruned log
+    /// once. A copy that ran "to the end of the file" would pick them up as
+    /// they landed, and the publish step would then add them again.
+    #[test]
+    fn appends_during_a_prunes_copy_come_through_once() {
+        let (dir, path, logger) = store_with_a_logger("prune-lockfree-during-copy");
+        arm(&retention::DURING_COPY, move || {
+            for _ in 0..3 {
+                logger.append(make_event("during the copy")).unwrap();
+            }
+        });
+
+        let (result, _) = the_prune(&path);
+        assert_eq!(result.unwrap(), 100);
+
+        let events = read_events(&path);
+        assert_eq!(
+            events.len(),
+            1 + 1100 + 3,
+            "the prune point, what was kept, the three"
+        );
+        let seqs: Vec<u64> = events[1..]
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            seqs,
+            (100..=PRUNE_HWM_TOP_SEQ + 3).collect::<Vec<_>>(),
+            "every entry once, in order"
+        );
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted() && !result.tail_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Entries appended after the copy and before the prune takes the lock are
+    /// carried across by the publish step.
+    #[test]
+    fn appends_between_a_prunes_copy_and_its_publish_are_carried_across() {
+        let (dir, path, logger) = store_with_a_logger("prune-lockfree-between");
+        arm(&retention::BETWEEN_PHASES, move || {
+            for _ in 0..3 {
+                logger.append(make_event("after the copy")).unwrap();
+            }
+        });
+
+        let (result, _) = the_prune(&path);
+        assert_eq!(result.unwrap(), 100);
+
+        let events = read_events(&path);
+        assert_eq!(events.len(), 1 + 1100 + 3);
+        assert_eq!(
+            events.last().unwrap()["seq"].as_u64(),
+            Some(PRUNE_HWM_TOP_SEQ + 3)
+        );
+        assert!(
+            events[events.len() - 3..]
+                .iter()
+                .all(|e| e["command"].as_str() == Some("after the copy"))
+        );
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted() && !result.tail_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The copy can stop in the middle of a line: an `append` writes its entry
+    /// in more than one `write`, and a reader without the lock sees whatever
+    /// has landed. The rest of that line is what the publish step adds, and
+    /// the line comes through whole.
+    #[test]
+    fn a_line_half_written_when_the_copy_stops_comes_through_whole() {
+        let (dir, path, logger) = store_with_a_logger("prune-lockfree-half-line");
+        logger.append(make_event("the half-written one")).unwrap();
+        let whole = fs::read(&path).unwrap();
+        let cut = whole.len() - 100;
+        fs::write(&path, &whole[..cut]).unwrap();
+        let rest = whole[cut..].to_vec();
+        let finishing = path.clone();
+        arm(&retention::BETWEEN_PHASES, move || {
+            let mut log = OpenOptions::new().append(true).open(&finishing).unwrap();
+            log.write_all(&rest).unwrap();
+        });
+
+        let (result, _) = the_prune(&path);
+        assert_eq!(result.unwrap(), 100);
+
+        let pruned = fs::read(&path).unwrap();
+        let after_the_prune_point = pruned.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let kept_from = whole.len() - (pruned.len() - after_the_prune_point);
+        assert!(
+            pruned[after_the_prune_point..] == whole[kept_from..],
+            "what follows the prune point is the log's own bytes, unbroken"
+        );
+        let events = read_events(&path);
+        assert_eq!(
+            events.last().unwrap()["command"].as_str(),
+            Some("the half-written one")
+        );
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What phase one read without the lock is confirmed under it. Each of
+    /// these changes the log, or the prune's own file, between the two — and
+    /// in each the prune ends having published nothing, says what it found,
+    /// and leaves the log as that change left it.
+    #[test]
+    fn a_prune_publishes_nothing_when_what_it_read_has_changed() {
+        type Change = fn(&Path);
+        let cases: [(&str, &str, Change); 4] = [
+            (
+                "the log is replaced by another file",
+                "the log was replaced",
+                |path| {
+                    let copy = path.with_extension("swap");
+                    fs::copy(path, &copy).unwrap();
+                    fs::rename(&copy, path).unwrap();
+                },
+            ),
+            (
+                "the head of the log is rewritten in the same file",
+                "the head of the log changed",
+                |path| {
+                    let mut log = OpenOptions::new().write(true).open(path).unwrap();
+                    log.write_all(b" ").unwrap();
+                },
+            ),
+            ("the log is cut short", "the log became shorter", |path| {
+                let log = OpenOptions::new().write(true).open(path).unwrap();
+                let length = log.metadata().unwrap().len();
+                log.set_len(length - 10).unwrap();
+            }),
+            (
+                "the prune's temporary file is swapped for another",
+                "no longer the file this prune wrote",
+                |path| {
+                    let temp = prune_temp_path_for(path);
+                    fs::remove_file(&temp).unwrap();
+                    fs::write(&temp, b"somebody else's").unwrap();
+                },
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (index, (label, says, change)) in cases.into_iter().enumerate() {
+            let (dir, path, _logger) =
+                store_with_a_logger(&format!("prune-lockfree-changed-{index}"));
+            let changing = path.clone();
+            let as_changed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let seen = as_changed.clone();
+            arm(&retention::BETWEEN_PHASES, move || {
+                change(&changing);
+                *seen.borrow_mut() = fs::read(&changing).unwrap();
+            });
+
+            let (result, warnings) = the_prune(&path);
+
+            match result {
+                Ok(0) => {}
+                other => wrong.push(format!(
+                    "{label}: the prune returned {other:?}, expected Ok(0)"
+                )),
+            }
+            if !warnings
+                .iter()
+                .any(|w| w.contains("audit prune abandoned") && w.contains(says))
+            {
+                wrong.push(format!("{label}: it did not say so: {warnings:?}"));
+            }
+            if as_changed.borrow().is_empty() {
+                wrong.push(format!(
+                    "{label}: the change never ran, so nothing was exercised"
+                ));
+            }
+            if fs::read(&path).unwrap() != *as_changed.borrow() {
+                wrong.push(format!("{label}: the log is not as the change left it"));
+            }
+            let temp = prune_temp_path_for(&path);
+            if says.contains("no longer the file") {
+                if fs::read(&temp).ok().as_deref() != Some(b"somebody else's".as_slice()) {
+                    wrong.push(format!(
+                        "{label}: the file that was not this prune's was removed"
+                    ));
+                }
+            } else if temp.exists() {
+                wrong.push(format!("{label}: the prune left its temporary file behind"));
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} disagreement(s):\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// One prune at a time: while the lock on the log's directory is held, a
+    /// prune says so and does nothing.
+    #[test]
+    fn a_prune_stands_aside_while_another_holds_the_directory() {
+        let (dir, path, _logger) = store_with_a_logger("prune-lockfree-excluded");
+        let before = fs::read(&path).unwrap();
+        let other = fs::File::open(&dir).unwrap();
+        assert!(secret::try_flock_exclusive(&other).unwrap());
+
+        let (result, warnings) = the_prune(&path);
+
+        assert_eq!(result.unwrap(), 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("audit prune skipped")
+                    && w.contains("another process is pruning")),
+            "{warnings:?}"
+        );
+        assert!(fs::read(&path).unwrap() == before);
+        assert!(!prune_temp_path_for(&path).exists());
+
+        // The control: with the directory let go, the same prune runs.
+        drop(other);
+        assert_eq!(the_prune(&path).0.unwrap(), 100);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A prune that cannot have the log's lock to publish gives up rather than
+    /// wait: what holds it for longer than a prune waits is `audit verify`,
+    /// for the length of its walk. The copy is thrown away and the log is as
+    /// it was.
+    #[test]
+    fn a_prune_gives_up_when_the_log_stays_locked() {
+        let (dir, path, _logger) = store_with_a_logger("prune-lockfree-log-busy");
+        let before = fs::read(&path).unwrap();
+        let reader = fs::File::open(&path).unwrap();
+        secret::flock_shared(&reader).unwrap();
+
+        let (result, warnings) = the_prune(&path);
+
+        assert_eq!(result.unwrap(), 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("audit prune postponed") && w.contains("in use for longer")),
+            "{warnings:?}"
+        );
+        assert!(fs::read(&path).unwrap() == before);
+        assert!(!prune_temp_path_for(&path).exists());
+
+        drop(reader);
+        assert_eq!(the_prune(&path).0.unwrap(), 100);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What an unfinished prune left under the temporary name goes on the
+    /// prune's own schedule — the append that reaches a multiple of
+    /// `PRUNE_CHECK_INTERVAL` — and with retention off as much as on. Not on
+    /// every append: a prune now runs outside `append`'s lock, and the file an
+    /// ordinary append found there could be one a prune is writing.
+    #[test]
+    fn a_leftover_is_swept_at_the_next_prune_check() {
+        let dir = test_dir("prune-lockfree-sweep");
+        let logger = test_logger(&dir);
+        assert_eq!(logger.retention_days, 0);
+        let entries: Vec<(&str, &str)> = (0..999).map(|_| ("e", "2026-04-04T00:00:00Z")).collect();
+        write_chain_entries(&logger.path, &TEST_SECRET, &entries, 2);
         let temp = prune_temp_path_for(&logger.path);
         fs::write(&temp, b"half of a log").unwrap();
 
-        logger.append(make_event("second")).unwrap();
+        logger.append(make_event("seq 999")).unwrap();
+        assert!(
+            temp.exists(),
+            "the control: an ordinary append leaves it alone"
+        );
 
-        assert!(!temp.exists(), "the append must have removed the leftover");
-        assert_eq!(read_events(&logger.path).len(), 2);
+        logger.append(make_event("seq 1000")).unwrap();
+        assert!(
+            !temp.exists(),
+            "the append at the check must have removed it"
+        );
+        assert_eq!(read_events(&logger.path).len(), 1001);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6293,9 +6576,17 @@ mod tests {
         let path = prune_hwm_fixture(&dir, &TEST_SECRET);
         let before = fs::read_to_string(&path).unwrap();
         write_hwm(&hwm_path_for(&path), 7).unwrap();
+        // What an earlier prune left unfinished. It goes even though this one
+        // does not run: a missing key is no reason to keep a stranded file.
+        let leftover = prune_temp_path_for(&path);
+        fs::write(&leftover, b"half of a log").unwrap();
 
         let pruned = prune_with_the_ring(&path, &SigningKey::for_test("default", None));
         assert_eq!(pruned, 0, "the prune must not run at all");
+        assert!(
+            !leftover.exists(),
+            "the leftover must still have been swept"
+        );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             before,
@@ -10373,8 +10664,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_prune_with_an_unusable_keyring_judges_no_more_than_verify_does() {
-        use std::os::unix::fs::PermissionsExt;
-
         let store = |name: &str| {
             let dir = test_dir(name);
             test_logger(&dir);
@@ -10402,14 +10691,19 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&listable);
 
-        let (dir, path) = store("prune-findings-unlistable");
-        // `0o300`: searchable and writable, not listable. The secret can
-        // still be opened by name, so this is the unlistable-directory fault
-        // and not a missing secret.
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let (dir, path) = store("prune-findings-unusable-ring");
+        // An epoch record that states no epoch: the ring can resolve no id,
+        // which is the same fatal state an unlistable key directory produces.
+        // It used to be produced that way here (`0o300`); a prune no longer
+        // runs in a directory it cannot open (ADR-0017), which the test after
+        // this one holds, so the state is reached through the record instead.
+        fs::write(
+            secret::epoch_record_path(&secret::secret_path_for(&path)),
+            "not an epoch",
+        )
+        .unwrap();
         let verified = verify_chain(&verify_config(&dir));
         let (pruned, record) = prune_and_read_record(&path, 90, Some(&path));
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         let verified = verified.expect("an unusable key store is a result, not an error");
         assert!(
@@ -10427,6 +10721,38 @@ mod tests {
             Some("pruned:unchecked=1"),
             "the range went unexamined, and that is the whole of what can be said"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0017: prunes keep one another out by a lock on the log's directory,
+    /// so a prune does not run in a directory it cannot open — it says so and
+    /// leaves the log alone. `0o300` is the unlistable-key-directory fault:
+    /// searchable and writable, so appends go on and the secret opens by name.
+    /// Through 1.2.2 a prune ran there and recorded the range as unchecked.
+    #[cfg(unix)]
+    #[test]
+    fn a_prune_does_not_run_in_a_directory_it_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = test_dir("prune-unopenable-directory");
+        test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let before = fs::read(&path).unwrap();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o300)).unwrap();
+        let (result, warnings) =
+            retention::prune_collecting(&test_signing_key(), 90, &path, true, retention_test_now());
+        let after = fs::read(&path);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(result.unwrap(), 0, "the prune must not have run");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("audit prune skipped") && w.contains("could not be opened")),
+            "and it must say why: {warnings:?}"
+        );
+        assert!(after.unwrap() == before, "the log is untouched");
+        assert!(!prune_temp_path_for(&path).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
