@@ -2438,9 +2438,9 @@ impl LockedLogError {
 }
 
 /// How many times [`open_log_locked`] opens the log before giving up on one
-/// that is replaced every time. A prune replaces it once per
-/// `PRUNE_CHECK_INTERVAL` appends, so a second mismatch in a row is already
-/// not a prune.
+/// that is replaced every time. A prune replaces it at most once per
+/// `PRUNE_CHECK_INTERVAL` appends — about once a day since #568 — so a second
+/// mismatch in a row is already not a prune.
 const LOG_REOPEN_ATTEMPTS: u32 = 3;
 
 /// Opens the audit log, takes `lock` on it, and makes sure the file that was

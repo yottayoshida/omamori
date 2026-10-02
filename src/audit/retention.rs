@@ -1,9 +1,11 @@
 //! Audit log retention and pruning.
 //!
-//! Automatic prune is triggered every `PRUNE_CHECK_INTERVAL` entries during
-//! `AuditLogger::append()`, once that append has released the log's lock. It
-//! builds the pruned log beside the real one without holding that lock, and
-//! takes it only to rename the result into place (ADR-0016, ADR-0017).
+//! Whether a prune is due is checked every `PRUNE_CHECK_INTERVAL` entries
+//! during `AuditLogger::append()`, once that append has released the log's
+//! lock; one is due when the first entry is more than [`PRUNE_SLACK`] past the
+//! retention period (#568). It builds the pruned log beside the real one
+//! without holding that lock, and takes it only to rename the result into
+//! place (ADR-0016, ADR-0017).
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -25,6 +27,24 @@ use crate::atomic_file::{TempGuard, describe_file_type, fsync_parent};
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
 pub(super) const MIN_RETENTION_DAYS: u32 = 7;
 pub(super) const MIN_RETAIN_ENTRIES: usize = 1000;
+/// How far past the retention period the first entry in the log has to be
+/// before a prune runs (#568).
+///
+/// A prune copies everything it keeps, however little it removes. Run whenever
+/// a single entry had aged out, it ran at every check on a busy log — a
+/// thousand appends apart, each time copying the whole log to drop the
+/// thousand entries that had passed the period since the last one. With a day
+/// of slack it runs when a day's worth has, about once a day, and the checks
+/// in between read the log's first line and stop.
+///
+/// It moves *when* a prune runs, not *what* it removes: a prune that runs
+/// still removes everything older than the period. So an entry can outlast the
+/// period by this much, and by however long the next check takes to come.
+///
+/// Fixed rather than configured or scaled to the period: a day reads the same
+/// against a period of seven days or ninety, and a setting can be added when
+/// someone needs one.
+pub(super) const PRUNE_SLACK: time::Duration = time::Duration::days(1);
 pub(super) const PRUNE_COMMAND: &str = "_prune";
 pub(super) const PRUNE_ACTION: &str = "retention";
 pub(super) const PRUNE_RESULT: &str = "pruned";
@@ -591,7 +611,8 @@ fn unlock(file: &fs::File) {
 /// It reads only what it has to: the head as far as the first entry it keeps,
 /// a thousand lines past that to know enough would remain, and the removed
 /// range once more for the walk. The retained part is copied without being
-/// looked at. A log with nothing old enough is left after a line or two.
+/// looked at. A log whose first entry is not yet [`PRUNE_SLACK`] past the
+/// period is left after a line or two.
 ///
 /// `load_ring` is `false` only in [`try_prune_at_no_ring`].
 fn try_prune_at_collect(
@@ -684,8 +705,8 @@ fn try_prune_at_collect(
     //
     // The range starts at line 0, prune point included. That prune point is
     // about to be discarded along with the range it covered, and the record
-    // it carries would die with it — on a log pruning every
-    // `PRUNE_CHECK_INTERVAL` appends, a trace with a lifetime of one prune —
+    // it carries would die with it — a trace with a lifetime of one prune,
+    // about a day on a busy log —
     // so the walk authenticates it and the record is carried forward.
     //
     // Read from the file a line at a time rather than held: the range a first
@@ -916,6 +937,15 @@ struct Boundary {
 /// is the end of the last entry older than the cutoff — lines that carry no
 /// readable timestamp are removed only when an entry that is kept follows
 /// them, which is what the pass over the whole file this replaces did.
+///
+/// **Whether a prune is due at all is settled at the first entry** — the
+/// first line carrying a readable timestamp, a prune point at the head
+/// aside. If it is not yet [`PRUNE_SLACK`] past the cutoff, nothing is due and
+/// the boundary handed back removes nothing. That is decided before the
+/// search for the boundary and not after it, because on every check between
+/// two prunes the head of the log holds up to a day of entries that are past
+/// the period, and walking them to find out it is not yet time is what a
+/// check must not cost.
 fn find_boundary(file: &fs::File, cutoff: OffsetDateTime) -> std::io::Result<Boundary> {
     use time::format_description::well_known::Rfc3339;
 
@@ -932,6 +962,7 @@ fn find_boundary(file: &fs::File, cutoff: OffsetDateTime) -> std::io::Result<Bou
     let mut line = String::new();
     let mut end = 0u64;
     let mut index = 0usize;
+    let mut due = false;
     loop {
         line.clear();
         let read = reader.read_line(&mut line)?;
@@ -963,6 +994,18 @@ fn find_boundary(file: &fs::File, cutoff: OffsetDateTime) -> std::io::Result<Bou
         let Ok(ts) = OffsetDateTime::parse(ts_str, &Rfc3339) else {
             continue;
         };
+
+        if !due {
+            if ts >= cutoff - PRUNE_SLACK {
+                return Ok(Boundary {
+                    offset: 0,
+                    lines_before: 0,
+                    head_prune: boundary.head_prune,
+                    first_retained_hash: String::new(),
+                });
+            }
+            due = true;
+        }
 
         if ts >= cutoff {
             boundary.offset = start;

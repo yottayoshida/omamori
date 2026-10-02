@@ -73,11 +73,13 @@ action = "move-to"
 destination = "/Users/you/.omamori-quarantine/"  # under your home directory, not /tmp
 ```
 
-**Enable audit retention** (prunes entries older than N days):
+**Enable audit retention** (prunes entries older than N days, about once a day):
 ```toml
 [audit]
 retention_days = 90  # 0 = keep all (default). Minimum 7 days.
 ```
+
+Entries are removed in batches, not one by one as they age out: a prune runs once the oldest entry at the head of the log is more than a day past the period, and then removes everything older than the period. So an entry can stay up to a day longer than `retention_days` (longer on a log that sees fewer than 1000 entries a day, since the check runs every 1000), and never less. A prune copies the part of the log it keeps, so it takes about a second per gigabyte kept and needs that much free space while it runs. See SECURITY.md → Audit Retention.
 
 **Enable strict mode** (block shim-intercepted commands when HMAC secret is unavailable):
 ```toml

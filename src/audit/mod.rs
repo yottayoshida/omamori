@@ -6565,6 +6565,171 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // --- a prune runs about once a day (#568) ---
+    //
+    // A prune used to run whenever the log's head held a single entry older
+    // than the retention period — on a busy log, at every check, each time
+    // copying everything it kept to drop the thousand entries that had aged
+    // out since the last one. It now waits until the first entry is more than
+    // a day past the period, and then removes everything older than the
+    // period, as before.
+
+    fn hours(n: i64) -> time::Duration {
+        time::Duration::hours(n)
+    }
+
+    fn stamp(at: OffsetDateTime) -> String {
+        at.format(&Rfc3339).unwrap()
+    }
+
+    /// One prune check at `now`, with the store's ring.
+    fn check_at(path: &Path, now: OffsetDateTime) -> u64 {
+        retention::prune_collecting(&test_signing_key(), 90, path, true, now)
+            .0
+            .unwrap()
+    }
+
+    /// An entry an hour for a hundred days, and a check every hour for three
+    /// more. Each hour one more entry passes the retention period; the prune
+    /// runs three times, not seventy-two.
+    #[test]
+    fn a_prune_runs_once_a_day_not_at_every_check() {
+        let dir = test_dir("prune-slack-three-days");
+        test_logger(&dir);
+        let path = dir.join("audit.jsonl");
+        let start = retention_test_now();
+        let stamps: Vec<String> = (0..2400)
+            .map(|k| stamp(start - time::Duration::days(100) + hours(k)))
+            .collect();
+        let entries: Vec<(&str, &str)> = stamps.iter().map(|ts| ("hourly", ts.as_str())).collect();
+        write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+
+        let mut ran_at = Vec::new();
+        for step in 0..72 {
+            if check_at(&path, start + hours(step)) > 0 {
+                ran_at.push(step);
+            }
+        }
+
+        assert_eq!(
+            ran_at,
+            vec![0, 25, 50],
+            "once when the first entry is ten days past the period, then once each time it is \
+             more than a day past it again"
+        );
+        let cutoff = start + hours(71) - time::Duration::days(90);
+        let still_old = read_events(&path)
+            .iter()
+            .filter(|e| e["command"] == "hourly")
+            .filter(|e| {
+                OffsetDateTime::parse(e["timestamp"].as_str().unwrap(), &Rfc3339).unwrap() < cutoff
+            })
+            .count();
+        assert!(
+            still_old <= 25,
+            "{still_old} entries past the period are still there: more than a day's worth"
+        );
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+        assert!(result.broken_at.is_none() && !result.halted());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The line is drawn at the first entry in the log: a second short of a
+    /// day past the period, nothing is removed and nothing past the head is
+    /// read; a second over, everything older than the period goes — the
+    /// entries that were inside that day included.
+    #[test]
+    fn a_prune_waits_for_the_first_entry_to_be_a_day_past_the_period() {
+        let now = retention_test_now();
+        let cutoff = now - time::Duration::days(90);
+        let a_day = time::Duration::days(1);
+        let second = time::Duration::seconds(1);
+        let store = |name: &str, first: OffsetDateTime| {
+            let dir = test_dir(name);
+            test_logger(&dir);
+            let path = dir.join("audit.jsonl");
+            let first = stamp(first);
+            let inside_the_day = stamp(cutoff - hours(1));
+            let recent = stamp(now - hours(1));
+            let mut entries: Vec<(&str, &str)> = vec![("first", first.as_str())];
+            entries.extend((0..299).map(|_| ("inside the day", inside_the_day.as_str())));
+            entries.extend((0..1200).map(|_| ("recent", recent.as_str())));
+            write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+            (dir, path)
+        };
+
+        let (dir, path) = store("prune-slack-not-yet", cutoff - a_day + second);
+        let before = fs::read(&path).unwrap();
+        assert!(
+            before.len() > 256 * 1024,
+            "the log must be far larger than one read"
+        );
+        retention::HEAD_READ.with(|slot| slot.set(None));
+        assert_eq!(check_at(&path, now), 0, "a second short of a day: not yet");
+        assert!(fs::read(&path).unwrap() == before);
+        let read = retention::HEAD_READ
+            .with(std::cell::Cell::get)
+            .expect("the prune must have looked at the head");
+        assert!(
+            read <= 64 * 1024,
+            "read {read} bytes to decide it was not time: the entries inside the day were walked"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let (dir, path) = store("prune-slack-now", cutoff - a_day - second);
+        assert_eq!(
+            check_at(&path, now),
+            300,
+            "a second over: the first entry and the 299 that were inside the day"
+        );
+        let events = read_events(&path);
+        assert_eq!(events.len(), 1201);
+        assert!(events[1..].iter().all(|e| e["command"] == "recent"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// "The first entry" is the first line that carries a readable timestamp.
+    /// A torn line and a line with no timestamp ahead of it decide nothing,
+    /// either way.
+    #[test]
+    fn lines_without_a_timestamp_do_not_decide_whether_a_prune_is_due() {
+        let now = retention_test_now();
+        let cutoff = now - time::Duration::days(90);
+        let store = |name: &str, old: OffsetDateTime| {
+            let dir = test_dir(name);
+            test_logger(&dir);
+            let path = dir.join("audit.jsonl");
+            let old = stamp(old);
+            let recent = stamp(now - hours(1));
+            let mut entries: Vec<(&str, &str)> = (0..100).map(|_| ("old", old.as_str())).collect();
+            entries.extend((0..1200).map(|_| ("recent", recent.as_str())));
+            write_chain_entries(&path, &TEST_SECRET, &entries, 2);
+            let content = fs::read_to_string(&path).unwrap();
+            fs::write(
+                &path,
+                format!("not json at all\n{{\"command\":\"no timestamp here\"}}\n{content}"),
+            )
+            .unwrap();
+            (dir, path)
+        };
+
+        let (dir, path) = store("prune-slack-junk-not-yet", cutoff - hours(12));
+        assert_eq!(
+            check_at(&path, now),
+            0,
+            "twelve hours past the period: not yet"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let (dir, path) = store("prune-slack-junk-now", cutoff - hours(36));
+        assert_eq!(
+            check_at(&path, now),
+            102,
+            "a day and a half past it: the hundred, and the two lines ahead of them"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #461: with no secret the prune does not run. `hmac_bytes(None, ..)`
     /// returns the fixed string `NO_HMAC_SECRET`, so the prune point standing
     /// where the removed entries used to be would carry a `target_hash` and an
@@ -9864,9 +10029,9 @@ mod tests {
     }
 
     /// Without this, the whole feature has a lifetime of one prune: the
-    /// previous prune point is dropped with the range it covered, so on a log
-    /// pruning every `PRUNE_CHECK_INTERVAL` appends the record would be gone
-    /// 1000 appends later.
+    /// previous prune point is dropped with the range it covered, so the
+    /// record would be gone at the next prune — about a day later on a busy
+    /// log.
     #[test]
     fn a_second_prune_carries_the_first_record_forward() {
         let dir = test_dir("prune-findings-carry");
