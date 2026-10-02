@@ -11,12 +11,10 @@ use time::OffsetDateTime;
 
 use super::AuditEvent;
 use super::chain::{
-    CHAIN_VERSION, RecomputedHash, compute_entry_hash, compute_entry_hash_for_write, hmac_bytes,
-    parse_line, prune_genesis_hash,
+    CHAIN_VERSION, compute_entry_hash_for_write, hmac_bytes, parse_line, prune_genesis_hash,
 };
 use super::secret::{Keyring, SigningKey, load_keyring, secret_path_for};
 use super::verify::{BreakCause, VerifyResult, Walk, keyring_failure, walk_lines};
-use super::{hwm_path_for, write_hwm};
 
 pub(super) const PRUNE_CHECK_INTERVAL: u64 = 1000;
 pub(super) const MIN_RETENTION_DAYS: u32 = 7;
@@ -418,8 +416,8 @@ pub(super) fn findings_for_removed_range(
 ///
 /// The record is tamper-evidence *about* the log held *in* the log, so it is
 /// read only from an entry that authenticates against the key its own
-/// `key_id` names — the same rule the post-prune high-water-mark follows
-/// since `#461`'s first half. That check is the walk's: `pruned_findings` is
+/// `key_id` names — the rule `#461` set for anything taken back out of the
+/// log. That check is the walk's: `pruned_findings` is
 /// filled past the prune point's own `entry_hash` comparison, and `pruned` is
 /// set there too. Every way of failing to get there produces `prior_lost`, so
 /// a record that could not be carried is visible as a record that could not
@@ -593,8 +591,8 @@ fn try_prune_at_collect(
 
     // `#461`: the ring is loaded here rather than after the rewrite, because
     // the range has to be walked — and the previous prune point's findings
-    // record authenticated — before the prune point replacing them is built. The post-prune high-water-mark below reuses this
-    // same ring. Lock order is unchanged — still one key-store acquisition,
+    // record authenticated — before the prune point replacing them is built.
+    // Lock order is unchanged — still one key-store acquisition,
     // inside the log's own flock, on a path that runs once per
     // `PRUNE_CHECK_INTERVAL` appends.
     let keyring = audit_path.map(|path| load_keyring(&secret_path_for(path)));
@@ -640,119 +638,22 @@ fn try_prune_at_collect(
     file.set_len(new_content.len() as u64)?;
     file.flush()?;
 
-    // Reset the high-water-mark from the retained entries.
-    //
-    // `#461`: the mark used to be the largest `seq` among them, read straight
-    // out of the JSON. That number is tamper-evidence *about* the log, and it
-    // was being taken from the log without checking whether the line it came
-    // from was written by omamori — so one planted line with a high `seq` put
-    // the mark wherever its author chose. No key is needed to write that line:
-    // this recomputation was the only thing that read the field back.
-    //
-    // What that buys an attacker is a false accusation, not concealment
-    // (Codex review, R2 — an earlier version of this comment had the direction
-    // backwards). `verify_chain` reports a truncated tail when the mark is
-    // *above* the chain, so a raised mark makes it say the log was cut when
-    // nothing was removed, and keeps saying it: prune is the only thing that
-    // recomputes the mark, and it runs once per 1000 appends. Lowering it —
-    // which is what would hide a removal — is not reachable this way, since the
-    // mark is a maximum. The defect is that tamper-evidence about the log was
-    // taken from the log, which is the same root `#456` closed on the append
-    // side and named this half as still open.
-    //
-    // The mark now comes from an entry that authenticates against the key it
-    // names. `#456` closed the append side of the same root — on-disk `seq`
-    // values trusted without verification — and named this half as still open.
-    if let (Some(audit_path), Some(keyring)) = (audit_path, keyring.as_ref()) {
-        match authenticated_max_seq(&lines[retain_from..], keyring) {
-            Some(seq) => {
-                if let Err(e) = write_hwm(&hwm_path_for(audit_path), seq) {
-                    warnings.push(format!(
-                        "omamori warning: failed to update audit high-water-mark after prune: {e}"
-                    ));
-                }
-            }
-            None => {
-                // Left where it was, deliberately. A mark below the chain reads
-                // as nothing; a mark above it reads as truncation. Neither is a
-                // claim this function can make right now, and the previous mark
-                // was at least derived when a key was available.
-                //
-                // The two ways to get here are worth telling apart, because one
-                // is a key-store fault the operator can fix and the other is a
-                // statement about the entries themselves.
-                let reason = match keyring.fatal_anomaly() {
-                    Some(anomaly) => anomaly.describe(),
-                    None => "no retained entry could be authenticated against the key it names"
-                        .to_string(),
-                };
-                warnings.push(format!(
-                    "omamori warning: audit high-water-mark left unchanged after prune — {reason}"
-                ));
-            }
-        }
-    }
+    // The high-water-mark is not touched (#568). `append` raises it to the
+    // `seq` it has just written whenever that is above the mark, this runs at
+    // the end of that `append` and under its lock, and a prune removes from the
+    // head — the end of the chain is where it was. So where `append` could
+    // write the mark, a recomputation here could only agree with it, or
+    // disagree with one that sits *above* the chain: the state `append` has
+    // just warned about as a possible truncation, and the one `audit verify`
+    // reports as exit 3. Where `append` could not write it, a write from here
+    // would go to the same path through the same `write_hwm`. Through 1.2.2
+    // this function recomputed the mark from what remained, which moved a mark
+    // above the chain down to the new end of it, and the report went away.
 
     warnings.push(format!(
         "omamori: pruned {prune_count} audit entries older than {retention_days}d"
     ));
     Ok(prune_count)
-}
-
-/// The highest `seq` among `retained` lines that authenticate against the key
-/// they name (`#461`).
-///
-/// Entries are tried in descending `seq` order and the first one that
-/// authenticates wins, so the ordinary case costs one HMAC rather than one per
-/// retained entry — and the answer is the same either way, since a lower `seq`
-/// cannot raise the maximum.
-///
-/// `None` covers both "the keyring holds nothing usable" and "nothing retained
-/// authenticated". They arrive here identically — an empty ring makes every
-/// `keyring.get` miss — and the caller reports which one it was from the ring's
-/// own anomalies. Kept as one path on purpose: a separate emptiness branch
-/// would be a second place to keep in step with what `get` actually returns.
-///
-/// Prune points are excluded by [`is_prune_point`], which checks all three
-/// fields, rather than by `command` alone as the code this replaced did. The
-/// first draft kept the looser check and argued that a real prune point carries
-/// `seq: 0`, so admitting one could only lower the mark. That argument holds
-/// for a real prune point and says nothing about an ordinary entry that merely
-/// *names* `_prune` — a user running a command by that name produces a signed
-/// entry with a real `seq`, and dropping it lowered the mark by one whenever it
-/// was the highest retained, leaving that one entry's removal undetectable
-/// (Codex review, P3). The stricter check is right on both: it still excludes
-/// the real prune point, whose `action`/`result` identify it.
-fn authenticated_max_seq(retained: &[&str], keyring: &Keyring) -> Option<u64> {
-    // `seq` is taken out here rather than checked in the loop, so the sort key
-    // is a plain `u64` and an entry without one is simply not a candidate — it
-    // could not anchor the mark in any case.
-    let mut candidates: Vec<(u64, AuditEvent)> = retained
-        .iter()
-        .filter_map(|line| parse_line::<AuditEvent>(line.trim()).ok())
-        .filter(|event| !is_prune_point(event))
-        .filter_map(|event| event.seq.map(|seq| (seq, event)))
-        .collect();
-    candidates.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
-
-    for (seq, event) in &candidates {
-        // `unwrap_or("default")` for the same reason `verify_chain` uses it: a
-        // missing `key_id` is an entry from before the field existed, and
-        // `"default"` is the id that epoch always carried.
-        let key_id = event.key_id.as_deref().unwrap_or("default");
-        let Some(secret) = keyring.get(key_id) else {
-            continue;
-        };
-        let RecomputedHash::Hash(recomputed) = compute_entry_hash(Some(secret), event) else {
-            // Legacy (no `chain_version`) or a version this build cannot hash.
-            // Either way this entry is not something to anchor the mark on.
-            continue;
-        };
-        if event.entry_hash.as_deref() == Some(recomputed.as_str()) {
-            return Some(*seq);
-        }
-    }
-    None
 }
 
 /// Build the prune point that replaces the pruned range.
