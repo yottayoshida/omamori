@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-03
+
+**Summary**: Audit retention can be turned on for a large log. A prune now runs about once a day instead of at every check, copies outside the log's lock so appends arriving meanwhile are recorded, publishes its result by rename so an interrupted prune leaves the log as it was, no longer moves the high-water-mark, and records what `audit verify` would have said about the range it removes. Retention is off by default (`retention_days = 0`), so a default install sees none of this.
+
 ### Fixed
 - **A prune now records what `audit verify` would have said about the entries it removes by running `audit verify`'s own walk over them** ([#539](https://github.com/yottayoshida/omamori/issues/539), [#540](https://github.com/yottayoshida/omamori/issues/540)). The `pruned:` record in a prune point used to come from a separate scan that held no key and recomputed no hash, and the two described one log differently. An entry rewritten in place — what `audit verify` reports as exit 1, "may have been tampered with" — was removed without trace, so the same store verified clean afterwards. A head that did not anchor was not noticed. A range the scan could not get through, because an entry named a key the keyring did not hold, wrote the same all-zero record as a clean range. And a gap between the last removed entry and the first kept one was never looked at, though after a prune nothing can check it: `audit verify` allows a gap behind a prune point.
 
