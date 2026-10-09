@@ -1603,7 +1603,31 @@ fn print_all_items(o: &mut Out<'_>, items: &[CheckItem]) {
 // JSON output
 // ---------------------------------------------------------------------------
 
-fn build_json_output(items: &[CheckItem], fix_mode: bool) -> serde_json::Value {
+/// `summary.risk_signals` in `doctor --json` (#509 item 3).
+///
+/// The human report has said "Risk signals below need attention." since #474
+/// and `--json` said nothing, so a consumer running `doctor` in CI saw a store
+/// whose chain was broken as it saw a healthy one. `needs_attention` is the
+/// same predicate the headline note uses, so the two cannot disagree;
+/// `chain_status` is `report --json`'s value, path-free. `null` where the
+/// human report prints no risk section at all (the config could not be
+/// loaded). The exit code is not moved: it reports the installation, and its
+/// three values are frozen by docs/CONTRACT.md.
+fn risk_signals_json(signals: Option<&RiskSignals>) -> serde_json::Value {
+    match signals {
+        Some(signals) => serde_json::json!({
+            "needs_attention": risk_signals_need_attention(signals),
+            "chain_status": signals.report.chain_status,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn build_json_output(
+    items: &[CheckItem],
+    fix_mode: bool,
+    signals: Option<&RiskSignals>,
+) -> serde_json::Value {
     let json_items: Vec<serde_json::Value> = items
         .iter()
         .map(|item| {
@@ -1649,6 +1673,7 @@ fn build_json_output(items: &[CheckItem], fix_mode: bool) -> serde_json::Value {
             "integrity": section_summary(&sections[2].1),
             "shim_activity": heartbeat_json_summary(),
             "staging": staging_json_summary(),
+            "risk_signals": risk_signals_json(signals),
         },
         "items": json_items,
     })
@@ -1658,7 +1683,10 @@ fn print_json(items: &[CheckItem], fix_mode: bool, _base_dir: &Path) -> Result<i
     let mut stdout = std::io::stdout().lock();
     let o = &mut Out::new(&mut stdout);
 
-    let output = build_json_output(items, fix_mode);
+    // Read once, after any repair `--fix --json` made, for the reason
+    // `run_diagnose` reads it once (#474).
+    let signals = collect_risk_signals();
+    let output = build_json_output(items, fix_mode, signals.as_ref());
     out!(o, "{}", serde_json::to_string_pretty(&output).unwrap());
 
     if items.iter().any(|i| i.status == CheckStatus::Fail) {
@@ -2495,7 +2523,7 @@ mod tests {
             detail: "after /usr/bin".to_string(),
             remediation: Some(Remediation::ManualOnly("fix PATH".to_string())),
         }];
-        let output = build_json_output(&items, false);
+        let output = build_json_output(&items, false, None);
         assert_eq!(output["summary"]["protection_status"], "warn");
     }
 
@@ -2517,7 +2545,7 @@ mod tests {
                 remediation: None,
             },
         ];
-        let output = build_json_output(&items, false);
+        let output = build_json_output(&items, false, None);
         assert_eq!(output["summary"]["protection_status"], "ok");
     }
 
@@ -2552,7 +2580,7 @@ mod tests {
             },
         ];
 
-        let output = build_json_output(&items, false);
+        let output = build_json_output(&items, false, None);
 
         // Backward compat: items[] still present with expected shape
         let items_arr = output["items"].as_array().unwrap();
@@ -2739,7 +2767,7 @@ mod tests {
             detail: "ok".to_string(),
             remediation: None,
         }];
-        let output = build_json_output(&items, false);
+        let output = build_json_output(&items, false, None);
         let activity = output["summary"].get("shim_activity");
         assert!(activity.is_some(), "shim_activity must be in summary");
         let activity = activity.unwrap();
@@ -2769,7 +2797,7 @@ mod tests {
             detail: "ok".to_string(),
             remediation: None,
         }];
-        let output = build_json_output(&items, false);
+        let output = build_json_output(&items, false, None);
         let staging = output["summary"].get("staging");
         assert!(staging.is_some(), "staging must be in summary");
         let staging = staging.unwrap();
@@ -3026,5 +3054,83 @@ mod tests {
                 .starts_with("unknown doctor flag: --bogus-next-flag"),
             "error: {err}"
         );
+    }
+
+    /// #509 item 3: `summary.risk_signals.needs_attention` is the headline
+    /// note's predicate, not a second one. The table is the note's own cases
+    /// and two quiet ones; `null` is the state with no risk section.
+    #[test]
+    fn json_risk_signals_say_what_the_headline_note_says() {
+        let cases = [
+            ("quiet", ReportAggregate::default(), false),
+            (
+                "truncated",
+                ReportAggregate {
+                    chain_status: ChainStatus::Truncated,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "keyring warning",
+                ReportAggregate {
+                    keyring_warnings: vec!["audit keyring: cannot read key-2".to_string()],
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "blocks only",
+                ReportAggregate {
+                    total_blocks: 42,
+                    ..Default::default()
+                },
+                false,
+            ),
+            ("unwritable", ReportAggregate::default(), true),
+        ];
+        for (name, report, audit_unwritable) in cases {
+            let signals = RiskSignals {
+                report,
+                audit_unwritable,
+            };
+            let json = build_json_output(&[], false, Some(&signals));
+            assert_eq!(
+                json["summary"]["risk_signals"]["needs_attention"],
+                serde_json::json!(risk_signals_need_attention(&signals)),
+                "{name}"
+            );
+        }
+        let none = build_json_output(&[], false, None);
+        assert!(none["summary"]["risk_signals"].is_null());
+        assert!(
+            none["summary"].get("risk_signals").is_some(),
+            "present and null, not absent"
+        );
+    }
+
+    /// The reason an inaccessible store carries embeds the data directory; the
+    /// JSON carries only the kind.
+    #[test]
+    fn json_risk_signals_carry_no_path() {
+        let signals = RiskSignals {
+            report: ReportAggregate {
+                chain_status: ChainStatus::Inaccessible {
+                    reason: "cannot read /home/someone/.local/share/omamori".to_string(),
+                    kind: "log_unreadable",
+                },
+                ..Default::default()
+            },
+            audit_unwritable: false,
+        };
+        let json = build_json_output(&[], false, Some(&signals));
+        assert_eq!(
+            json["summary"]["risk_signals"],
+            serde_json::json!({
+                "needs_attention": true,
+                "chain_status": { "status": "inaccessible", "kind": "log_unreadable" }
+            })
+        );
+        assert!(!serde_json::to_string(&json).unwrap().contains("someone"));
     }
 }
