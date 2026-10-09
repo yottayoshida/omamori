@@ -19,7 +19,7 @@ use super::chain::parse_line;
 use super::error::AuditError;
 use super::retention::PrunedFindings;
 use super::secret::open_read_nofollow;
-use super::verify::{KeyStoreFailure, verify_chain};
+use super::verify::{KeyStoreFailure, verify_chain_reporting};
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 
 /// Chain integrity status. Originally 3-state per SEC-R8; #177 B1 step 2
@@ -400,8 +400,11 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
     let path = resolved_audit_path(config);
 
     // Chain status via existing verify_chain (SEC-R11: shared reader)
-    let mut keyring_warnings = Vec::new();
-    result.chain_status = match verify_chain(config) {
+    // #509 item 2: the keyring's warnings come with every outcome, not only
+    // with `Ok` — see `VerifyOutcome`.
+    let outcome = verify_chain_reporting(config);
+    let keyring_warnings = outcome.keyring_warnings;
+    result.chain_status = match outcome.result {
         Ok(verify_result) => {
             // #491: `hwm_unusable` replaced the bool this reads. Both states it
             // now covers were already folded into the old flag, so what `doctor`
@@ -423,7 +426,6 @@ pub fn aggregate_report(config: &AuditConfig, days: u32) -> ReportAggregate {
             // slot, since they say nothing about the links that are still
             // here.
             result.pruned_findings = verify_result.pruned_findings;
-            keyring_warnings = verify_result.keyring_warnings.clone();
             // #470: `Truncated` is checked *above* the two halted states, not
             // below them. It used to sit last, which was invisible while
             // `verify_chain` suppressed the comparison during a halt — the two

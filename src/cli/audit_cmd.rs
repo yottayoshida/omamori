@@ -272,16 +272,19 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
     // resolved at the print sites.
     let allow_repair = crate::detector::repair_gate_reporting(&load_result.config.detectors);
 
-    match audit::verify_chain(&load_result.config.audit) {
+    let outcome = audit::verify_chain_reporting(&load_result.config.audit);
+    // #457: keyring problems are reported whatever the verdict turns out to
+    // be. A truncated or partly-unreadable ring changes what "chain intact"
+    // actually covers, and a shorter key set that verifies fewer entries is
+    // indistinguishable from a complete one unless it is said out loud.
+    // #509 item 2: "whatever the verdict" includes the verdicts that are
+    // errors — printed from here rather than from the `Ok` arm, which a store
+    // whose log could not be opened never reached.
+    for warning in &outcome.keyring_warnings {
+        eprintln!("omamori warning: {warning}");
+    }
+    match outcome.result {
         Ok(result) => {
-            // #457: keyring problems are reported whatever the verdict turns
-            // out to be. A truncated or partly-unreadable ring changes what
-            // "chain intact" actually covers, and a shorter key set that
-            // verifies fewer entries is indistinguishable from a complete one
-            // unless it is said out loud.
-            for warning in &result.keyring_warnings {
-                eprintln!("omamori warning: {warning}");
-            }
             // #461: above the verdict arms, for the reason the keyring
             // warnings are — this has to be said whatever the verdict turns
             // out to be. Putting it inside `format_verify_success_message`

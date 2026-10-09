@@ -363,6 +363,15 @@ the opposite of the intent. A **prohibition** is not withheld: `#473` establishe
 perform the action it forbids, since that action destroys the key the store's newer
 entries were signed with.
 
+**Paths in a warning** ([#509](https://github.com/yottayoshida/omamori/issues/509)). A
+keyring warning names the file it could not read. `omamori audit verify` prints it in full,
+in every session: it is the detail surface, and the one the SEC-R5 substitution above sends a
+person to ("run `omamori audit verify` directly in your terminal") — the file's name is what
+they need there. `omamori doctor` is a summary, and in a session an AI agent is reading it
+counts keyring problems instead of listing them. Machine-readable output carries neither:
+`report --json` and `doctor --json` are path-free. The difference between the two human
+surfaces is deliberate, not an oversight of one of them.
+
 **Residual risks in these two mechanisms**, all found by review while closing `#473` and
 all recorded rather than fixed:
 
@@ -1404,7 +1413,7 @@ Only the first two are quiet, and they are the two where nothing has been preven
 
 `kind` is path-free and stable for machine consumers; `reason` carries the data directory and is not serialized, the same split `keyring_unusable` uses.
 
-**Non-fatal keyring problems now reach `doctor` too.** A retired key file that cannot be read leaves the chain genuinely intact when nothing in the remaining log was signed with it — so this travels beside `chain_status` rather than changing it. It was previously printed by `verify` alone, which is the surface an operator consults after they already suspect something.
+**Non-fatal keyring problems now reach `doctor` too.** A retired key file that cannot be read leaves the chain genuinely intact when nothing in the remaining log was signed with it — so this travels beside `chain_status` rather than changing it. It was previously printed by `verify` alone, which is the surface an operator consults after they already suspect something. Through 1.3.0 both surfaces still lost it whenever the verdict discarded the keyring — a log that could not be opened, or a key store judged unusable after the ring was read (an interrupted rotation, a missing or unreadable active key); it now travels with every verdict reached after the ring was read ([#509](https://github.com/yottayoshida/omamori/issues/509)). A symlinked secret stops before the ring is read, so there is nothing to carry.
 
 ### Truncation Detection Across a Halt (#470)
 

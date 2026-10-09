@@ -790,6 +790,25 @@ pub(super) fn keyring_failure(keyring: &Keyring) -> Option<KeyStoreFailure> {
     })
 }
 
+/// [`resolve_key_store`]'s answer, with what reading the keyring found that is
+/// not itself the answer (#509 item 2): an unreadable retired key, a truncated
+/// ring. Empty when the ring was never read — a symlinked secret stops before
+/// it. Carried beside the verdict because several verdicts discard the ring,
+/// and the warnings went with it.
+struct ResolvedKeyStore {
+    store: KeyStore,
+    keyring_warnings: Vec<String>,
+}
+
+impl ResolvedKeyStore {
+    fn before_the_keyring(store: KeyStore) -> Self {
+        Self {
+            store,
+            keyring_warnings: Vec::new(),
+        }
+    }
+}
+
 /// Resolve the keys this run can verify with, or say why it cannot.
 ///
 /// The order of the first two observations is load-bearing and predates this
@@ -799,7 +818,10 @@ pub(super) fn keyring_failure(keyring: &Keyring) -> Option<KeyStoreFailure> {
 /// requirement was always about *report order* — #506 satisfies it by recording
 /// the observation here, before anything walks the log, rather than by leaving
 /// the function.
-fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) -> KeyStore {
+fn resolve_key_store(
+    log_path: &std::path::Path,
+    secret_path: &std::path::Path,
+) -> ResolvedKeyStore {
     // #457: the active secret is no longer used as a hash key — the anchor and
     // every entry are verified with the key each one names. The read stays for
     // two reasons that have nothing to do with hashing: it preserves the ELOOP
@@ -823,11 +845,11 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
         // symlinked secret plus a deleted tail — and it was the one early
         // return the first draft of this change overlooked.
         Err(e) if is_symlink_attack(&e) => {
-            return KeyStore::Unusable(KeyStoreFailure {
+            return ResolvedKeyStore::before_the_keyring(KeyStore::Unusable(KeyStoreFailure {
                 kind: "secret_symlink",
                 reason: e.to_string(),
                 remedy: String::new(),
-            });
+            }));
         }
         Err(e) => Some(e),
     };
@@ -837,8 +859,29 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // and report every entry as tampered — a false accusation caused by a
     // permissions problem. Nothing consults the ring once this fires.
     let keyring = load_keyring(secret_path);
+    // #509 item 2: from here on the ring has been read, and what it found that
+    // is not itself the verdict travels with every outcome — including the
+    // ones that discard the ring.
+    let found = |exclude_active_key: bool| -> Vec<String> {
+        keyring
+            .anomalies()
+            .iter()
+            .filter(|a| {
+                !matches!(
+                    a,
+                    super::secret::KeyringAnomaly::DirectoryUnreadable { .. }
+                        | super::secret::KeyringAnomaly::EpochRecordUnreadable { .. }
+                ) && !(exclude_active_key
+                    && matches!(a, super::secret::KeyringAnomaly::ActiveKeyUnreadable { .. }))
+            })
+            .map(|a| a.describe())
+            .collect()
+    };
     if let Some(failure) = keyring_failure(&keyring) {
-        return KeyStore::Unusable(failure);
+        return ResolvedKeyStore {
+            keyring_warnings: found(false),
+            store: KeyStore::Unusable(failure),
+        };
     }
 
     // Reached only with a listing in hand, which is what makes the secret's own
@@ -851,7 +894,10 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // change removes elsewhere. Shared rather than repeated because the two
     // commands disagreeing about one store is the defect being closed.
     let Some(e) = secret_error else {
-        return KeyStore::Usable(keyring);
+        return ResolvedKeyStore {
+            keyring_warnings: found(false),
+            store: KeyStore::Usable(keyring),
+        };
     };
 
     // #487 B: `SecretUnavailable` covers two states that could not be less
@@ -872,16 +918,22 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // directory this function already listed; `verify` is not a hot path, and
     // the alternative is a copy of `rotate`'s condition that can drift from it.
     if e.kind() == std::io::ErrorKind::NotFound && interrupted_rotation_evidence(secret_path) {
-        return KeyStore::Unusable(KeyStoreFailure {
-            kind: "rotation_interrupted",
-            reason: "the active audit key is missing and this store has rotated before — \
+        return ResolvedKeyStore {
+            keyring_warnings: found(false),
+            store: KeyStore::Unusable(KeyStoreFailure {
+                kind: "rotation_interrupted",
+                reason: "the active audit key is missing and this store has rotated before — \
                      a rotation that stopped between filing the old key and moving its \
                      replacement into place leaves exactly this"
-                .to_string(),
-            remedy: String::new(),
-        });
+                    .to_string(),
+                remedy: String::new(),
+            }),
+        };
     }
-    match classify_secret_failure(e) {
+    // An unreadable active key is reported by the verdict below; the ring's
+    // own note about it would say it twice.
+    let keyring_warnings = found(true);
+    let store = match classify_secret_failure(e) {
         // #471 (review): quiet only while nothing has been written. A store
         // that already holds entries and has lost its active key is not a fresh
         // install — the next append mints a *different* secret under the same
@@ -903,10 +955,45 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
             reason: other.to_string(),
             remedy: String::new(),
         }),
+    };
+    ResolvedKeyStore {
+        store,
+        keyring_warnings,
     }
 }
 
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
+    verify_chain_reporting(config).result
+}
+
+/// [`verify_chain`]'s result, with what reading the keyring found beside it.
+///
+/// #509 item 2: on `Ok` the warnings are also in `VerifyResult` — this is the
+/// same list. On `Err` they had nowhere to go: a store whose retired key is
+/// unreadable and whose log could not be opened reported the second fault and
+/// lost the first, on `audit verify` and on `doctor` alike.
+#[non_exhaustive]
+pub struct VerifyOutcome {
+    pub result: Result<VerifyResult, AuditError>,
+    /// Non-fatal keyring problems found on the way, whatever `result` is.
+    /// Empty when the run stopped before the keyring was read.
+    pub keyring_warnings: Vec<String>,
+}
+
+/// [`verify_chain`], keeping the keyring's warnings on every path.
+pub fn verify_chain_reporting(config: &AuditConfig) -> VerifyOutcome {
+    let mut keyring_warnings = Vec::new();
+    let result = verify_chain_into(config, &mut keyring_warnings);
+    VerifyOutcome {
+        result,
+        keyring_warnings,
+    }
+}
+
+fn verify_chain_into(
+    config: &AuditConfig,
+    keyring_warnings_out: &mut Vec<String>,
+) -> Result<VerifyResult, AuditError> {
     // #471: not `FileNotFound`. That variant means "there is no log yet", which
     // is a quiet state; this is a configuration that cannot name a log at all,
     // and `status` has always reported it as a fault. The two shared one
@@ -927,7 +1014,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     //
     // Only one early return is left here, and it is the one #471 established:
     // "nothing has been written yet" is quiet, and everything else is not.
-    let (keyring, key_store_failure) = match resolve_key_store(&path, &secret_path) {
+    let resolved = resolve_key_store(&path, &secret_path);
+    keyring_warnings_out.clone_from(&resolved.keyring_warnings);
+    let (keyring, key_store_failure) = match resolved.store {
         KeyStore::Usable(keyring) => (keyring, None),
         KeyStore::Unusable(failure) => (Keyring::empty(), Some(failure)),
         KeyStore::NothingWrittenYet => return Err(AuditError::SecretUnavailable),
@@ -985,7 +1074,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     let reader = std::io::BufReader::new(&file);
 
     let result = VerifyResult {
-        keyring_warnings: keyring.anomalies().iter().map(|a| a.describe()).collect(),
+        // The ring's own findings, kept even where the store's verdict
+        // discarded the ring (#509 item 2).
+        keyring_warnings: resolved.keyring_warnings,
         // #506: set before the first line is read, so `halted()` is already true
         // when the loop starts and every line takes the tally path — including
         // the one that keeps `last_structural_seq` moving, which is what the
