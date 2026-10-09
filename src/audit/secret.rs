@@ -538,7 +538,26 @@ fn claim_next_epoch(
 /// compile: passing the same string at two sites is valid Rust that silently
 /// lets one branch suppress the other (#473 review found exactly that between
 /// the two rotation warnings, only one of which carries the prohibition).
-pub(super) const WARN_KIND_KEYSTORE: &str = "keystore";
+///
+/// #521: one kind per [`UnprotectedReason`], chosen by [`keystore_warn_kind`].
+/// #473 gave the four a single sentinel on the argument that they are "one
+/// condition seen four ways". The messages are not one: only
+/// `EpochRecordUnreadable` carries a repair, and a fix-and-retry reaches the
+/// two listing-derived reasons in turn — repair the directory's permissions,
+/// and the next command finds the record unreadable — so the warning with the
+/// repair was the one a shared sentinel silenced, for the rest of the window,
+/// at the moment the operator was looking.
+pub(super) const WARN_KIND_KEYSTORE_DIR_UNLISTABLE: &str = "keystore-dir-unlistable";
+pub(super) const WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE: &str =
+    "keystore-epoch-record-unreadable";
+/// The same reason with its repair withheld (SEC-R5, an AI session reading).
+/// A different text, so a different sentinel: otherwise the agent's copy,
+/// which only routes to `audit verify`, held back the copy with the repair
+/// from a person typing a command in the next five minutes (#521 review).
+pub(super) const WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE_WITHHELD: &str =
+    "keystore-epoch-record-unreadable-withheld";
+pub(super) const WARN_KIND_KEYSTORE_ACTIVE_KEY_MISSING: &str = "keystore-active-key-missing";
+pub(super) const WARN_KIND_KEYSTORE_ACTIVE_KEY_UNUSABLE: &str = "keystore-active-key-unusable";
 pub(super) const WARN_KIND_ROTATION_MINTED: &str = "rotation-minted";
 pub(super) const WARN_KIND_ROTATION_UNMINTED: &str = "rotation-unminted";
 /// #518: the four printers `load_signing_key_locked` reaches that #473 left
@@ -678,6 +697,25 @@ fn may_warn(policy: KeyWarnPolicy, kind: &str, store: &Path) -> bool {
                 None => true,
             }
         }
+    }
+}
+
+/// The throttle kind for a key-store warning (#521): one per distinct text
+/// [`keystore_warning`] can print. Exhaustive, with no `_`, so a reason added
+/// later needs an arm here — and `every_keystore_text_has_its_own_kind` checks
+/// that the arm does not reuse another text's kind. That includes the two
+/// reasons `key_store_outlook` does not produce today.
+pub(super) fn keystore_warn_kind(reason: &UnprotectedReason, with_repair: bool) -> &'static str {
+    match reason {
+        UnprotectedReason::KeyDirUnlistable(_) => WARN_KIND_KEYSTORE_DIR_UNLISTABLE,
+        UnprotectedReason::EpochRecordUnreadable(_) if with_repair => {
+            WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE
+        }
+        UnprotectedReason::EpochRecordUnreadable(_) => {
+            WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE_WITHHELD
+        }
+        UnprotectedReason::ActiveKeyMissing => WARN_KIND_KEYSTORE_ACTIVE_KEY_MISSING,
+        UnprotectedReason::ActiveKeyUnusable(_) => WARN_KIND_KEYSTORE_ACTIVE_KEY_UNUSABLE,
     }
 }
 
@@ -953,12 +991,14 @@ fn load_signing_key_locked(
     let (retired, recorded) = match key_store_outlook(secret_path) {
         KeyStoreOutlook::Unprotected(reason) => {
             // #473: this block runs from `AuditLogger::from_config`, i.e. on
-            // every guarded command, and printed unconditionally. One sentinel
-            // for the whole block: these four are one condition seen four ways
-            // (the key store cannot answer), so reporting one and suppressing
-            // the others for the window would be the sharing this change exists
-            // to remove — between *kinds*, not within one.
-            if may_warn(policy, WARN_KIND_KEYSTORE, secret_path) {
+            // every guarded command, and printed unconditionally. #521: one
+            // sentinel per reason, not one for the block — see
+            // `WARN_KIND_KEYSTORE_DIR_UNLISTABLE`.
+            if may_warn(
+                policy,
+                keystore_warn_kind(&reason, policy.allows_repair()),
+                secret_path,
+            ) {
                 warnings.push(keystore_warning(&reason, policy.allows_repair()));
             }
             return SigningKey {
