@@ -1,11 +1,14 @@
 //! `omamori doctor [--fix] [--verbose] [--json]` subcommand.
 //!
 //! Diagnose installation health and optionally auto-repair issues.
-//! Writes nothing to disk by default (no AI guard); `--fix` requires
-//! non-AI environment (DI-7). Note: since #349, the diagnose path can spawn
-//! a short-lived probe subprocess (to verify a hook's embedded exe path
-//! still satisfies the hook-check contract) — "read-only" here means no
-//! filesystem mutation, not "no subprocess execution".
+//! Repairs nothing by default (no AI guard); `--fix` requires non-AI
+//! environment (DI-7). Note: since #349, the diagnose path can spawn a
+//! short-lived probe subprocess (to verify a hook's embedded exe path still
+//! satisfies the hook-check contract). The risk-signal section — and, since
+//! #509, `--json` — verifies the audit chain, which can rewrite a missing or
+//! unusable high-water-mark sidecar and probes the audit directory's
+//! writability with a temporary file, as `audit verify` and `report` do; and
+//! it holds the log's shared lock while it walks (#579).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
