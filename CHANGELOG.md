@@ -6,6 +6,11 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Fixed
+- **The test suite no longer fails at random with "Text file busy" on Linux** ([#344](https://github.com/yottayoshida/omamori/issues/344)). Every failure the weekly Flake watch recorded over five weeks, 13 in 1,000 full-suite runs on ubuntu, was a test exec'ing a script it had just written. Linux refuses to exec a file that any process has open for writing, and test threads share one process: another thread's child, forked while the script was being written, held a copy of the write descriptor until its own exec. Every fixture the suite executes is now written by a short-lived child process, so the test process never holds one. Measured on the change: 0 failures in 600 runs, against 5 in 200 on `main` at the same time.
+
+  Not claimed: the two other symptoms #344 named, a content-hash mismatch in `check_claude_settings_*` and a `config enable` audit-line count, remain unexplained. Neither appeared in those 1,000 runs, nor in CI since the diagnostics of 1.0.4 landed. Flake watch keeps running as the suite's watch for any random failure.
+
 ## [1.3.0] - 2026-10-03
 
 **Summary**: Audit retention can be turned on for a large log. A prune now runs about once a day instead of at every check, copies outside the log's lock so appends arriving meanwhile are recorded, publishes its result by rename so an interrupted prune leaves the log as it was, no longer moves the high-water-mark, and records what `audit verify` would have said about the range it removes. Retention is off by default (`retention_days = 0`), so a default install sees none of this.

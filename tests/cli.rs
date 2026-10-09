@@ -7493,7 +7493,15 @@ fn run_installed(
 fn copy_binary_to(dir: &std::path::Path) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let exe = dir.join("omamori");
-    fs::copy(binary(), &exe).unwrap();
+    // A child `cp`, not `fs::copy`: a copy written by this process can be held
+    // open by another test's fork until that fork execs, and on Linux exec'ing
+    // the copy inside that window fails with "Text file busy" (#344).
+    let status = Command::new("/bin/cp")
+        .arg(binary())
+        .arg(&exe)
+        .status()
+        .unwrap();
+    assert!(status.success(), "cp to {} failed: {status}", exe.display());
     exe
 }
 
