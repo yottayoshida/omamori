@@ -368,9 +368,9 @@ keyring warning names the file it could not read. `omamori audit verify` prints 
 in every session: it is the detail surface, and the one the SEC-R5 substitution above sends a
 person to ("run `omamori audit verify` directly in your terminal") — the file's name is what
 they need there. `omamori doctor` is a summary, and in a session an AI agent is reading it
-counts keyring problems instead of listing them. Machine-readable output carries neither:
-`report --json` and `doctor --json` are path-free. The difference between the two human
-surfaces is deliberate, not an oversight of one of them.
+counts keyring problems instead of listing them. Machine-readable output does not carry the
+warnings at all: neither `report --json` nor `doctor --json` includes them. The difference
+between the two human surfaces is deliberate, not an oversight of one of them.
 
 **Residual risks in these two mechanisms**, all found by review while closing `#473` and
 all recorded rather than fixed:
