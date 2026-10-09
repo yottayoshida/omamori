@@ -11609,7 +11609,8 @@ mod tests {
     #[test]
     fn throttle_kinds_are_distinct() {
         let kinds = [
-            // #521: four, one per reason.
+            // #521: one per reason, and the epoch record's has two — its text
+            // changes with whether the repair is shown.
             secret::WARN_KIND_KEYSTORE_DIR_UNLISTABLE,
             secret::WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE,
             secret::WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE_WITHHELD,
