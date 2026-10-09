@@ -1,18 +1,21 @@
 name: Flake watch
 
-# #344: the suite fails at a low rate (38 measured runs, one failure) in test
-# groups unrelated to each other. Two of the three symptoms reported there are
-# closed; the third — `config enable` seeing a count of audit lines other than
-# one — has never been observed with diagnostics in place, so the mechanism is
-# still unknown and nothing can be fixed from a report that only says "it
-# failed".
+# Repeats the full suite to catch tests that fail at random: a red that has
+# nothing to do with the change under test, which CONTRIBUTING.md files as
+# `bug`. On a PR such a run is re-run and its evidence lost; this job keeps the
+# **full output** of every failing iteration instead.
 #
-# This job exists to make the next occurrence self-describing rather than
-# waiting for one to land on a PR, where the run is re-run and the evidence is
-# lost. It repeats the suite and keeps the **full output** of every failing
-# iteration: the diagnostics added for that assertion (#536) print the fixture
-# directory, the high-water-mark sidecar and every audit line, and the previous
-# measurement harness threw exactly that away.
+# It was added for #344 and found what static audits of the suite had not.
+# All 13 failures it recorded in 1,000 runs (2026-09-07 to 10-05) were one
+# race: a test exec'd a script it had just written, and Linux refused with
+# "Text file busy" because another test thread's freshly forked child still
+# held a copy of the write descriptor. #575 removed that cause: 0 failures in
+# 600 runs of the fix, against 5 in 200 on main measured at the same time.
+# The two other symptoms #344 named (a `check_claude_settings_*` content-hash
+# mismatch, a `config enable` audit-line count) were never seen here and stay
+# unexplained. The diagnostics added for the second (#536) print the fixture
+# directory, the high-water-mark sidecar and every audit line, which is why a
+# failing iteration keeps its whole log.
 #
 # Scope, stated rather than implied: **ubuntu-latest only**, while ci.yml's
 # `test` job runs on macOS too. `std::env::temp_dir()` is a shared `/tmp` on
@@ -21,8 +24,11 @@ name: Flake watch
 # only exists on macOS stays invisible here. Widening this to a matrix is a
 # cost decision (macOS runners bill at 10x), left to the owner.
 #
-# Sunset: delete this workflow once #344 is closed. It measures one open
-# question and has no value after that question is answered.
+# Sunset: delete this workflow after 12 consecutive scheduled runs with no
+# failure. It began as the measurement of one open question (#344, now
+# closed), but it is the only thing that has found a random failure the
+# suite's own checks missed; twelve clean weeks is the point at which it has
+# stopped earning its runner time.
 
 on:
   schedule:
