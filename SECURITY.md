@@ -364,13 +364,15 @@ perform the action it forbids, since that action destroys the key the store's ne
 entries were signed with.
 
 **Paths in a warning** ([#509](https://github.com/yottayoshida/omamori/issues/509)). A
-keyring warning names the file it could not read. `omamori audit verify` prints it in full,
-in every session: it is the detail surface, and the one the SEC-R5 substitution above sends a
-person to ("run `omamori audit verify` directly in your terminal") — the file's name is what
-they need there. `omamori doctor` is a summary, and in a session an AI agent is reading it
-counts keyring problems instead of listing them. Machine-readable output does not carry the
-warnings at all: neither `report --json` nor `doctor --json` includes them. The difference
-between the two human surfaces is deliberate, not an oversight of one of them.
+keyring warning names the file it could not read, and three human surfaces print it.
+`omamori audit verify` and `omamori report` print it in full, in every session: they are the
+commands a person runs to look at the audit store itself, and `audit verify` is the one the
+SEC-R5 substitution above sends a person to ("run `omamori audit verify` directly in your
+terminal") — the file's name is what they need there. `omamori doctor` is the health summary
+of the whole installation, and in a session an AI agent is reading it counts keyring problems
+instead of listing them. Machine-readable output does not carry the warnings at all: neither
+`report --json` nor `doctor --json` includes them. The split is deliberate — by what the
+command is for, not by which surface happened to be edited.
 
 **Residual risks in these two mechanisms**, all found by review while closing `#473` and
 all recorded rather than fixed:
@@ -1413,7 +1415,7 @@ Only the first two are quiet, and they are the two where nothing has been preven
 
 `kind` is path-free and stable for machine consumers; `reason` carries the data directory and is not serialized, the same split `keyring_unusable` uses.
 
-**Non-fatal keyring problems now reach `doctor` too.** A retired key file that cannot be read leaves the chain genuinely intact when nothing in the remaining log was signed with it — so this travels beside `chain_status` rather than changing it. It was previously printed by `verify` alone, which is the surface an operator consults after they already suspect something. Through 1.3.0 both surfaces still lost it whenever the verdict discarded the keyring — a log that could not be opened, or a key store judged unusable after the ring was read (an interrupted rotation, a missing or unreadable active key); it now travels with every verdict reached after the ring was read ([#509](https://github.com/yottayoshida/omamori/issues/509)). A symlinked secret stops before the ring is read, so there is nothing to carry.
+**Non-fatal keyring problems now reach `doctor` too.** A retired key file that cannot be read leaves the chain genuinely intact when nothing in the remaining log was signed with it — so this travels beside `chain_status` rather than changing it. It was previously printed by `verify` alone, which is the surface an operator consults after they already suspect something. Through 1.3.0 both surfaces still lost it whenever the verdict discarded the keyring — a log that could not be opened, or a key store judged unusable after the ring was read (an interrupted rotation, a missing or unreadable active key); it now travels with every verdict reached after the ring was read ([#509](https://github.com/yottayoshida/omamori/issues/509)). What the ring never looked at it cannot report: a symlinked secret stops before the ring is read, and a key directory that cannot be listed or an epoch record that states no epoch stops the ring before it opens any retired key — an unreadable retired key in such a store is reported once that fault is repaired.
 
 ### Truncation Detection Across a Halt (#470)
 

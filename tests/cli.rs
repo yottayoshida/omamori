@@ -7779,7 +7779,11 @@ fn keyring_warnings_survive_every_verdict() {
     use std::os::unix::fs::PermissionsExt;
 
     let keyring_line = "audit keyring: cannot read";
-    for shape in ["log-symlink", "rotation-interrupted"] {
+    // The third shape, an unreadable active key, is the verdict itself
+    // (`secret_unreadable`): the ring's note about the same file is withheld
+    // so it is not said twice, and with the retired key readable no keyring
+    // line may appear at all.
+    for shape in ["log-symlink", "rotation-interrupted", "secret-unreadable"] {
         for unreadable in [true, false] {
             let home = unique_dir(&format!("509-2-{shape}-{unreadable}"));
             let (_, exit) = hook_check_in(&home, "rm -rf /tmp/omamori-509-2", false);
@@ -7793,7 +7797,12 @@ fn keyring_warnings_survive_every_verdict() {
                     fs::rename(data.join("audit.jsonl"), &elsewhere).unwrap();
                     std::os::unix::fs::symlink(&elsewhere, data.join("audit.jsonl")).unwrap();
                 }
-                _ => fs::remove_file(data.join("audit-secret")).unwrap(),
+                "rotation-interrupted" => fs::remove_file(data.join("audit-secret")).unwrap(),
+                _ => fs::set_permissions(
+                    data.join("audit-secret"),
+                    fs::Permissions::from_mode(0o000),
+                )
+                .unwrap(),
             }
             if unreadable {
                 fs::set_permissions(&retired, fs::Permissions::from_mode(0o000)).unwrap();
@@ -7802,6 +7811,8 @@ fn keyring_warnings_survive_every_verdict() {
             let verify = run_in(&home, &["audit", "verify"]);
             let doctor = run_in(&home, &["doctor"]);
             let _ = fs::set_permissions(&retired, fs::Permissions::from_mode(0o600));
+            let _ =
+                fs::set_permissions(data.join("audit-secret"), fs::Permissions::from_mode(0o600));
             let verify_err = String::from_utf8_lossy(&verify.stderr).to_string();
             let doctor_out = format!(
                 "{}{}",

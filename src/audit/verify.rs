@@ -289,11 +289,13 @@ pub struct VerifyResult {
     /// Why that key could not be resolved — see [`KeyUnavailableKind`].
     pub key_unavailable_kind: Option<KeyUnavailableKind>,
     /// #457: non-fatal problems assembling the keyring — a truncated ring, or
-    /// a file shaped like a retired key that could not be read. Verification
-    /// still ran (the keys that loaded authenticate their own entries), but
-    /// the coverage is incomplete and saying so is the whole point: a shorter
-    /// key set that verifies fewer entries looks identical to a complete one
-    /// unless it is reported.
+    /// a file shaped like a retired key that could not be read. Where
+    /// verification ran, the keys that loaded authenticate their own entries
+    /// and the coverage is incomplete — saying so is the whole point: a
+    /// shorter key set that verifies fewer entries looks identical to a
+    /// complete one unless it is reported. #509: also filled when the key
+    /// store as a whole was judged unusable (`key_store_failure`), where no
+    /// entry was authenticated — what the ring found is still worth saying.
     pub keyring_warnings: Vec<String>,
     /// #506: the key material could not be used at all — see
     /// [`KeyStoreFailure`]. The third terminal state, and the only one that is
@@ -930,8 +932,10 @@ fn resolve_key_store(
             }),
         };
     }
-    // An unreadable active key is reported by the verdict below; the ring's
-    // own note about it would say it twice.
+    // An unreadable active key is the verdict below (`secret_unreadable`); the
+    // ring's own note about the same file would report it a second time. The
+    // verdict's reason is the open error, which does not always name the file —
+    // a known gap of that wording, not of this filter.
     let keyring_warnings = found(true);
     let store = match classify_secret_failure(e) {
         // #471 (review): quiet only while nothing has been written. A store

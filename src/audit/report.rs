@@ -211,7 +211,7 @@ pub struct ReportAggregate {
     pub hwm_tampered: bool,
     /// #471 item 3: non-fatal keyring problems `verify_chain` reports and
     /// nothing else used to read — a truncated ring, or a file shaped like a
-    /// retired key that could not be read. Verification still ran, so
+    /// retired key that could not be read. Where verification ran,
     /// `chain_status` may well be `Intact`; what is incomplete is the coverage,
     /// and a shorter key set that verifies fewer entries looks identical to a
     /// complete one unless it is said out loud.
