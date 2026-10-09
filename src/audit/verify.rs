@@ -934,8 +934,9 @@ fn resolve_key_store(
     }
     // An unreadable active key is the verdict below (`secret_unreadable`); the
     // ring's own note about the same file would report it a second time. The
-    // verdict's reason is the open error, which does not always name the file —
-    // a known gap of that wording, not of this filter.
+    // verdict's reason is the open error, which does not always name the file
+    // (`Permission denied` does not) — a gap of that wording, not of this
+    // filter: through 1.3.0 this verdict carried no warnings at all.
     let keyring_warnings = found(true);
     let store = match classify_secret_failure(e) {
         // #471 (review): quiet only while nothing has been written. A store

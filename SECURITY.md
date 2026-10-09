@@ -364,9 +364,10 @@ perform the action it forbids, since that action destroys the key the store's ne
 entries were signed with.
 
 **Paths in a warning** ([#509](https://github.com/yottayoshida/omamori/issues/509)). A
-keyring warning names the file it could not read, and three human surfaces print it.
-`omamori audit verify` and `omamori report` print it in full, in every session: they are the
-commands a person runs to look at the audit store itself, and `audit verify` is the one the
+keyring warning names the file it could not read, and four human surfaces print it.
+`omamori audit verify`, `omamori report` and `omamori audit hash-cwd` print it in full, in every
+session: they are the commands a person runs to look at the audit store itself — `hash-cwd` is
+an investigator's tool — and `audit verify` is the one the
 SEC-R5 substitution above sends a person to ("run `omamori audit verify` directly in your
 terminal") — the file's name is what they need there. `omamori doctor` is the health summary
 of the whole installation, and in a session an AI agent is reading it counts keyring problems
