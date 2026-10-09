@@ -7899,18 +7899,41 @@ fn status_does_not_report_a_removed_log_as_not_yet_created() {
 /// verify" with exit 0, `report` intact, `doctor` quiet, `status` "log created
 /// on first event" — while deleting the file was reported. The control is the
 /// same store left alone.
+///
+/// R2 added three shapes of the same cut: a log emptied with `echo >`, which
+/// leaves one newline that `status` counted as content; the key store made
+/// unusable as well, which halted the walk and skipped the check; and the
+/// sidecar spoiled as well, which skipped it too.
 #[cfg(unix)]
 #[test]
 fn an_emptied_log_reads_as_a_cut_tail() {
-    for emptied in [true, false] {
-        let home = home_with_a_written_store(&format!("509-emptied-{emptied}"));
-        if emptied {
-            fs::write(home.join(".local/share/omamori/audit.jsonl"), "").unwrap();
-        }
+    type Setup = fn(&std::path::Path);
+    let cases: [(&str, Setup); 5] = [
+        ("untouched", |_| {}),
+        ("emptied", |data| {
+            fs::write(data.join("audit.jsonl"), "").unwrap()
+        }),
+        ("newline-only", |data| {
+            fs::write(data.join("audit.jsonl"), "\n").unwrap()
+        }),
+        ("emptied-no-key", |data| {
+            fs::write(data.join("audit.jsonl"), "").unwrap();
+            fs::remove_file(data.join("audit-secret")).unwrap();
+        }),
+        ("emptied-spoiled-mark", |data| {
+            fs::write(data.join("audit.jsonl"), "").unwrap();
+            fs::write(data.join("audit.jsonl.hwm"), "x\n").unwrap();
+        }),
+    ];
+    for (shape, setup) in cases {
+        let home = home_with_a_written_store(&format!("509-emptied-{shape}"));
+        setup(&home.join(".local/share/omamori"));
         let verify = run_in(&home, &["audit", "verify"]);
         let report = run_in(&home, &["report", "--json"]);
         let doctor = run_in(&home, &["doctor"]);
         let status = run_in(&home, &["status"]);
+        let verify_out = String::from_utf8_lossy(&verify.stdout).to_string();
+        let verify_err = String::from_utf8_lossy(&verify.stderr).to_string();
         let report_json: serde_json::Value =
             serde_json::from_str(&String::from_utf8_lossy(&report.stdout)).unwrap();
         let layer3 = String::from_utf8_lossy(&status.stdout)
@@ -7919,25 +7942,45 @@ fn an_emptied_log_reads_as_a_cut_tail() {
             .unwrap_or_default()
             .to_string();
         let doctor_out = String::from_utf8_lossy(&doctor.stdout).to_string();
-        if emptied {
-            assert_eq!(verify.status.code(), Some(3), "{:?}", verify);
-            assert_eq!(report_json["chain_status"]["status"], "truncated");
+        let risk = doctor_out.contains("Risk signals below need attention.");
+        if shape == "untouched" {
+            assert_eq!(verify.status.code(), Some(0), "{shape}: {verify_err}");
+            assert_eq!(report_json["chain_status"]["status"], "intact");
+            assert!(!risk, "{shape}: {doctor_out}");
+            assert!(layer3.contains("[ok]"), "{shape}: {layer3}");
+            let _ = fs::remove_dir_all(&home);
+            continue;
+        }
+        assert_eq!(verify.status.code(), Some(3), "{shape}: {verify_err}");
+        assert!(
+            !verify_out.contains("chain intact"),
+            "{shape}: nothing was verified, so nothing is intact: {verify_out}"
+        );
+        assert!(risk, "{shape}: {doctor_out}");
+        assert!(
+            layer3.contains("[warn]") && layer3.contains("the audit log is empty"),
+            "{shape}: {layer3}"
+        );
+        if shape == "emptied-spoiled-mark" {
             assert!(
-                doctor_out.contains("Risk signals below need attention."),
-                "{doctor_out}"
-            );
-            assert!(
-                layer3.contains("[warn]") && layer3.contains("the audit log is empty"),
-                "{layer3}"
+                verify_err.contains("high-water-mark file could not be used"),
+                "{shape}: {verify_err}"
             );
         } else {
-            assert_eq!(verify.status.code(), Some(0), "{:?}", verify);
-            assert_eq!(report_json["chain_status"]["status"], "intact");
             assert!(
-                !doctor_out.contains("Risk signals below need attention."),
-                "{doctor_out}"
+                verify_err.contains("cut to nothing"),
+                "{shape}: {verify_err}"
             );
-            assert!(layer3.contains("[ok]"), "{layer3}");
+            assert_eq!(
+                report_json["chain_status"]["status"], "truncated",
+                "{shape}: {report_json}"
+            );
+        }
+        if shape == "emptied-no-key" {
+            assert!(
+                verify_err.contains("could not start either"),
+                "{shape}: both findings: {verify_err}"
+            );
         }
         let _ = fs::remove_dir_all(&home);
     }

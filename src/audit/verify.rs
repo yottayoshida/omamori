@@ -1112,16 +1112,29 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // can go. Through 1.3.0 the comparison below needed an end to compare and
     // was skipped, so emptying the log (`: > audit.jsonl`) read as "no entries
     // to verify" with exit 0 on every surface, while deleting the file was
-    // reported. A halted walk with no end keeps its skip: that is the
+    // reported.
+    //
+    // A key store that cannot be used halts the walk before its first line,
+    // and a log with no line at all gives that halt nothing to skip past: the
+    // cut is reported over it, as every removed tail has been since #506 (R2).
+    // A halt *at a line* — which counts that line as unverified — keeps its
+    // skip when nothing from there on states an end: that is the
     // forward-compatibility rule SECURITY.md → Truncation Detection Across a
-    // Halt describes, and it is reported as a halt (exit 4) instead.
+    // Halt describes. A mark that cannot be read is reported here as it is
+    // beside a log that has entries (R2): the empty log gives no end to write
+    // in its place, so it stays reported.
     if result.broken_at.is_none()
         && structural_end.is_none()
-        && !result.halted()
-        && let HwmState::Valid(_) = read_hwm(&hwm_path_for(&path))
+        && result.unverified_entries_after == 0
     {
-        result.hwm_compared = true;
-        result.tail_truncated = true;
+        match read_hwm(&hwm_path_for(&path)) {
+            HwmState::Valid(_) => {
+                result.hwm_compared = true;
+                result.tail_truncated = true;
+            }
+            HwmState::Unusable(reason) => result.hwm_unusable = Some(reason),
+            HwmState::Missing => {}
+        }
     }
     if result.broken_at.is_none()
         && let Some(structural_end) = structural_end
@@ -2131,7 +2144,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         secret_available,
         unprotected_reason,
         retention_days: config.retention_days,
-        missing_log: missing_log(&path, path_error.is_none()),
+        missing_log: missing_log(&path, path_error.is_none(), entry_count),
         path_error,
         append_outlook,
     }
@@ -2143,14 +2156,22 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
 /// event" under `[ok]` while `verify` reported it gone.
 ///
 /// An emptied log is the same loss by another route (#509 review): the file
-/// exists, holds nothing, and the sidecar says entries were written.
-fn missing_log(path: &std::path::Path, log_readable_or_absent: bool) -> Option<String> {
+/// exists, holds no line, and the sidecar says entries were written. "No
+/// line" is `entry_count`, which skips blank lines as `verify` does, so a log
+/// emptied with `echo >` reads the same as one emptied with `: >` (R2). A log
+/// that still holds lines is counted, not judged: `status` never walks the
+/// chain, and `audit verify` is what says whether those lines are a chain.
+fn missing_log(
+    path: &std::path::Path,
+    log_readable_or_absent: bool,
+    entry_count: u64,
+) -> Option<String> {
     if !log_readable_or_absent || nothing_written_yet(path) {
         return None;
     }
     match std::fs::metadata(path) {
         Err(_) => Some(LOG_MISSING_REASON.to_string()),
-        Ok(meta) if meta.len() == 0 => Some(LOG_EMPTIED_REASON.to_string()),
+        Ok(_) if entry_count == 0 => Some(LOG_EMPTIED_REASON.to_string()),
         Ok(_) => None,
     }
 }
