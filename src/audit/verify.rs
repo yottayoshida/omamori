@@ -748,6 +748,46 @@ pub(super) const MAX_STRUCTURAL_HASH: usize = 128;
 /// the first append and is not removed with the log, so a sidecar beside an
 /// absent log says the log existed. A log with bytes in it says the same more
 /// directly.
+/// The error for an audit path that cannot be resolved (#471). Shared with
+/// `show_entries` (#509): a reader that called this "no entries recorded yet"
+/// gave a second answer about one state.
+fn path_unresolved() -> AuditError {
+    AuditError::StoreInaccessible {
+        kind: "path_unresolved",
+        reason: "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
+    }
+}
+
+/// Why a store that has written a log, and has none now, is not "nothing
+/// recorded yet". One string for every surface that says it (#509).
+const LOG_MISSING_REASON: &str = "the audit log is gone, but this store has written one before \
+     (its high-water-mark sidecar is still here)";
+
+/// What a failure to open the log means, once nothing else about the store
+/// has been decided. Shared by `verify_chain` and `show_entries` (#509): the
+/// second used to map every `NotFound` to `FileNotFound`, so `audit show` and
+/// `audit unknown` answered "no entries recorded yet" for a log that had been
+/// removed, while `verify` said it was gone.
+fn log_open_error(path: &std::path::Path, e: std::io::Error) -> AuditError {
+    match e.kind() {
+        // Quiet only if nothing was ever written here. A missing log with a
+        // high-water-mark sidecar still beside it is a log that was removed.
+        std::io::ErrorKind::NotFound if nothing_written_yet(path) => AuditError::FileNotFound,
+        std::io::ErrorKind::NotFound => AuditError::StoreInaccessible {
+            kind: "log_missing",
+            reason: LOG_MISSING_REASON.to_string(),
+        },
+        _ if is_symlink_attack(&e) => AuditError::StoreInaccessible {
+            kind: "log_symlink",
+            reason: e.to_string(),
+        },
+        _ => AuditError::StoreInaccessible {
+            kind: "log_unreadable",
+            reason: e.to_string(),
+        },
+    }
+}
+
 fn nothing_written_yet(path: &std::path::Path) -> bool {
     let log_has_content = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
     !log_has_content && !hwm_path_for(path).exists()
@@ -911,10 +951,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     // is a quiet state; this is a configuration that cannot name a log at all,
     // and `status` has always reported it as a fault. The two shared one
     // variant, so the louder of them inherited the quieter one's verdict.
-    let path = resolved_audit_path(config).ok_or_else(|| AuditError::StoreInaccessible {
-        kind: "path_unresolved",
-        reason: "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
-    })?;
+    let path = resolved_audit_path(config).ok_or_else(path_unresolved)?;
     let secret_path = secret_path_for(&path);
 
     // #506: the key material is resolved into a *value* rather than into an
@@ -961,25 +998,7 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         if let Some(failure) = key_store_failure.clone() {
             return failure.into_error();
         }
-        match e.kind() {
-            // Quiet only if nothing was ever written here. A missing log with a
-            // high-water-mark sidecar still beside it is a log that was removed.
-            std::io::ErrorKind::NotFound if nothing_written_yet(&path) => AuditError::FileNotFound,
-            std::io::ErrorKind::NotFound => AuditError::StoreInaccessible {
-                kind: "log_missing",
-                reason: "the audit log is gone, but this store has written one before \
-                     (its high-water-mark sidecar is still here)"
-                    .to_string(),
-            },
-            _ if is_symlink_attack(&e) => AuditError::StoreInaccessible {
-                kind: "log_symlink",
-                reason: e.to_string(),
-            },
-            _ => AuditError::StoreInaccessible {
-                kind: "log_unreadable",
-                reason: e.to_string(),
-            },
-        }
+        log_open_error(&path, e)
     })?;
 
     let reader = std::io::BufReader::new(&file);
@@ -1842,11 +1861,10 @@ pub fn show_entries(
 ) -> Result<(), AuditError> {
     use std::collections::VecDeque;
 
-    let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
-    let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => AuditError::FileNotFound,
-        _ => AuditError::Io(e),
-    })?;
+    // #509: the same answers `verify_chain` gives — "nothing recorded yet" only
+    // when nothing was ever written here.
+    let path = resolved_audit_path(config).ok_or_else(path_unresolved)?;
+    let file = open_read_nofollow(&path).map_err(|e| log_open_error(&path, e))?;
 
     let reader = std::io::BufReader::new(&file);
     let capacity = opts.last.unwrap_or(usize::MAX);
@@ -2049,7 +2067,16 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
                 .count() as u64;
             (count, None)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
+        // #509: quiet only when nothing was ever written here — the test
+        // `verify_chain` and `show_entries` apply. A log removed from a store
+        // whose sidecar remains read as "log created on first event" under
+        // `[ok]` while `verify` reported it gone.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && nothing_written_yet(&path) => {
+            (0, None)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (0, Some(LOG_MISSING_REASON.to_string()))
+        }
         // #492: sanitized here rather than at each display site. Every message
         // this arm can produce ends with the audit path, and an **absolute**
         // `audit.path` reaches this point verbatim — `AuditConfig::validate`

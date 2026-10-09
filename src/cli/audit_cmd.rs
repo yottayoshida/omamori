@@ -742,6 +742,12 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
             println!("omamori audit: no entries recorded yet");
             Ok(0)
         }
+        // #509: a store that cannot be read is not an empty one. Worded like
+        // `verify`'s "cannot verify — {reason}".
+        Err(audit::AuditError::StoreInaccessible { reason, .. }) => {
+            eprintln!("omamori audit show: cannot read the audit log — {reason}");
+            Ok(1)
+        }
         Err(e) if is_broken_pipe(&e) => Ok(0),
         Err(e) => {
             eprintln!("omamori audit show: {e}");
@@ -813,6 +819,12 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
         Err(audit::AuditError::FileNotFound) => {
             println!("omamori audit: no entries recorded yet");
             Ok(0)
+        }
+        // #509: a store that cannot be read is not an empty one. Worded like
+        // `verify`'s "cannot verify — {reason}".
+        Err(audit::AuditError::StoreInaccessible { reason, .. }) => {
+            eprintln!("omamori audit unknown: cannot read the audit log — {reason}");
+            Ok(1)
         }
         Err(e) if is_broken_pipe(&e) => Ok(0),
         Err(e) => {

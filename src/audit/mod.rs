@@ -11518,18 +11518,23 @@ mod tests {
         };
         let mut buf = Vec::new();
         let err = show_entries(&config, &opts, &mut buf).unwrap_err();
+        // #509: classified as `verify_chain` classifies it — `log_symlink` —
+        // rather than handed on as a bare `Io`.
         match err {
-            AuditError::Io(e) => assert!(
-                // "possible attack", not "symlink": these fixtures use
-                // `test_dir` names containing the word "symlink", and the error
-                // embeds the path — so `contains("symlink")` passes regardless
-                // of what the error says. Found by same-class scan after Codex
-                // Round 1 flagged the same defect in
-                // `read_secret_rejects_symlink` (#457).
-                e.to_string().contains("possible attack"),
-                "expected the symlink/possible-attack error, got: {e}"
-            ),
-            other => panic!("expected Io error, got: {other}"),
+            AuditError::StoreInaccessible { kind, reason } => {
+                assert_eq!(kind, "log_symlink");
+                assert!(
+                    // "possible attack", not "symlink": these fixtures use
+                    // `test_dir` names containing the word "symlink", and the
+                    // error embeds the path — so `contains("symlink")` passes
+                    // regardless of what the error says. Found by same-class
+                    // scan after Codex Round 1 flagged the same defect in
+                    // `read_secret_rejects_symlink` (#457).
+                    reason.contains("possible attack"),
+                    "expected the symlink/possible-attack error, got: {reason}"
+                );
+            }
+            other => panic!("expected StoreInaccessible(log_symlink), got: {other}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }

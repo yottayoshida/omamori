@@ -2494,11 +2494,14 @@ fn audit_show_relaxed_flag_reaches_parser() {
 
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
+    // A home that resolves and has recorded nothing. This test used to remove
+    // `HOME`, and passed because an unresolvable audit path read as "no
+    // entries recorded yet" — the answer #509 retired.
     let output = cmd
         .args(["audit", "show", "--relaxed"])
+        .env("HOME", &dir)
         .env("XDG_CONFIG_HOME", &dir)
         .env("XDG_DATA_HOME", &dir)
-        .env_remove("HOME")
         .output()
         .unwrap();
 
@@ -7766,6 +7769,173 @@ fn run_installed(
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .unwrap_or_else(|e| panic!("failed to run {} {}: {e}", exe.display(), args.join(" ")))
+}
+
+/// `omamori <args>` with `HOME` set to the empty string — an audit path that
+/// cannot be resolved. Config comes from `config_home`, so nothing reads the
+/// developer's own.
+fn run_with_empty_home(config_home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(args)
+        .env("HOME", "")
+        .env("XDG_CONFIG_HOME", config_home.join(".config"))
+        .output()
+        .expect("failed to run omamori with HOME=\"\"")
+}
+
+/// A home holding a written store — one block recorded, so the log, the key
+/// and the high-water-mark sidecar all exist.
+fn home_with_a_written_store(name: &str) -> PathBuf {
+    let home = unique_dir(name);
+    let (_, exit) = hook_check_in(&home, "rm -rf /tmp/omamori-509-seed", false);
+    assert_eq!(exit, 2, "the seeding block must be refused and recorded");
+    assert!(home.join(".local/share/omamori/audit.jsonl.hwm").exists());
+    home
+}
+
+/// #509 item 1: `audit show` and `audit unknown` say "no entries recorded yet"
+/// only when `audit verify` would also read the store as never written — the
+/// same test, `nothing_written_yet`. A log removed from a store that had one,
+/// a symlink at the log, and an unresolvable `HOME` used to get that sentence
+/// and exit 0 while `verify` reported each as a fault.
+#[cfg(unix)]
+#[test]
+fn audit_show_and_unknown_say_nothing_recorded_only_when_nothing_was() {
+    let nothing_yet = "no entries recorded yet";
+
+    // Never written: the quiet answer, as before.
+    let fresh = unique_dir("509-fresh");
+    for verb in ["show", "unknown"] {
+        let out = run_in(&fresh, &["audit", verb]);
+        assert_eq!(out.status.code(), Some(0), "{verb} on a fresh store");
+        assert!(String::from_utf8_lossy(&out.stdout).contains(nothing_yet));
+    }
+    let _ = fs::remove_dir_all(&fresh);
+
+    // Written, then the log removed: the sidecar says it existed.
+    let removed = home_with_a_written_store("509-log-removed");
+    fs::remove_file(removed.join(".local/share/omamori/audit.jsonl")).unwrap();
+    for verb in ["show", "unknown"] {
+        let out = run_in(&removed, &["audit", verb]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{verb}: {stdout}{stderr}");
+        assert!(!stdout.contains(nothing_yet), "{verb}: {stdout}");
+        assert!(
+            stderr.contains("cannot read the audit log")
+                && stderr.contains("the audit log is gone"),
+            "{verb}: {stderr}"
+        );
+    }
+    let _ = fs::remove_dir_all(&removed);
+
+    // A symlink at the log.
+    let linked = home_with_a_written_store("509-log-symlink");
+    let log = linked.join(".local/share/omamori/audit.jsonl");
+    let elsewhere = linked.join("elsewhere.jsonl");
+    fs::rename(&log, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+    let out = run_in(&linked, &["audit", "show"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot read the audit log"), "{stderr}");
+    let _ = fs::remove_dir_all(&linked);
+
+    // No resolvable HOME.
+    let config_home = unique_dir("509-empty-home");
+    for verb in ["show", "unknown"] {
+        let out = run_with_empty_home(&config_home, &["audit", verb]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{verb}: {stdout}{stderr}");
+        assert!(!stdout.contains(nothing_yet), "{verb}: {stdout}");
+        assert!(stderr.contains("HOME is unset"), "{verb}: {stderr}");
+    }
+    let _ = fs::remove_dir_all(&config_home);
+}
+
+/// #509, same-class: `status` asked the same question its own way and gave the
+/// same wrong answer — a removed log read as "log created on first event"
+/// under `[ok]`. Quiet only when nothing was ever written.
+#[cfg(unix)]
+#[test]
+fn status_does_not_report_a_removed_log_as_not_yet_created() {
+    let layer3 = |out: &std::process::Output| -> String {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("Layer 3 (audit)"))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // The control: the same store with the sidecar removed too. The key is
+    // still there, so the only difference from the case below is the evidence
+    // that a log existed.
+    let wiped = home_with_a_written_store("509-status-wiped");
+    let data = wiped.join(".local/share/omamori");
+    fs::remove_file(data.join("audit.jsonl")).unwrap();
+    fs::remove_file(data.join("audit.jsonl.hwm")).unwrap();
+    let line = layer3(&run_in(&wiped, &["status"]));
+    assert!(
+        line.contains("[ok]") && line.contains("log created on first event"),
+        "{line}"
+    );
+    let _ = fs::remove_dir_all(&wiped);
+
+    let removed = home_with_a_written_store("509-status-removed");
+    fs::remove_file(removed.join(".local/share/omamori/audit.jsonl")).unwrap();
+    let line = layer3(&run_in(&removed, &["status"]));
+    assert!(
+        line.contains("[warn]") && line.contains("the audit log is gone"),
+        "{line}"
+    );
+    let _ = fs::remove_dir_all(&removed);
+}
+
+/// #509 item 5: the `inaccessible` states reach `report --json` through a real
+/// store, with their path-free `kind` and no path. The serde tests build the
+/// variant by hand; this is the measurement repeated by CI.
+#[cfg(unix)]
+#[test]
+fn report_json_names_the_inaccessible_states_without_a_path() {
+    let chain_status = |out: &std::process::Output| -> serde_json::Value {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        parsed["chain_status"].clone()
+    };
+
+    let removed = home_with_a_written_store("509-report-missing");
+    fs::remove_file(removed.join(".local/share/omamori/audit.jsonl")).unwrap();
+    let out = run_in(&removed, &["report", "--json"]);
+    assert_eq!(
+        chain_status(&out),
+        serde_json::json!({ "status": "inaccessible", "kind": "log_missing" })
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&*removed.to_string_lossy()));
+    let _ = fs::remove_dir_all(&removed);
+
+    let linked = home_with_a_written_store("509-report-symlink");
+    let log = linked.join(".local/share/omamori/audit.jsonl");
+    let elsewhere = linked.join("elsewhere.jsonl");
+    fs::rename(&log, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+    let out = run_in(&linked, &["report", "--json"]);
+    assert_eq!(
+        chain_status(&out),
+        serde_json::json!({ "status": "inaccessible", "kind": "log_symlink" })
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&*linked.to_string_lossy()));
+    let _ = fs::remove_dir_all(&linked);
+
+    let config_home = unique_dir("509-report-empty-home");
+    let out = run_with_empty_home(&config_home, &["report", "--json"]);
+    assert_eq!(
+        chain_status(&out),
+        serde_json::json!({ "status": "inaccessible", "kind": "path_unresolved" })
+    );
+    let _ = fs::remove_dir_all(&config_home);
 }
 
 fn copy_binary_to(dir: &std::path::Path) -> PathBuf {
