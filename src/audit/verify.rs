@@ -746,13 +746,18 @@ fn structural_line(trimmed: &str) -> Option<StructuralLine> {
 /// carries one of them to the next line, so it declines anything longer.
 pub(super) const MAX_STRUCTURAL_HASH: usize = 128;
 
+/// Why an audit path does not resolve — one sentence for `verify`, `show`,
+/// `report` and `status`, which used to carry three copies of it.
+pub(super) const PATH_UNRESOLVED_REASON: &str =
+    "HOME is unset, empty, or relative — cannot resolve audit path";
+
 /// The error for an audit path that cannot be resolved (#471). Shared with
 /// `show_entries` (#509): a reader that called this "no entries recorded yet"
 /// gave a second answer about one state.
 fn path_unresolved() -> AuditError {
     AuditError::StoreInaccessible {
         kind: "path_unresolved",
-        reason: "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
+        reason: PATH_UNRESOLVED_REASON.to_string(),
     }
 }
 
@@ -2042,9 +2047,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             secret_available: false,
             unprotected_reason: None,
             retention_days: config.retention_days,
-            path_error: Some(
-                "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
-            ),
+            path_error: Some(PATH_UNRESOLVED_REASON.to_string()),
             // Not probed: there is no resolved path to probe.
             append_outlook: None,
             missing_log: None,
