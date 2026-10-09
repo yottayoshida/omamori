@@ -115,6 +115,10 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
             out!(o, "  {:<6} {:<36} disabled", "[info]", "Layer 3 (audit)");
         } else if let Some(ref err) = summary.path_error {
             out!(o, "  {:<6} {:<36} {err}", "[warn]", "Layer 3 (audit)");
+        } else if let Some(ref gone) = summary.missing_log {
+            // #509: before the "log created on first event" arm, which this
+            // state used to reach.
+            out!(o, "  {:<6} {:<36} {gone}", "[warn]", "Layer 3 (audit)");
         } else if let Some(reason) = &summary.unprotected_reason {
             // #471: this arm used to print `HMAC secret missing` for every
             // reason `read_secret` could fail, and never fired at all for the
