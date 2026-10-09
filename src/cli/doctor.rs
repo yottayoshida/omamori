@@ -5,10 +5,10 @@
 //! environment (DI-7). Note: since #349, the diagnose path can spawn a
 //! short-lived probe subprocess (to verify a hook's embedded exe path still
 //! satisfies the hook-check contract). The risk-signal section — and, since
-//! #509, `--json` — verifies the audit chain, which can rewrite a missing or
-//! unusable high-water-mark sidecar and probes the audit directory's
-//! writability with a temporary file, as `audit verify` and `report` do; and
-//! it holds the log's shared lock while it walks (#579).
+//! #509, `--json` — verifies the audit chain as `audit verify` and `report`
+//! do, which can rewrite a missing or unusable high-water-mark sidecar and
+//! holds the log's shared lock while it walks (#579); it also probes the
+//! audit directory's writability with a temporary file.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -93,7 +93,8 @@ pub(crate) fn run_doctor_command(args: &[OsString]) -> Result<i32, AppError> {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnose mode (no filesystem writes; may spawn a probe subprocess — #349)
+// Diagnose mode (repairs nothing; writes only what the module doc lists;
+// may spawn a probe subprocess — #349)
 // ---------------------------------------------------------------------------
 
 fn run_diagnose(items: &[CheckItem], verbose: bool) -> Result<i32, AppError> {

@@ -2462,7 +2462,8 @@ const LOG_REOPEN_ATTEMPTS: u32 = 3;
 /// again.
 ///
 /// Only for callers that lock. The readers that take no lock — `audit show`,
-/// the entry counts, `report` — are not routed through here: the check means
+/// the entry counts, `report`'s tallies — are not routed through here (its
+/// verdict is `verify_chain`'s, which does lock; #579): the check means
 /// nothing without the lock, and holding one for a whole read would make every
 /// `append` in that time give up.
 pub(super) fn open_log_locked(path: &Path, lock: LogLock) -> Result<fs::File, LockedLogError> {
