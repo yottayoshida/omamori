@@ -485,6 +485,18 @@ pub struct AuditSummary {
     /// different answer from [`AppendOutlook::NoLogYet`], which is an
     /// observation that a file is absent.
     pub append_outlook: Option<AppendOutlook>,
+    /// The log is absent from, or empty in, a store that has written one — its
+    /// high-water-mark sidecar is still there (#509). The reason, for a caller
+    /// that names it; `None` otherwise.
+    ///
+    /// Kept out of `path_error`, which means "the log cannot be read, so an
+    /// append will fail": here the next append recreates the log and records,
+    /// and `break-glass` reads `path_error` to tell the operator their bypass
+    /// will go unrecorded (or, under `strict`, be refused). Neither is true of
+    /// this state. What *is* true is that the store has lost what it wrote,
+    /// which `audit verify` reports and `status` must not file as "log created
+    /// on first event".
+    pub missing_log: Option<String>,
 }
 
 /// What a write to the audit log would meet right now (#514).
@@ -735,6 +747,55 @@ fn structural_line(trimmed: &str) -> Option<StructuralLine> {
 /// recorded at the version dispatch in `verify_chain`). This scan has to ask for two, and
 /// carries one of them to the next line, so it declines anything longer.
 pub(super) const MAX_STRUCTURAL_HASH: usize = 128;
+
+/// Why an audit path does not resolve — one sentence for `verify`, `show`,
+/// `report` and `status`, which used to carry three copies of it.
+pub(super) const PATH_UNRESOLVED_REASON: &str =
+    "HOME is unset, empty, or relative — cannot resolve audit path";
+
+/// The error for an audit path that cannot be resolved (#471). Shared with
+/// `show_entries` (#509): a reader that called this "no entries recorded yet"
+/// gave a second answer about one state.
+fn path_unresolved() -> AuditError {
+    AuditError::StoreInaccessible {
+        kind: "path_unresolved",
+        reason: PATH_UNRESOLVED_REASON.to_string(),
+    }
+}
+
+/// Why a store that has written a log, and has none now, is not "nothing
+/// recorded yet". One string for every surface that says it (#509).
+const LOG_MISSING_REASON: &str = "the audit log is gone, but this store has written one before \
+     (its high-water-mark sidecar is still here)";
+
+/// [`LOG_MISSING_REASON`]'s twin for a log that is present and empty.
+const LOG_EMPTIED_REASON: &str = "the audit log is empty, but this store has written entries \
+     (its high-water-mark sidecar is still here)";
+
+/// What a failure to open the log means, once nothing else about the store
+/// has been decided. Shared by `verify_chain` and `show_entries` (#509): the
+/// second used to map every `NotFound` to `FileNotFound`, so `audit show` and
+/// `audit unknown` answered "no entries recorded yet" for a log that had been
+/// removed, while `verify` said it was gone.
+fn log_open_error(path: &std::path::Path, e: std::io::Error) -> AuditError {
+    match e.kind() {
+        // Quiet only if nothing was ever written here. A missing log with a
+        // high-water-mark sidecar still beside it is a log that was removed.
+        std::io::ErrorKind::NotFound if nothing_written_yet(path) => AuditError::FileNotFound,
+        std::io::ErrorKind::NotFound => AuditError::StoreInaccessible {
+            kind: "log_missing",
+            reason: LOG_MISSING_REASON.to_string(),
+        },
+        _ if is_symlink_attack(&e) => AuditError::StoreInaccessible {
+            kind: "log_symlink",
+            reason: e.to_string(),
+        },
+        _ => AuditError::StoreInaccessible {
+            kind: "log_unreadable",
+            reason: e.to_string(),
+        },
+    }
+}
 
 /// Is this a store nothing has ever been written to?
 ///
@@ -1003,10 +1064,7 @@ fn verify_chain_into(
     // is a quiet state; this is a configuration that cannot name a log at all,
     // and `status` has always reported it as a fault. The two shared one
     // variant, so the louder of them inherited the quieter one's verdict.
-    let path = resolved_audit_path(config).ok_or_else(|| AuditError::StoreInaccessible {
-        kind: "path_unresolved",
-        reason: "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
-    })?;
+    let path = resolved_audit_path(config).ok_or_else(path_unresolved)?;
     let secret_path = secret_path_for(&path);
 
     // #506: the key material is resolved into a *value* rather than into an
@@ -1055,25 +1113,7 @@ fn verify_chain_into(
         if let Some(failure) = key_store_failure.clone() {
             return failure.into_error();
         }
-        match e.kind() {
-            // Quiet only if nothing was ever written here. A missing log with a
-            // high-water-mark sidecar still beside it is a log that was removed.
-            std::io::ErrorKind::NotFound if nothing_written_yet(&path) => AuditError::FileNotFound,
-            std::io::ErrorKind::NotFound => AuditError::StoreInaccessible {
-                kind: "log_missing",
-                reason: "the audit log is gone, but this store has written one before \
-                     (its high-water-mark sidecar is still here)"
-                    .to_string(),
-            },
-            _ if is_symlink_attack(&e) => AuditError::StoreInaccessible {
-                kind: "log_symlink",
-                reason: e.to_string(),
-            },
-            _ => AuditError::StoreInaccessible {
-                kind: "log_unreadable",
-                reason: e.to_string(),
-            },
-        }
+        log_open_error(&path, e)
     })?;
 
     let reader = std::io::BufReader::new(&file);
@@ -1163,6 +1203,35 @@ fn verify_chain_into(
         // tail on a whole log.
         last_walked_seq
     };
+    // #509 review: a log holding no chain entry at all, beside a mark that
+    // says entries were written, is a tail cut to nothing — the furthest a cut
+    // can go. Through 1.3.0 the comparison below needed an end to compare and
+    // was skipped, so emptying the log (`: > audit.jsonl`) read as "no entries
+    // to verify" with exit 0 on every surface, while deleting the file was
+    // reported.
+    //
+    // A key store that cannot be used halts the walk before its first line,
+    // and a log with no line at all gives that halt nothing to skip past: the
+    // cut is reported over it, as every removed tail has been since #506 (R2).
+    // A halt *at a line* — which counts that line as unverified — keeps its
+    // skip when nothing from there on states an end: that is the
+    // forward-compatibility rule SECURITY.md → Truncation Detection Across a
+    // Halt describes. A mark that cannot be read is reported here as it is
+    // beside a log that has entries (R2): the empty log gives no end to write
+    // in its place, so it stays reported.
+    if result.broken_at.is_none()
+        && structural_end.is_none()
+        && result.unverified_entries_after == 0
+    {
+        match read_hwm(&hwm_path_for(&path)) {
+            HwmState::Valid(_) => {
+                result.hwm_compared = true;
+                result.tail_truncated = true;
+            }
+            HwmState::Unusable(reason) => result.hwm_unusable = Some(reason),
+            HwmState::Missing => {}
+        }
+    }
     if result.broken_at.is_none()
         && let Some(structural_end) = structural_end
     {
@@ -1938,11 +2007,10 @@ pub fn show_entries(
 ) -> Result<(), AuditError> {
     use std::collections::VecDeque;
 
-    let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
-    let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => AuditError::FileNotFound,
-        _ => AuditError::Io(e),
-    })?;
+    // #509: the same answers `verify_chain` gives — "nothing recorded yet" only
+    // when nothing was ever written here.
+    let path = resolved_audit_path(config).ok_or_else(path_unresolved)?;
+    let file = open_read_nofollow(&path).map_err(|e| log_open_error(&path, e))?;
 
     let reader = std::io::BufReader::new(&file);
     let capacity = opts.last.unwrap_or(usize::MAX);
@@ -2073,6 +2141,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             path_error: None,
             // Not probed: auditing is off, so no append is attempted.
             append_outlook: None,
+            missing_log: None,
         };
     }
 
@@ -2087,11 +2156,10 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             secret_available: false,
             unprotected_reason: None,
             retention_days: config.retention_days,
-            path_error: Some(
-                "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
-            ),
+            path_error: Some(PATH_UNRESOLVED_REASON.to_string()),
             // Not probed: there is no resolved path to probe.
             append_outlook: None,
+            missing_log: None,
         };
     };
     // #471: the writer's own question, asked the writer's way. `read_secret`
@@ -2172,8 +2240,35 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         secret_available,
         unprotected_reason,
         retention_days: config.retention_days,
+        missing_log: missing_log(&path, path_error.is_none(), entry_count),
         path_error,
         append_outlook,
+    }
+}
+
+/// [`AuditSummary::missing_log`]: quiet only when nothing was ever written
+/// here — the test `verify_chain` and `show_entries` apply (#509). A log
+/// removed from a store whose sidecar remains read as "log created on first
+/// event" under `[ok]` while `verify` reported it gone.
+///
+/// An emptied log is the same loss by another route (#509 review): the file
+/// exists, holds no line, and the sidecar says entries were written. "No
+/// line" is `entry_count`, which skips blank lines as `verify` does, so a log
+/// emptied with `echo >` reads the same as one emptied with `: >` (R2). A log
+/// that still holds lines is counted, not judged: `status` never walks the
+/// chain, and `audit verify` is what says whether those lines are a chain.
+fn missing_log(
+    path: &std::path::Path,
+    log_readable_or_absent: bool,
+    entry_count: u64,
+) -> Option<String> {
+    if !log_readable_or_absent || nothing_written_yet(path) {
+        return None;
+    }
+    match std::fs::metadata(path) {
+        Err(_) => Some(LOG_MISSING_REASON.to_string()),
+        Ok(_) if entry_count == 0 => Some(LOG_EMPTIED_REASON.to_string()),
+        Ok(_) => None,
     }
 }
 

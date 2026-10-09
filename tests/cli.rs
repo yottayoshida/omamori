@@ -2494,11 +2494,14 @@ fn audit_show_relaxed_flag_reaches_parser() {
 
     let mut cmd = Command::new(binary());
     clean_ai_env(&mut cmd);
+    // A home that resolves and has recorded nothing. This test used to remove
+    // `HOME`, and passed because an unresolvable audit path read as "no
+    // entries recorded yet" — the answer #509 retired.
     let output = cmd
         .args(["audit", "show", "--relaxed"])
+        .env("HOME", &dir)
         .env("XDG_CONFIG_HOME", &dir)
         .env("XDG_DATA_HOME", &dir)
-        .env_remove("HOME")
         .output()
         .unwrap();
 
@@ -7766,6 +7769,326 @@ fn run_installed(
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .output()
         .unwrap_or_else(|e| panic!("failed to run {} {}: {e}", exe.display(), args.join(" ")))
+}
+
+/// `omamori <args>` with `HOME` set to the empty string — an audit path that
+/// cannot be resolved. Config comes from `config_home`, so nothing reads the
+/// developer's own.
+fn run_with_empty_home(config_home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(args)
+        .env("HOME", "")
+        .env("XDG_CONFIG_HOME", config_home.join(".config"))
+        .output()
+        .expect("failed to run omamori with HOME=\"\"")
+}
+
+/// A home holding a written store — one block recorded, so the log, the key
+/// and the high-water-mark sidecar all exist.
+fn home_with_a_written_store(name: &str) -> PathBuf {
+    let home = unique_dir(name);
+    let (_, exit) = hook_check_in(&home, "rm -rf /tmp/omamori-509-seed", false);
+    assert_eq!(exit, 2, "the seeding block must be refused and recorded");
+    assert!(home.join(".local/share/omamori/audit.jsonl.hwm").exists());
+    home
+}
+
+/// #509 item 1: `audit show` and `audit unknown` say "no entries recorded yet"
+/// only when `audit verify` would also read the store as never written — the
+/// same test, `nothing_written_yet`. A log removed from a store that had one,
+/// a symlink at the log, and an unresolvable `HOME` used to get that sentence
+/// and exit 0 while `verify` reported each as a fault.
+#[cfg(unix)]
+#[test]
+fn audit_show_and_unknown_say_nothing_recorded_only_when_nothing_was() {
+    let nothing_yet = "no entries recorded yet";
+
+    // Never written: the quiet answer, as before.
+    let fresh = unique_dir("509-fresh");
+    for verb in ["show", "unknown"] {
+        let out = run_in(&fresh, &["audit", verb]);
+        assert_eq!(out.status.code(), Some(0), "{verb} on a fresh store");
+        assert!(String::from_utf8_lossy(&out.stdout).contains(nothing_yet));
+    }
+    let _ = fs::remove_dir_all(&fresh);
+
+    // Written, then the log removed: the sidecar says it existed.
+    let removed = home_with_a_written_store("509-log-removed");
+    fs::remove_file(removed.join(".local/share/omamori/audit.jsonl")).unwrap();
+    for verb in ["show", "unknown"] {
+        let out = run_in(&removed, &["audit", verb]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{verb}: {stdout}{stderr}");
+        assert!(!stdout.contains(nothing_yet), "{verb}: {stdout}");
+        assert!(
+            stderr.contains("cannot read the audit log")
+                && stderr.contains("the audit log is gone"),
+            "{verb}: {stderr}"
+        );
+    }
+    let _ = fs::remove_dir_all(&removed);
+
+    // A symlink at the log.
+    let linked = home_with_a_written_store("509-log-symlink");
+    let log = linked.join(".local/share/omamori/audit.jsonl");
+    let elsewhere = linked.join("elsewhere.jsonl");
+    fs::rename(&log, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+    let out = run_in(&linked, &["audit", "show"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot read the audit log"), "{stderr}");
+    let _ = fs::remove_dir_all(&linked);
+
+    // No resolvable HOME.
+    let config_home = unique_dir("509-empty-home");
+    for verb in ["show", "unknown"] {
+        let out = run_with_empty_home(&config_home, &["audit", verb]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{verb}: {stdout}{stderr}");
+        assert!(!stdout.contains(nothing_yet), "{verb}: {stdout}");
+        assert!(stderr.contains("HOME is unset"), "{verb}: {stderr}");
+    }
+    let _ = fs::remove_dir_all(&config_home);
+}
+
+/// #509, same-class: `status` asked the same question its own way and gave the
+/// same wrong answer — a removed log read as "log created on first event"
+/// under `[ok]`. Quiet only when nothing was ever written.
+#[cfg(unix)]
+#[test]
+fn status_does_not_report_a_removed_log_as_not_yet_created() {
+    let layer3 = |out: &std::process::Output| -> String {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("Layer 3 (audit)"))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // The control: the same store with the sidecar removed too. The key is
+    // still there, so the only difference from the case below is the evidence
+    // that a log existed.
+    let wiped = home_with_a_written_store("509-status-wiped");
+    let data = wiped.join(".local/share/omamori");
+    fs::remove_file(data.join("audit.jsonl")).unwrap();
+    fs::remove_file(data.join("audit.jsonl.hwm")).unwrap();
+    let line = layer3(&run_in(&wiped, &["status"]));
+    assert!(
+        line.contains("[ok]") && line.contains("log created on first event"),
+        "{line}"
+    );
+    let _ = fs::remove_dir_all(&wiped);
+
+    let removed = home_with_a_written_store("509-status-removed");
+    fs::remove_file(removed.join(".local/share/omamori/audit.jsonl")).unwrap();
+    let line = layer3(&run_in(&removed, &["status"]));
+    assert!(
+        line.contains("[warn]") && line.contains("the audit log is gone"),
+        "{line}"
+    );
+    let _ = fs::remove_dir_all(&removed);
+}
+
+/// #509 review: a log emptied in place (`: > audit.jsonl`), beside the
+/// sidecar that says entries were written, is a tail cut to nothing. Through
+/// 1.3.0 every surface read it as healthy — `audit verify` "no entries to
+/// verify" with exit 0, `report` intact, `doctor` quiet, `status` "log created
+/// on first event" — while deleting the file was reported. The control is the
+/// same store left alone.
+///
+/// R2 added three shapes of the same cut: a log emptied with `echo >`, which
+/// leaves one newline that `status` counted as content; the key store made
+/// unusable as well, which halted the walk and skipped the check; and the
+/// sidecar spoiled as well, which skipped it too.
+#[cfg(unix)]
+#[test]
+fn an_emptied_log_reads_as_a_cut_tail() {
+    type Setup = fn(&std::path::Path);
+    let cases: [(&str, Setup); 5] = [
+        ("untouched", |_| {}),
+        ("emptied", |data| {
+            fs::write(data.join("audit.jsonl"), "").unwrap()
+        }),
+        ("newline-only", |data| {
+            fs::write(data.join("audit.jsonl"), "\n").unwrap()
+        }),
+        ("emptied-no-key", |data| {
+            fs::write(data.join("audit.jsonl"), "").unwrap();
+            fs::remove_file(data.join("audit-secret")).unwrap();
+        }),
+        ("emptied-spoiled-mark", |data| {
+            fs::write(data.join("audit.jsonl"), "").unwrap();
+            fs::write(data.join("audit.jsonl.hwm"), "x\n").unwrap();
+        }),
+    ];
+    for (shape, setup) in cases {
+        let home = home_with_a_written_store(&format!("509-emptied-{shape}"));
+        setup(&home.join(".local/share/omamori"));
+        let verify = run_in(&home, &["audit", "verify"]);
+        let report = run_in(&home, &["report", "--json"]);
+        let doctor = run_in(&home, &["doctor"]);
+        let status = run_in(&home, &["status"]);
+        let verify_out = String::from_utf8_lossy(&verify.stdout).to_string();
+        let verify_err = String::from_utf8_lossy(&verify.stderr).to_string();
+        let report_json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&report.stdout)).unwrap();
+        let layer3 = String::from_utf8_lossy(&status.stdout)
+            .lines()
+            .find(|l| l.contains("Layer 3 (audit)"))
+            .unwrap_or_default()
+            .to_string();
+        let doctor_out = String::from_utf8_lossy(&doctor.stdout).to_string();
+        let risk = doctor_out.contains("Risk signals below need attention.");
+        if shape == "untouched" {
+            assert_eq!(verify.status.code(), Some(0), "{shape}: {verify_err}");
+            assert_eq!(report_json["chain_status"]["status"], "intact");
+            assert!(!risk, "{shape}: {doctor_out}");
+            assert!(layer3.contains("[ok]"), "{shape}: {layer3}");
+            let _ = fs::remove_dir_all(&home);
+            continue;
+        }
+        assert_eq!(verify.status.code(), Some(3), "{shape}: {verify_err}");
+        assert!(
+            !verify_out.contains("chain intact"),
+            "{shape}: nothing was verified, so nothing is intact: {verify_out}"
+        );
+        assert!(risk, "{shape}: {doctor_out}");
+        assert!(
+            layer3.contains("[warn]") && layer3.contains("the audit log is empty"),
+            "{shape}: {layer3}"
+        );
+        if shape == "emptied-spoiled-mark" {
+            assert!(
+                verify_err.contains("high-water-mark file could not be used"),
+                "{shape}: {verify_err}"
+            );
+        } else {
+            assert!(
+                verify_err.contains("cut to nothing"),
+                "{shape}: {verify_err}"
+            );
+            assert_eq!(
+                report_json["chain_status"]["status"], "truncated",
+                "{shape}: {report_json}"
+            );
+        }
+        if shape == "emptied-no-key" {
+            assert!(
+                verify_err.contains("could not start either"),
+                "{shape}: both findings: {verify_err}"
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+/// #509 item 5, the rest of it: the `inaccessible` states whose reason embeds
+/// a path, and the two key-store states, through a real store. `report --json`
+/// must carry the kind and no path.
+#[cfg(unix)]
+#[test]
+fn report_json_names_the_key_store_and_unreadable_log_states_without_a_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    type Setup = fn(&std::path::Path);
+    let cases: [(&str, Setup); 5] = [
+        ("secret_symlink", |data| {
+            let secret = data.join("audit-secret");
+            fs::rename(&secret, data.join("elsewhere-secret")).unwrap();
+            std::os::unix::fs::symlink(data.join("elsewhere-secret"), &secret).unwrap();
+        }),
+        ("secret_unreadable", |data| {
+            fs::set_permissions(data.join("audit-secret"), fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }),
+        ("active_key_missing", |data| {
+            fs::remove_file(data.join("audit-secret")).unwrap();
+        }),
+        ("rotation_interrupted", |data| {
+            fs::rename(
+                data.join("audit-secret"),
+                data.join("audit-secret.1.retired"),
+            )
+            .unwrap();
+        }),
+        ("log_unreadable", |data| {
+            fs::set_permissions(data.join("audit.jsonl"), fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }),
+    ];
+    for (kind, setup) in cases {
+        let home = home_with_a_written_store(&format!("509-5-{kind}"));
+        let data = home.join(".local/share/omamori");
+        setup(&data);
+        let out = run_in(&home, &["report", "--json"]);
+        for f in ["audit-secret", "audit.jsonl"] {
+            let _ = fs::set_permissions(data.join(f), fs::Permissions::from_mode(0o600));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{kind}: {e}: {stdout}"));
+        assert_eq!(
+            parsed["chain_status"],
+            serde_json::json!({ "status": "inaccessible", "kind": kind }),
+            "{kind}"
+        );
+        assert!(
+            !stdout.contains(&*home.to_string_lossy()),
+            "{kind}: the reason embeds a path and must not reach --json: {stdout}"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+/// #509 item 5: the `inaccessible` states reach `report --json` through a real
+/// store, with their path-free `kind` and no path. The serde tests build the
+/// variant by hand; this is the measurement repeated by CI.
+#[cfg(unix)]
+#[test]
+fn report_json_names_the_inaccessible_states_without_a_path() {
+    let chain_status = |out: &std::process::Output| -> serde_json::Value {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        parsed["chain_status"].clone()
+    };
+
+    let removed = home_with_a_written_store("509-report-missing");
+    fs::remove_file(removed.join(".local/share/omamori/audit.jsonl")).unwrap();
+    let out = run_in(&removed, &["report", "--json"]);
+    assert_eq!(
+        chain_status(&out),
+        serde_json::json!({ "status": "inaccessible", "kind": "log_missing" })
+    );
+    // `log_missing`'s reason is a fixed sentence with no path in it, so no
+    // path check here — the states whose reason does embed one are pinned in
+    // `report_json_names_the_key_store_and_unreadable_log_states_without_a_path`.
+    let _ = fs::remove_dir_all(&removed);
+
+    let linked = home_with_a_written_store("509-report-symlink");
+    let log = linked.join(".local/share/omamori/audit.jsonl");
+    let elsewhere = linked.join("elsewhere.jsonl");
+    fs::rename(&log, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &log).unwrap();
+    let out = run_in(&linked, &["report", "--json"]);
+    assert_eq!(
+        chain_status(&out),
+        serde_json::json!({ "status": "inaccessible", "kind": "log_symlink" })
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&*linked.to_string_lossy()));
+    let _ = fs::remove_dir_all(&linked);
+
+    let config_home = unique_dir("509-report-empty-home");
+    let out = run_with_empty_home(&config_home, &["report", "--json"]);
+    assert_eq!(
+        chain_status(&out),
+        serde_json::json!({ "status": "inaccessible", "kind": "path_unresolved" })
+    );
+    let _ = fs::remove_dir_all(&config_home);
 }
 
 /// #509 item 2: what the keyring found is reported on every verdict, not only

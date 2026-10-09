@@ -326,6 +326,31 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 // before, and prints exactly what it printed: `unknown_version_at`
                 // and `key_unavailable_at` are both `None` there, so this was
                 // already the next arm reached.
+                //
+                // #509 (R2): a log with no chain entry left. Neither form below
+                // fits it — the success line says "0 entries verified, chain
+                // intact.", and the halted one speaks of an end the remaining
+                // lines claim when none remain — and there is nothing for
+                // `audit show` to inspect.
+                if result.chain_entries == 0
+                    && result.never_protected_entries == 0
+                    && result.unverified_entries_after == 0
+                {
+                    eprintln!(
+                        "omamori audit verify: the audit log holds no chain entry, but its \
+                         high-water-mark says entries were written \u{2014} the tail may have \
+                         been cut to nothing."
+                    );
+                    if let Some(failure) = &result.key_store_failure {
+                        eprintln!("  Verification could not start either: {}", failure.reason);
+                        print_remedy(&failure.remedy, allow_repair);
+                        eprintln!(
+                            "  Two findings on one log is not a coincidence to explain away \
+                             \u{2014} treat it as possible tampering."
+                        );
+                    }
+                    return Ok(3);
+                }
                 if result.halted() {
                     // Deliberately not `format_verify_success_message`: that
                     // sentence ends "chain intact.", which is the one thing a
@@ -577,6 +602,17 @@ fn run_audit_verify(args: &[OsString]) -> Result<i32, AppError> {
                 // arm above learnt that lesson from the exit-4 one.
                 print_halted_hwm_notes(&result);
                 Ok(2)
+            } else if let (0, Some(reason)) = (result.chain_entries, &result.hwm_unusable) {
+                // #509 (R2): beside an empty log, a mark that cannot be read
+                // reached "no entries to verify" and exit 0 — and an empty
+                // log gives no end to write in its place.
+                eprintln!(
+                    "omamori audit verify: no entry was verified, and the high-water-mark \
+                     file could not be used \u{2014} {reason}."
+                );
+                print_hwm_write_note(&result.hwm_write, MarkExisted::Yes);
+                eprintln!("  This may indicate an attempt to defeat tail-truncation detection.");
+                Ok(3)
             } else if result.chain_entries == 0 && result.legacy_entries > 0 {
                 eprintln!(
                     "omamori audit verify: no chain entries found ({} legacy entries skipped)",
@@ -745,6 +781,12 @@ fn run_audit_show(args: &[OsString]) -> Result<i32, AppError> {
             println!("omamori audit: no entries recorded yet");
             Ok(0)
         }
+        // #509: a store that cannot be read is not an empty one. Worded like
+        // `verify`'s "cannot verify — {reason}".
+        Err(audit::AuditError::StoreInaccessible { reason, .. }) => {
+            eprintln!("omamori audit show: cannot read the audit log — {reason}");
+            Ok(1)
+        }
         Err(e) if is_broken_pipe(&e) => Ok(0),
         Err(e) => {
             eprintln!("omamori audit show: {e}");
@@ -816,6 +858,12 @@ fn run_audit_unknown(args: &[OsString]) -> Result<i32, AppError> {
         Err(audit::AuditError::FileNotFound) => {
             println!("omamori audit: no entries recorded yet");
             Ok(0)
+        }
+        // #509: a store that cannot be read is not an empty one. Worded like
+        // `verify`'s "cannot verify — {reason}".
+        Err(audit::AuditError::StoreInaccessible { reason, .. }) => {
+            eprintln!("omamori audit unknown: cannot read the audit log — {reason}");
+            Ok(1)
         }
         Err(e) if is_broken_pipe(&e) => Ok(0),
         Err(e) => {
