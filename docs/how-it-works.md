@@ -52,7 +52,9 @@ macOS only at runtime — shim paths and Trash integration are macOS-specific. C
 
 ### How omamori handles new / renamed tools
 
-omamori routes by **payload shape** (`tool_input.command` / `cmd` / `file_path` / `path` / `url`), not by tool name. A renamed AI tool carrying a `command` field still reaches the full pipeline; unrecognised shapes still allow but emit `unknown_tool_fail_open` audit events. Review with `omamori audit unknown` or check `omamori doctor`'s 30-day count line.
+omamori routes by **payload shape** (`tool_input.command` / `cmd` / `file_path` / `path` / `notebook_path` / `url`), not by tool name. In Claude Code every tool call reaches the hook — the installed entry's matcher is `"*"` ([ADR-0018](adr/0018-every-claude-code-tool-reaches-the-hook.md); through 1.3.0 it was `"Bash"` and only shell commands arrived, [#576](https://github.com/yottayoshida/omamori/issues/576)). A renamed AI tool carrying a `command` field still reaches the full pipeline; unrecognised shapes still allow but emit an `unknown_tool_fail_open` audit event, once per tool name per day. Review with `omamori audit unknown` or check `omamori doctor`'s 30-day count line.
+
+Tool names only ever relax the check: `Read`, `Grep` and `NotebookRead` are stopped only at the audit secret, `Glob` and `LS` are not checked, and every other name — an unknown one included — is treated as a writer. Only a call named `Bash` is ever approved by the hook; every other allowed call returns no decision, so Claude Code's own permission settings apply.
 
 For the full shape catalogue, scope, known operational noise (legitimate tools like `Glob` / `Task` landing in fail-open), and the strict-mode trade-off, see [SECURITY.md → Hook Coverage](../SECURITY.md#hook-coverage-layer-2).
 
@@ -81,7 +83,7 @@ Terminal → rm -rf src/
 | **Self-defense** | Blocks self-modification commands (`config disable`, `uninstall`, etc.), hook/config editing, env-var unsetting while AI-detected | Acceptance test suite |
 | **Audit chain** | HMAC-SHA256 signed, hash-chained tamper-evident JSONL log at `~/.local/share/omamori/audit.jsonl` — also records successful `config disable/enable/add` mutations, not just command decisions | `omamori audit verify` |
 | **Integrity monitoring** | Verifies shims, hooks, config, core policy, PATH order. Detects subtle hook body rewrites | `omamori doctor`, `omamori status` |
-| **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, Claude Code settings.json | Hook integration tests |
+| **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, everything under `~/.omamori`, Claude Code `settings.json` / `settings.local.json`, and AI reads of the audit HMAC secret — Claude Code tools only; shell commands that write these files are not blocked ([#577](https://github.com/yottayoshida/omamori/issues/577)) | Hook integration tests, ACCEPTANCE_TEST.md live row |
 | **Auto-sync** | Detects version mismatch after `brew upgrade` and auto-regenerates hook files | Smoke test |
 
 Core policy: built-in rules (15 at 1.0, including self-protection rules) cannot be disabled via `config.toml` — an AI agent setting `enabled = false` is ignored. For legitimate overrides, see `omamori override` in [CLI Reference](cli.md).

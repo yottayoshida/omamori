@@ -97,7 +97,7 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 | PATH override bypass (`PATH=/usr/bin:$PATH rm`) | not covered | supported (v0.10.1) | Hook integration, acceptance test T-3' |
 | Env-var tampering (`unset CLAUDECODE`, `export -n`) | not covered | supported | Hook integration env-tampering corpus |
 | Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (Phase 2 builtin rules) | Acceptance tests |
-| Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code Tier 1; Codex CLI Tier 2) | Hook integration file-protection tests |
+| Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code only — Codex CLI's hook sees shell commands alone; v0.9.7–1.3.0 the Claude Code entry routed `Bash` only and this never ran, [#576](https://github.com/yottayoshida/omamori/issues/576)) | Hook integration file-protection tests, `tool_calls_through_the_installed_hook`, ACCEPTANCE_TEST.md live row |
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
 | Self-modification commands in command context (`omamori config disable/enable/add`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`, `break-glass`, `audit key rotate`) | supported (env guard) | supported (Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
 
@@ -107,7 +107,7 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 |---------|--------|-----------|
 | Interpreter commands (`python -c "shutil.rmtree(...)"`) | Zero real-world incidents in target tools; protocol-level enforcement (MCP) is the right layer | [#74](https://github.com/yottayoshida/omamori/issues/74) |
 | Commands outside the curated rule set | omamori guards a narrow set of known destructive patterns, not arbitrary commands | [Security Model](#security-model) |
-| AI overwrites/destroys user source files via native Write/Edit tools | Command-guard scope: omamori observes Bash commands and protects its own files only; native editor-tool writes are outside the interception layer | Git hygiene (`git diff` before commit), AI tool file sandbox |
+| AI overwrites/destroys user source files via native Write/Edit tools | Command-guard scope: omamori's hook sees every Claude Code tool call but judges an editor-tool write only against omamori's own files; a write to anything else is left to the agent's own permission flow | Git hygiene (`git diff` before commit), AI tool file sandbox |
 
 #### Not caught — structural limit
 
@@ -425,13 +425,18 @@ all recorded rather than fixed:
   the reader to *look*, not to change or delete anything; and `audit key rotate`'s "set
   `audit.path` explicitly in `config.toml`, or fix `HOME`" describes an environment that cannot
   resolve a path at all, not a degraded key store, and setting a path weakens no protection.
-- **The throttle sentinel is outside `PROTECTED_FILE_PATTERNS`**
-  ([#520](https://github.com/yottayoshida/omamori/issues/520)). `~/.omamori` is covered only
-  as two named files, so a guarded agent can create or refresh the sentinel — its name is a
-  truncated digest of the secret path, which follows from the config — and keep the warning
-  suppressed. This hides a notification, not the evidence: entries are still stamped
+- **The unknown-tool sentinels can be planted from a shell command** ([#577](https://github.com/yottayoshida/omamori/issues/577)). A sentinel under
+  `~/.omamori` marks a tool name as already recorded today ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)); `touch`ing one for a name
+  ahead of time leaves that tool's first call of the day unrecorded. The editor tools cannot,
+  for the reason below. The record is marked only once it has been written, so a failed
+  append is retried rather than lost.
+- **The throttle sentinel can be refreshed from a shell command**
+  ([#520](https://github.com/yottayoshida/omamori/issues/520), [#577](https://github.com/yottayoshida/omamori/issues/577)). `~/.omamori` is protected as a whole since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md), so an editor tool can no longer
+  create or refresh the sentinel; a shell command (`touch`) still can — its name is a
+  truncated digest of the secret path, which follows from the config — and so keep the
+  warning suppressed. This hides a notification, not the evidence: entries are still stamped
   `UNRESOLVED_KEY_ID`, and `verify`, `status` and `doctor` still report the state from the
-  store itself. Pre-existing for `#359`'s sentinel; `#473` widened which warnings depend on it.
+  store itself.
 - **Two key-store reasons share one sentinel**
   ([#521](https://github.com/yottayoshida/omamori/issues/521)), and only one of them carries a
   repair — so a fix-and-retry sequence can suppress the repair for the rest of the window.
@@ -483,6 +488,12 @@ cat | /usr/local/bin/omamori hook-check --provider claude-code
 exit $?
 ```
 
+**Which tools reach it** ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)). The `settings.json` entry `omamori install --hooks` writes has `"matcher": "*"`: every tool call goes through `hook-check`, which routes it by the shape of its input ([Scope: unknown / new tools](#scope-unknown--new-tools-v096)). From v0.9.7 through 1.3.0 the entry said `"Bash"` and nothing but shell commands reached the hook, so the file-protection guard and the shape routing were implemented, tested by calling `hook-check` directly, and never ran in a Claude Code session ([#576](https://github.com/yottayoshida/omamori/issues/576)). An entry still saying `"Bash"` is rewritten on the first guarded command after the upgrade, and `omamori doctor` fails it until then. A Claude Code session that is already running keeps the hooks it started with until it is restarted.
+
+**Only a shell command is approved.** On an allow, `hook-check` prints `permissionDecision: "allow"` for a call named `Bash` and for nothing else (#62 added it so that Auto mode would not prompt for every command omamori had already judged). Claude Code reads that value as approval and skips its own prompt, so every other allowed call exits 0 with nothing on stdout — Claude Code's "no decision" — and the user's permission settings decide. A tool that merely carries a `command` field (`Monitor`, some MCP tools) is checked like a shell command and is still not approved.
+
+**When omamori cannot answer** — its binary missing, the hook script broken — the wrapper exits 2, and that stops every tool call in Claude Code, not only shell commands. This is the fail-closed half of G-6. A `!` command in Claude Code does not pass through the hook and can run `omamori install --hooks`.
+
 ### Cursor Hooks
 
 The `omamori cursor-hook` subcommand uses the same `check_command_for_hook()` pipeline internally, with Cursor's JSON stdin/stdout protocol.
@@ -518,7 +529,7 @@ Wrapper kind flows into the audit log only. Block-reason **stderr** text remains
 
 #### Forensic semantics (v0.9.8+)
 
-An audit row exists for every **Claude Code / Codex `hook-check` Layer 2 deny verdict** (`BlockMeta` / `BlockRule` / `BlockStructural`); the **absence** of a row in those provider paths implies `Allow` (or, in the limit, a missed-detection bypass). Provider scope is deliberate: Cursor hooks emit stderr-only deny messages without an audit-log append (see `### Cursor Hooks` above for the integration boundary), so absence in the audit log does NOT imply Cursor deny did not happen. HMAC chain integrity is not the same as forensic completeness — the chain protects against tampering with recorded events, not against under-recording. When investigating an incident or verifying coverage on the in-scope providers, treat audit-log absence and audit-log presence as orthogonal signals: HMAC `omamori audit verify` proves the recorded events are unforged, while `omamori hook-check --provider claude-code` dry-run on the same `tool_input.command` proves whether the structural pipeline reaches a deny at all. The two together close the gap; either alone is insufficient.
+An audit row exists for every **Claude Code / Codex `hook-check` Layer 2 deny verdict** (`BlockMeta` / `BlockRule` / `BlockStructural`; a file-protection block, `layer2:file-protection`, including a refusal because the working directory could not be resolved, `rule_id: unresolvable-base`; and a refusal of input that could not be validated, `layer2:input-validation`, which records the tool name but not the input — the last two recorded since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md), the release that made Claude Code send every tool to the hook); the **absence** of a row in those provider paths implies `Allow` (or, in the limit, a missed-detection bypass). Provider scope is deliberate: Cursor hooks emit stderr-only deny messages without an audit-log append (see `### Cursor Hooks` above for the integration boundary), so absence in the audit log does NOT imply Cursor deny did not happen. HMAC chain integrity is not the same as forensic completeness — the chain protects against tampering with recorded events, not against under-recording. When investigating an incident or verifying coverage on the in-scope providers, treat audit-log absence and audit-log presence as orthogonal signals: HMAC `omamori audit verify` proves the recorded events are unforged, while `omamori hook-check --provider claude-code` dry-run on the same `tool_input.command` proves whether the structural pipeline reaches a deny at all. The two together close the gap; either alone is insufficient.
 
 #### Audit-append failure semantics (SEC-7)
 
@@ -537,13 +548,17 @@ This v0.9.7 change did not require a `CHAIN_VERSION` bump on its own (that came 
 
 ### Scope: unknown / new tools (v0.9.6+)
 
-AI tool platforms ship new tools and rename existing ones on their own cadence; omamori is locally installed and updated on the user's cadence. A `tool_name` allowlist baked into the binary would always be slightly behind reality, so we route by **payload shape** instead of by name. See `README.md` → "How omamori handles new / renamed tools" for the full table.
+AI tool platforms ship new tools and rename existing ones on their own cadence; omamori is locally installed and updated on the user's cadence. A `tool_name` allowlist baked into the binary would always be slightly behind reality, so we route by **payload shape** instead of by name. See [docs/how-it-works.md](docs/how-it-works.md) → "How omamori handles new / renamed tools".
 
-The threat we care about: a provider-side rename of a write/exec tool silently bypasses Layer 2. Pre-v0.9.6, `HookInput::UnknownTool` short-circuited to allow regardless of the carried `tool_input`. Codex adversarial-review ② A-2 (2026-04-23, critical) flagged this as a forward-compat fail-open, and v0.9.6 closes it: a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` now reaches the full shell pipeline (Phase 1B detectors, Phase 2 rules, unwrap stack) on the strength of the `command` field alone. Wrong-type routing fields (`command: 42`) fail closed.
+**In Claude Code this needs every tool to reach the hook**, which it does since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md) and did not from v0.9.7 through 1.3.0 ([#576](https://github.com/yottayoshida/omamori/issues/576) — see [Claude Code Hooks](#claude-code-hooks)). **Names relax, they never tighten**: once a call is routed as a file operation, `Read`, `Grep` and `NotebookRead` are checked for the audit secret alone (a file named `audit-secret*`, or a directory holding one); `Glob` and `LS`, which list names and read nothing, are not checked; every other name, including one omamori does not know, gets the whole protected list — so a writing tool that is renamed is still treated as a writer.
 
-The residual risk is `tool_input` shapes we don't recognise at all (no `command`/`cmd`/`file_path`/`path`/`url`). That's still **Allow**, on purpose: starting to block unreviewed payload shapes would break user workflow on every legitimate AI tool update. But the silence is gone — the call is recorded as an `unknown_tool_fail_open` event in the audit chain, stderr carries a one-line hint, and `omamori doctor` surfaces a 30-day count. Users review the events with `omamori audit unknown`.
+The threat we care about: a provider-side rename of a write/exec tool silently bypasses Layer 2. Pre-v0.9.6, `HookInput::UnknownTool` short-circuited to allow regardless of the carried `tool_input`. Codex adversarial-review ② A-2 (2026-04-23, critical) flagged this as a forward-compat fail-open, and v0.9.6 closes it: a payload like `{"tool_name":"FuturePlanWriter","tool_input":{"command":"/bin/rm -rf /"}}` now reaches the full shell pipeline (Phase 1B detectors, Phase 2 rules, unwrap stack) on the strength of the `command` field alone. Wrong-type routing fields fail closed: for a call named `Bash`, any of them; for any other tool, a `command` or `cmd` that is not a string — an exec shape omamori cannot inspect — while a `path` or `url` of another type is ignored and the call is routed by what remains. An empty `tool_input` is refused only for `Bash`; many tools take no arguments.
 
-The 30-day count assumes a roughly correct, monotonic OS clock. The cutoff is computed as `now_utc() - 30 days` and applied as a `>=` filter on the per-event RFC 3339 timestamp, so significant NTP rewinds or other clock anomalies move the cutoff window and silently shrink or zero the count. Treat the surfaced number as a drift indicator, not a forensic counter — investigate spikes via `omamori audit unknown` and HMAC-verify suspicious windows with `omamori audit verify` rather than relying on the doctor count alone.
+The residual risk is `tool_input` shapes we don't recognise at all (no `command`/`cmd`/`file_path`/`path`/`notebook_path`/`url`). That's still **Allow**, on purpose: starting to block unreviewed payload shapes would break user workflow on every legitimate AI tool update. But the silence is gone — the call is recorded as an `unknown_tool_fail_open` event in the audit chain, stderr carries a one-line hint, and `omamori doctor` surfaces a 30-day count. **Once per tool name per day** ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)): with every Claude Code tool routed to the hook, `AskUserQuestion`, `Agent` and most MCP calls land here, and a record costs a locked append and two syncs (35–41 ms measured, against 7–9 ms for the rest of the hook). A sentinel under `~/.omamori` keyed by the tool name gates it, so a new or renamed tool is still recorded the first time it appears.
+
+A path carried in a field other than those three — an array of `paths`, an Artifact upload's `file_paths` or `files` (routed as a URL, since it also carries `url`) — and a `Grep` given no `path` (it searches the working directory) are not checked against the protected list. Neither is a `Grep` started above the directory that holds the secret. Users review the events with `omamori audit unknown`.
+
+The 30-day count assumes a roughly correct, monotonic OS clock. The cutoff is computed as `now_utc() - 30 days` and applied as a `>=` filter on the per-event RFC 3339 timestamp, so significant NTP rewinds or other clock anomalies move the cutoff window and silently shrink or zero the count. Treat the surfaced number as a drift indicator, not a forensic counter — investigate an unfamiliar tool name via `omamori audit unknown` and HMAC-verify suspicious windows with `omamori audit verify` rather than relying on the doctor count alone.
 
 This is a **trade-off, not a complete mitigation**. Threat-model implications:
 
@@ -553,16 +568,16 @@ This is a **trade-off, not a complete mitigation**. Threat-model implications:
 
 #### Known limitations carried into v0.9.6
 
-The shape catalogue is intentionally narrow in v0.9.6 and several known-good Claude Code tools land in the unknown branch — `NotebookEdit` (`notebook_path`), `Task` (`subagent_type`/`prompt`), `TodoWrite` (`todos`), `WebSearch` (`query`), and similar. Operationally:
+The shape catalogue is intentionally narrow in v0.9.6 and several known-good Claude Code tools land in the unknown branch — `NotebookEdit` (`notebook_path`, routed as a file operation since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)), `Task` (`subagent_type`/`prompt`), `TodoWrite` (`todos`), `WebSearch` (`query`), and similar. Operationally:
 
 | Surface | Behavior in v0.9.6 | Honest read |
 |---|---|---|
 | **Protection** (does the dangerous shape reach the unwrap stack?) | Routes correctly: `command`/`cmd`/`file_path`/`path` always reach the full pipeline regardless of `tool_name` | Effective. The forward-compat fail-open Codex ② A-2 flagged is closed for the dangerous-shape class. |
-| **Observability** (`audit unknown` count, `doctor` 30-day line) | Includes legitimate-tool noise on every `Glob` / `Task` / `TodoWrite` / `WebSearch` invocation | **Upper bound on adversarial activity, not a lower bound**. A baseline of routine fail-opens is expected; spikes or unfamiliar tool names are the actionable signal. |
+| **Observability** (`audit unknown` count, `doctor` 30-day line) | Includes legitimate-tool noise from `Task` / `TodoWrite` / `WebSearch` and the like — on every invocation through 1.3.0, once per tool name per day since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md) | **Upper bound on adversarial activity, not a lower bound**. A baseline of routine fail-opens is expected. Through 1.3.0 a spike in one tool's count was a signal; with one record per name per day, an unfamiliar tool name is. |
 | **Audit schema borrowing** | `target_count` re-used to record `tool_input` top-level key count for `unknown_tool_fail_open` events; `command` field re-used to carry `tool_name` | Downstream analytics that aggregate these columns across action types will see skewed distributions. Use `action == "unknown_tool_fail_open"` as the filter, not field semantics. |
-| **stderr dedup** (per the original release-blocker UX wording) | One stderr line per hook-check invocation; no in-process dedup — `omamori hook-check` is short-lived (1 process = 1 dispatch), so a process-local guard would be dead code | Each fail-open emits one line. If user noise becomes a problem, session-level dedup will land alongside strict-mode. |
+| **stderr dedup** (per the original release-blocker UX wording) | One stderr line per hook-check invocation through 1.3.0; since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md) the line and the record come once per tool name per day, through a sentinel under `~/.omamori` — a hook process cannot see a session | A tool used every day leaves one line a day. |
 
-A future omamori release will address these by (1) widening the shape catalogue to cover known legitimate tool fields, (2) adding dedicated audit columns so `unknown_tool_fail_open` events do not borrow `target_count` / `command` semantics, (3) opt-in `strict-mode` so users can fail-closed on unrecognised shapes, and (4) session-level stderr dedup.
+A future omamori release will address these by (1) widening the shape catalogue to cover known legitimate tool fields, (2) adding dedicated audit columns so `unknown_tool_fail_open` events do not borrow `target_count` / `command` semantics, (3) opt-in `strict-mode` so users can fail-closed on unrecognised shapes. (4), session-level stderr dedup, landed as the daily one above.
 
 ### Hook Limitations
 
@@ -660,8 +675,8 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 - `config disable`, `config enable`, `config add`, `uninstall`, and `init --force` are blocked when AI detector env vars are present
 - Uses the same detector logic as the PATH shim (`evaluate_detectors()`)
 - Hooks also block these commands as string patterns (Claude Code + Cursor)
-- Hooks block shell commands that modify `config.toml` (sed, echo, etc.)
-- **Edit/Write file_path guard** (v0.8.0 #110): AI Edit/Write/MultiEdit operations on protected files (config, hooks, audit, settings.json) are blocked via `PROTECTED_FILE_PATTERNS` with path normalization and symlink resolution
+- **Shell commands that write omamori's files are not blocked** — `sed -i` or `echo >>` on `config.toml`, `touch` under `~/.omamori`, and `cat` of the audit secret all pass ([#577](https://github.com/yottayoshida/omamori/issues/577)). This line used to say the hooks blocked them; the substring patterns that did were removed in v0.10.4 and nothing took over the shell route.
+- **Edit/Write file_path guard** (v0.8.0 #110): AI Edit/Write/MultiEdit/NotebookEdit operations on protected files (config, hooks, audit, `settings.json`, `settings.local.json`, anything under `~/.omamori`) are blocked via `PROTECTED_FILE_PATTERNS` with path normalization and symlink resolution — in Claude Code, and from v0.9.7 through 1.3.0 in no session at all ([#576](https://github.com/yottayoshida/omamori/issues/576))
 
 ### Known limitations
 
@@ -669,8 +684,8 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 |--------------|-----------|-------|
 | `omamori config disable` | Yes — env var guard | All tools with known env vars |
 | `omamori uninstall` | Yes — env var guard | All tools with known env vars |
-| Direct config.toml editing (Edit/Write) | **Yes** — file_path guard (v0.8.0) | Claude Code PreToolUse. Codex CLI: Bash only (structural limitation) |
-| Direct config.toml editing (Bash: sed, echo >>) | Claude Code + Cursor | Hooks block Bash patterns containing config.toml |
+| Direct config.toml editing (Edit/Write) | **Yes** — file_path guard (v0.8.0) | Claude Code PreToolUse, every tool since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md) (v0.9.7–1.3.0: not reached, [#576](https://github.com/yottayoshida/omamori/issues/576)). Codex CLI: Bash only (structural limitation) |
+| Direct config.toml editing (Bash: sed, echo >>) | **No** | Not recognised since v0.10.4 ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
 | Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
 | env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |
 | Unknown AI tool (no env var) | **No** | Guard depends on known env vars |
@@ -890,12 +905,12 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 
 | Attack | Defense | Effectiveness |
 |--------|---------|---------------|
-| AI modifies log via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
+| AI modifies log via omamori hook layer | `PROTECTED_FILE_PATTERNS` | Blocked for an editor-tool write in Claude Code ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)). **Not blocked through a shell command** — `>>`, `sed -i`, `cp` onto the log pass ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
 | AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
 | AI deletes/reorders entries mid-chain | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` — **unless** a `chain_version` entry this binary doesn't recognize is also planted ahead of the tamper (#177 B1): verification stops at that entry and reports exit 4 ("unrecognized chain_version", not tamper language) instead of exit 1. The tamper is not hidden — the high-water-mark is preserved untouched, `report`/`doctor` are non-quiet, and removing the planted entry restores full detection — but the *language* softens from "broken" to "unverifiable" while it's present. See [Forward-Unknown Chain Versions](#forward-unknown-chain-versions-177) |
 | AI truncates log tail (removes last K entries) | Seq high-water-mark file (`<audit-log>.hwm`, e.g. `audit.jsonl.hwm`), symlink-safe atomic write/read | Detected by `omamori audit verify` (exit 3). Symlink swap and torn writes are rejected. A same-user attacker who directly overwrites the `.hwm` file's content (not via symlink) can still defeat detection — structural limitation, same as row below. **Making the sidecar unusable reaches the same place by a second route** (#491 gave the state a name): a shape omamori refuses to read as a mark — mode `000`, a FIFO, content that is not an integer — is reported once at exit 3 and then *replaced* by the next run that can authenticate a chain end, since both `verify` and `append` re-bootstrap rather than treat tamper evidence as a fresh install. So truncate-then-spoil is one loud run followed by a mark set to the truncated end. The two shapes that are **not** replaced are a symlink (refused by `write_hwm`) and a directory (`rename` gives `EISDIR`); those keep reporting exit 3 on every run because nothing repairs them. The comparison **survives a verification halt** (#470): an entry whose `chain_version` or `key_id` this binary cannot resolve no longer suppresses it, so planting one ahead of the deletion does not buy silence and the verdict stays exit 3. What it compares against in that state is the end the surviving lines *state* rather than an authenticated one, so an attacker who also renumbers the tail can still hide the removal — and one who ends the file on an unrecognized-`chain_version` line stating no `seq` that reads as an unsigned 64-bit integer gets exit 4 instead, since nothing states an end to compare. See [Truncation Detection Across a Halt](#truncation-detection-across-a-halt-470). **The report lasts until the chain has grown back to the mark** — as many appends as entries were removed — and a prune does not shorten that ([#568](https://github.com/yottayoshida/omamori/issues/568)); see [The High-Water-Mark Across a Prune](#the-high-water-mark-across-a-prune-461-568) |
-| AI accesses secret via omamori hook layer | `PROTECTED_FILE_PATTERNS` + Phase 2 rules | Detected and blocked |
-| AI Edit/Write to protected files (config, audit, hooks, settings.json) | `is_protected_file_path` + `PROTECTED_FILE_PATTERNS` | **Blocked** (v0.8.0 #110) |
+| AI accesses secret via omamori hook layer | `PROTECTED_FILE_PATTERNS`, and for reading tools the secret check ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)) | Blocked when a Claude Code tool that reads (`Read`, `Grep`, `NotebookRead`) or writes names the secret, or a reading tool names the directory holding it, in `file_path`/`path`/`notebook_path` — compared without regard to case. A listing tool (`Glob`) is not checked: it reads names, not contents. **Not blocked**: a path in another field, a `Grep` started above that directory, and every shell command — `cat`, `xxd`, `cp` of the secret pass ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
+| AI Edit/Write to protected files (config, audit, hooks, settings.json, `~/.omamori`) | `is_protected_file_path` + `PROTECTED_FILE_PATTERNS` | **Blocked** in Claude Code (v0.8.0 #110; from v0.9.7 through 1.3.0 the hook was registered for `Bash` alone and this never ran, [#576](https://github.com/yottayoshida/omamori/issues/576)) |
 | AI directly operates on files via OS (bypassing hook layer) | None (same OS user) | **Not protected** (structural limitation) |
 | AI reads secret and forges valid chain | None (same OS user) | **Not protected** (structural limitation) |
 

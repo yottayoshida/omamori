@@ -71,6 +71,20 @@ pub(crate) fn sentinel_name_for_store(kind: &str, store: &Path) -> String {
     format!("warn-{kind}-{}", &format!("{digest:x}")[..8])
 }
 
+/// The window for recording a tool whose input shape `hook-check` does not
+/// recognise (ADR-0018): once per tool name per day.
+pub(crate) const UNKNOWN_TOOL_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+/// The sentinel name for an unrecognised-shape tool.
+///
+/// Digested for the reason [`sentinel_name_for_store`] is — a tool name is
+/// whatever the agent platform sends, MCP names included, and has no business
+/// becoming a path component as it stands.
+pub(crate) fn unknown_tool_sentinel_name(tool_name: &str) -> String {
+    let digest = Sha256::digest(tool_name.as_bytes());
+    format!("unknown-tool-{}", &format!("{digest:x}")[..8])
+}
+
 /// Whether this warning should be printed now, touching the sentinel if so.
 ///
 /// Fails open in every uncertain case: an unreadable sentinel, a non-file at
@@ -78,27 +92,36 @@ pub(crate) fn sentinel_name_for_store(kind: &str, store: &Path) -> String {
 /// throttle itself is broken is the wrong direction for a tool whose product is
 /// telling the operator what happened.
 pub(crate) fn should_emit_at(path: &Path) -> bool {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if !meta.file_type().is_file() {
-            return true;
-        }
-        if let Ok(mtime) = meta.modified()
-            && let Ok(elapsed) = mtime.elapsed()
-            && elapsed.as_secs() < THROTTLE_SECS
-        {
-            return false;
-        }
+    if is_fresh(path, THROTTLE_SECS) {
+        return false;
     }
-
-    touch(path);
+    mark(path);
     true
 }
 
+/// Whether the sentinel at `path` was touched within the last `window_secs`.
+/// Every uncertain case — no file, a non-file, no mtime, a clock that will not
+/// answer — is "not fresh", for the reason [`should_emit_at`] fails open.
+pub(crate) fn is_fresh(path: &Path, window_secs: u64) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.file_type().is_file()
+            && meta
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .is_some_and(|elapsed| elapsed.as_secs() < window_secs)
+    })
+}
+
+/// Touch the sentinel at `path`. Separate from [`is_fresh`] for a caller that
+/// marks only once the thing being throttled has actually happened (ADR-0018:
+/// the unknown-tool record).
+///
 /// Writes via `atomic_file::atomic_write_with_mode` (#322-class: this sentinel
 /// had the same predictable-temp-name + `create(true)` race as the heartbeat
 /// writer before #307). Content is empty — only the mtime matters
-/// ([`should_emit_at`] reads it, never the bytes).
-fn touch(path: &Path) {
+/// ([`is_fresh`] reads it, never the bytes).
+pub(crate) fn mark(path: &Path) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -223,5 +246,72 @@ mod tests {
             "and it keeps failing open rather than latching"
         );
         let _ = std::fs::remove_dir_all(&s);
+    }
+
+    /// ADR-0018: one sentinel per tool name, fixed width, and no name of the
+    /// tool itself in the file name (MCP names are whatever the platform
+    /// sends).
+    #[test]
+    fn unknown_tool_sentinels_are_distinct_per_name() {
+        let mut seen = std::collections::HashSet::new();
+        for name in [
+            "AskUserQuestion",
+            "Agent",
+            "mcp__notion__notion-search",
+            "../x",
+            "a/b",
+        ] {
+            let sentinel = unknown_tool_sentinel_name(name);
+            let hex = sentinel.strip_prefix("unknown-tool-").expect("prefix");
+            assert_eq!(hex.len(), 8, "{sentinel}");
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{sentinel}");
+            assert!(seen.insert(sentinel), "{name}");
+        }
+    }
+
+    /// The window is the caller's: a day for unknown tools, where the default
+    /// is five minutes. A sentinel touched just now suppresses within either,
+    /// and one older than the window does not.
+    #[test]
+    fn the_window_is_the_callers() {
+        let s = tmp("window");
+        let _ = std::fs::remove_file(&s);
+        assert!(!is_fresh(&s, UNKNOWN_TOOL_WINDOW_SECS));
+        mark(&s);
+        assert!(is_fresh(&s, UNKNOWN_TOOL_WINDOW_SECS));
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&s)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+        assert!(
+            is_fresh(&s, UNKNOWN_TOOL_WINDOW_SECS),
+            "an hour is inside a day"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&s)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+        assert!(should_emit_at(&s), "and outside five minutes");
+        let _ = std::fs::remove_file(&s);
+    }
+
+    /// `is_fresh` only looks; `mark` is what makes it fresh.
+    #[test]
+    fn is_fresh_does_not_mark() {
+        let s = tmp("look-only");
+        let _ = std::fs::remove_file(&s);
+        assert!(!is_fresh(&s, UNKNOWN_TOOL_WINDOW_SECS));
+        assert!(
+            !is_fresh(&s, UNKNOWN_TOOL_WINDOW_SECS),
+            "looking twice changes nothing"
+        );
+        mark(&s);
+        assert!(is_fresh(&s, UNKNOWN_TOOL_WINDOW_SECS));
+        let _ = std::fs::remove_file(&s);
     }
 }

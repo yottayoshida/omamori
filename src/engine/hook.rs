@@ -606,8 +606,21 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
-    match extract_hook_input(&input) {
+    let call = read_hook_call(&input);
+    let reply = AllowReply::for_call(&provider, call.tool_name.as_deref());
+
+    // Every path field first, whatever the call is routed as (ADR-0018
+    // review). A file named in any of them is the file the tool will touch.
+    let tool = call.tool_name.as_deref().unwrap_or("unknown");
+    for path in &call.paths {
+        if let Some(verdict) = file_op_verdict(tool, path, base.as_deref()) {
+            return block_file_op(tool, path, &verdict, &provider, verbose, json_error);
+        }
+    }
+
+    match call.input {
         HookInput::MalformedJson => {
+            let warnings = record_input_validation_block(None, &provider);
             if json_error {
                 emit_json_error(
                     "layer2:input-validation",
@@ -616,10 +629,11 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                     None,
                     None,
                     HINT_INPUT_VALIDATION,
-                    &[],
+                    &warnings,
                 );
                 return Ok(2);
             }
+            crate::audit::print_warnings(&warnings);
             eprintln!("omamori hook: blocked — hook input is not valid JSON");
             eprintln!("  The command was denied because omamori cannot verify its safety.");
             eprintln!(
@@ -635,6 +649,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
             Ok(2)
         }
         HookInput::MalformedMissingField => {
+            let warnings = record_input_validation_block(call.tool_name.as_deref(), &provider);
             if json_error {
                 emit_json_error(
                     "layer2:input-validation",
@@ -643,10 +658,11 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                     None,
                     None,
                     HINT_INPUT_VALIDATION,
-                    &[],
+                    &warnings,
                 );
                 return Ok(2);
             }
+            crate::audit::print_warnings(&warnings);
             eprintln!("omamori hook: blocked — required fields missing from hook input");
             eprintln!("  The command was denied because omamori cannot verify its safety.");
             eprintln!("  Expected: tool_input.command or tool_input.file_path");
@@ -669,49 +685,194 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
             verbose,
             json_error,
             base.as_deref(),
+            reply,
         ),
+        // Judged ahead of routing with every other path field, once — a
+        // second judgment here could only repeat the first or race it.
         HookInput::FileOp { tool, path } => {
-            if let Some(verdict) = is_protected_file_path(&path, base.as_deref()) {
-                if json_error {
-                    emit_json_error(
-                        "layer2:file-protection",
-                        verdict.rule_id(),
-                        &verdict.blocked_reason(&tool),
-                        verdict.matched_pattern(),
-                        None,
-                        verdict.hint(),
-                        &[],
-                    );
-                    return Ok(2);
-                }
-                eprintln!("omamori hook: {}", verdict.blocked_reason(&tool));
-                if let Some(line) = verdict.matched_line() {
-                    eprintln!("{line}");
-                }
-                for line in verdict.remediation_lines() {
-                    eprintln!("{line}");
-                }
-                if verbose {
-                    eprintln!("  provider: {provider}");
-                    eprintln!("  tool: {tool}");
-                    eprintln!("  path: {path}");
-                }
-                Ok(2)
-            } else {
-                print_hook_check_allow_response(&format!(
-                    "omamori: {tool} to non-protected path — allowed"
-                ));
-                Ok(0)
-            }
+            reply.send(&format!(
+                "omamori: {tool} to non-protected path {path:?} — allowed"
+            ));
+            Ok(0)
         }
         HookInput::Command(command) => {
             if command.is_empty() {
-                print_hook_check_allow_response("omamori: empty command");
+                reply.send("omamori: empty command");
                 return Ok(0);
             }
-            run_hook_check_command(&command, &provider, verbose, json_error)
+            run_hook_check_command(&command, &provider, verbose, json_error, reply)
         }
     }
+}
+
+/// What an allowed call tells Claude Code (ADR-0018).
+///
+/// `permissionDecision: "allow"` is not "omamori has no objection": Claude
+/// Code reads it as approval and skips its own permission prompt (#62 added it
+/// so that Auto mode would stop prompting for every shell command omamori had
+/// already judged). Once every tool reaches the hook, printing it for every
+/// allowed call would approve every MCP call, every `WebFetch` and every edit
+/// the user's settings would have asked about. Exit 0 with nothing on stdout
+/// is Claude Code's "no decision": its normal permission flow runs.
+///
+/// So the approval is kept for exactly what it was added for — a call named
+/// `Bash` — and withheld from everything else, including a tool that merely
+/// carries a `command` field (`Monitor`, some MCP tools): those are still
+/// checked like a shell command, and still not approved by omamori. Other
+/// providers keep what they had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowReply {
+    Approve,
+    Silent,
+}
+
+impl AllowReply {
+    fn for_call(provider: &str, tool_name: Option<&str>) -> Self {
+        match (provider, tool_name) {
+            ("claude-code", Some(name)) if name != "Bash" => Self::Silent,
+            _ => Self::Approve,
+        }
+    }
+
+    fn send(self, reason: &str) {
+        if self == Self::Approve {
+            print_hook_check_allow_response(reason);
+        }
+    }
+}
+
+/// Record a refusal of input omamori could not validate, as the deny it is
+/// (ADR-0018 review). SECURITY.md → Forensic semantics says that on the
+/// Claude Code path the absence of a row means the call was allowed; these
+/// refusals wrote none, which was rare while only `Bash` reached the hook and
+/// is not once every tool does (an MCP tool whose `command` is an array is
+/// refused on every call). The raw input is not recorded — it is what could
+/// not be read — only the tool name it claimed, if any.
+fn record_input_validation_block(tool_name: Option<&str>, provider: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    audit_log_hook_block_collect(
+        tool_name.unwrap_or("<invalid hook input>"),
+        provider,
+        Some("invalid-input"),
+        None,
+        "layer2:input-validation".to_string(),
+        None,
+        &mut warnings,
+    );
+    warnings
+}
+
+/// What a file operation may do to the file it names, judged from the tool's
+/// name *after* the call was routed by shape (ADR-0018).
+///
+/// Names only ever relax the check. A tool omamori does not recognise gets the
+/// whole protected list, so a writing tool that is renamed is still treated as
+/// a writer; only the reading and listing tools Claude Code ships are let
+/// through to files that are protected against modification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileAccess {
+    /// Reads contents: checked for the audit HMAC secret only. Reading
+    /// `config.toml`, `settings.json` or `audit.jsonl` is ordinary work.
+    Read,
+    /// Lists names without reading contents: not checked.
+    List,
+    /// Anything else: the whole of `PROTECTED_FILE_PATTERNS`.
+    Write,
+}
+
+fn file_access(tool: &str) -> FileAccess {
+    match tool {
+        "Read" | "Grep" | "NotebookRead" => FileAccess::Read,
+        "Glob" | "LS" => FileAccess::List,
+        _ => FileAccess::Write,
+    }
+}
+
+/// Whether this file operation is blocked, and why.
+fn file_op_verdict(tool: &str, path: &str, base: Option<&Path>) -> Option<FileProtectionVerdict> {
+    match file_access(tool) {
+        FileAccess::Write => is_protected_file_path(path, base),
+        FileAccess::Read => reads_audit_secret(path, base),
+        FileAccess::List => None,
+    }
+}
+
+/// A file operation routed by shape — from a known editor tool or from a tool
+/// whose name omamori does not know.
+fn run_hook_check_file_op(
+    tool: &str,
+    path: &str,
+    provider: &str,
+    verbose: bool,
+    json_error: bool,
+    base: Option<&Path>,
+    reply: AllowReply,
+) -> Result<i32, AppError> {
+    match file_op_verdict(tool, path, base) {
+        Some(verdict) => block_file_op(tool, path, &verdict, provider, verbose, json_error),
+        None => {
+            reply.send(&format!("omamori: {tool} to non-protected path — allowed"));
+            Ok(0)
+        }
+    }
+}
+
+/// Refuse a file operation on the verdict already reached — never judging
+/// again. The path check runs ahead of routing (every path field), and an
+/// earlier version handed its hit to [`run_hook_check_file_op`], which
+/// judged the path a second time and allowed on a miss: a symlink swapped
+/// between the two judgments turned a block into an allow that never went
+/// back to the shell check the call's `command` was due (ADR-0018 review).
+fn block_file_op(
+    tool: &str,
+    path: &str,
+    verdict: &FileProtectionVerdict,
+    provider: &str,
+    verbose: bool,
+    json_error: bool,
+) -> Result<i32, AppError> {
+    // Recorded before anything is printed, like every other Layer 2 deny, so
+    // that "no row means allow" stays true for this path (SECURITY.md →
+    // Forensic semantics). An unresolvable base is recorded too, under its own
+    // `rule_id` (`unresolvable-base`): it is a refusal to decide rather than a
+    // match, but it is still a refusal, and `--json-error` already reports it
+    // on this layer.
+    let mut warnings = Vec::new();
+    audit_log_hook_block_collect(
+        &format!("{tool} {path}"),
+        provider,
+        Some(verdict.rule_id()),
+        None,
+        "layer2:file-protection".to_string(),
+        None,
+        &mut warnings,
+    );
+    if json_error {
+        emit_json_error(
+            "layer2:file-protection",
+            verdict.rule_id(),
+            &verdict.blocked_reason(tool),
+            verdict.matched_pattern(),
+            None,
+            verdict.hint(),
+            &warnings,
+        );
+        return Ok(2);
+    }
+    crate::audit::print_warnings(&warnings);
+    eprintln!("omamori hook: {}", verdict.blocked_reason(tool));
+    if let Some(line) = verdict.matched_line() {
+        eprintln!("{line}");
+    }
+    for line in verdict.remediation_lines() {
+        eprintln!("{line}");
+    }
+    if verbose {
+        eprintln!("  provider: {provider}");
+        eprintln!("  tool: {tool}");
+        eprintln!("  path: {path}");
+    }
+    Ok(2)
 }
 
 /// Evaluate a shell command through the three-phase hook check pipeline.
@@ -720,6 +881,7 @@ fn run_hook_check_command(
     provider: &str,
     verbose: bool,
     json_error: bool,
+    reply: AllowReply,
 ) -> Result<i32, AppError> {
     // What the check reports on the way — structural policy routing, staging,
     // the materialize audit — is collected rather than printed (ADR-0013). A
@@ -742,7 +904,7 @@ fn run_hook_check_command(
     }
     match result {
         HookCheckResult::Allow => {
-            print_hook_check_allow_response("omamori: no dangerous pattern detected");
+            reply.send("omamori: no dangerous pattern detected");
             Ok(0)
         }
         HookCheckResult::AllowByBreakGlass {
@@ -807,17 +969,13 @@ fn run_hook_check_command(
                 }
             }
             crate::audit::print_warnings(&lines);
-            print_hook_check_allow_response(
-                "omamori: break-glass bypass active — allowing command",
-            );
+            reply.send("omamori: break-glass bypass active — allowing command");
             Ok(0)
         }
         HookCheckResult::AllowMaterialize { .. } => {
             // Staging write + audit already done in resolve_structural_block.
             // Silent on success per plan (AI agents parse stderr).
-            print_hook_check_allow_response(
-                "omamori: structural block materialized — allowing command",
-            );
+            reply.send("omamori: structural block materialized — allowing command");
             Ok(0)
         }
         HookCheckResult::BlockMeta {
@@ -1001,12 +1159,13 @@ fn run_hook_check_command(
 //
 // **Scope and known noise (Known Limitation)**: legitimate Claude Code
 // tools whose `tool_input` shape is not in our recognised set (e.g.
-// NotebookEdit's `notebook_path`, Task's `subagent_type`, TodoWrite's
-// `todos`, WebSearch's `query`) currently land in the unknown branch
-// and emit fail-open events on every invocation. Counts surfaced via
-// `omamori audit unknown` and `omamori doctor`'s 30-day line are an
-// **upper bound on adversarial activity**, not a lower bound — they
-// include this legitimate noise. An opt-in strict-mode that lets users
+// Agent's `subagent_type`, AskUserQuestion's `questions`, WebSearch's
+// `query`, most MCP tools) land in the unknown branch. Since ADR-0018
+// every Claude Code tool reaches the hook, and each name is recorded at
+// most once a day (`NotebookEdit`'s `notebook_path` is now routed as a
+// file operation). Counts surfaced via `omamori audit unknown` and
+// `omamori doctor`'s 30-day line are an **upper bound on adversarial
+// activity**, not a lower bound — they include this legitimate noise. An opt-in strict-mode that lets users
 // choose between fail-open (today) and fail-closed (block) for
 // unrecognised shapes is planned for a future omamori release. See
 // `SECURITY.md` → "Scope: unknown / new tools" for the trade-off
@@ -1019,6 +1178,7 @@ fn run_hook_check_unknown_tool(
     verbose: bool,
     json_error: bool,
     base: Option<&Path>,
+    reply: AllowReply,
 ) -> Result<i32, AppError> {
     match classify_input_shape(tool_input) {
         // Shell-shape and file-op-shape *should* have been resolved at
@@ -1027,50 +1187,19 @@ fn run_hook_check_unknown_tool(
         // we re-enter the same checks rather than silently allowing.
         InputShape::ShellCommand(cmd) => {
             if cmd.is_empty() {
-                print_hook_check_allow_response("omamori: empty command");
+                reply.send("omamori: empty command");
                 return Ok(0);
             }
-            run_hook_check_command(cmd, provider, verbose, json_error)
+            run_hook_check_command(cmd, provider, verbose, json_error, reply)
         }
         InputShape::FileOp(path) => {
-            if let Some(verdict) = is_protected_file_path(path, base) {
-                if json_error {
-                    emit_json_error(
-                        "layer2:file-protection",
-                        verdict.rule_id(),
-                        &verdict.blocked_reason(tool_name),
-                        verdict.matched_pattern(),
-                        None,
-                        verdict.hint(),
-                        &[],
-                    );
-                    return Ok(2);
-                }
-                eprintln!("omamori hook: {}", verdict.blocked_reason(tool_name));
-                if let Some(line) = verdict.matched_line() {
-                    eprintln!("{line}");
-                }
-                for line in verdict.remediation_lines() {
-                    eprintln!("{line}");
-                }
-                if verbose {
-                    eprintln!("  provider: {provider}");
-                    eprintln!("  tool: {tool_name}");
-                    eprintln!("  path: {path}");
-                }
-                Ok(2)
-            } else {
-                print_hook_check_allow_response(&format!(
-                    "omamori: '{tool_name}' file op to non-protected path — allowed"
-                ));
-                Ok(0)
-            }
+            run_hook_check_file_op(tool_name, path, provider, verbose, json_error, base, reply)
         }
         InputShape::ReadOnlyUrl => {
             // url-shape inputs are read-only fetch tools (WebFetch,
             // WebSearch, …). Allow without hint — these are not the
             // class of fail-open we set out to make observable.
-            print_hook_check_allow_response(&format!(
+            reply.send(&format!(
                 "omamori: '{tool_name}' read-only url tool — allowed"
             ));
             Ok(0)
@@ -1078,21 +1207,37 @@ fn run_hook_check_unknown_tool(
         InputShape::Unknown => {
             // Observable fail-open: stderr hint + audit event + allow.
             // The allow keeps user workflow alive; the hint + audit
-            // make the silence a thing of the past. One stderr line
-            // per invocation — `omamori hook-check` is a short-lived
-            // process (1 invocation = 1 dispatch), so a process-local
-            // dedup guard would be dead code. If user noise becomes a
-            // problem, session-level dedup is one of the follow-ups
-            // tracked for a future release. See `SECURITY.md` →
-            // "Scope: unknown / new tools" for the full set
-            // (catalogue widening, dedicated audit columns, opt-in
-            // strict-mode, session-level dedup).
-            eprintln!(
-                "omamori: unknown tool '{tool_name}' routed as fail-open. \
-                 Review via 'omamori audit unknown'"
+            // make the silence a thing of the past.
+            //
+            // ADR-0018: at most once per tool name per day. With every Claude
+            // Code tool routed here, `AskUserQuestion`, `Agent` and most MCP
+            // calls land in this branch, and the record costs 35–41 ms (config,
+            // key store, a locked append, two syncs) against 7–9 ms for the
+            // rest of the hook. What the record is for — a tool omamori has
+            // not seen, or one that was renamed — is still recorded the first
+            // time it appears. This is the "session-level dedup" SECURITY.md →
+            // "Scope: unknown / new tools" listed as a follow-up, at a day's
+            // grain because a hook process cannot see a session.
+            let sentinel = crate::warn_throttle::sentinel_path(
+                &crate::warn_throttle::unknown_tool_sentinel_name(tool_name),
             );
-            audit_log_unknown_tool_fail_open(tool_name, tool_input, provider);
-            print_hook_check_allow_response(&format!(
+            let seen_today = sentinel.as_deref().is_some_and(|p| {
+                crate::warn_throttle::is_fresh(p, crate::warn_throttle::UNKNOWN_TOOL_WINDOW_SECS)
+            });
+            if !seen_today {
+                eprintln!(
+                    "omamori: unknown tool '{tool_name}' routed as fail-open. \
+                     Review via 'omamori audit unknown'"
+                );
+                // Marked only once the record is in (ADR-0018 review): marking
+                // first lost the day's record whenever the append failed.
+                if audit_log_unknown_tool_fail_open(tool_name, tool_input, provider)
+                    && let Some(p) = sentinel.as_deref()
+                {
+                    crate::warn_throttle::mark(p);
+                }
+            }
+            reply.send(&format!(
                 "omamori: unknown tool '{tool_name}' routed as fail-open — allowed"
             ));
             Ok(0)
@@ -1115,7 +1260,7 @@ fn audit_log_unknown_tool_fail_open(
     tool_name: &str,
     tool_input: &serde_json::Value,
     provider: &str,
-) {
+) -> bool {
     let load_result = match load_config(None) {
         Ok(r) => r,
         Err(e) => {
@@ -1124,7 +1269,7 @@ fn audit_log_unknown_tool_fail_open(
                  — config load failed: {e}. The 'omamori audit unknown' review surface is \
                  incomplete for this event."
             );
-            return;
+            return false;
         }
     };
     // #527: verdict from this load's detector set, not the built-in list.
@@ -1136,7 +1281,9 @@ fn audit_log_unknown_tool_fail_open(
                 // Audit disabled in config — that's a user choice, not an
                 // error, so stay quiet (the user opted out of the review
                 // surface entirely).
-                return;
+                // Nothing to record into, by the user's choice: done for the
+                // day, so the config is not reloaded on every call.
+                return true;
             }
         };
 
@@ -1183,7 +1330,9 @@ fn audit_log_unknown_tool_fail_open(
             "fail-open",
             "omamori audit unknown",
         );
+        return false;
     }
+    true
 }
 
 fn warn_audit_append_error(
@@ -1841,6 +1990,12 @@ impl MatchKind {
     }
 }
 
+/// The name every audit-secret file starts with — the active key, retired
+/// keys, the epoch record, the pending marker, the lock. One constant so that
+/// the write-side pattern below and the read-side check (`reads_audit_secret`)
+/// cannot drift apart.
+const AUDIT_SECRET_PREFIX: &str = "audit-secret";
+
 /// Patterns that identify omamori's own files and external hook registrations.
 /// SECURITY: pub(crate) const, never pub const. See threat model T2.
 pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
@@ -1851,7 +2006,7 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
         "integrity baseline",
     ),
     (
-        "audit-secret",
+        AUDIT_SECRET_PREFIX,
         MatchKind::FilenamePrefix,
         "audit HMAC secret",
     ),
@@ -1903,6 +2058,27 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
         ".claude/settings.json",
         MatchKind::Subpath,
         "Claude Code settings (contains hook config)",
+    ),
+    (
+        // ADR-0018: `disableAllHooks` here turns omamori's hook off with
+        // every other, which is a hook/config edit in G-5's sense. Claude Code
+        // writing it itself (an "always allow" answer) does not go through a
+        // tool call and is not affected.
+        ".claude/settings.local.json",
+        MatchKind::Subpath,
+        "Claude Code local settings (can disable hooks)",
+    ),
+    (
+        // #520: the base directory as a whole — shims, hook scripts and their
+        // snippets, the integrity baseline, and the sentinels that throttle
+        // warnings and unknown-tool records. The throttle sentinel used to
+        // match nothing, so an agent could keep it fresh and hold a warning
+        // that the audit trail had stopped being tamper-evident below the
+        // surface. Last, so a more specific entry above names the match
+        // (`.integrity.json` reports as the integrity baseline).
+        ".omamori",
+        MatchKind::Subpath,
+        "omamori base directory",
     ),
 ];
 
@@ -1998,7 +2174,10 @@ impl FileProtectionVerdict {
     fn remediation_lines(&self) -> &'static [&'static str] {
         match self {
             Self::Matched { .. } => &[
-                "  AI agents cannot modify omamori configuration or security files.",
+                // ADR-0018: also printed for a reading tool stopped at the audit
+                // secret, so it names both; "modify" alone misdescribed that
+                // block (found in the live check).
+                "  AI agents cannot modify omamori's configuration or security files, or read its audit secret.",
                 "  To edit config: use `omamori config` CLI or edit the file directly in your terminal.",
             ],
             Self::BaseUnresolvable => &[
@@ -2034,29 +2213,26 @@ impl FileProtectionVerdict {
 /// only appear once `base` is joined in, so falling back to `/` would
 /// silently reopen exactly the gap this function exists to close.
 fn is_protected_file_path(path: &str, base: Option<&Path>) -> Option<FileProtectionVerdict> {
-    if base.is_none() && Path::new(path).is_relative() {
+    let Some(paths) = protection_candidates(path, base) else {
         return Some(FileProtectionVerdict::BaseUnresolvable);
-    }
-    // Absolute `path`s never consult `base` (normalize_path only joins a
-    // relative path); the `/` here is an unused placeholder for that case.
-    let lexical = crate::context::normalize_path(path, base.unwrap_or(Path::new("/")));
-
-    let candidates: Vec<std::path::PathBuf> = match std::fs::canonicalize(&lexical) {
-        Ok(canonical) => vec![canonical],
-        Err(_) => lexical
-            .parent()
-            .and_then(|p| std::fs::canonicalize(p).ok())
-            .and_then(|cp| lexical.file_name().map(|f| cp.join(f)))
-            .into_iter()
-            .collect(),
     };
+
+    // Compared case-folded (ADR-0018 review; `fold_name`). macOS's default
+    // filesystem ignores case, and the canonical candidate repairs a
+    // spelling only for a path that exists: `Write .claude/SETTINGS.LOCAL.JSON`
+    // in a project with no local settings yet matched nothing, and created
+    // the file Claude Code then reads as `settings.local.json`. Every pattern
+    // is lower case (`protected_patterns_are_lower_case`), so folding the
+    // path can only widen a match — on a case-sensitive filesystem it blocks
+    // `Audit.jsonl` too, which is the safe side.
+    let folded: Vec<std::path::PathBuf> = paths.iter().map(|p| fold_case(p)).collect();
 
     // #374: build each MatchPath once, ahead of the pattern loop, instead of
     // re-collecting the same path's components inside every Subpath check.
     // Lexical first — per pattern, the lexical path is checked before any
     // candidate, preserving the pre-#374 verdict order.
-    let match_paths: Vec<crate::context::MatchPath> = std::iter::once(&lexical)
-        .chain(candidates.iter())
+    let match_paths: Vec<crate::context::MatchPath> = folded
+        .iter()
         .map(|p| crate::context::MatchPath::new(p))
         .collect();
 
@@ -2070,6 +2246,103 @@ fn is_protected_file_path(path: &str, base: Option<&Path>) -> Option<FileProtect
         }
     }
     None
+}
+
+/// `path` case-folded, for matching against `PROTECTED_FILE_PATTERNS` and the
+/// audit-secret prefix. Lossy on a name that is not UTF-8 — for matching
+/// only, never for opening.
+fn fold_case(path: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(fold_name(&path.to_string_lossy()))
+}
+
+/// Case-fold a name the way a case-insensitive filesystem compares it: each
+/// character upper-cased, then lower-cased. ASCII lower-casing is not enough
+/// (ADR-0018 review): APFS treats `ſ` (U+017F) as `s` and `K` (U+212A, the
+/// Kelvin sign) as `k`, so `Write .claude/ſettings.local.json` created the
+/// file Claude Code reads as `settings.local.json`. Going through upper case
+/// takes both to their ASCII letters; a character that widens (`ß` to `ss`)
+/// can only widen a match.
+fn fold_name(name: &str) -> String {
+    name.chars()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The paths a protection check looks at for `path`: the lexically normalised
+/// path first, then its canonical form — the file itself if it exists, or its
+/// parent's canonical form joined with the file name if only the parent
+/// resolves. `None` when `path` is relative and `base` is unresolvable (#175).
+fn protection_candidates(path: &str, base: Option<&Path>) -> Option<Vec<std::path::PathBuf>> {
+    if base.is_none() && Path::new(path).is_relative() {
+        return None;
+    }
+    // Absolute `path`s never consult `base` (normalize_path only joins a
+    // relative path); the `/` here is an unused placeholder for that case.
+    let lexical = crate::context::normalize_path(path, base.unwrap_or(Path::new("/")));
+
+    let canonical: Vec<std::path::PathBuf> = match std::fs::canonicalize(&lexical) {
+        Ok(canonical) => vec![canonical],
+        Err(_) => lexical
+            .parent()
+            .and_then(|p| std::fs::canonicalize(p).ok())
+            .and_then(|cp| lexical.file_name().map(|f| cp.join(f)))
+            .into_iter()
+            .collect(),
+    };
+    Some(std::iter::once(lexical).chain(canonical).collect())
+}
+
+/// Whether a reading tool's `path` names the audit HMAC secret, or a directory
+/// holding it (ADR-0018).
+///
+/// Reading tools are checked for this alone: a secret read is the step before
+/// forging a self-consistent chain (SECURITY.md → Defense Boundary), while
+/// reading `config.toml`, `settings.json` or `audit.jsonl` is ordinary work.
+/// A directory counts because `Grep` reads every file under the path it is
+/// given. Only a directory that holds a secret-named entry directly is caught;
+/// a search started further up is a residual SECURITY.md records.
+///
+/// Judged on the same candidates [`is_protected_file_path`] uses, and in
+/// ASCII lower case like it, so a symlinked spelling is caught as the
+/// canonical form and a case-changed one whether or not the file exists.
+fn reads_audit_secret(path: &str, base: Option<&Path>) -> Option<FileProtectionVerdict> {
+    let Some(paths) = protection_candidates(path, base) else {
+        return Some(FileProtectionVerdict::BaseUnresolvable);
+    };
+    for candidate in &paths {
+        let names_secret = fold_case(candidate)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.starts_with(AUDIT_SECRET_PREFIX));
+        if names_secret {
+            return Some(FileProtectionVerdict::Matched {
+                pattern: AUDIT_SECRET_PREFIX,
+                kind: MatchKind::FilenamePrefix,
+                description: "audit HMAC secret",
+            });
+        }
+        if holds_audit_secret(candidate) {
+            return Some(FileProtectionVerdict::Matched {
+                pattern: AUDIT_SECRET_PREFIX,
+                kind: MatchKind::FilenamePrefix,
+                description: "the directory holding the audit HMAC secret",
+            });
+        }
+    }
+    None
+}
+
+/// Whether `dir` is a directory with an entry named like the audit secret
+/// directly inside it. Anything that cannot be listed is not one.
+fn holds_audit_secret(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| fold_name(n).starts_with(AUDIT_SECRET_PREFIX))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2109,7 +2382,8 @@ enum HookInput {
 enum InputShape<'a> {
     /// `tool_input.command` or `tool_input.cmd` is a string → route as Bash.
     ShellCommand(&'a str),
-    /// `tool_input.file_path` or `tool_input.path` is a string → route as FileOp.
+    /// `tool_input.file_path`, `tool_input.path` or `tool_input.notebook_path`
+    /// is a string → route as FileOp.
     FileOp(&'a str),
     /// `tool_input.url` is a string and no shell/file fields are present
     /// → read-only fetch, allow.
@@ -2130,11 +2404,14 @@ fn classify_input_shape(tool_input: &serde_json::Value) -> InputShape<'_> {
     if let Some(s) = tool_input.get("cmd").and_then(|v| v.as_str()) {
         return InputShape::ShellCommand(s);
     }
-    if let Some(s) = tool_input.get("file_path").and_then(|v| v.as_str()) {
-        return InputShape::FileOp(s);
-    }
-    if let Some(s) = tool_input.get("path").and_then(|v| v.as_str()) {
-        return InputShape::FileOp(s);
+    // The same list `read_hook_call` judges ahead of routing, so a field
+    // routed here as a file is always one that was judged. ADR-0018 added
+    // `notebook_path` (`NotebookEdit`), which until every tool reached the
+    // hook was never routed.
+    for field in PATH_FIELDS {
+        if let Some(s) = tool_input.get(*field).and_then(|v| v.as_str()) {
+            return InputShape::FileOp(s);
+        }
     }
     if tool_input.get("url").and_then(|v| v.as_str()).is_some() {
         return InputShape::ReadOnlyUrl;
@@ -2146,8 +2423,17 @@ fn classify_input_shape(tool_input: &serde_json::Value) -> InputShape<'_> {
 /// Such inputs must fail-close (MalformedMissingField), not silently fall
 /// through to UnknownTool — otherwise an attacker can present a
 /// `command: 42` payload and bypass shell checks.
-fn has_routing_field_with_wrong_type(tool_input: &serde_json::Value) -> bool {
-    for field in ["command", "cmd", "file_path", "path", "url"] {
+///
+/// ADR-0018: which fields count depends on the tool. For `Bash` (and a call
+/// with no `tool_name`) every routing field does, as before. For any other
+/// tool only the shell fields do — a `command` that is not a string is still
+/// an exec shape omamori cannot inspect, and refusing it is G-6 — while a
+/// `path` or `url` of another type is ignored and the call is routed by what
+/// remains. With every Claude Code tool reaching the hook, refusing those would
+/// block every call of any tool whose schema happens to use the name for an
+/// array or an object.
+fn has_routing_field_with_wrong_type(tool_input: &serde_json::Value, fields: &[&str]) -> bool {
+    for &field in fields {
         if let Some(val) = tool_input.get(field)
             && val.as_str().is_none()
         {
@@ -2157,7 +2443,73 @@ fn has_routing_field_with_wrong_type(tool_input: &serde_json::Value) -> bool {
     false
 }
 
-/// Parse PreToolUse hook stdin into a typed `HookInput`.
+/// Every field `classify_input_shape` routes on.
+const ROUTING_FIELDS: &[&str] = &[
+    "command",
+    "cmd",
+    "file_path",
+    "path",
+    "notebook_path",
+    "url",
+];
+/// The fields that route a call to the shell pipeline.
+const SHELL_FIELDS: &[&str] = &["command", "cmd"];
+/// The fields that name a file, every one of which is judged.
+const PATH_FIELDS: &[&str] = &["file_path", "path", "notebook_path"];
+
+/// A parsed hook call: the routed input, and the tool name it arrived with —
+/// which decides what an allow may say (`AllowReply`) and how strictly a
+/// malformed input is treated.
+struct HookCall {
+    input: HookInput,
+    tool_name: Option<String>,
+    /// Every string in a path field of `tool_input`, whichever field routing
+    /// picked (ADR-0018 review). Routing looks at one field — the first of
+    /// `command`, `file_path`, `path`, `notebook_path` — so a call carrying a
+    /// harmless `file_path` and a protected `path`, or a `command` and a
+    /// protected `file_path`, was judged on the field it was routed by alone.
+    paths: Vec<String>,
+}
+
+fn read_hook_call(input: &str) -> HookCall {
+    let v = match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(v) => v,
+        Err(_) => {
+            return HookCall {
+                input: HookInput::MalformedJson,
+                tool_name: None,
+                paths: Vec::new(),
+            };
+        }
+    };
+    let tool_name = v
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    let paths = v
+        .get("tool_input")
+        .map(|ti| {
+            PATH_FIELDS
+                .iter()
+                .filter_map(|f| ti.get(*f).and_then(|p| p.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    HookCall {
+        input: route_hook_input(&v, tool_name.as_deref()),
+        tool_name,
+        paths,
+    }
+}
+
+/// [`read_hook_call`]'s routed input alone, for the tests that predate it.
+#[cfg(test)]
+fn extract_hook_input(input: &str) -> HookInput {
+    read_hook_call(input).input
+}
+
+/// Route a parsed PreToolUse payload to a typed `HookInput`.
 ///
 /// **Priority chain** — pre-PR6 ordering preserved + extended for v0.9.6:
 ///
@@ -2187,14 +2539,16 @@ fn has_routing_field_with_wrong_type(tool_input: &serde_json::Value) -> bool {
 ///   silently allow as UnknownTool. Pre-PR6 code did this; my round-1
 ///   fix collapsed steps 2–5 into one tool_input dispatch and lost
 ///   the middle priority. This priority chain restores all 6 steps.
-fn extract_hook_input(input: &str) -> HookInput {
-    let v = match serde_json::from_str::<serde_json::Value>(input) {
-        Ok(v) => v,
-        Err(_) => return HookInput::MalformedJson,
-    };
-
-    let tool_name = v.get("tool_name").and_then(|t| t.as_str());
+fn route_hook_input(v: &serde_json::Value, tool_name: Option<&str>) -> HookInput {
     let ti = v.get("tool_input");
+
+    // ADR-0018: an empty or non-object `tool_input` is refused only for
+    // `Bash` (or a call that names no tool), which always carries a command.
+    // Every Claude Code tool reaches the hook now, and the ones that take no
+    // arguments (`CronList`, many MCP tools) send `{}` — refusing that would
+    // block every call they make.
+    let strict = matches!(tool_name, None | Some("Bash"));
+    let wrong_type_fields = if strict { ROUTING_FIELDS } else { SHELL_FIELDS };
 
     // Pre-classify tool_input once so each priority gate can consult
     // the result without re-parsing. Type validation (wrong-type
@@ -2202,11 +2556,11 @@ fn extract_hook_input(input: &str) -> HookInput {
     // bad payload short-circuits before any priority gate.
     let ti_object_check = ti.map(|t| {
         let object_ok = matches!(t.as_object(), Some(obj) if !obj.is_empty());
-        let wrong_type = has_routing_field_with_wrong_type(t);
+        let wrong_type = has_routing_field_with_wrong_type(t, wrong_type_fields);
         (t, object_ok, wrong_type)
     });
 
-    if let Some((_, false, _)) = ti_object_check {
+    if strict && let Some((_, false, _)) = ti_object_check {
         return HookInput::MalformedMissingField;
     }
     if let Some((_, _, true)) = ti_object_check {
@@ -2322,7 +2676,7 @@ fn parse_json_error_flag(args: &[OsString]) -> bool {
 
 const HINT_INPUT_VALIDATION: &str = "Tell the user: this action was blocked by omamori because the input could not be verified. Ask if you should try a different approach or if the user prefers to handle it directly.";
 
-const HINT_FILE_PROTECTION: &str = "Tell the user: this file is protected by omamori and AI modifications are blocked. Describe the intended change and ask if you should try a different approach or if the user prefers to make the change directly.";
+const HINT_FILE_PROTECTION: &str = "Tell the user: this file is protected by omamori — AI agents may not modify it, and may not read the audit secret. Describe the intended change and ask if you should try a different approach or if the user prefers to make the change directly.";
 
 /// #175 / QA+Security Phase 8 review: distinct from `HINT_FILE_PROTECTION`
 /// because `FileProtectionVerdict::BaseUnresolvable` is an infrastructure
@@ -2417,7 +2771,7 @@ fn print_cursor_response(
 // ---------------------------------------------------------------------------
 
 pub fn fuzz_extract_hook_input(input: &str) {
-    let _ = extract_hook_input(input);
+    let _ = read_hook_call(input);
 }
 
 pub fn fuzz_check_command_for_hook(command: &str) {
@@ -4621,5 +4975,323 @@ mod tests {
         with_home(Some(""), || {
             try_prune_staging(7, 10);
         });
+    }
+
+    // --- ADR-0018 (#576 / #520) ---
+
+    /// Only a call named `Bash` is ever approved for Claude Code. Every other
+    /// tool — including one that carries a `command` field — gets no decision,
+    /// so Claude Code's own permission flow runs. Other providers are left as
+    /// they were.
+    #[test]
+    fn allow_reply_approves_only_bash_for_claude_code() {
+        let cases = [
+            ("claude-code", Some("Bash"), AllowReply::Approve),
+            ("claude-code", None, AllowReply::Approve),
+            ("claude-code", Some("Edit"), AllowReply::Silent),
+            ("claude-code", Some("Write"), AllowReply::Silent),
+            ("claude-code", Some("Monitor"), AllowReply::Silent),
+            ("claude-code", Some("mcp__x__y"), AllowReply::Silent),
+            ("claude-code", Some("bash"), AllowReply::Silent),
+            ("codex", Some("Edit"), AllowReply::Approve),
+            ("unknown", Some("Edit"), AllowReply::Approve),
+        ];
+        for (provider, tool, expected) in cases {
+            assert_eq!(
+                AllowReply::for_call(provider, tool),
+                expected,
+                "{provider} / {tool:?}"
+            );
+        }
+    }
+
+    /// An empty input is refused only for `Bash` (and a call naming no tool):
+    /// `CronList` and many MCP tools take no arguments.
+    #[test]
+    fn an_empty_input_is_refused_only_for_bash() {
+        assert!(matches!(
+            extract_hook_input(r#"{"tool_name":"Bash","tool_input":{}}"#),
+            HookInput::MalformedMissingField
+        ));
+        assert!(matches!(
+            extract_hook_input(r#"{"tool_input":{}}"#),
+            HookInput::MalformedMissingField
+        ));
+        match extract_hook_input(r#"{"tool_name":"CronList","tool_input":{}}"#) {
+            HookInput::UnknownTool { tool_name, .. } => assert_eq!(tool_name, "CronList"),
+            other => panic!("expected UnknownTool, got {other:?}"),
+        }
+    }
+
+    /// Outside `Bash` a non-string `path`/`url` is ignored and the call routed
+    /// by what remains; a non-string `command` is still refused, because it is
+    /// an exec shape omamori cannot inspect (G-6).
+    #[test]
+    fn a_mistyped_field_outside_bash_is_refused_only_when_it_is_a_command() {
+        match extract_hook_input(
+            r#"{"tool_name":"SomeMcp","tool_input":{"path":["a"],"query":"x"}}"#,
+        ) {
+            HookInput::UnknownTool { .. } => {}
+            other => panic!("expected UnknownTool, got {other:?}"),
+        }
+        match extract_hook_input(
+            r#"{"tool_name":"SomeMcp","tool_input":{"path":["a"],"file_path":"/tmp/x/.integrity.json"}}"#,
+        ) {
+            HookInput::FileOp { path, .. } => assert_eq!(path, "/tmp/x/.integrity.json"),
+            other => panic!("the string field still routes, got {other:?}"),
+        }
+        for input in [
+            r#"{"tool_name":"SomeMcp","tool_input":{"command":["rm","-rf","/"]}}"#,
+            r#"{"tool_name":"SomeMcp","tool_input":{"cmd":42}}"#,
+            r#"{"tool_name":"Bash","tool_input":{"path":["a"],"command":"ls"}}"#,
+        ] {
+            assert!(
+                matches!(extract_hook_input(input), HookInput::MalformedMissingField),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn notebook_path_routes_as_a_file_operation() {
+        match extract_hook_input(
+            r#"{"tool_name":"NotebookEdit","tool_input":{"notebook_path":"/x/.claude/settings.json"}}"#,
+        ) {
+            HookInput::FileOp { tool, path } => {
+                assert_eq!(tool, "NotebookEdit");
+                assert_eq!(path, "/x/.claude/settings.json");
+            }
+            other => panic!("expected FileOp, got {other:?}"),
+        }
+    }
+
+    /// Names relax, never tighten: an unknown name is a writer.
+    #[test]
+    fn file_access_is_read_list_or_write() {
+        for tool in ["Read", "Grep", "NotebookRead"] {
+            assert_eq!(file_access(tool), FileAccess::Read, "{tool}");
+        }
+        for tool in ["Glob", "LS"] {
+            assert_eq!(file_access(tool), FileAccess::List, "{tool}");
+        }
+        for tool in [
+            "Edit",
+            "Write",
+            "MultiEdit",
+            "NotebookEdit",
+            "FuturePlanWriter",
+            "read",
+        ] {
+            assert_eq!(file_access(tool), FileAccess::Write, "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_reading_tool_is_stopped_only_at_the_secret() {
+        let base = Some(Path::new("/unused-test-base"));
+        let blocked = |tool: &str, path: &str| file_op_verdict(tool, path, base).is_some();
+        // The secret family, by name — the file need not exist.
+        for path in [
+            "/home/u/.local/share/omamori/audit-secret",
+            "/home/u/.local/share/omamori/audit-secret.1.retired",
+            "/custom/dir/audit-secret.epoch",
+        ] {
+            assert!(blocked("Read", path), "Read {path}");
+            assert!(blocked("Grep", path), "Grep {path}");
+        }
+        // Everything else a writer is stopped at, a reader is not.
+        for path in [
+            "/home/u/.config/omamori/config.toml",
+            "/home/u/.claude/settings.json",
+            "/home/u/.local/share/omamori/audit.jsonl",
+            "/home/u/.omamori/.integrity.json",
+        ] {
+            assert!(!blocked("Read", path), "Read {path}");
+            assert!(blocked("Write", path), "Write {path}");
+        }
+        // A lister is not checked at all.
+        assert!(!blocked(
+            "Glob",
+            "/home/u/.local/share/omamori/audit-secret"
+        ));
+    }
+
+    /// `Grep` reads every file under a directory, so a directory holding the
+    /// secret is the secret. The control is the same directory without it.
+    #[test]
+    fn a_reading_tool_is_stopped_at_a_directory_holding_the_secret() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-adr0018-holds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        assert!(
+            file_op_verdict("Grep", &path, None).is_none(),
+            "nothing in it yet"
+        );
+        std::fs::write(dir.join("audit-secret.1.retired"), "k").unwrap();
+        let verdict = file_op_verdict("Grep", &path, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(
+                verdict,
+                Some(FileProtectionVerdict::Matched {
+                    pattern: "audit-secret",
+                    ..
+                })
+            ),
+            "{verdict:?}"
+        );
+    }
+
+    /// #520: the base directory as a whole, and the local settings file that
+    /// can switch every hook off. `.omamori` matches a path component, not a
+    /// prefix of one.
+    #[test]
+    fn the_base_directory_and_local_settings_are_protected() {
+        let (pattern, kind, _) =
+            is_protected_file_path("/home/u/.omamori/warn-keystore-0123abcd").expect("sentinel");
+        assert_eq!((pattern, kind), (".omamori", MatchKind::Subpath));
+        let (pattern, _, _) =
+            is_protected_file_path("/home/u/.omamori/unknown-tool-89abcdef").expect("sentinel");
+        assert_eq!(pattern, ".omamori");
+        let (pattern, _, _) =
+            is_protected_file_path("/home/u/.omamori/.integrity.json").expect("baseline");
+        assert_eq!(
+            pattern, ".integrity.json",
+            "a more specific entry still names the match"
+        );
+        let (pattern, _, _) =
+            is_protected_file_path("/p/.claude/settings.local.json").expect("local settings");
+        assert_eq!(pattern, ".claude/settings.local.json");
+        assert!(is_protected_file_path("/home/u/.omamori-quarantine/x").is_none());
+        assert!(is_protected_file_path("/home/u/omamori/x.txt").is_none());
+    }
+
+    /// The case folding in `is_protected_file_path` can only widen a match if
+    /// every pattern is lower case.
+    #[test]
+    fn protected_patterns_are_lower_case() {
+        for (pattern, _, _) in PROTECTED_FILE_PATTERNS {
+            assert_eq!(*pattern, fold_name(pattern), "{pattern}");
+        }
+        assert_eq!(AUDIT_SECRET_PREFIX, fold_name(AUDIT_SECRET_PREFIX));
+    }
+
+    /// ADR-0018 review: macOS ignores case, and the canonical candidate fixes
+    /// a spelling only for a path that exists — these do not.
+    #[test]
+    fn a_case_changed_name_is_protected_whether_or_not_it_exists() {
+        for path in [
+            "/nonexistent-adr0018/p/.claude/SETTINGS.LOCAL.JSON",
+            "/nonexistent-adr0018/p/.CLAUDE/settings.json",
+            "/nonexistent-adr0018/home/.OMAMORI/warn-keystore-0123abcd",
+            "/nonexistent-adr0018/home/.config/OMAMORI/Config.Toml",
+        ] {
+            assert!(is_protected_file_path(path).is_some(), "{path}");
+        }
+        let base = Some(Path::new("/unused-test-base"));
+        assert!(file_op_verdict("Read", "/nonexistent-adr0018/AUDIT-SECRET", base).is_some());
+        assert!(
+            file_op_verdict("Read", "/nonexistent-adr0018/Audit-Secret.1.retired", base).is_some()
+        );
+    }
+
+    /// ADR-0018 review: APFS folds case beyond ASCII — `ſ` (U+017F) names the
+    /// same file as `s`, the Kelvin sign (U+212A) the same as `k`.
+    #[test]
+    fn a_name_folded_beyond_ascii_is_protected() {
+        for path in [
+            "/nonexistent-adr0018/p/.claude/\u{17F}ettings.local.json",
+            "/nonexistent-adr0018/p/.claude/\u{17F}ettings.json",
+            "/nonexistent-adr0018/home/.codex/hoo\u{212A}s.json",
+        ] {
+            assert!(is_protected_file_path(path).is_some(), "{path:?}");
+        }
+        let base = Some(Path::new("/unused-test-base"));
+        assert!(file_op_verdict("Read", "/nonexistent-adr0018/audit-\u{17F}ecret", base).is_some());
+        assert_eq!(fold_name("\u{17F}\u{212A}SS\u{DF}"), "skssss");
+    }
+
+    /// ADR-0018 review: the block taken on the path check ahead of routing is
+    /// final. Judging again could turn it into an allow (a symlink swapped in
+    /// between) that never returns to the shell check; this path is not
+    /// protected, and the verdict handed in still blocks.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_block_is_not_judged_a_second_time() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-adr0018-final-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dir.to_string_lossy().to_string();
+        let verdict = FileProtectionVerdict::Matched {
+            pattern: ".integrity.json",
+            kind: MatchKind::ExactFile,
+            description: "integrity baseline",
+        };
+        let code = crate::test_support::with_home_and_xdg(Some(&home), || {
+            block_file_op(
+                "Write",
+                "/nonexistent-adr0018/notes.txt",
+                &verdict,
+                "claude-code",
+                false,
+                false,
+            )
+            .unwrap()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(code, 2);
+        assert!(file_op_verdict("Write", "/nonexistent-adr0018/notes.txt", None).is_none());
+    }
+
+    /// ADR-0018 review: a refusal because the working directory cannot be
+    /// resolved is recorded, under its own rule id.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn an_unresolvable_base_block_is_recorded() {
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-adr0018-unresolvable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dir.to_string_lossy().to_string();
+        let verdict = file_op_verdict("Write", "relative/notes.txt", None)
+            .expect("an unresolvable base refuses");
+        let code = crate::test_support::with_home_and_xdg(Some(&home), || {
+            block_file_op(
+                "Write",
+                "relative/notes.txt",
+                &verdict,
+                "claude-code",
+                false,
+                false,
+            )
+            .unwrap()
+        });
+        let log = std::fs::read_to_string(dir.join(".local/share/omamori/audit.jsonl"))
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(code, 2);
+        assert!(log.contains("\"rule_id\":\"unresolvable-base\""), "{log}");
+        assert!(
+            log.contains("\"detection_layer\":\"layer2:file-protection\""),
+            "{log}"
+        );
     }
 }

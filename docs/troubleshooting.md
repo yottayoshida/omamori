@@ -2,9 +2,9 @@
 
 Stuck on something else — a false positive, a temporary bypass, "why was this blocked?", or a staging-file message? Start with the [FAQ](FAQ.md). This section covers the hook-error class of problems specifically.
 
-## Claude Code blocks every Bash command with a "hook error" / "No such file or directory"
+## Claude Code blocks every tool call with a "hook error" / "No such file or directory"
 
-This means the hook script registered in `~/.claude/settings.json` points at a path that no longer exists (e.g. a Homebrew Cellar path from a removed version, or a build directory that was cleaned up). omamori's hooks are fail-close by design, so a missing hook script blocks everything rather than silently allowing it.
+This means the hook script registered in `~/.claude/settings.json` points at a path that no longer exists (e.g. a Homebrew Cellar path from a removed version, or a build directory that was cleaned up). omamori's hooks are fail-close by design, so a missing hook script blocks everything rather than silently allowing it — every tool call, not only shell commands, since the hook is registered for every tool ([ADR-0018](adr/0018-every-claude-code-tool-reaches-the-hook.md); through 1.3.0 it was registered for `Bash` alone).
 
 **Fix**: in a plain terminal (not through an AI agent), run:
 
@@ -14,11 +14,11 @@ omamori install --hooks
 
 This regenerates the hook script at the canonical path and re-merges the entry into `~/.claude/settings.json`. `omamori doctor --fix` diagnoses the same class of problem in more detail.
 
-**Why a plain terminal, specifically**: the "hook error" you're seeing blocks *every* Bash command through Claude Code — including one where you ask the AI agent to run `omamori install --hooks` itself. That command would go through the exact same broken hook and fail the same way, so an AI agent cannot fix this from inside its own Bash tool no matter what it tries (verified in #355). The hook wrapper itself now prints this same guidance to stderr when it can't reach `hook-check` at all (a broken/missing exec path, not a policy decision) — if you see that message, it's confirming the same thing this section describes.
+**Why a plain terminal, specifically**: the "hook error" you're seeing blocks *every* tool call through Claude Code — `Read` and `Edit` as well as `Bash`, so the agent cannot even look at the problem — including one where you ask the AI agent to run `omamori install --hooks` itself. That command would go through the exact same broken hook and fail the same way, so an AI agent cannot fix this from inside its own Bash tool no matter what it tries (verified in #355). The hook wrapper itself now prints this same guidance to stderr when it can't reach `hook-check` at all (a broken/missing exec path, not a policy decision) — if you see that message, it's confirming the same thing this section describes.
 
 If the above doesn't fix it, check for a **project-level** `.claude/settings.json` (in the repository you're working in, not `~/.claude/settings.json`). A `PreToolUse` entry tagged `x-omamori-version` there can also point at a stale path — remove that entry manually, since `omamori install --hooks` only manages the user-level `~/.claude/settings.json`.
 
-## Claude Code blocks every Bash command with a hook error that isn't "No such file or directory"
+## Claude Code blocks every tool call with a hook error that isn't "No such file or directory"
 
 Unlike the missing-path case above, the hook's registered path can exist but still be the wrong binary — for example, if you're developing omamori itself and run `cargo build`/`cargo test` in the repo, the shim's background self-repair could (rarely) resolve its own executable to a stale build artifact and bake that path into the hook script (#349).
 

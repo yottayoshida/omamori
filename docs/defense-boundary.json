@@ -119,8 +119,8 @@
       "surface": "Config/hook file editing (Edit/Write operations)",
       "layer1": "not applicable",
       "layer2": "supported",
-      "layer2_note": "Claude Code Tier 1; Codex CLI Tier 2",
-      "verified_by": "Hook integration file-protection tests"
+      "layer2_note": "Claude Code only — Codex CLI's hook sees shell commands alone; v0.9.7–1.3.0 the Claude Code entry routed Bash only and this never ran (#576)",
+      "verified_by": "Hook integration file-protection tests, tool_calls_through_the_installed_hook, ACCEPTANCE_TEST.md live row"
     },
     {
       "id": "static-shell-expansion-obfuscation",
@@ -159,7 +159,7 @@
       "id": "ai-overwrites-user-files-native-tools",
       "category": "out_of_scope",
       "surface": "AI overwrites/destroys user source files via native Write/Edit tools",
-      "reason": "Command-guard scope: omamori observes Bash commands and protects its own files only; native editor-tool writes are outside the interception layer",
+      "reason": "Command-guard scope: omamori's hook sees every Claude Code tool call but judges an editor-tool write only against omamori's own files; a write to anything else is left to the agent's own permission flow",
       "reference": "Git hygiene (`git diff` before commit), AI tool file sandbox"
     },
     {

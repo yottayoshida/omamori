@@ -132,7 +132,8 @@ pub enum ClaudeSettingsOutcome {
     /// File existed and already contained an up-to-date omamori entry.
     AlreadyPresent,
     /// File existed and contained an omamori-managed entry whose `matcher` was
-    /// in legacy form (`"*"` or boolean string). Migrated to simple `"Bash"`
+    /// not [`CLAUDE_HOOK_MATCHER`] — a boolean string the parser rejects, or
+    /// the `"Bash"` that v0.9.7 through 1.3.0 wrote (ADR-0018). Migrated
     /// (Q2=c partial migrate; user-managed entries are not touched).
     MatcherMigrated,
     /// Stale omamori entries (from different install roots or legacy formats)
@@ -917,11 +918,32 @@ fn generate_install_baseline(base_dir: &Path) -> Result<(), crate::AppError> {
     Ok(())
 }
 
+/// The `matcher` of omamori's Claude Code `PreToolUse` entry: every tool.
+///
+/// ADR-0018. `hook-check` routes by the shape of `tool_input`, not by
+/// `tool_name`, and SECURITY.md promises that a renamed tool carrying
+/// `file_path`/`path`/`command` still reaches the full pipeline — which holds
+/// only if Claude Code sends it. v0.9.7 through 1.3.0 wrote `"Bash"` here and
+/// nothing but shell commands reached the hook (#576): the file-protection
+/// guard was implemented, tested by calling `hook-check` directly, and never
+/// ran in a Claude Code session.
+///
+/// Read by the installer, `doctor`'s settings check and the shim's settings
+/// sync, so the three cannot disagree about what "current" means.
+pub(crate) const CLAUDE_HOOK_MATCHER: &str = "*";
+
+/// Said wherever omamori rewrites the matcher of an existing entry. A running
+/// Claude Code session keeps the hooks it started with, so a rewritten file —
+/// which `doctor` then reports as correct — protects nothing until the
+/// session is restarted (ADR-0018 review).
+pub(crate) const CLAUDE_RESTART_NOTE: &str =
+    "restart running Claude Code sessions: a session keeps the hooks it started with";
+
 /// Build the JSON value for one omamori entry inside Claude Code's
 /// `hooks.PreToolUse` array.
 ///
 /// Spec (current Claude Code, see https://code.claude.com/docs/en/hooks):
-/// - `matcher`: simple string `"Bash"`. The legacy boolean form
+/// - `matcher`: [`CLAUDE_HOOK_MATCHER`]. A boolean form such as
 ///   `"tool == \"Bash\""` is silently rejected by the current parser (#195).
 /// - `hooks`: nested array with `type: "command"`. The older flat `command`
 ///   field on the matcher object is deprecated.
@@ -931,7 +953,7 @@ fn generate_install_baseline(base_dir: &Path) -> Result<(), crate::AppError> {
 pub(crate) fn claude_settings_entry(script_path: &Path) -> serde_json::Value {
     let command = shell_words::quote(&script_path.display().to_string()).into_owned();
     serde_json::json!({
-        "matcher": "Bash",
+        "matcher": CLAUDE_HOOK_MATCHER,
         "hooks": [{
             "type": "command",
             "command": command,
@@ -1073,10 +1095,12 @@ pub(crate) fn merge_claude_settings(
             kept_canonical = true;
             return true; // keep the first canonical match
         }
+        // ADR-0018: `"Bash"` is not legacy syntax, but it is not what this
+        // build routes either, so replacing it is a matcher migration rather
+        // than the version-only refresh `StaleEntriesCleaned` reports.
         if e.get("matcher")
             .and_then(|m| m.as_str())
-            .map(is_legacy_matcher)
-            .unwrap_or(false)
+            .is_some_and(|m| is_legacy_matcher(m) || m != CLAUDE_HOOK_MATCHER)
         {
             had_legacy_matcher = true;
         }
@@ -1226,12 +1250,15 @@ pub(crate) fn is_omamori_hook_path(path: &Path) -> bool {
             == Some("hooks")
 }
 
-/// True if `matcher` is a legacy form that the current Claude Code parser
-/// silently rejects: wildcard `"*"` or boolean expression
-/// (`"tool == \"Bash\""` etc.). The modern parser accepts simple strings like
-/// `"Bash"`, `"Edit"`, `"Read"`.
-fn is_legacy_matcher(matcher: &str) -> bool {
-    matcher == "*" || matcher.contains("==") || matcher.contains("&&") || matcher.contains("||")
+/// True if `matcher` is a boolean expression (`"tool == \"Bash\""` etc.),
+/// which the current Claude Code parser silently rejects.
+///
+/// `"*"` is not one: it matches every tool, and since ADR-0018 it is what
+/// omamori writes. Through 1.3.0 this function also called `"*"` legacy, and
+/// that is how the editor tools stopped reaching the hook — an entry that
+/// routed every tool was "migrated" to one that routed only `Bash` (#576).
+pub(crate) fn is_legacy_matcher(matcher: &str) -> bool {
+    matcher.contains("==") || matcher.contains("&&") || matcher.contains("||")
 }
 
 // ---------------------------------------------------------------------------
@@ -4285,7 +4312,7 @@ mod tests {
         assert_eq!(
             doc.pointer("/hooks/PreToolUse/0/matcher")
                 .and_then(|v| v.as_str()),
-            Some("Bash")
+            Some(CLAUDE_HOOK_MATCHER)
         );
         assert_eq!(
             doc.pointer("/hooks/PreToolUse/0/x-omamori-version")
@@ -4412,7 +4439,7 @@ mod tests {
         assert_eq!(
             doc.pointer("/hooks/PreToolUse/0/matcher")
                 .and_then(|v| v.as_str()),
-            Some("Bash"),
+            Some(CLAUDE_HOOK_MATCHER),
             "legacy boolean matcher must migrate to simple Bash"
         );
 
@@ -4421,13 +4448,15 @@ mod tests {
 
     #[test]
     #[serial_test::serial(home_env)]
-    fn merge_claude_migrates_wildcard_matcher() {
+    fn merge_claude_replaces_v096_wildcard_entry_without_calling_it_a_migration() {
         let dir = fresh_test_dir("v005");
         let script = fake_script(&dir);
         let claude_dir = dir.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
 
-        // Older v0.9.6 snippet form: matcher = "*", flat command field
+        // Older v0.9.6 snippet form: matcher = "*", flat command field. The
+        // flat form is outdated; the matcher is not (ADR-0018). Through 1.3.0
+        // this was reported as a matcher migration — to `"Bash"`.
         let stale = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
@@ -4445,7 +4474,71 @@ mod tests {
         let result = with_test_home(&dir, || {
             merge_claude_settings(&claude_dir, &script).unwrap()
         });
-        assert!(matches!(result, ClaudeSettingsOutcome::MatcherMigrated));
+        assert!(
+            matches!(result, ClaudeSettingsOutcome::StaleEntriesCleaned(1)),
+            "got {result:?}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc.pointer("/hooks/PreToolUse/0/matcher")
+                .and_then(|v| v.as_str()),
+            Some("*")
+        );
+        assert!(
+            doc.pointer("/hooks/PreToolUse/0/hooks/0/command").is_some(),
+            "rewritten into the nested form"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// #576 / ADR-0018: the entry v0.9.7 through 1.3.0 wrote. It is replaced
+    /// by one routing every tool, and the replacement is reported as a matcher
+    /// migration rather than the version-only refresh.
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn merge_claude_migrates_the_bash_only_matcher_of_1_3_0() {
+        let dir = fresh_test_dir("adr0018");
+        let script = fake_script(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let shape_of_1_3_0 = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": script.display().to_string()}],
+                    "x-omamori-version": "1.3.0"
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&shape_of_1_3_0).unwrap(),
+        )
+        .unwrap();
+
+        let result = with_test_home(&dir, || {
+            merge_claude_settings(&claude_dir, &script).unwrap()
+        });
+        assert!(
+            matches!(result, ClaudeSettingsOutcome::MatcherMigrated),
+            "got {result:?}"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        let entries = doc
+            .pointer("/hooks/PreToolUse")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(entries.len(), 1, "replaced, not added beside: {entries:?}");
+        assert_eq!(
+            entries[0].get("matcher").and_then(|v| v.as_str()),
+            Some("*")
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -4588,11 +4681,13 @@ mod tests {
     #[test]
     fn is_legacy_matcher_classifies_correctly() {
         // V-013: legacy forms
-        assert!(is_legacy_matcher("*"));
         assert!(is_legacy_matcher("tool == \"Bash\""));
         assert!(is_legacy_matcher("tool == \"Bash\" && tool == \"Edit\""));
         assert!(is_legacy_matcher("tool == \"Bash\" || tool == \"Edit\""));
-        // Modern simple matchers
+        // Modern simple matchers. `"*"` is one (ADR-0018): through 1.3.0 this
+        // asserted the opposite, and an entry routing every tool was migrated
+        // to one routing only `Bash` (#576).
+        assert!(!is_legacy_matcher("*"));
         assert!(!is_legacy_matcher("Bash"));
         assert!(!is_legacy_matcher("Edit"));
         assert!(!is_legacy_matcher("Read"));
@@ -4601,10 +4696,13 @@ mod tests {
     #[test]
     fn claude_settings_entry_uses_current_spec() {
         let entry = claude_settings_entry(Path::new("/usr/local/.omamori/hooks/x.sh"));
+        // ADR-0018 / #576: every tool, so that the editor tools and a renamed
+        // tool reach the hook. A literal rather than the constant: the
+        // constant is what is under test.
         assert_eq!(
             entry.get("matcher").and_then(|v| v.as_str()),
-            Some("Bash"),
-            "matcher must be simple string"
+            Some("*"),
+            "matcher must route every tool"
         );
         assert!(
             entry.pointer("/hooks/0/type").is_some(),
@@ -5002,13 +5100,15 @@ mod tests {
         let claude_dir = dir.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
 
+        // The current matcher, so this pins the cleanup count rather than the
+        // matcher migration (which outranks it, and has its own test).
         let stale_entry_a = serde_json::json!({
-            "matcher": "Bash",
+            "matcher": CLAUDE_HOOK_MATCHER,
             "hooks": [{"type": "command", "command": "/var/folders/tmp1/hooks/claude-pretooluse.sh"}],
             "x-omamori-version": "0.9.7"
         });
         let stale_entry_b = serde_json::json!({
-            "matcher": "Bash",
+            "matcher": CLAUDE_HOOK_MATCHER,
             "hooks": [{"type": "command", "command": "/var/folders/tmp2/hooks/claude-pretooluse.sh"}],
             "x-omamori-version": "0.9.8"
         });
@@ -5066,8 +5166,10 @@ mod tests {
         let claude_dir = dir.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
 
+        // The matcher 1.3.0 wrote: outdated since ADR-0018, so its removal is
+        // a migration as well as a cleanup.
         let legacy_entry = serde_json::json!({
-            "matcher": "*",
+            "matcher": "Bash",
             "hooks": [{"type": "command", "command": format!("{}/hooks/claude-pretooluse.sh", base_dir.display())}]
         });
 
@@ -5083,7 +5185,7 @@ mod tests {
         let result = with_test_home(&dir, || {
             merge_claude_settings(&claude_dir, &script).unwrap()
         });
-        // Legacy wildcard matcher → MatcherMigrated takes priority over StaleEntriesCleaned
+        // An outdated matcher → MatcherMigrated takes priority over StaleEntriesCleaned
         assert!(
             matches!(result, ClaudeSettingsOutcome::MatcherMigrated),
             "expected MatcherMigrated, got {result:?}"
@@ -5098,7 +5200,7 @@ mod tests {
         assert_eq!(arr.len(), 1, "only new canonical entry");
         assert_eq!(
             arr[0].get("matcher").and_then(|v| v.as_str()),
-            Some("Bash"),
+            Some(CLAUDE_HOOK_MATCHER),
             "canonical entry has current matcher"
         );
 
@@ -5117,7 +5219,7 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
 
         let stale_entry = serde_json::json!({
-            "matcher": "Bash",
+            "matcher": CLAUDE_HOOK_MATCHER,
             "hooks": [{"type": "command", "command": "/var/folders/old/hooks/claude-pretooluse.sh"}],
             "x-omamori-version": "0.9.7"
         });
@@ -5238,7 +5340,7 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
 
         let stale_entry = serde_json::json!({
-            "matcher": "Bash",
+            "matcher": CLAUDE_HOOK_MATCHER,
             "hooks": [{"type": "command", "command": "/var/folders/old/hooks/claude-pretooluse.sh"}],
             "x-omamori-version": "0.9.7"
         });

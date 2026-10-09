@@ -4466,3 +4466,239 @@ fn verify_does_not_claim_a_bootstrap_it_could_not_perform() {
     restored.unwrap();
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// --- ADR-0018 (#576 / #520): every Claude Code tool reaches the hook ---
+//
+// Every case above sends `tool_name: "Bash"` or a made-up name, and calls the
+// hook the way a test does — which is how the editor tools went unrouted from
+// v0.9.7 through 1.3.0 with this whole suite green: the guard worked, Claude
+// Code never sent it anything (#576). The wiring is pinned in `installer.rs`
+// and in ACCEPTANCE_TEST.md's live row; these pin what the hook decides once
+// it *is* sent the tools Claude Code ships, through the installed wrapper.
+
+/// What a tool call through the installed hook must come to.
+#[derive(Debug, PartialEq)]
+enum ToolCallOutcome {
+    /// exit 2.
+    Block,
+    /// exit 0 with nothing on stdout — "no decision", so Claude Code's own
+    /// permission flow runs. Never `permissionDecision: "allow"`: that skips
+    /// the user's prompt, and is kept for `Bash` alone.
+    SilentAllow,
+}
+
+/// (tool_name, tool_input, expected, what the case is about). `{secret}` in
+/// the input is replaced with the test home's audit-secret path, `{home}` with
+/// the test home.
+const TOOL_CALL_CASES: &[(&str, &str, ToolCallOutcome, &str)] = &[
+    // Writers get the whole protected list.
+    (
+        "Write",
+        r#"{"file_path":"{home}/.config/omamori/config.toml","content":"x"}"#,
+        ToolCallOutcome::Block,
+        "Write to config.toml",
+    ),
+    (
+        "Edit",
+        r#"{"file_path":"{home}/project/.claude/settings.local.json","old_string":"a","new_string":"b"}"#,
+        ToolCallOutcome::Block,
+        "Edit to settings.local.json (can disable hooks)",
+    ),
+    (
+        "Write",
+        r#"{"file_path":"{home}/.omamori/warn-keystore-0123abcd","content":""}"#,
+        ToolCallOutcome::Block,
+        "#520: the warning-throttle sentinel",
+    ),
+    (
+        "NotebookEdit",
+        r#"{"notebook_path":"{home}/.claude/settings.json","new_source":"x"}"#,
+        ToolCallOutcome::Block,
+        "notebook_path is a file path",
+    ),
+    (
+        "FuturePlanWriter",
+        r#"{"file_path":"{home}/project/.integrity.json"}"#,
+        ToolCallOutcome::Block,
+        "an unknown name is treated as a writer",
+    ),
+    (
+        "Write",
+        r#"{"file_path":"{home}/project/.claude/SETTINGS.LOCAL.JSON","content":"{}"}"#,
+        ToolCallOutcome::Block,
+        "a case-changed name that does not exist yet (macOS ignores case)",
+    ),
+    (
+        "Write",
+        r#"{"file_path":"{home}/project/.claude/\u017fettings.local.json","content":"{}"}"#,
+        ToolCallOutcome::Block,
+        "a name APFS folds beyond ASCII (U+017F is s)",
+    ),
+    (
+        "FuturePlanWriter",
+        r#"{"file_path":"{home}/project/ok.txt","path":"{home}/.omamori/hooks/claude-pretooluse.sh"}"#,
+        ToolCallOutcome::Block,
+        "every path field is judged, not only the routed one",
+    ),
+    (
+        "Monitor",
+        r#"{"command":"true","file_path":"{home}/.claude/settings.json"}"#,
+        ToolCallOutcome::Block,
+        "a path field beside a command is judged too",
+    ),
+    (
+        "Write",
+        r#"{"file_path":"{home}/project/notes.txt","content":"x"}"#,
+        ToolCallOutcome::SilentAllow,
+        "Write elsewhere is left to Claude Code",
+    ),
+    (
+        "Write",
+        r#"{"file_path":"{home}/.omamori-quarantine/x","content":"x"}"#,
+        ToolCallOutcome::SilentAllow,
+        ".omamori matches a component, not a prefix",
+    ),
+    // Readers are checked for the secret alone.
+    (
+        "Read",
+        r#"{"file_path":"{secret}"}"#,
+        ToolCallOutcome::Block,
+        "Read of the audit secret",
+    ),
+    (
+        "Read",
+        r#"{"file_path":"{home}/.local/share/omamori/AUDIT-SECRET"}"#,
+        ToolCallOutcome::Block,
+        "the secret in another case",
+    ),
+    (
+        "Read",
+        r#"{"file_path":"{home}/.config/omamori/config.toml"}"#,
+        ToolCallOutcome::SilentAllow,
+        "Read of config.toml is ordinary work",
+    ),
+    (
+        "Read",
+        r#"{"file_path":"{home}/.claude/settings.json"}"#,
+        ToolCallOutcome::SilentAllow,
+        "Read of settings.json is ordinary work",
+    ),
+    // Listers are not checked.
+    (
+        "Glob",
+        r#"{"pattern":"*","path":"{home}/.local/share/omamori"}"#,
+        ToolCallOutcome::SilentAllow,
+        "Glob lists names, reads nothing",
+    ),
+    // A `command` field is a shell command whatever the tool is called.
+    (
+        "Monitor",
+        r#"{"command":"rm -rf ~/projects","description":"x"}"#,
+        ToolCallOutcome::Block,
+        "a command field reaches the shell pipeline",
+    ),
+    (
+        "Monitor",
+        r#"{"command":"ls","description":"x"}"#,
+        ToolCallOutcome::SilentAllow,
+        "but only Bash is ever approved",
+    ),
+    // Tools without arguments, and fields of other types.
+    (
+        "CronList",
+        r#"{}"#,
+        ToolCallOutcome::SilentAllow,
+        "an empty input is refused only for Bash",
+    ),
+    (
+        "SomeMcpTool",
+        r#"{"path":["a","b"],"query":"x"}"#,
+        ToolCallOutcome::SilentAllow,
+        "a non-string path is ignored outside Bash",
+    ),
+    (
+        "SomeMcpTool",
+        r#"{"command":["rm","-rf","/"]}"#,
+        ToolCallOutcome::Block,
+        "a non-string command is still refused (G-6)",
+    ),
+    (
+        "Bash",
+        r#"{}"#,
+        ToolCallOutcome::Block,
+        "Bash with no command is still refused",
+    ),
+];
+
+#[test]
+fn tool_calls_through_the_installed_hook() {
+    let (base, hook_path, shim_dir) = setup_hook_env("adr0018-tools");
+    // A store, so the audit secret exists where the Read case points.
+    let (_, _, exit) = run_hook_script(
+        &hook_path,
+        &shim_dir,
+        &pretooluse_bash_json("rm -rf ~/adr0018-seed"),
+    );
+    assert_eq!(exit, 2, "the seeding block must run");
+    let secret = base.join(".local/share/omamori/audit-secret");
+    assert!(secret.exists(), "the seeding block must mint the secret");
+
+    for (tool, input, expected, about) in TOOL_CALL_CASES {
+        let input = input
+            .replace("{secret}", &secret.to_string_lossy())
+            .replace("{home}", &base.to_string_lossy());
+        let tool_input: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let json = pretooluse_unknown_with_input(tool, tool_input);
+        let (stdout, _, exit) = run_hook_script(&hook_path, &shim_dir, &json);
+        let actual = match exit {
+            2 => ToolCallOutcome::Block,
+            0 if stdout.trim().is_empty() => ToolCallOutcome::SilentAllow,
+            _ => panic!("{tool} ({about}): exit {exit}, stdout {stdout:?}"),
+        };
+        assert_eq!(&actual, expected, "{tool}: {about}");
+    }
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The control for the case above: `Bash` is still approved, so Auto mode
+/// does not start prompting for every shell command (#62).
+#[test]
+fn bash_is_still_approved_through_the_installed_hook() {
+    let (base, hook_path, shim_dir) = setup_hook_env("adr0018-bash");
+    let (stdout, _, exit) = run_hook_script(&hook_path, &shim_dir, &pretooluse_bash_json("ls"));
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(exit, 0);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("allow JSON");
+    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+}
+
+/// A `Grep` over the directory holding the secret reads the secret.
+#[test]
+fn grep_over_the_directory_holding_the_secret_is_blocked() {
+    let (base, hook_path, shim_dir) = setup_hook_env("adr0018-grep");
+    let (_, _, exit) = run_hook_script(
+        &hook_path,
+        &shim_dir,
+        &pretooluse_bash_json("rm -rf ~/adr0018-seed"),
+    );
+    assert_eq!(exit, 2, "the seeding block must run");
+    let data = base.join(".local/share/omamori");
+    let grep = |path: &Path| {
+        pretooluse_unknown_with_input(
+            "Grep",
+            serde_json::json!({ "pattern": ".", "path": path.to_string_lossy() }),
+        )
+    };
+    let (_, _, holding) = run_hook_script(&hook_path, &shim_dir, &grep(&data));
+    let elsewhere = base.join("project");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let (stdout, _, other) = run_hook_script(&hook_path, &shim_dir, &grep(&elsewhere));
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(holding, 2, "the data directory holds the secret");
+    assert_eq!(other, 0, "a directory without one is not checked further");
+    assert!(
+        stdout.trim().is_empty(),
+        "and Grep is never approved: {stdout}"
+    );
+}

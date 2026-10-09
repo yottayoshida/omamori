@@ -385,7 +385,9 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
 
     // Determine resync need:
     //   1. omamori entry missing → resync
-    //   2. entry present but version stale or matcher legacy → resync
+    //   2. entry present but version stale, or matcher not
+    //      `CLAUDE_HOOK_MATCHER` (legacy, or the `"Bash"` of v0.9.7–1.3.0,
+    //      ADR-0018) → resync
     //   3. multiple omamori entries (stale accumulation) → resync
     //   4. entry present and current, exactly 1 → no-op
     let needs_resync = match doc.pointer("/hooks/PreToolUse").and_then(|v| v.as_array()) {
@@ -413,7 +415,9 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
                                 let u = c.trim_matches('\'').trim_matches('"');
                                 Path::new(u) == script_path
                             });
-                    version != env!("CARGO_PKG_VERSION") || matcher != "Bash" || !path_current
+                    version != env!("CARGO_PKG_VERSION")
+                        || matcher != installer::CLAUDE_HOOK_MATCHER
+                        || !path_current
                 }
                 _ => true, // multiple entries → stale accumulation, force cleanup
             }
@@ -433,6 +437,14 @@ pub(crate) fn ensure_settings_current_for(base_dir: &Path, claude_dir: &Path) ->
         }
         Ok(installer::ClaudeSettingsOutcome::StaleEntriesCleaned(n)) => {
             eprintln!("omamori: cleaned {n} stale hook(s) from Claude settings");
+            true
+        }
+        Ok(installer::ClaudeSettingsOutcome::MatcherMigrated) => {
+            eprintln!(
+                "omamori: Claude settings auto-synced to v{} — the hook now reaches every tool; {}",
+                env!("CARGO_PKG_VERSION"),
+                installer::CLAUDE_RESTART_NOTE
+            );
             true
         }
         Ok(_) => {
@@ -1450,7 +1462,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(home_env)]
-    fn ensure_settings_resyncs_on_legacy_matcher() {
+    fn ensure_settings_resyncs_on_the_bash_only_matcher_of_1_3_0() {
         let dir = std::env::temp_dir().join(format!("omamori-shim-legacy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let claude_dir = dir.join(".claude");
@@ -1464,8 +1476,12 @@ mod tests {
         let stale = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "*",
-                    "hooks": [{"type": "command", "command": omamori_cmd}]
+                    // #576 / ADR-0018: the matcher 1.3.0 wrote, under this
+                    // build's own version tag — so the matcher is the only
+                    // thing that can make this entry outdated.
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": omamori_cmd}],
+                    "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]
             }
         });
@@ -1488,14 +1504,14 @@ mod tests {
         unsafe { std::env::set_var("HOME", &dir) };
 
         let result = ensure_settings_current_for(&dir, &claude_dir);
-        assert!(result, "should re-sync when matcher is legacy");
+        assert!(result, "should re-sync when the matcher routes only Bash");
 
         let raw = std::fs::read_to_string(claude_dir.join("settings.json")).unwrap();
         let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
             doc.pointer("/hooks/PreToolUse/0/matcher")
                 .and_then(|v| v.as_str()),
-            Some("Bash")
+            Some("*")
         );
 
         match saved {
@@ -1634,7 +1650,7 @@ mod tests {
         let current = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": omamori_cmd}],
                     "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]
