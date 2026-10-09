@@ -538,6 +538,7 @@ fn claim_next_epoch(
 /// compile: passing the same string at two sites is valid Rust that silently
 /// lets one branch suppress the other (#473 review found exactly that between
 /// the two rotation warnings, only one of which carries the prohibition).
+///
 /// #521: one kind per [`UnprotectedReason`], chosen by [`keystore_warn_kind`].
 /// #473 gave the four a single sentinel on the argument that they are "one
 /// condition seen four ways". The messages are not one: only
@@ -549,6 +550,12 @@ fn claim_next_epoch(
 pub(super) const WARN_KIND_KEYSTORE_DIR_UNLISTABLE: &str = "keystore-dir-unlistable";
 pub(super) const WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE: &str =
     "keystore-epoch-record-unreadable";
+/// The same reason with its repair withheld (SEC-R5, an AI session reading).
+/// A different text, so a different sentinel: otherwise the agent's copy,
+/// which only routes to `audit verify`, held back the copy with the repair
+/// from a person typing a command in the next five minutes (#521 review).
+pub(super) const WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE_WITHHELD: &str =
+    "keystore-epoch-record-unreadable-withheld";
 pub(super) const WARN_KIND_KEYSTORE_ACTIVE_KEY_MISSING: &str = "keystore-active-key-missing";
 pub(super) const WARN_KIND_KEYSTORE_ACTIVE_KEY_UNUSABLE: &str = "keystore-active-key-unusable";
 pub(super) const WARN_KIND_ROTATION_MINTED: &str = "rotation-minted";
@@ -693,14 +700,20 @@ fn may_warn(policy: KeyWarnPolicy, kind: &str, store: &Path) -> bool {
     }
 }
 
-/// The throttle kind for a key-store warning (#521). Exhaustive, with no `_`:
-/// a reason added later has to be given its own kind here rather than
-/// inheriting another's — including the two `key_store_outlook` does not
-/// produce today, so that the day it does they do not share.
-pub(super) fn keystore_warn_kind(reason: &UnprotectedReason) -> &'static str {
+/// The throttle kind for a key-store warning (#521): one per distinct text
+/// [`keystore_warning`] can print. Exhaustive, with no `_`, so a reason added
+/// later needs an arm here — and `every_keystore_text_has_its_own_kind` checks
+/// that the arm does not reuse another text's kind. That includes the two
+/// reasons `key_store_outlook` does not produce today.
+pub(super) fn keystore_warn_kind(reason: &UnprotectedReason, with_repair: bool) -> &'static str {
     match reason {
         UnprotectedReason::KeyDirUnlistable(_) => WARN_KIND_KEYSTORE_DIR_UNLISTABLE,
-        UnprotectedReason::EpochRecordUnreadable(_) => WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE,
+        UnprotectedReason::EpochRecordUnreadable(_) if with_repair => {
+            WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE
+        }
+        UnprotectedReason::EpochRecordUnreadable(_) => {
+            WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE_WITHHELD
+        }
         UnprotectedReason::ActiveKeyMissing => WARN_KIND_KEYSTORE_ACTIVE_KEY_MISSING,
         UnprotectedReason::ActiveKeyUnusable(_) => WARN_KIND_KEYSTORE_ACTIVE_KEY_UNUSABLE,
     }
@@ -981,7 +994,11 @@ fn load_signing_key_locked(
             // every guarded command, and printed unconditionally. #521: one
             // sentinel per reason, not one for the block — see
             // `WARN_KIND_KEYSTORE_DIR_UNLISTABLE`.
-            if may_warn(policy, keystore_warn_kind(&reason), secret_path) {
+            if may_warn(
+                policy,
+                keystore_warn_kind(&reason, policy.allows_repair()),
+                secret_path,
+            ) {
                 warnings.push(keystore_warning(&reason, policy.allows_repair()));
             }
             return SigningKey {

@@ -430,13 +430,18 @@ all recorded rather than fixed:
   ahead of time leaves that tool's first call of the day unrecorded. The editor tools cannot,
   for the reason below. The record is marked only once it has been written, so a failed
   append is retried rather than lost.
-- **The throttle sentinel can be refreshed from a shell command**
+- **A throttle sentinel can be refreshed from a shell command**
   ([#520](https://github.com/yottayoshida/omamori/issues/520), [#577](https://github.com/yottayoshida/omamori/issues/577)). `~/.omamori` is protected as a whole since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md), so an editor tool can no longer
   create or refresh the sentinel; a shell command (`touch`) still can — its name is a
   truncated digest of the secret path, which follows from the config — and so keep the
   warning suppressed. This hides a notification, not the evidence: entries are still stamped
   `UNRESOLVED_KEY_ID`, and `verify`, `status` and `doctor` still report the state from the
   store itself.
+- ~~**Two key-store reasons share one sentinel**~~
+  ([#521](https://github.com/yottayoshida/omamori/issues/521)) — **closed.** Each reason has
+  its own sentinel kind, and the one reason whose text changes with the disclosure gate — an
+  unreadable epoch record, with or without its repair — has one per text, so an AI session's
+  copy cannot hold back the copy with the repair either.
 
 ## Environment Variable Detection
 

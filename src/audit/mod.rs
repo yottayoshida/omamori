@@ -11612,6 +11612,7 @@ mod tests {
             // #521: four, one per reason.
             secret::WARN_KIND_KEYSTORE_DIR_UNLISTABLE,
             secret::WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE,
+            secret::WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE_WITHHELD,
             secret::WARN_KIND_KEYSTORE_ACTIVE_KEY_MISSING,
             secret::WARN_KIND_KEYSTORE_ACTIVE_KEY_UNUSABLE,
             secret::WARN_KIND_ROTATION_MINTED,
@@ -11627,6 +11628,39 @@ mod tests {
             unique.len(),
             kinds.len(),
             "two warning kinds share a sentinel, so one silences the other: {kinds:?}"
+        );
+    }
+
+    /// #521 review: two key-store warnings with different text never share a
+    /// kind — checked over every reason and both disclosure settings, through
+    /// the function the call site uses, not by comparing constants.
+    #[test]
+    fn every_keystore_text_has_its_own_kind() {
+        use secret::UnprotectedReason as R;
+        let mut seen: Vec<(String, &'static str)> = Vec::new();
+        for reason in [
+            R::KeyDirUnlistable("cannot list /k".to_string()),
+            R::EpochRecordUnreadable("/k/audit-secret.epoch does not hold a key epoch".to_string()),
+            R::ActiveKeyMissing,
+            R::ActiveKeyUnusable("/k/audit-secret is a FIFO".to_string()),
+        ] {
+            for with_repair in [true, false] {
+                let text = secret::keystore_warning(&reason, with_repair);
+                let kind = secret::keystore_warn_kind(&reason, with_repair);
+                for (other_text, other_kind) in &seen {
+                    assert!(
+                        other_text == &text || other_kind != &kind,
+                        "two texts share {kind}:\n  {other_text}\n  {text}"
+                    );
+                }
+                seen.push((text, kind));
+            }
+        }
+        let kinds: std::collections::HashSet<_> = seen.iter().map(|(_, k)| *k).collect();
+        assert_eq!(
+            kinds.len(),
+            5,
+            "four reasons, one of which has two texts: {kinds:?}"
         );
     }
 
