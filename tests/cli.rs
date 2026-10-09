@@ -3291,9 +3291,14 @@ fn hook_check_unknown_tool_with_payload_allowed() {
     .to_string();
     let (stdout, _, exit_code) = run_hook_check(&input);
     assert_eq!(exit_code, 0, "unknown tool with payload must be allowed");
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
-    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+    // ADR-0018: an allowed call that is not `Bash` says nothing. Claude Code
+    // reads `permissionDecision: "allow"` as approval and skips its own
+    // prompt; with every tool reaching the hook, printing it here would
+    // approve every call the user's settings would have asked about.
+    assert!(
+        stdout.trim().is_empty(),
+        "no decision on stdout, so Claude Code's own permission flow runs: {stdout}"
+    );
 }
 
 /// #111: Known tool_name with empty tool_input → blocked (malformed).
@@ -3318,9 +3323,14 @@ fn hook_check_tool_name_only_allowed() {
     .to_string();
     let (stdout, _, exit_code) = run_hook_check(&input);
     assert_eq!(exit_code, 0, "tool_name-only must be allowed");
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
-    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+    // ADR-0018: an allowed call that is not `Bash` says nothing. Claude Code
+    // reads `permissionDecision: "allow"` as approval and skips its own
+    // prompt; with every tool reaching the hook, printing it here would
+    // approve every call the user's settings would have asked about.
+    assert!(
+        stdout.trim().is_empty(),
+        "no decision on stdout, so Claude Code's own permission flow runs: {stdout}"
+    );
 }
 
 /// #110: Edit to non-protected path → allowed.
@@ -3333,9 +3343,14 @@ fn hook_check_edit_non_protected_path_allowed() {
     .to_string();
     let (stdout, _, exit_code) = run_hook_check(&input);
     assert_eq!(exit_code, 0, "Edit to non-protected path must be allowed");
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
-    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+    // ADR-0018: an allowed call that is not `Bash` says nothing. Claude Code
+    // reads `permissionDecision: "allow"` as approval and skips its own
+    // prompt; with every tool reaching the hook, printing it here would
+    // approve every call the user's settings would have asked about.
+    assert!(
+        stdout.trim().is_empty(),
+        "no decision on stdout, so Claude Code's own permission flow runs: {stdout}"
+    );
 }
 
 /// #110 V-001: Edit to config.toml → blocked.
@@ -3506,9 +3521,14 @@ fn hook_check_write_unrelated_path_allowed() {
     .to_string();
     let (stdout, _, exit_code) = run_hook_check(&input);
     assert_eq!(exit_code, 0, "Write to unrelated path must be allowed");
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("must return valid JSON");
-    assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+    // ADR-0018: an allowed call that is not `Bash` says nothing. Claude Code
+    // reads `permissionDecision: "allow"` as approval and skips its own
+    // prompt; with every tool reaching the hook, printing it here would
+    // approve every call the user's settings would have asked about.
+    assert!(
+        stdout.trim().is_empty(),
+        "no decision on stdout, so Claude Code's own permission flow runs: {stdout}"
+    );
 }
 
 /// #320: block message names the matched pattern and match-kind, so a
@@ -4144,6 +4164,264 @@ fn audit_rows_in(home: &std::path::Path) -> Vec<serde_json::Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `hook-check` in `home` for any tool call, the way [`hook_check_in`] runs a
+/// shell command. Returns stdout, stderr (with `home` replaced by `<HOME>`)
+/// and the exit code.
+fn tool_call_in(
+    home: &std::path::Path,
+    tool_name: &str,
+    tool_input: serde_json::Value,
+    json_error: bool,
+) -> (String, String, i32) {
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    cmd.args(["hook-check", "--provider", "claude-code"]);
+    if json_error {
+        cmd.arg("--json-error");
+    }
+    let mut child = cmd
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env_remove("OMAMORI_VERBOSE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn hook-check");
+    let input = serde_json::json!({ "tool_name": tool_name, "tool_input": tool_input });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().expect("failed to wait");
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).replace(&*home.to_string_lossy(), "<HOME>"),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+/// ADR-0018: a file-protection block is recorded like every other Layer 2
+/// deny, in text mode and under `--json-error`. Through 1.3.0 it was not — and
+/// SECURITY.md's "no row means allow" for the Claude Code path held only
+/// because Claude Code never sent the hook a file operation (#576).
+#[test]
+fn a_file_protection_block_is_recorded_in_the_audit_chain() {
+    for json_error in [false, true] {
+        let home = unique_dir("adr0018-fileop-audit");
+        let config = home.join(".config/omamori/config.toml");
+        let (_, stderr, exit) = tool_call_in(
+            &home,
+            "Write",
+            serde_json::json!({ "file_path": config.to_string_lossy(), "content": "x" }),
+            json_error,
+        );
+        assert_eq!(exit, 2, "json_error={json_error}: {stderr}");
+        let rows = audit_rows_in(&home);
+        let blocks: Vec<_> = rows
+            .iter()
+            .filter(|r| r["detection_layer"] == "layer2:file-protection")
+            .collect();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "json_error={json_error}: one row, got {rows:?}"
+        );
+        assert_eq!(blocks[0]["action"], "block");
+        assert_eq!(blocks[0]["rule_id"], "protected-file");
+        if json_error {
+            let parsed: serde_json::Value =
+                serde_json::from_str(stderr.trim()).expect("one JSON object on stderr");
+            assert_eq!(parsed["layer"], "layer2:file-protection");
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+/// The control: an allowed file operation writes nothing — Layer 2 allows are
+/// not recorded, and this one is not an unrecognised shape either.
+#[test]
+fn an_allowed_file_operation_writes_no_audit_row() {
+    let home = unique_dir("adr0018-fileop-allow");
+    let (stdout, _, exit) = tool_call_in(
+        &home,
+        "Write",
+        serde_json::json!({ "file_path": home.join("notes.txt").to_string_lossy(), "content": "x" }),
+        false,
+    );
+    assert_eq!(exit, 0);
+    assert!(stdout.trim().is_empty(), "never approved: {stdout}");
+    assert!(audit_rows_in(&home).is_empty());
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// ADR-0018: the block message for a reading tool says what was refused. The
+/// live check found it printing "cannot modify" for a `Read` of the secret.
+#[test]
+fn a_blocked_read_of_the_secret_names_the_read() {
+    let home = unique_dir("adr0018-read-message");
+    let secret = home.join(".local/share/omamori/audit-secret");
+    let (_, stderr, exit) = tool_call_in(
+        &home,
+        "Read",
+        serde_json::json!({ "file_path": secret.to_string_lossy() }),
+        false,
+    );
+    assert_eq!(exit, 2, "{stderr}");
+    assert!(
+        stderr.contains("blocked Read to protected file"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("read its audit secret"), "{stderr}");
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// ADR-0018 review: a refusal of input that could not be validated is a Layer
+/// 2 deny like any other, and is recorded — otherwise "no row means allow"
+/// (SECURITY.md → Forensic semantics) fails for every call of a tool that is
+/// refused for its shape, which `"*"` made routine.
+#[test]
+fn an_input_validation_block_is_recorded() {
+    let home = unique_dir("adr0018-input-validation");
+    let (_, stderr, exit) = tool_call_in(&home, "Bash", serde_json::json!({}), false);
+    assert_eq!(exit, 2, "{stderr}");
+    let (_, stderr, exit) = tool_call_in(
+        &home,
+        "SomeMcpExec",
+        serde_json::json!({ "command": ["rm", "-rf", "/"] }),
+        true,
+    );
+    assert_eq!(exit, 2, "{stderr}");
+    let rows: Vec<_> = audit_rows_in(&home)
+        .into_iter()
+        .filter(|r| r["detection_layer"] == "layer2:input-validation")
+        .collect();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["command"], "Bash");
+    assert_eq!(rows[1]["command"], "SomeMcpExec");
+    assert!(
+        rows.iter()
+            .all(|r| r["action"] == "block" && r["rule_id"] == "invalid-input")
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// ADR-0018 review: the once-a-day mark is set only after the record is in.
+/// With the data directory unusable the append fails, and the next call tries
+/// again — the hint appears both times — instead of the day's record being
+/// lost to a mark set before it.
+#[test]
+fn an_unknown_tool_whose_record_failed_is_tried_again() {
+    let home = unique_dir("adr0018-unknown-retry");
+    let share = home.join(".local/share");
+    fs::create_dir_all(&share).unwrap();
+    fs::write(share.join("omamori"), "not a directory").unwrap();
+    let mut hints = 0;
+    for _ in 0..2 {
+        let (_, stderr, exit) = tool_call_in(
+            &home,
+            "AskUserQuestion",
+            serde_json::json!({ "questions": [] }),
+            false,
+        );
+        assert_eq!(exit, 0, "{stderr}");
+        hints += stderr.matches("routed as fail-open").count();
+    }
+    assert_eq!(hints, 2, "the failed record is retried, not marked as done");
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// ADR-0018 review: rewriting the 1.3.0 entry says to restart Claude Code —
+/// a running session keeps the hooks it started with, and `doctor` reports
+/// the rewritten file as correct.
+#[test]
+fn install_over_the_bash_only_entry_says_to_restart_claude_code() {
+    let home = unique_dir("adr0018-restart-note");
+    let base = home.join(".omamori");
+    let claude = home.join(".claude");
+    fs::create_dir_all(&claude).unwrap();
+    let script = base.join("hooks/claude-pretooluse.sh");
+    fs::write(
+        claude.join("settings.json"),
+        serde_json::json!({
+            "hooks": { "PreToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{ "type": "command", "command": script.to_string_lossy() }],
+                "x-omamori-version": "1.3.0"
+            }]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut cmd = Command::new(binary());
+    clean_ai_env(&mut cmd);
+    let out = cmd
+        .args(["install", "--base-dir"])
+        .arg(&base)
+        .arg("--source")
+        .arg(binary())
+        .arg("--hooks")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .output()
+        .expect("install");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("restart running Claude Code sessions"),
+        "{text}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(doc["hooks"]["PreToolUse"][0]["matcher"], "*");
+    let _ = fs::remove_dir_all(&home);
+}
+
+/// ADR-0018: an unrecognised shape is recorded once per tool name per day.
+/// With every Claude Code tool routed to the hook, `AskUserQuestion`, `Agent`
+/// and most MCP calls land here, and each record costs a locked append and two
+/// syncs. A second name is still recorded — the record is how a new or
+/// renamed tool shows up in `omamori audit unknown`.
+#[test]
+fn an_unrecognised_tool_is_recorded_once_a_day_per_name() {
+    let home = unique_dir("adr0018-unknown-dedup");
+    let unknown_rows = |home: &std::path::Path| {
+        audit_rows_in(home)
+            .into_iter()
+            .filter(|r| r["action"] == "unknown_tool_fail_open")
+            .map(|r| r["command"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..3 {
+        let (stdout, _, exit) = tool_call_in(
+            &home,
+            "AskUserQuestion",
+            serde_json::json!({ "questions": [] }),
+            false,
+        );
+        assert_eq!(exit, 0);
+        assert!(stdout.trim().is_empty(), "never approved: {stdout}");
+    }
+    assert_eq!(unknown_rows(&home), vec!["AskUserQuestion"]);
+    let (_, _, exit) = tool_call_in(
+        &home,
+        "ToolSearch",
+        serde_json::json!({ "query": "x" }),
+        false,
+    );
+    assert_eq!(exit, 0);
+    assert_eq!(unknown_rows(&home), vec!["AskUserQuestion", "ToolSearch"]);
+    let _ = fs::remove_dir_all(&home);
 }
 
 /// A row without the fields that place it in time and in the chain — what

@@ -502,8 +502,11 @@ fn check_cursor_snippet(path: &Path, resolved_exe: &ResolvedExe) -> CheckItem {
 /// 1. settings.json exists and parses as JSON
 /// 2. `hooks.PreToolUse` contains an omamori-managed entry (`command` path
 ///    inside `~/.omamori/`)
-/// 3. The matcher is current spec (`"Bash"` simple string), not legacy
-///    (`"*"` or boolean) which the current parser silently rejects
+/// 3. The matcher is [`installer::CLAUDE_HOOK_MATCHER`] (every tool,
+///    ADR-0018) — not a boolean form, which the current parser silently
+///    rejects, and not a narrower one such as the `"Bash"` that v0.9.7
+///    through 1.3.0 wrote, under which the editor tools never reach the hook
+///    (#576)
 /// 4. The command points at a real file whose sha256 matches the bundled
 ///    hook script (T2 tampering detection)
 ///
@@ -642,13 +645,24 @@ fn check_claude_settings_integration_with_verifier(
     };
 
     let matcher = entry.get("matcher").and_then(|m| m.as_str()).unwrap_or("");
-    if matcher != "Bash" {
+    if matcher != installer::CLAUDE_HOOK_MATCHER {
+        let why = if matcher.is_empty() {
+            // Claude Code reads a missing matcher as every tool, so this is
+            // not a gap in coverage — only an entry omamori did not write,
+            // which the shim's sync replaces (ADR-0018 review).
+            "missing; omamori writes the matcher explicitly"
+        } else if installer::is_legacy_matcher(matcher) {
+            "legacy form silently rejected"
+        } else {
+            "tools it does not name never reach the hook, so file protection is inactive"
+        };
         return CheckItem {
             category,
             name,
             status: CheckStatus::Fail,
             detail: format!(
-                "(matcher = {matcher:?}, expected \"Bash\" — legacy form silently rejected)"
+                "(matcher = {matcher:?}, expected {:?} — {why})",
+                installer::CLAUDE_HOOK_MATCHER
             ),
             remediation: Some(Remediation::RunInstall),
         };
@@ -3146,7 +3160,7 @@ mod tests {
         let stale = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "*",
+                    "matcher": "tool == \"Bash\"",
                     "command": script.display().to_string()
                 }]
             }
@@ -3165,6 +3179,67 @@ mod tests {
         assert!(
             item.detail.contains("matcher"),
             "detail should mention matcher: {}",
+            item.detail
+        );
+        assert!(
+            item.detail.contains("silently rejected"),
+            "a boolean form is the parser's refusal: {}",
+            item.detail
+        );
+
+        match saved {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn check_claude_settings_fails_on_the_bash_only_matcher_of_1_3_0() {
+        let dir = std::env::temp_dir().join(format!("omamori-int-bashonly-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let claude_dir = dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let omamori_hooks = dir.join(".omamori").join("hooks");
+        fs::create_dir_all(&omamori_hooks).unwrap();
+        let script = omamori_hooks.join("claude-pretooluse.sh");
+        fs::write(
+            &script,
+            installer::render_hook_script(&installer::resolved_current_omamori_exe().unwrap()),
+        )
+        .unwrap();
+
+        // #576 / ADR-0018: the entry 1.3.0 wrote. The parser accepts it and
+        // shell commands reach the hook, so nothing looked wrong — but the
+        // editor tools never did, and file protection never ran.
+        let stale = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{"type": "command", "command": script.display().to_string()}],
+                }]
+            }
+        });
+        fs::write(
+            claude_dir.join("settings.json"),
+            serde_json::to_string_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let saved = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &dir) };
+
+        let item = check_claude_settings_integration(&dir.join(".omamori"));
+        assert_eq!(item.status, CheckStatus::Fail);
+        assert!(
+            item.detail.contains("matcher"),
+            "detail should mention matcher: {}",
+            item.detail
+        );
+        assert!(
+            item.detail.contains("never reach the hook") && !item.detail.contains("rejected"),
+            "the parser does not reject it; say what it costs instead: {}",
             item.detail
         );
 
@@ -3200,7 +3275,7 @@ mod tests {
         let hybrid_only = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [
                         {"type": "command", "command": "/usr/local/bin/userhook"},
                         {"type": "command", "command": omamori_cmd}
@@ -3257,7 +3332,7 @@ mod tests {
         let current = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": omamori_cmd}],
                     "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]
@@ -3317,7 +3392,7 @@ mod tests {
         let current = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": omamori_cmd}],
                     "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]
@@ -3390,7 +3465,7 @@ mod tests {
         let current = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": omamori_cmd}],
                     "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]
@@ -3472,7 +3547,7 @@ mod tests {
         let current = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": omamori_cmd}],
                     "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]
@@ -3546,7 +3621,7 @@ mod tests {
         let current = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": omamori_cmd}],
                     "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]
@@ -3654,7 +3729,7 @@ mod tests {
         let settings_json = serde_json::json!({
             "hooks": {
                 "PreToolUse": [{
-                    "matcher": "Bash",
+                    "matcher": installer::CLAUDE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": omamori_cmd}],
                     "x-omamori-version": env!("CARGO_PKG_VERSION")
                 }]

@@ -164,6 +164,15 @@ fn aggregate_layer2_status(result: &installer::InstallResult) -> Layer2Status {
                 warnings.push("  cat ~/.omamori/hooks/claude-settings.snippet.json".to_string());
             }
         }
+        Some(installer::ClaudeSettingsOutcome::MatcherMigrated) => {
+            tools.push("Claude Code".to_string());
+            // ADR-0018: the entry now routes every tool, which a running
+            // session does not see.
+            warnings.push(format!(
+                "Claude Code: hook now reaches every tool — {}",
+                installer::CLAUDE_RESTART_NOTE
+            ));
+        }
         Some(_) => tools.push("Claude Code".to_string()),
         None => {}
     }

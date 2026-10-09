@@ -152,6 +152,8 @@ echo "exit=$?"
 | T-2 | Claude Code session で AI agent に `omamori config disable rm-recursive-to-trash` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook: blocked/` | config 改変 block (Phase 2 builtin rule `omamori-config-modify-block` 経路、実機 message 例: `omamori hook: blocked — blocked attempt to modify omamori rules`) | [ ] |
 | T-3 (precedence smoke check) | raw terminal で `which rm` (PATH を変更しない素の状態で) | `which rm` 出力が `~/.omamori/shim/rm` を含む | shim が PATH 先頭にあることの baseline 確認 | [ ] |
 | T-3' (bypass attempt 検出) | Claude Code session で AI agent に `PATH=/usr/bin:$PATH rm dummy.txt` を実行させる | `exit = 2 ∧ stderr ~~ /omamori hook:/` | hook が PATH 改変付き invocation を block — v0.10.1 `detect_path_shim_bypass()` で closure (#227) | [ ] |
+| T-4 (editor tool が hook に届く) | Claude Code session で AI agent に、作業用ディレクトリへ `.integrity.json`（新規の空ファイル、本物の baseline ではない）を **Write ツールで** 作らせる | Write が拒否される ∧ 理由に `omamori hook: blocked Write to protected file` ∧ ファイルが作られていない | Claude Code が Edit/Write を hook に送っていることそのものの確認（ADR-0018）。**`hook-check` の dry-run で代替しない** — v0.9.7〜1.3.0 は dry-run が block を返し続けた間、実 session の Write は hook を通らず成功していた (#576) | [ ] |
+| T-5 (hook は Bash 以外を許可しない) | T-4 と同じ session を既定の permission mode で開き、AI agent に作業用ディレクトリの `notes.txt` を Write させる | Claude Code 自身の確認が出る（omamori が `permissionDecision: "allow"` を返していない） | Bash 以外の道具の allow は「判断なし」(ADR-0018)。allow を返すと利用者の確認を飛ばす | [ ] |
 
 ## Doctor / Explain (D-*)
 
