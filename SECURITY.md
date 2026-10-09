@@ -437,10 +437,6 @@ all recorded rather than fixed:
   warning suppressed. This hides a notification, not the evidence: entries are still stamped
   `UNRESOLVED_KEY_ID`, and `verify`, `status` and `doctor` still report the state from the
   store itself.
-- **Two key-store reasons share one sentinel**
-  ([#521](https://github.com/yottayoshida/omamori/issues/521)), and only one of them carries a
-  repair — so a fix-and-retry sequence can suppress the repair for the rest of the window.
-  Bounded: the message returns once the window expires.
 
 ## Environment Variable Detection
 
