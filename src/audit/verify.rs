@@ -483,6 +483,18 @@ pub struct AuditSummary {
     /// different answer from [`AppendOutlook::NoLogYet`], which is an
     /// observation that a file is absent.
     pub append_outlook: Option<AppendOutlook>,
+    /// The log is absent from, or empty in, a store that has written one — its
+    /// high-water-mark sidecar is still there (#509). The reason, for a caller
+    /// that names it; `None` otherwise.
+    ///
+    /// Kept out of `path_error`, which means "the log cannot be read, so an
+    /// append will fail": here the next append recreates the log and records,
+    /// and `break-glass` reads `path_error` to tell the operator their bypass
+    /// will go unrecorded (or, under `strict`, be refused). Neither is true of
+    /// this state. What *is* true is that the store has lost what it wrote,
+    /// which `audit verify` reports and `status` must not file as "log created
+    /// on first event".
+    pub missing_log: Option<String>,
 }
 
 /// What a write to the audit log would meet right now (#514).
@@ -734,20 +746,6 @@ fn structural_line(trimmed: &str) -> Option<StructuralLine> {
 /// carries one of them to the next line, so it declines anything longer.
 pub(super) const MAX_STRUCTURAL_HASH: usize = 128;
 
-/// Is this a store nothing has ever been written to?
-///
-/// #471 (review): the two quiet errors were named "there is no log yet" and
-/// "the first key has not been minted", and neither checked. Measured on a
-/// release build: **deleting `audit.jsonl` outright left `doctor` saying
-/// `quiet`**, and so did deleting the active key of a store that already held
-/// entries. An audit tool has no business being silent about either, and
-/// `docs/CONTRACT.md` had already published the claim that only "nothing has
-/// been written" stays quiet.
-///
-/// The evidence is on disk and costs two stats. `audit.jsonl.hwm` is created by
-/// the first append and is not removed with the log, so a sidecar beside an
-/// absent log says the log existed. A log with bytes in it says the same more
-/// directly.
 /// The error for an audit path that cannot be resolved (#471). Shared with
 /// `show_entries` (#509): a reader that called this "no entries recorded yet"
 /// gave a second answer about one state.
@@ -761,6 +759,10 @@ fn path_unresolved() -> AuditError {
 /// Why a store that has written a log, and has none now, is not "nothing
 /// recorded yet". One string for every surface that says it (#509).
 const LOG_MISSING_REASON: &str = "the audit log is gone, but this store has written one before \
+     (its high-water-mark sidecar is still here)";
+
+/// [`LOG_MISSING_REASON`]'s twin for a log that is present and empty.
+const LOG_EMPTIED_REASON: &str = "the audit log is empty, but this store has written entries \
      (its high-water-mark sidecar is still here)";
 
 /// What a failure to open the log means, once nothing else about the store
@@ -788,6 +790,20 @@ fn log_open_error(path: &std::path::Path, e: std::io::Error) -> AuditError {
     }
 }
 
+/// Is this a store nothing has ever been written to?
+///
+/// #471 (review): the two quiet errors were named "there is no log yet" and
+/// "the first key has not been minted", and neither checked. Measured on a
+/// release build: **deleting `audit.jsonl` outright left `doctor` saying
+/// `quiet`**, and so did deleting the active key of a store that already held
+/// entries. An audit tool has no business being silent about either, and
+/// `docs/CONTRACT.md` had already published the claim that only "nothing has
+/// been written" stays quiet.
+///
+/// The evidence is on disk and costs two stats. `audit.jsonl.hwm` is created by
+/// the first append and is not removed with the log, so a sidecar beside an
+/// absent log says the log existed. A log with bytes in it says the same more
+/// directly.
 fn nothing_written_yet(path: &std::path::Path) -> bool {
     let log_has_content = std::fs::metadata(path).is_ok_and(|m| m.len() > 0);
     !log_has_content && !hwm_path_for(path).exists()
@@ -1086,6 +1102,22 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         // tail on a whole log.
         last_walked_seq
     };
+    // #509 review: a log holding no chain entry at all, beside a mark that
+    // says entries were written, is a tail cut to nothing — the furthest a cut
+    // can go. Through 1.3.0 the comparison below needed an end to compare and
+    // was skipped, so emptying the log (`: > audit.jsonl`) read as "no entries
+    // to verify" with exit 0 on every surface, while deleting the file was
+    // reported. A halted walk with no end keeps its skip: that is the
+    // forward-compatibility rule SECURITY.md → Truncation Detection Across a
+    // Halt describes, and it is reported as a halt (exit 4) instead.
+    if result.broken_at.is_none()
+        && structural_end.is_none()
+        && !result.halted()
+        && let HwmState::Valid(_) = read_hwm(&hwm_path_for(&path))
+    {
+        result.hwm_compared = true;
+        result.tail_truncated = true;
+    }
     if result.broken_at.is_none()
         && let Some(structural_end) = structural_end
     {
@@ -1995,6 +2027,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             path_error: None,
             // Not probed: auditing is off, so no append is attempted.
             append_outlook: None,
+            missing_log: None,
         };
     }
 
@@ -2014,6 +2047,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             ),
             // Not probed: there is no resolved path to probe.
             append_outlook: None,
+            missing_log: None,
         };
     };
     // #471: the writer's own question, asked the writer's way. `read_secret`
@@ -2067,16 +2101,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
                 .count() as u64;
             (count, None)
         }
-        // #509: quiet only when nothing was ever written here — the test
-        // `verify_chain` and `show_entries` apply. A log removed from a store
-        // whose sidecar remains read as "log created on first event" under
-        // `[ok]` while `verify` reported it gone.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && nothing_written_yet(&path) => {
-            (0, None)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (0, Some(LOG_MISSING_REASON.to_string()))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
         // #492: sanitized here rather than at each display site. Every message
         // this arm can produce ends with the audit path, and an **absolute**
         // `audit.path` reaches this point verbatim — `AuditConfig::validate`
@@ -2103,8 +2128,27 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         secret_available,
         unprotected_reason,
         retention_days: config.retention_days,
+        missing_log: missing_log(&path, path_error.is_none()),
         path_error,
         append_outlook,
+    }
+}
+
+/// [`AuditSummary::missing_log`]: quiet only when nothing was ever written
+/// here — the test `verify_chain` and `show_entries` apply (#509). A log
+/// removed from a store whose sidecar remains read as "log created on first
+/// event" under `[ok]` while `verify` reported it gone.
+///
+/// An emptied log is the same loss by another route (#509 review): the file
+/// exists, holds nothing, and the sidecar says entries were written.
+fn missing_log(path: &std::path::Path, log_readable_or_absent: bool) -> Option<String> {
+    if !log_readable_or_absent || nothing_written_yet(path) {
+        return None;
+    }
+    match std::fs::metadata(path) {
+        Err(_) => Some(LOG_MISSING_REASON.to_string()),
+        Ok(meta) if meta.len() == 0 => Some(LOG_EMPTIED_REASON.to_string()),
+        Ok(_) => None,
     }
 }
 

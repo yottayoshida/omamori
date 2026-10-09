@@ -7893,6 +7893,114 @@ fn status_does_not_report_a_removed_log_as_not_yet_created() {
     let _ = fs::remove_dir_all(&removed);
 }
 
+/// #509 review: a log emptied in place (`: > audit.jsonl`), beside the
+/// sidecar that says entries were written, is a tail cut to nothing. Through
+/// 1.3.0 every surface read it as healthy — `audit verify` "no entries to
+/// verify" with exit 0, `report` intact, `doctor` quiet, `status` "log created
+/// on first event" — while deleting the file was reported. The control is the
+/// same store left alone.
+#[cfg(unix)]
+#[test]
+fn an_emptied_log_reads_as_a_cut_tail() {
+    for emptied in [true, false] {
+        let home = home_with_a_written_store(&format!("509-emptied-{emptied}"));
+        if emptied {
+            fs::write(home.join(".local/share/omamori/audit.jsonl"), "").unwrap();
+        }
+        let verify = run_in(&home, &["audit", "verify"]);
+        let report = run_in(&home, &["report", "--json"]);
+        let doctor = run_in(&home, &["doctor"]);
+        let status = run_in(&home, &["status"]);
+        let report_json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&report.stdout)).unwrap();
+        let layer3 = String::from_utf8_lossy(&status.stdout)
+            .lines()
+            .find(|l| l.contains("Layer 3 (audit)"))
+            .unwrap_or_default()
+            .to_string();
+        let doctor_out = String::from_utf8_lossy(&doctor.stdout).to_string();
+        if emptied {
+            assert_eq!(verify.status.code(), Some(3), "{:?}", verify);
+            assert_eq!(report_json["chain_status"]["status"], "truncated");
+            assert!(
+                doctor_out.contains("Risk signals below need attention."),
+                "{doctor_out}"
+            );
+            assert!(
+                layer3.contains("[warn]") && layer3.contains("the audit log is empty"),
+                "{layer3}"
+            );
+        } else {
+            assert_eq!(verify.status.code(), Some(0), "{:?}", verify);
+            assert_eq!(report_json["chain_status"]["status"], "intact");
+            assert!(
+                !doctor_out.contains("Risk signals below need attention."),
+                "{doctor_out}"
+            );
+            assert!(layer3.contains("[ok]"), "{layer3}");
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
+/// #509 item 5, the rest of it: the `inaccessible` states whose reason embeds
+/// a path, and the two key-store states, through a real store. `report --json`
+/// must carry the kind and no path.
+#[cfg(unix)]
+#[test]
+fn report_json_names_the_key_store_and_unreadable_log_states_without_a_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    type Setup = fn(&std::path::Path);
+    let cases: [(&str, Setup); 5] = [
+        ("secret_symlink", |data| {
+            let secret = data.join("audit-secret");
+            fs::rename(&secret, data.join("elsewhere-secret")).unwrap();
+            std::os::unix::fs::symlink(data.join("elsewhere-secret"), &secret).unwrap();
+        }),
+        ("secret_unreadable", |data| {
+            fs::set_permissions(data.join("audit-secret"), fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }),
+        ("active_key_missing", |data| {
+            fs::remove_file(data.join("audit-secret")).unwrap();
+        }),
+        ("rotation_interrupted", |data| {
+            fs::rename(
+                data.join("audit-secret"),
+                data.join("audit-secret.1.retired"),
+            )
+            .unwrap();
+        }),
+        ("log_unreadable", |data| {
+            fs::set_permissions(data.join("audit.jsonl"), fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }),
+    ];
+    for (kind, setup) in cases {
+        let home = home_with_a_written_store(&format!("509-5-{kind}"));
+        let data = home.join(".local/share/omamori");
+        setup(&data);
+        let out = run_in(&home, &["report", "--json"]);
+        for f in ["audit-secret", "audit.jsonl"] {
+            let _ = fs::set_permissions(data.join(f), fs::Permissions::from_mode(0o600));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{kind}: {e}: {stdout}"));
+        assert_eq!(
+            parsed["chain_status"],
+            serde_json::json!({ "status": "inaccessible", "kind": kind }),
+            "{kind}"
+        );
+        assert!(
+            !stdout.contains(&*home.to_string_lossy()),
+            "{kind}: the reason embeds a path and must not reach --json: {stdout}"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
 /// #509 item 5: the `inaccessible` states reach `report --json` through a real
 /// store, with their path-free `kind` and no path. The serde tests build the
 /// variant by hand; this is the measurement repeated by CI.
@@ -7913,7 +8021,9 @@ fn report_json_names_the_inaccessible_states_without_a_path() {
         chain_status(&out),
         serde_json::json!({ "status": "inaccessible", "kind": "log_missing" })
     );
-    assert!(!String::from_utf8_lossy(&out.stdout).contains(&*removed.to_string_lossy()));
+    // `log_missing`'s reason is a fixed sentence with no path in it, so no
+    // path check here — the states whose reason does embed one are pinned in
+    // `report_json_names_the_key_store_and_unreadable_log_states_without_a_path`.
     let _ = fs::remove_dir_all(&removed);
 
     let linked = home_with_a_written_store("509-report-symlink");
