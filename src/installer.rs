@@ -2345,15 +2345,11 @@ mod tests {
         // the original issue reported (`Unrecognized option: 'provider'`).
         let path =
             std::env::temp_dir().join(format!("omamori-verify-oldbinary-{}", std::process::id()));
-        fs::write(
+        crate::test_support::write_script(
             &path,
             "#!/bin/sh\ncat >/dev/null\necho \"Unrecognized option: 'provider'\" >&2\nexit 2\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            0o755,
+        );
 
         let status = verify_hook_contract(&path, Duration::from_secs(2));
         assert_eq!(
@@ -2369,11 +2365,7 @@ mod tests {
     #[cfg(unix)]
     fn verify_hook_contract_times_out_on_hung_binary() {
         let path = std::env::temp_dir().join(format!("omamori-verify-hang-{}", std::process::id()));
-        fs::write(&path, "#!/bin/sh\nsleep 5\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_support::write_script(&path, "#!/bin/sh\nsleep 5\n", 0o755);
 
         let start = std::time::Instant::now();
         let status = verify_hook_contract(&path, Duration::from_millis(100));
@@ -2406,18 +2398,14 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("probe.sh");
         let marker = dir.join("invoked");
-        fs::write(
+        crate::test_support::write_script(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\ncat >/dev/null\necho x >> \"{}\"\nexit 0\n",
                 marker.display()
             ),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            0o755,
+        );
 
         let status = verify_hook_contract(&path, Duration::from_secs(2));
         assert_eq!(status, HookContractStatus::Ok);
@@ -2935,9 +2923,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
+        // The wrapper execs this stub, so it is written from a child: see
+        // `write_script` (#344). `hook.sh` below is only read by `/bin/sh`.
         let fake_exe = dir.join("omamori");
-        fs::write(&fake_exe, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_script(&fake_exe, "#!/bin/sh\nexit 1\n", 0o755);
 
         let hook_script = render_hook_script(&fake_exe);
         let hook_path = dir.join("hook.sh");
@@ -2980,11 +2969,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
+        // The wrapper execs this stub, so it is written from a child: see
+        // `write_script` (#344). `hook.sh` below is only read by `/bin/sh`.
         let fake_exe = dir.join("omamori");
         if let Some(body) = inner {
-            fs::write(&fake_exe, format!("#!/bin/sh\n{body}\n")).unwrap();
             let mode = if executable { 0o755 } else { 0o644 };
-            fs::set_permissions(&fake_exe, fs::Permissions::from_mode(mode)).unwrap();
+            crate::test_support::write_script(&fake_exe, &format!("#!/bin/sh\n{body}\n"), mode);
         }
         // inner=None && !fake_exe.exists() (the 127 case): leave it absent.
 
@@ -3041,9 +3031,12 @@ mod tests {
 
         for (tag, inner, executable, expected_exit, expect_hint) in cases {
             let (code, stderr) = run_wrapper_around_stub(*inner, *executable, tag);
+            // stderr in the message: a stub the wrapper could not exec exits
+            // 126 and is remapped to 2, so the code alone does not say
+            // whether the stub ran (#344).
             assert_eq!(
                 code, *expected_exit,
-                "case '{tag}': wrapper exit code mismatch"
+                "case '{tag}': wrapper exit code mismatch (stderr: {stderr:?})"
             );
             for line in RECOVERY_HINT_LINES {
                 assert_eq!(

@@ -113,3 +113,95 @@ pub(crate) fn non_utf8_path_like() -> std::ffi::OsString {
     use std::os::unix::ffi::OsStringExt;
     std::ffi::OsString::from_vec(vec![0xff, 0xfe, b'/', b'x'])
 }
+
+/// Create `path` holding `body` with permission bits `mode`, without this
+/// process ever opening it for writing (#344).
+///
+/// Linux refuses to `execve` a file that any process has open for writing
+/// (`ETXTBSY`, "Text file busy"). Every test thread shares one process, so a
+/// fixture written here with `fs::write` and executed straight after loses a
+/// race it cannot see: if another thread spawns a child while the write
+/// descriptor is open, that child holds a copy until its own exec
+/// (`O_CLOEXEC` closes it only then), and executing the fixture inside that
+/// window fails. A short-lived `/bin/sh` writes the file instead, so no
+/// descriptor on it ever exists in this process for a sibling's fork to copy.
+///
+/// The body travels as one argument, which is simpler than feeding a pipe.
+/// An argument is capped (`MAX_ARG_STRLEN`, 128 KiB on Linux); a larger body
+/// fails the spawn loudly rather than writing a truncated file.
+/// `set_permissions` is `chmod(2)`, which opens nothing.
+///
+/// Use this for every fixture a test executes with its execute bit set —
+/// directly, or through a script that runs it. A fixture that is only read,
+/// or one expected to fail with `EACCES` (the permission check comes before
+/// the busy check), can stay on `fs::write`.
+#[cfg(unix)]
+pub(crate) fn write_script(path: &std::path::Path, body: &str, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", WRITE_SCRIPT_SH, "sh"])
+        .arg(path)
+        .arg(body)
+        .status()
+        .expect("spawn /bin/sh to write the fixture");
+    assert!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// `write_script`'s shell body: `$1` is the path, `$2` the content. `>|`, not
+/// `>`: macOS's `/bin/sh` is bash, which takes `noclobber` from an exported
+/// `SHELLOPTS` and would then refuse to replace a fixture an earlier run left.
+#[cfg(unix)]
+const WRITE_SCRIPT_SH: &str = "printf %s \"$2\" >| \"$1\"";
+
+/// The five tests that rely on `write_script` would catch a body that stopped
+/// arriving at all, but not one that arrived altered — a `%` or `\` taken as
+/// a format, a dropped trailing newline — or a mode that drifted. This pins
+/// both, over an existing longer file so a missing truncate shows too.
+#[cfg(unix)]
+#[test]
+fn write_script_replaces_a_file_with_the_exact_body_and_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!("omamori-write-script-{}", std::process::id()));
+    std::fs::write(&path, "an earlier, longer fixture that must not survive\n").unwrap();
+    let body = "#!/bin/sh\nprintf '%s\\n' \"$1\" 100% \\\n  && exit 0\n\n";
+
+    write_script(&path, body, 0o751);
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(written, body);
+    assert_eq!(mode, 0o751);
+}
+
+/// The `>|` in `WRITE_SCRIPT_SH`, exercised the way it can fail: bash reads
+/// `noclobber` from `SHELLOPTS` in its environment. Set on the child only, so
+/// no process global is touched. On a `/bin/sh` that ignores `SHELLOPTS`
+/// (dash) this passes either way, and so does the defect it guards against.
+#[cfg(unix)]
+#[test]
+fn write_script_overwrites_even_when_the_shell_inherits_noclobber() {
+    let path = std::env::temp_dir().join(format!(
+        "omamori-write-script-noclobber-{}",
+        std::process::id()
+    ));
+    std::fs::write(&path, "old").unwrap();
+
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", WRITE_SCRIPT_SH, "sh"])
+        .arg(&path)
+        .arg("new")
+        .env("SHELLOPTS", "noclobber")
+        .status()
+        .unwrap();
+
+    let written = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(status.success(), "the shell refused to overwrite: {status}");
+    assert_eq!(written, "new");
+}
