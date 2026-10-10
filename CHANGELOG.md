@@ -6,6 +6,10 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-10
+
+**Summary**: In Claude Code every tool call reaches omamori's hook again, so an agent's `Edit` or `Write` to omamori's own files — its config, the audit log and key, the Claude Code settings that hold its hook — is refused, as the documents said it was; since v0.9.7 only `Bash` reached the hook. The installed hook is rewritten the next time a shim runs, and a Claude Code session that is already running keeps the old one until it is restarted. The audit surfaces now agree on what a removed or emptied log is, keyring problems are reported whatever the verdict, each key-store warning is throttled on its own, and `doctor --json` carries the risk signals the human report points at.
+
 ### Added
 - **`doctor --json` reports the risk signals the human report points at** ([#509](https://github.com/yottayoshida/omamori/issues/509)). Since #474 `doctor` has printed "Risk signals below need attention." under its headline when the audit store holds something to act on, and `--json` carried nothing of it, so a consumer running `doctor` in CI saw a store whose chain was broken exactly as it saw a healthy one. `summary.risk_signals` now holds `needs_attention` — true exactly when that line is printed — and `chain_status`, the same value `report --json` gives, path-free; it is `null` where the human report has no risk section (the config could not be loaded). Under `--fix --json` the value is the one `doctor` would print run after the repair. The exit code is unchanged: it reports the installation, and its three values are frozen by the contract. `doctor --json` now verifies the audit chain the way `doctor` does, so it takes as long on a large log — and, like `doctor`, `report` and `audit verify`, holds the log's shared lock while it walks: an append arriving meanwhile waits 0.5 s and gives up, unrecorded (refused under `[audit] strict`). That cost is tracked in [#579](https://github.com/yottayoshida/omamori/issues/579); a CI job or a scheduled `doctor --json` on a machine where guarded commands run should expect it.
 
