@@ -8091,6 +8091,77 @@ fn report_json_names_the_inaccessible_states_without_a_path() {
     let _ = fs::remove_dir_all(&config_home);
 }
 
+/// #509 item 2: what the keyring found is reported on every verdict, not only
+/// on the ones that keep the ring. Two shapes that used to lose it: a log that
+/// cannot be opened (the verdict is an error), and a store whose active key is
+/// gone after a rotation (the verdict discards the ring). In each, one retired
+/// key is unreadable; the control is the same shape with that key readable.
+#[cfg(unix)]
+#[test]
+fn keyring_warnings_survive_every_verdict() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let keyring_line = "audit keyring: cannot read";
+    // The third shape, an unreadable active key, is the verdict itself
+    // (`secret_unreadable`): the ring's note about the same file is withheld
+    // so it is not said twice, and with the retired key readable no keyring
+    // line may appear at all.
+    for shape in ["log-symlink", "rotation-interrupted", "secret-unreadable"] {
+        for unreadable in [true, false] {
+            let home = unique_dir(&format!("509-2-{shape}-{unreadable}"));
+            let (_, exit) = hook_check_in(&home, "rm -rf /tmp/omamori-509-2", false);
+            assert_eq!(exit, 2);
+            let data = home.join(".local/share/omamori");
+            let retired = data.join("audit-secret.1.retired");
+            fs::copy(data.join("audit-secret"), &retired).unwrap();
+            match shape {
+                "log-symlink" => {
+                    let elsewhere = home.join("elsewhere.jsonl");
+                    fs::rename(data.join("audit.jsonl"), &elsewhere).unwrap();
+                    std::os::unix::fs::symlink(&elsewhere, data.join("audit.jsonl")).unwrap();
+                }
+                "rotation-interrupted" => fs::remove_file(data.join("audit-secret")).unwrap(),
+                _ => fs::set_permissions(
+                    data.join("audit-secret"),
+                    fs::Permissions::from_mode(0o000),
+                )
+                .unwrap(),
+            }
+            if unreadable {
+                fs::set_permissions(&retired, fs::Permissions::from_mode(0o000)).unwrap();
+            }
+
+            let verify = run_in(&home, &["audit", "verify"]);
+            let doctor = run_in(&home, &["doctor"]);
+            let _ = fs::set_permissions(&retired, fs::Permissions::from_mode(0o600));
+            let _ =
+                fs::set_permissions(data.join("audit-secret"), fs::Permissions::from_mode(0o600));
+            let verify_err = String::from_utf8_lossy(&verify.stderr).to_string();
+            let doctor_out = format!(
+                "{}{}",
+                String::from_utf8_lossy(&doctor.stdout),
+                String::from_utf8_lossy(&doctor.stderr)
+            );
+            assert_ne!(
+                verify.status.code(),
+                Some(0),
+                "{shape}: a faulty store: {verify_err}"
+            );
+            assert_eq!(
+                verify_err.contains(keyring_line),
+                unreadable,
+                "{shape}, unreadable={unreadable}, verify: {verify_err}"
+            );
+            assert_eq!(
+                doctor_out.contains(keyring_line),
+                unreadable,
+                "{shape}, unreadable={unreadable}, doctor: {doctor_out}"
+            );
+            let _ = fs::remove_dir_all(&home);
+        }
+    }
+}
+
 fn copy_binary_to(dir: &std::path::Path) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let exe = dir.join("omamori");

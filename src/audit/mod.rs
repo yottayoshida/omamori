@@ -29,7 +29,8 @@ pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, UnprotectedReason, rotate_key};
 pub use verify::{
     AppendOutlook, AuditSummary, HwmWrite, KeyStoreFailure, KeyUnavailableKind, ShowOptions,
-    VerifyResult, audit_summary, count_unknown_tool_fail_opens_within, show_entries, verify_chain,
+    VerifyOutcome, VerifyResult, audit_summary, count_unknown_tool_fail_opens_within, show_entries,
+    verify_chain, verify_chain_reporting,
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
