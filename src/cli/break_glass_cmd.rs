@@ -622,6 +622,7 @@ mod tests {
             // The existing fixtures all describe stores whose appends land; the
             // states where they do not get their own tests below (#514).
             append_outlook: Some(crate::audit::AppendOutlook::Writable),
+            missing_log: None,
         }
     }
 
@@ -1013,6 +1014,53 @@ mod tests {
             text.contains("cannot be read") && !text.contains("auditing is not running"),
             "so the message must be about the log, not the switch: {text}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #509 review: a store whose log was removed while its high-water-mark
+    /// sidecar remains is not one whose log "cannot be read". The next append
+    /// recreates the log and records, so the consent prompt must not say the
+    /// bypass goes unrecorded — or, under `strict`, that it is refused. `status`
+    /// learns about this state from `missing_log`, not from `path_error`.
+    #[test]
+    fn a_removed_log_does_not_make_the_prompt_promise_an_unrecorded_bypass() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-bg-cmd-removedlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        // A store that has written: the sidecar is the evidence.
+        std::fs::write(dir.join("audit.jsonl.hwm"), "3").unwrap();
+        let audit_config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(log.clone()),
+            retention_days: 0,
+            strict: true,
+        };
+
+        let summary = crate::audit::audit_summary(&audit_config);
+        assert!(summary.path_error.is_none(), "{:?}", summary.path_error);
+        assert!(
+            summary.missing_log.is_some(),
+            "the removal is reported, elsewhere"
+        );
+        for strict in [false, true] {
+            let text = format_audit_expectation(Some(AuditOutlook {
+                summary: &summary,
+                strict,
+            }));
+            // The no-log-yet sentence, conditional on the first append —
+            // not the cannot-be-read one, which promises an unrecorded (or,
+            // strict, refused) bypass outright.
+            assert!(
+                text.contains("logged once the audit log is created")
+                    && !text.contains("NOT be recorded")
+                    && !text.contains("cannot be read"),
+                "strict={strict}: {text}"
+            );
+        }
+        assert!(!log.exists(), "asking did not create the log");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

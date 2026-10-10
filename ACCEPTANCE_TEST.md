@@ -219,7 +219,7 @@ echo "exit=$?"
 | Rep-4 | `omamori report --last 91d` | `exit ≠ 0 ∧ stderr ~~ /out of range/` | SEC-R4 upper bound | [ ] |
 | Rep-5 | `omamori report --last 7` | `exit ≠ 0 ∧ stderr ~~ /invalid duration/` | no-unit rejection | [ ] |
 | Rep-6 | `omamori report --last 1d` | `exit = 0` | SEC-R4 lower bound | [ ] |
-| Rep-7 | `omamori report --json --last 7d \| jq .chain_status.status` | `"intact" or "broken" or "unavailable"` | chain_status 3-state (SEC-R8) | [ ] |
+| Rep-7 | `omamori report --json --last 7d \| jq .chain_status.status` | one of `"intact"`, `"broken"`, `"truncated"`, `"unverifiable"`, `"key_unavailable"`, `"unprotected"`, `"keyring_unusable"`, `"inaccessible"`, `"unavailable"` | chain_status values (SEC-R8; meanings in [SECURITY.md → What "Unavailable" Means](SECURITY.md#what-unavailable-means-471-487)). On a healthy, written store: `"intact"` | [ ] |
 | Rep-8 | `omamori report --json \| jq 'has("by_rule")'` | `true` | by_rule present in JSON (SEC-R2) | [ ] |
 
 ## Audit Trail (A-*)

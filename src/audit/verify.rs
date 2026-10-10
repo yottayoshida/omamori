@@ -289,11 +289,13 @@ pub struct VerifyResult {
     /// Why that key could not be resolved — see [`KeyUnavailableKind`].
     pub key_unavailable_kind: Option<KeyUnavailableKind>,
     /// #457: non-fatal problems assembling the keyring — a truncated ring, or
-    /// a file shaped like a retired key that could not be read. Verification
-    /// still ran (the keys that loaded authenticate their own entries), but
-    /// the coverage is incomplete and saying so is the whole point: a shorter
-    /// key set that verifies fewer entries looks identical to a complete one
-    /// unless it is reported.
+    /// a file shaped like a retired key that could not be read. Where
+    /// verification ran, the keys that loaded authenticate their own entries
+    /// and the coverage is incomplete — saying so is the whole point: a
+    /// shorter key set that verifies fewer entries looks identical to a
+    /// complete one unless it is reported. #509: also filled when the key
+    /// store as a whole was judged unusable (`key_store_failure`), where no
+    /// entry was authenticated — what the ring found is still worth saying.
     pub keyring_warnings: Vec<String>,
     /// #506: the key material could not be used at all — see
     /// [`KeyStoreFailure`]. The third terminal state, and the only one that is
@@ -483,6 +485,18 @@ pub struct AuditSummary {
     /// different answer from [`AppendOutlook::NoLogYet`], which is an
     /// observation that a file is absent.
     pub append_outlook: Option<AppendOutlook>,
+    /// The log is absent from, or empty in, a store that has written one — its
+    /// high-water-mark sidecar is still there (#509). The reason, for a caller
+    /// that names it; `None` otherwise.
+    ///
+    /// Kept out of `path_error`, which means "the log cannot be read, so an
+    /// append will fail": here the next append recreates the log and records,
+    /// and `break-glass` reads `path_error` to tell the operator their bypass
+    /// will go unrecorded (or, under `strict`, be refused). Neither is true of
+    /// this state. What *is* true is that the store has lost what it wrote,
+    /// which `audit verify` reports and `status` must not file as "log created
+    /// on first event".
+    pub missing_log: Option<String>,
 }
 
 /// What a write to the audit log would meet right now (#514).
@@ -734,6 +748,55 @@ fn structural_line(trimmed: &str) -> Option<StructuralLine> {
 /// carries one of them to the next line, so it declines anything longer.
 pub(super) const MAX_STRUCTURAL_HASH: usize = 128;
 
+/// Why an audit path does not resolve — one sentence for `verify`, `show`,
+/// `report` and `status`, which used to carry three copies of it.
+pub(super) const PATH_UNRESOLVED_REASON: &str =
+    "HOME is unset, empty, or relative — cannot resolve audit path";
+
+/// The error for an audit path that cannot be resolved (#471). Shared with
+/// `show_entries` (#509): a reader that called this "no entries recorded yet"
+/// gave a second answer about one state.
+fn path_unresolved() -> AuditError {
+    AuditError::StoreInaccessible {
+        kind: "path_unresolved",
+        reason: PATH_UNRESOLVED_REASON.to_string(),
+    }
+}
+
+/// Why a store that has written a log, and has none now, is not "nothing
+/// recorded yet". One string for every surface that says it (#509).
+const LOG_MISSING_REASON: &str = "the audit log is gone, but this store has written one before \
+     (its high-water-mark sidecar is still here)";
+
+/// [`LOG_MISSING_REASON`]'s twin for a log that is present and empty.
+const LOG_EMPTIED_REASON: &str = "the audit log is empty, but this store has written entries \
+     (its high-water-mark sidecar is still here)";
+
+/// What a failure to open the log means, once nothing else about the store
+/// has been decided. Shared by `verify_chain` and `show_entries` (#509): the
+/// second used to map every `NotFound` to `FileNotFound`, so `audit show` and
+/// `audit unknown` answered "no entries recorded yet" for a log that had been
+/// removed, while `verify` said it was gone.
+fn log_open_error(path: &std::path::Path, e: std::io::Error) -> AuditError {
+    match e.kind() {
+        // Quiet only if nothing was ever written here. A missing log with a
+        // high-water-mark sidecar still beside it is a log that was removed.
+        std::io::ErrorKind::NotFound if nothing_written_yet(path) => AuditError::FileNotFound,
+        std::io::ErrorKind::NotFound => AuditError::StoreInaccessible {
+            kind: "log_missing",
+            reason: LOG_MISSING_REASON.to_string(),
+        },
+        _ if is_symlink_attack(&e) => AuditError::StoreInaccessible {
+            kind: "log_symlink",
+            reason: e.to_string(),
+        },
+        _ => AuditError::StoreInaccessible {
+            kind: "log_unreadable",
+            reason: e.to_string(),
+        },
+    }
+}
+
 /// Is this a store nothing has ever been written to?
 ///
 /// #471 (review): the two quiet errors were named "there is no log yet" and
@@ -790,6 +853,25 @@ pub(super) fn keyring_failure(keyring: &Keyring) -> Option<KeyStoreFailure> {
     })
 }
 
+/// [`resolve_key_store`]'s answer, with what reading the keyring found that is
+/// not itself the answer (#509 item 2): an unreadable retired key, a truncated
+/// ring. Empty when the ring was never read — a symlinked secret stops before
+/// it. Carried beside the verdict because several verdicts discard the ring,
+/// and the warnings went with it.
+struct ResolvedKeyStore {
+    store: KeyStore,
+    keyring_warnings: Vec<String>,
+}
+
+impl ResolvedKeyStore {
+    fn before_the_keyring(store: KeyStore) -> Self {
+        Self {
+            store,
+            keyring_warnings: Vec::new(),
+        }
+    }
+}
+
 /// Resolve the keys this run can verify with, or say why it cannot.
 ///
 /// The order of the first two observations is load-bearing and predates this
@@ -799,7 +881,10 @@ pub(super) fn keyring_failure(keyring: &Keyring) -> Option<KeyStoreFailure> {
 /// requirement was always about *report order* — #506 satisfies it by recording
 /// the observation here, before anything walks the log, rather than by leaving
 /// the function.
-fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) -> KeyStore {
+fn resolve_key_store(
+    log_path: &std::path::Path,
+    secret_path: &std::path::Path,
+) -> ResolvedKeyStore {
     // #457: the active secret is no longer used as a hash key — the anchor and
     // every entry are verified with the key each one names. The read stays for
     // two reasons that have nothing to do with hashing: it preserves the ELOOP
@@ -823,11 +908,11 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
         // symlinked secret plus a deleted tail — and it was the one early
         // return the first draft of this change overlooked.
         Err(e) if is_symlink_attack(&e) => {
-            return KeyStore::Unusable(KeyStoreFailure {
+            return ResolvedKeyStore::before_the_keyring(KeyStore::Unusable(KeyStoreFailure {
                 kind: "secret_symlink",
                 reason: e.to_string(),
                 remedy: String::new(),
-            });
+            }));
         }
         Err(e) => Some(e),
     };
@@ -837,8 +922,29 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // and report every entry as tampered — a false accusation caused by a
     // permissions problem. Nothing consults the ring once this fires.
     let keyring = load_keyring(secret_path);
+    // #509 item 2: from here on the ring has been read, and what it found that
+    // is not itself the verdict travels with every outcome — including the
+    // ones that discard the ring.
+    let found = |exclude_active_key: bool| -> Vec<String> {
+        keyring
+            .anomalies()
+            .iter()
+            .filter(|a| {
+                !matches!(
+                    a,
+                    super::secret::KeyringAnomaly::DirectoryUnreadable { .. }
+                        | super::secret::KeyringAnomaly::EpochRecordUnreadable { .. }
+                ) && !(exclude_active_key
+                    && matches!(a, super::secret::KeyringAnomaly::ActiveKeyUnreadable { .. }))
+            })
+            .map(|a| a.describe())
+            .collect()
+    };
     if let Some(failure) = keyring_failure(&keyring) {
-        return KeyStore::Unusable(failure);
+        return ResolvedKeyStore {
+            keyring_warnings: found(false),
+            store: KeyStore::Unusable(failure),
+        };
     }
 
     // Reached only with a listing in hand, which is what makes the secret's own
@@ -851,7 +957,10 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // change removes elsewhere. Shared rather than repeated because the two
     // commands disagreeing about one store is the defect being closed.
     let Some(e) = secret_error else {
-        return KeyStore::Usable(keyring);
+        return ResolvedKeyStore {
+            keyring_warnings: found(false),
+            store: KeyStore::Usable(keyring),
+        };
     };
 
     // #487 B: `SecretUnavailable` covers two states that could not be less
@@ -872,16 +981,25 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
     // directory this function already listed; `verify` is not a hot path, and
     // the alternative is a copy of `rotate`'s condition that can drift from it.
     if e.kind() == std::io::ErrorKind::NotFound && interrupted_rotation_evidence(secret_path) {
-        return KeyStore::Unusable(KeyStoreFailure {
-            kind: "rotation_interrupted",
-            reason: "the active audit key is missing and this store has rotated before — \
+        return ResolvedKeyStore {
+            keyring_warnings: found(false),
+            store: KeyStore::Unusable(KeyStoreFailure {
+                kind: "rotation_interrupted",
+                reason: "the active audit key is missing and this store has rotated before — \
                      a rotation that stopped between filing the old key and moving its \
                      replacement into place leaves exactly this"
-                .to_string(),
-            remedy: String::new(),
-        });
+                    .to_string(),
+                remedy: String::new(),
+            }),
+        };
     }
-    match classify_secret_failure(e) {
+    // An unreadable active key is the verdict below (`secret_unreadable`); the
+    // ring's own note about the same file would report it a second time. The
+    // verdict's reason is the open error, which does not always name the file
+    // (`Permission denied` does not) — a gap of that wording, not of this
+    // filter: through 1.3.0 this verdict carried no warnings at all.
+    let keyring_warnings = found(true);
+    let store = match classify_secret_failure(e) {
         // #471 (review): quiet only while nothing has been written. A store
         // that already holds entries and has lost its active key is not a fresh
         // install — the next append mints a *different* secret under the same
@@ -903,18 +1021,50 @@ fn resolve_key_store(log_path: &std::path::Path, secret_path: &std::path::Path) 
             reason: other.to_string(),
             remedy: String::new(),
         }),
+    };
+    ResolvedKeyStore {
+        store,
+        keyring_warnings,
     }
 }
 
 pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
+    verify_chain_reporting(config).result
+}
+
+/// [`verify_chain`]'s result, with what reading the keyring found beside it.
+///
+/// #509 item 2: on `Ok` the warnings are also in `VerifyResult` — this is the
+/// same list. On `Err` they had nowhere to go: a store whose retired key is
+/// unreadable and whose log could not be opened reported the second fault and
+/// lost the first, on `audit verify` and on `doctor` alike.
+#[non_exhaustive]
+pub struct VerifyOutcome {
+    pub result: Result<VerifyResult, AuditError>,
+    /// Non-fatal keyring problems found on the way, whatever `result` is.
+    /// Empty when the run stopped before the keyring was read.
+    pub keyring_warnings: Vec<String>,
+}
+
+/// [`verify_chain`], keeping the keyring's warnings on every path.
+pub fn verify_chain_reporting(config: &AuditConfig) -> VerifyOutcome {
+    let mut keyring_warnings = Vec::new();
+    let result = verify_chain_into(config, &mut keyring_warnings);
+    VerifyOutcome {
+        result,
+        keyring_warnings,
+    }
+}
+
+fn verify_chain_into(
+    config: &AuditConfig,
+    keyring_warnings_out: &mut Vec<String>,
+) -> Result<VerifyResult, AuditError> {
     // #471: not `FileNotFound`. That variant means "there is no log yet", which
     // is a quiet state; this is a configuration that cannot name a log at all,
     // and `status` has always reported it as a fault. The two shared one
     // variant, so the louder of them inherited the quieter one's verdict.
-    let path = resolved_audit_path(config).ok_or_else(|| AuditError::StoreInaccessible {
-        kind: "path_unresolved",
-        reason: "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
-    })?;
+    let path = resolved_audit_path(config).ok_or_else(path_unresolved)?;
     let secret_path = secret_path_for(&path);
 
     // #506: the key material is resolved into a *value* rather than into an
@@ -927,7 +1077,9 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
     //
     // Only one early return is left here, and it is the one #471 established:
     // "nothing has been written yet" is quiet, and everything else is not.
-    let (keyring, key_store_failure) = match resolve_key_store(&path, &secret_path) {
+    let resolved = resolve_key_store(&path, &secret_path);
+    keyring_warnings_out.clone_from(&resolved.keyring_warnings);
+    let (keyring, key_store_failure) = match resolved.store {
         KeyStore::Usable(keyring) => (keyring, None),
         KeyStore::Unusable(failure) => (Keyring::empty(), Some(failure)),
         KeyStore::NothingWrittenYet => return Err(AuditError::SecretUnavailable),
@@ -961,31 +1113,15 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         if let Some(failure) = key_store_failure.clone() {
             return failure.into_error();
         }
-        match e.kind() {
-            // Quiet only if nothing was ever written here. A missing log with a
-            // high-water-mark sidecar still beside it is a log that was removed.
-            std::io::ErrorKind::NotFound if nothing_written_yet(&path) => AuditError::FileNotFound,
-            std::io::ErrorKind::NotFound => AuditError::StoreInaccessible {
-                kind: "log_missing",
-                reason: "the audit log is gone, but this store has written one before \
-                     (its high-water-mark sidecar is still here)"
-                    .to_string(),
-            },
-            _ if is_symlink_attack(&e) => AuditError::StoreInaccessible {
-                kind: "log_symlink",
-                reason: e.to_string(),
-            },
-            _ => AuditError::StoreInaccessible {
-                kind: "log_unreadable",
-                reason: e.to_string(),
-            },
-        }
+        log_open_error(&path, e)
     })?;
 
     let reader = std::io::BufReader::new(&file);
 
     let result = VerifyResult {
-        keyring_warnings: keyring.anomalies().iter().map(|a| a.describe()).collect(),
+        // The ring's own findings, kept even where the store's verdict
+        // discarded the ring (#509 item 2).
+        keyring_warnings: resolved.keyring_warnings,
         // #506: set before the first line is read, so `halted()` is already true
         // when the loop starts and every line takes the tally path — including
         // the one that keeps `last_structural_seq` moving, which is what the
@@ -1067,6 +1203,35 @@ pub fn verify_chain(config: &AuditConfig) -> Result<VerifyResult, AuditError> {
         // tail on a whole log.
         last_walked_seq
     };
+    // #509 review: a log holding no chain entry at all, beside a mark that
+    // says entries were written, is a tail cut to nothing — the furthest a cut
+    // can go. Through 1.3.0 the comparison below needed an end to compare and
+    // was skipped, so emptying the log (`: > audit.jsonl`) read as "no entries
+    // to verify" with exit 0 on every surface, while deleting the file was
+    // reported.
+    //
+    // A key store that cannot be used halts the walk before its first line,
+    // and a log with no line at all gives that halt nothing to skip past: the
+    // cut is reported over it, as every removed tail has been since #506 (R2).
+    // A halt *at a line* — which counts that line as unverified — keeps its
+    // skip when nothing from there on states an end: that is the
+    // forward-compatibility rule SECURITY.md → Truncation Detection Across a
+    // Halt describes. A mark that cannot be read is reported here as it is
+    // beside a log that has entries (R2): the empty log gives no end to write
+    // in its place, so it stays reported.
+    if result.broken_at.is_none()
+        && structural_end.is_none()
+        && result.unverified_entries_after == 0
+    {
+        match read_hwm(&hwm_path_for(&path)) {
+            HwmState::Valid(_) => {
+                result.hwm_compared = true;
+                result.tail_truncated = true;
+            }
+            HwmState::Unusable(reason) => result.hwm_unusable = Some(reason),
+            HwmState::Missing => {}
+        }
+    }
     if result.broken_at.is_none()
         && let Some(structural_end) = structural_end
     {
@@ -1842,11 +2007,10 @@ pub fn show_entries(
 ) -> Result<(), AuditError> {
     use std::collections::VecDeque;
 
-    let path = resolved_audit_path(config).ok_or(AuditError::FileNotFound)?;
-    let file = open_read_nofollow(&path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => AuditError::FileNotFound,
-        _ => AuditError::Io(e),
-    })?;
+    // #509: the same answers `verify_chain` gives — "nothing recorded yet" only
+    // when nothing was ever written here.
+    let path = resolved_audit_path(config).ok_or_else(path_unresolved)?;
+    let file = open_read_nofollow(&path).map_err(|e| log_open_error(&path, e))?;
 
     let reader = std::io::BufReader::new(&file);
     let capacity = opts.last.unwrap_or(usize::MAX);
@@ -1977,6 +2141,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             path_error: None,
             // Not probed: auditing is off, so no append is attempted.
             append_outlook: None,
+            missing_log: None,
         };
     }
 
@@ -1991,11 +2156,10 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
             secret_available: false,
             unprotected_reason: None,
             retention_days: config.retention_days,
-            path_error: Some(
-                "HOME is unset, empty, or relative — cannot resolve audit path".to_string(),
-            ),
+            path_error: Some(PATH_UNRESOLVED_REASON.to_string()),
             // Not probed: there is no resolved path to probe.
             append_outlook: None,
+            missing_log: None,
         };
     };
     // #471: the writer's own question, asked the writer's way. `read_secret`
@@ -2076,8 +2240,35 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         secret_available,
         unprotected_reason,
         retention_days: config.retention_days,
+        missing_log: missing_log(&path, path_error.is_none(), entry_count),
         path_error,
         append_outlook,
+    }
+}
+
+/// [`AuditSummary::missing_log`]: quiet only when nothing was ever written
+/// here — the test `verify_chain` and `show_entries` apply (#509). A log
+/// removed from a store whose sidecar remains read as "log created on first
+/// event" under `[ok]` while `verify` reported it gone.
+///
+/// An emptied log is the same loss by another route (#509 review): the file
+/// exists, holds no line, and the sidecar says entries were written. "No
+/// line" is `entry_count`, which skips blank lines as `verify` does, so a log
+/// emptied with `echo >` reads the same as one emptied with `: >` (R2). A log
+/// that still holds lines is counted, not judged: `status` never walks the
+/// chain, and `audit verify` is what says whether those lines are a chain.
+fn missing_log(
+    path: &std::path::Path,
+    log_readable_or_absent: bool,
+    entry_count: u64,
+) -> Option<String> {
+    if !log_readable_or_absent || nothing_written_yet(path) {
+        return None;
+    }
+    match std::fs::metadata(path) {
+        Err(_) => Some(LOG_MISSING_REASON.to_string()),
+        Ok(_) if entry_count == 0 => Some(LOG_EMPTIED_REASON.to_string()),
+        Ok(_) => None,
     }
 }
 

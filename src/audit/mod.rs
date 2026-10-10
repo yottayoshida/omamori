@@ -29,7 +29,8 @@ pub use report::{ChainStatus, ReportAggregate, aggregate_report};
 pub use secret::{RotationResult, UnprotectedReason, rotate_key};
 pub use verify::{
     AppendOutlook, AuditSummary, HwmWrite, KeyStoreFailure, KeyUnavailableKind, ShowOptions,
-    VerifyResult, audit_summary, count_unknown_tool_fail_opens_within, show_entries, verify_chain,
+    VerifyOutcome, VerifyResult, audit_summary, count_unknown_tool_fail_opens_within, show_entries,
+    verify_chain, verify_chain_reporting,
 };
 
 // --- Internal imports from submodules (used by AuditLogger + tests) ---
@@ -11518,18 +11519,23 @@ mod tests {
         };
         let mut buf = Vec::new();
         let err = show_entries(&config, &opts, &mut buf).unwrap_err();
+        // #509: classified as `verify_chain` classifies it — `log_symlink` —
+        // rather than handed on as a bare `Io`.
         match err {
-            AuditError::Io(e) => assert!(
-                // "possible attack", not "symlink": these fixtures use
-                // `test_dir` names containing the word "symlink", and the error
-                // embeds the path — so `contains("symlink")` passes regardless
-                // of what the error says. Found by same-class scan after Codex
-                // Round 1 flagged the same defect in
-                // `read_secret_rejects_symlink` (#457).
-                e.to_string().contains("possible attack"),
-                "expected the symlink/possible-attack error, got: {e}"
-            ),
-            other => panic!("expected Io error, got: {other}"),
+            AuditError::StoreInaccessible { kind, reason } => {
+                assert_eq!(kind, "log_symlink");
+                assert!(
+                    // "possible attack", not "symlink": these fixtures use
+                    // `test_dir` names containing the word "symlink", and the
+                    // error embeds the path — so `contains("symlink")` passes
+                    // regardless of what the error says. Found by same-class
+                    // scan after Codex Round 1 flagged the same defect in
+                    // `read_secret_rejects_symlink` (#457).
+                    reason.contains("possible attack"),
+                    "expected the symlink/possible-attack error, got: {reason}"
+                );
+            }
+            other => panic!("expected StoreInaccessible(log_symlink), got: {other}"),
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -11609,7 +11615,13 @@ mod tests {
     #[test]
     fn throttle_kinds_are_distinct() {
         let kinds = [
-            secret::WARN_KIND_KEYSTORE,
+            // #521: one per reason, and the epoch record's has two — its text
+            // changes with whether the repair is shown.
+            secret::WARN_KIND_KEYSTORE_DIR_UNLISTABLE,
+            secret::WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE,
+            secret::WARN_KIND_KEYSTORE_EPOCH_RECORD_UNREADABLE_WITHHELD,
+            secret::WARN_KIND_KEYSTORE_ACTIVE_KEY_MISSING,
+            secret::WARN_KIND_KEYSTORE_ACTIVE_KEY_UNUSABLE,
             secret::WARN_KIND_ROTATION_MINTED,
             secret::WARN_KIND_ROTATION_UNMINTED,
             // #518
@@ -11624,6 +11636,96 @@ mod tests {
             kinds.len(),
             "two warning kinds share a sentinel, so one silences the other: {kinds:?}"
         );
+    }
+
+    /// #521 review: two key-store warnings with different text never share a
+    /// kind — checked over every reason and both disclosure settings, through
+    /// the function the call site uses, not by comparing constants.
+    #[test]
+    fn every_keystore_text_has_its_own_kind() {
+        use secret::UnprotectedReason as R;
+        let mut seen: Vec<(String, &'static str)> = Vec::new();
+        for reason in [
+            R::KeyDirUnlistable("cannot list /k".to_string()),
+            R::EpochRecordUnreadable("/k/audit-secret.epoch does not hold a key epoch".to_string()),
+            R::ActiveKeyMissing,
+            R::ActiveKeyUnusable("/k/audit-secret is a FIFO".to_string()),
+        ] {
+            for with_repair in [true, false] {
+                let text = secret::keystore_warning(&reason, with_repair);
+                let kind = secret::keystore_warn_kind(&reason, with_repair);
+                for (other_text, other_kind) in &seen {
+                    assert!(
+                        other_text == &text || other_kind != &kind,
+                        "two texts share {kind}:\n  {other_text}\n  {text}"
+                    );
+                }
+                seen.push((text, kind));
+            }
+        }
+        let kinds: std::collections::HashSet<_> = seen.iter().map(|(_, k)| *k).collect();
+        assert_eq!(
+            kinds.len(),
+            5,
+            "four reasons, one of which has two texts: {kinds:?}"
+        );
+    }
+
+    /// #521: the fix-and-retry sequence the issue describes, on one store and
+    /// inside one throttle window. The key directory cannot be listed, so the
+    /// first command reports that; the operator repairs the permissions, and
+    /// the next command finds the epoch record unreadable — and must report
+    /// it, because that warning is the one carrying the repair. Under one
+    /// shared sentinel the second report was suppressed for the rest of the
+    /// window.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_fixed_key_directory_does_not_silence_the_epoch_record_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = test_dir("521-fix-and-retry");
+        let store = home.join("store");
+        fs::create_dir_all(&store).unwrap();
+        let secret_path = store.join("audit-secret");
+
+        let (first, second) = crate::test_support::with_home(Some(home.to_str().unwrap()), || {
+            let mut first = Vec::new();
+            fs::set_permissions(&store, fs::Permissions::from_mode(0o300)).unwrap();
+            secret::load_signing_key_with(
+                &secret_path,
+                secret::KeyWarnPolicy::throttled(true),
+                &mut first,
+            );
+            fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+
+            fs::write(store.join("audit-secret.epoch"), "not-a-number").unwrap();
+            let mut second = Vec::new();
+            secret::load_signing_key_with(
+                &secret_path,
+                secret::KeyWarnPolicy::throttled(true),
+                &mut second,
+            );
+            (first, second)
+        });
+
+        assert_eq!(
+            first.len(),
+            1,
+            "the unlistable directory is reported: {first:?}"
+        );
+        assert_eq!(
+            second.len(),
+            1,
+            "and the unreadable record after it, inside the same window: {second:?}"
+        );
+        assert!(
+            second[0].contains("audit-secret.epoch") || second[0].contains("epoch record"),
+            "it is the record's warning: {second:?}"
+        );
+        assert_ne!(first[0], second[0], "two messages, two reports");
+
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// #518: the two `load_or_create_secret` sites really do pass **different**
