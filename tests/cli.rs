@@ -8162,6 +8162,51 @@ fn keyring_warnings_survive_every_verdict() {
     }
 }
 
+/// #509 item 3: `doctor --json` carries the risk-signal verdict the human
+/// report prints, through a real store. The exit code is not part of it.
+#[cfg(unix)]
+#[test]
+fn doctor_json_reports_the_risk_signals_the_headline_does() {
+    let note = "Risk signals below need attention.";
+    for removed in [true, false] {
+        let home = unique_dir(&format!("509-3-{removed}"));
+        let (_, exit) = hook_check_in(&home, "rm -rf /tmp/omamori-509-3", false);
+        assert_eq!(exit, 2);
+        if removed {
+            fs::remove_file(home.join(".local/share/omamori/audit.jsonl")).unwrap();
+        }
+        let human = run_in(&home, &["doctor"]);
+        let json_out = run_in(&home, &["doctor", "--json"]);
+        let stdout = String::from_utf8_lossy(&json_out.stdout).to_string();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+        let signals = &parsed["summary"]["risk_signals"];
+        assert_eq!(
+            signals["needs_attention"],
+            serde_json::json!(String::from_utf8_lossy(&human.stdout).contains(note)),
+            "removed={removed}: the JSON and the headline agree: {signals}"
+        );
+        assert_eq!(
+            signals["needs_attention"],
+            serde_json::json!(removed),
+            "{signals}"
+        );
+        if removed {
+            assert_eq!(
+                signals["chain_status"],
+                serde_json::json!({ "status": "inaccessible", "kind": "log_missing" })
+            );
+        }
+        // The section added here carries no path. (`items` has always named
+        // shim and hook paths; that is not this section.)
+        assert!(
+            !signals.to_string().contains(&*home.to_string_lossy()),
+            "no path: {signals}"
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+}
+
 fn copy_binary_to(dir: &std::path::Path) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let exe = dir.join("omamori");
