@@ -363,7 +363,8 @@ fn hook_version_drift_suffix(installed: Option<&str>) -> String {
         }
         HookVersionDrift::Drift { installed } => format!(
             " [version drift: hooks rendered by v{installed}, binary is v{} \u{2014} run \
-             `omamori install --hooks` (or `omamori doctor --fix`) to regenerate]",
+             `omamori install --hooks` (or `omamori doctor --fix` directly in your terminal, not via AI) \
+             to regenerate]",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -1810,6 +1811,16 @@ mod tests {
             "suffix: {suffix}"
         );
         assert!(suffix.contains("version drift"), "suffix: {suffix}");
+    }
+
+    #[test]
+    fn hook_version_drift_suffix_sends_doctor_fix_to_a_terminal_without_ai() {
+        let content = "#!/bin/sh\n# omamori hook v0.0.1 — wrapper\nexit 0\n";
+        let suffix = hook_version_drift_suffix(installer::parse_hook_version(content));
+        assert!(
+            suffix.contains("`omamori doctor --fix` directly in your terminal, not via AI"),
+            "suffix: {suffix}"
+        );
     }
 
     #[test]
