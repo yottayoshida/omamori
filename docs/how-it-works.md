@@ -26,7 +26,7 @@ Layer 2 hooks defend against evasion patterns via builtin rules. Structural patt
 | Extractable | pipe-to-shell (`curl … \| bash`), parse edge cases | **allow** with audit-logged staging file |
 | Opaque | dynamic generation (`bash -c "$(cmd)"`), shell obfuscation (`$'rm'`, `{rm,-rf,/}`), oversized input | **block** |
 
-Environment-variable tampering, PATH override attempts, and self-modification commands (`config disable`, `uninstall`, etc.) are always blocked. See [SECURITY.md](../SECURITY.md) for the full structural pattern taxonomy.
+Environment-variable tampering, PATH override attempts, and self-modification commands (`config disable`, `uninstall`, etc.) are blocked, except in the shapes listed under [SECURITY.md → Rules That Never See the `omamori` Command](../SECURITY.md#rules-that-never-see-the-omamori-command-586) ([#586](https://github.com/yottayoshida/omamori/issues/586), [#593](https://github.com/yottayoshida/omamori/issues/593)). See [SECURITY.md](../SECURITY.md) for the full structural pattern taxonomy.
 
 > Extractable structural patterns are allowed by default, with an audit trail. To hard-block all structural patterns instead, set `[structural] action = "block"` in config.toml.
 
@@ -80,7 +80,7 @@ Terminal → rm -rf src/
 |------------|--------------|-------------|
 | **Layer 1 — PATH shim** | Intercepts destructive commands (`rm`, `git`, `chmod`, `find`, `rsync`) by name when an AI env var is detected | `omamori test`, CI |
 | **Layer 2 — Hooks** | Catches evasion patterns: shell wrappers, pipe-to-shell, dynamic generation, PATH override bypass | Hook integration tests |
-| **Self-defense** | Blocks self-modification commands (`config disable`, `uninstall`, etc.), hook/config editing, env-var unsetting while AI-detected | Acceptance test suite |
+| **Self-defense** | Blocks self-modification commands (`config disable`, `uninstall`, etc.), hook/config editing, env-var unsetting while AI-detected (known gaps: #577, #586, #593) | Acceptance test suite |
 | **Audit chain** | HMAC-SHA256 signed, hash-chained tamper-evident JSONL log at `~/.local/share/omamori/audit.jsonl` — also records successful `config disable/enable/add` mutations, not just command decisions | `omamori audit verify` |
 | **Integrity monitoring** | Verifies shims, hooks, config, core policy, PATH order. Detects subtle hook body rewrites | `omamori doctor`, `omamori status` |
 | **File protection** | Blocks AI Edit/Write on config, hooks, audit log, integrity baseline, everything under `~/.omamori`, Claude Code `settings.json` / `settings.local.json`, and AI reads of the audit HMAC secret — Claude Code tools only; shell commands that write these files are not blocked ([#577](https://github.com/yottayoshida/omamori/issues/577)) | Hook integration tests, ACCEPTANCE_TEST.md live row |
