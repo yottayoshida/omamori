@@ -104,7 +104,7 @@ Layer 2 (hooks):      phase: rule: rm-recursive-to-trash
 
 Read it as: which layer matched, which rule, and what action would apply (`trash` means the targets are moved to Trash instead of deleted; `block` refuses outright).
 
-**Run it in your own terminal.** `explain` is itself blocked in AI-agent environments — if an AI could ask "would this be blocked?" before every attempt, it could probe the ruleset for gaps (oracle-attack prevention, by design). The `hint: run omamori explain …` line in a block message is addressed to *you*, the human, even when the AI is the one showing it to you.
+**Run it in your own terminal.** `explain` is itself blocked in AI-agent environments — if an AI could ask "would this be blocked?" before every attempt, it could probe the ruleset for gaps (oracle-attack prevention, by design). A block message's hint therefore starts "Tell the user:" and gives the `omamori explain -- …` command for *you* to run in your own terminal, so the agent passes it on instead of trying it. Words that a shell would split or expand are single-quoted, so under a default bash or zsh pasting the command runs `explain` and nothing else (a global alias of your own on a plain word is outside this). The hint shows `omamori explain -- <the command>` instead when the command holds a `$'…'` word (quoting it would stop the expansion the hook saw), a backtick (it would break the hint's own quoting), or — in a hook block — non-ASCII characters, which the hook's parser does not carry through intact. `explain` on your own retyping of such a command may report a different verdict from the one that blocked it.
 
 `--json` gives the same verdict machine-readably; `--config PATH` simulates against an alternate config file.
 

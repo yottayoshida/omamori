@@ -795,12 +795,13 @@ pub(crate) fn run_command(
             match &outcome {
                 ActionOutcome::Blocked { .. } | ActionOutcome::Failed { .. } => {
                     eprintln!("{}", outcome.message());
-                    let explain_cmd = format_explain_hint(&invocation);
-                    eprintln!("  hint: run `{explain_cmd}` for details");
-                    eprintln!(
-                        "  hint: false positive? run `omamori break-glass --rule {}` to bypass for 1h",
-                        rule.name
-                    );
+                    let argv: Vec<&str> = std::iter::once(invocation.program.as_str())
+                        .chain(invocation.args.iter().map(String::as_str))
+                        .collect();
+                    let explain = crate::engine::hook::argv_explain_hint(&argv);
+                    for hint in crate::engine::hook::block_hints(explain, Some(&rule.name)) {
+                        eprintln!("  hint: {hint}");
+                    }
                 }
                 ActionOutcome::Trashed { message, .. } | ActionOutcome::MovedTo { message, .. } => {
                     eprintln!("{message}");
@@ -833,16 +834,6 @@ pub(crate) fn run_command(
     }
 
     Ok(outcome.exit_code())
-}
-
-/// Format `omamori explain -- <program> <args...>` hint for block messages.
-fn format_explain_hint(invocation: &CommandInvocation) -> String {
-    let args_str = if invocation.args.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", shell_words::join(&invocation.args))
-    };
-    format!("omamori explain -- {}{}", invocation.program, args_str)
 }
 
 // ---------------------------------------------------------------------------

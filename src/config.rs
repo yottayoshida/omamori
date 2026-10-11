@@ -189,7 +189,7 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
                         warnings.push(format!(
                             "failed to parse config at {} ({error})\n  \
                              Built-in default rules are active for safety.\n  \
-                             Fix the syntax error or run: omamori init --force",
+                             Fix the syntax error, or run `omamori init --force` directly in your terminal (not via AI).",
                             path.display()
                         ));
                         Config::default()
@@ -551,7 +551,7 @@ fn apply_user_overrides(
         if has_enabled_override && !has_overrides_entry && ur.enabled == Some(false) {
             warnings.push(format!(
                 "rule `{}` is a core safety rule and cannot be disabled via config. \
-                 Ignored. To override: omamori override disable {}",
+                 Ignored. To override, run `omamori override disable {}` directly in your terminal (not via AI).",
                 rule.name, rule.name
             ));
         }
@@ -966,7 +966,7 @@ pub fn default_rules() -> Vec<RuleConfig> {
             vec!["key".to_string(), "rotate".to_string()],
             Vec::new(),
             Some(
-                "omamori blocked audit key rotation via AI — run it yourself in a plain terminal if you intended to rotate the signing key"
+                "omamori blocked audit key rotation via AI — only the user can rotate the signing key, from their own terminal"
                     .to_string(),
             ),
         )
@@ -1105,7 +1105,7 @@ pub fn write_default_config(path: &Path, force: bool) -> Result<WriteConfigResul
 
         if !force {
             return Err(AppError::Config(format!(
-                "config already exists at {}\n  Use `omamori init --force` to overwrite.",
+                "config already exists at {}\n  To overwrite it, run `omamori init --force` directly in your terminal (not via AI).",
                 path.display()
             )));
         }
@@ -1205,6 +1205,43 @@ mod tests {
                 |w: &String| w.contains("core safety rule") && w.contains("cannot be disabled")
             ),
             "expected immutability warning, got: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn the_core_rule_warning_sends_the_override_to_a_terminal_without_ai() {
+        let user_rules = vec![UserRule {
+            name: "git-push-force-block".to_string(),
+            command: None,
+            action: None,
+            enabled: Some(false),
+            destination: None,
+            match_all: None,
+            match_any: None,
+            message: None,
+            subcommand: None,
+        }];
+        let mut warnings = Vec::new();
+        merge_rules(default_rules(), &user_rules, &no_overrides(), &mut warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains(
+                "run `omamori override disable git-push-force-block` directly in your terminal (not via AI)"
+            )),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_existing_config_sends_init_force_to_a_terminal_without_ai() {
+        let dir = std::env::temp_dir().join(format!("omamori-init-exists-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "").unwrap();
+        let err = write_default_config(&path, false).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            err.contains("run `omamori init --force` directly in your terminal (not via AI)"),
+            "{err}"
         );
     }
 
@@ -1871,11 +1908,11 @@ name = "malformed-no-command"
         assert_eq!(
             rule.message.as_deref(),
             Some(
-                "omamori blocked audit key rotation via AI — run it yourself in a plain \
-                 terminal if you intended to rotate the signing key"
+                "omamori blocked audit key rotation via AI — only the user can rotate the \
+                 signing key, from their own terminal"
             ),
-            "message must point AI readers at a plain-terminal escape hatch, not the \
-             `explain`/`break-glass` hints (both are dead ends for AI readers per #393)"
+            "the reason is read first by the agent, so it must not tell its reader to run \
+             the rotation (#393)"
         );
     }
 
@@ -2483,6 +2520,29 @@ message = "custom"
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_that_does_not_parse_sends_init_force_to_a_terminal_without_ai() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("omamori-cfg-unparsed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(&path, "[[rules]\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let result = load_config(Some(&path)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w
+                    .contains("run `omamori init --force` directly in your terminal (not via AI)")),
+            "{:?}",
+            result.warnings
+        );
     }
 
     // --- Staging GC config (#313) ---
