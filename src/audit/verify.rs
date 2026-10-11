@@ -2192,18 +2192,7 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
     };
     let secret_available = unprotected_reason.is_none();
 
-    // #514: asked with the writer's own opener, minus `create`. The read below
-    // cannot stand in for it — it opens `O_RDONLY`, so a log at mode `0400`
-    // reads fine and reports no error while every append fails.
-    let append_outlook = Some(match open_audit_existing_rw(&path) {
-        Ok(_) => AppendOutlook::Writable,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppendOutlook::NoLogYet,
-        // Sanitized for the reason the read arm below states at length: this
-        // message ends with the audit path, `config.toml` can put escape
-        // sequences into an absolute `audit.path`, and `break-glass` prints
-        // this two lines above the prompt the operator is answering.
-        Err(e) => AppendOutlook::NotWritable(super::strip_control_chars(&e.to_string())),
-    });
+    let append_outlook = Some(append_outlook_at(&path));
 
     let (entry_count, path_error) = match open_read_nofollow(&path) {
         Ok(f) => {
@@ -2243,6 +2232,20 @@ pub fn audit_summary(config: &AuditConfig) -> AuditSummary {
         missing_log: missing_log(&path, path_error.is_none(), entry_count),
         path_error,
         append_outlook,
+    }
+}
+
+pub(crate) fn append_outlook_at(path: &std::path::Path) -> AppendOutlook {
+    // #514: asked with the writer's own opener, minus `create`. A read cannot
+    // stand in for it — it opens `O_RDONLY`, so a log at mode `0400` reads fine
+    // and reports no error while every append fails.
+    match open_audit_existing_rw(path) {
+        Ok(_) => AppendOutlook::Writable,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AppendOutlook::NoLogYet,
+        // Sanitized: this message ends with the audit path, `config.toml` can
+        // put escape sequences into an absolute `audit.path`, and `break-glass`
+        // prints this two lines above the prompt the operator is answering.
+        Err(e) => AppendOutlook::NotWritable(super::strip_control_chars(&e.to_string())),
     }
 }
 

@@ -249,10 +249,11 @@ fn section_annotations(section: DoctorSection) -> &'static [fn(&mut Out<'_>, boo
     }
 }
 
-/// Probes whether the resolved audit log path's parent directory accepts
-/// writes, without touching `audit.jsonl` or its HMAC secret, and without
-/// creating any directory (doctor's diagnose path writes nothing to disk
-/// by default — see module doc). Best-effort: unresolvable
+/// Whether an append to the resolved audit log would land: an existing log
+/// that the writer's own opener refuses is not writable; otherwise its parent
+/// directory is probed. Nothing is written to `audit.jsonl` or its HMAC
+/// secret, and no directory is created (doctor's diagnose path writes nothing
+/// to disk by default — see module doc). Best-effort: unresolvable
 /// (`resolved_audit_path` → `None`, e.g. unusable `HOME`) or any I/O error
 /// is reported as not writable rather than silently skipped — this is the
 /// doctor-side complement to the sentinel-based stderr throttle in
@@ -260,13 +261,22 @@ fn section_annotations(section: DoctorSection) -> &'static [fn(&mut Out<'_>, boo
 /// same failure, so it can't be the only surface for this condition.
 ///
 /// If the parent doesn't exist yet (fresh install, nothing has appended to
-/// the audit log), probes the nearest existing ancestor instead — a
-/// reasonable proxy, since a non-writable ancestor blocks creating the
-/// parent too.
+/// the audit log), probes the nearest ancestor that is there in any form —
+/// a dangling link included — instead: a reasonable proxy, since a
+/// non-writable ancestor blocks creating the parent too.
 fn audit_path_is_writable(config: &crate::audit::AuditConfig) -> Option<bool> {
     let path = crate::audit::resolved_audit_path(config)?;
+    if matches!(
+        crate::audit::verify::append_outlook_at(&path),
+        crate::audit::AppendOutlook::NotWritable(_)
+    ) {
+        return Some(false);
+    }
     let parent = path.parent()?;
-    let probe_dir = std::iter::successors(Some(parent), |p| p.parent()).find(|p| p.exists())?;
+    // Not `exists()`: it follows a link, so a dangling one reads as absent and the probe lands
+    // in the directory above it, where it succeeds while every append fails.
+    let probe_dir = std::iter::successors(Some(parent), |p| p.parent())
+        .find(|p| p.symlink_metadata().is_ok())?;
     // Process ID alone is not unique enough: multiple threads within one
     // process (e.g. parallel `cargo test` runs) share it, and when
     // `probe_dir` resolves to a common ancestor (like the OS temp root),
@@ -2074,6 +2084,99 @@ mod tests {
             !dir.exists(),
             "probing writability must not create the missing parent directory"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_holding_the_audit_log_is_not_writable() {
+        let root = std::env::temp_dir().join(format!(
+            "omamori-doctor-dangling-data-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("nowhere");
+        let link = root.join("data");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(link.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(false));
+        assert!(
+            !target.exists(),
+            "probing writability must not create the link's target"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_audit_log_the_writer_cannot_open_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "omamori-doctor-read-only-log-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("audit.jsonl");
+        std::fs::write(&log, "").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(log.clone()),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(false));
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_audit_log_that_is_a_symlink_is_not_writable() {
+        let dir =
+            std::env::temp_dir().join(format!("omamori-doctor-linked-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("elsewhere.jsonl");
+        std::fs::write(&real, "").unwrap();
+        let log = dir.join("audit.jsonl");
+        std::os::unix::fs::symlink(&real, &log).unwrap();
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(log),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_an_existing_directory_holding_the_audit_log_is_writable() {
+        let root = std::env::temp_dir().join(format!(
+            "omamori-doctor-linked-data-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let target = root.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("data");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let config = crate::audit::AuditConfig {
+            enabled: true,
+            path: Some(link.join("audit.jsonl")),
+            retention_days: 0,
+            strict: false,
+        };
+        assert_eq!(audit_path_is_writable(&config), Some(true));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

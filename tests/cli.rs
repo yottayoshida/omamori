@@ -8207,6 +8207,73 @@ fn doctor_json_reports_the_risk_signals_the_headline_does() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn doctor_says_the_audit_log_cannot_be_written_when_the_data_directory_is_a_dangling_link() {
+    let home = unique_dir("486-dangling-data-dir");
+    fs::create_dir_all(home.join(".local/share")).unwrap();
+    let target = home.join("nowhere");
+    std::os::unix::fs::symlink(&target, home.join(".local/share/omamori")).unwrap();
+
+    let out = run_in(&home, &["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("Risk signals below need attention."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("audit log: not writable"), "{stdout}");
+    assert!(!target.exists(), "doctor must not create the link's target");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_warns_when_the_audit_log_cannot_be_written() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = home_with_a_written_store("486-status-read-only-log");
+    let log = home.join(".local/share/omamori/audit.jsonl");
+    let layer3 = |out: &std::process::Output| -> String {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.contains("Layer 3 (audit)"))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let writable = layer3(&run_in(&home, &["status"]));
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o400)).unwrap();
+    let read_only = layer3(&run_in(&home, &["status"]));
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(writable.contains("[ok]"), "{writable}");
+    assert!(
+        read_only.contains("[warn]") && read_only.contains("not writable"),
+        "{read_only}"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_says_the_audit_log_cannot_be_written_when_the_log_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = unique_dir("486-read-only-log");
+    let (_, exit) = hook_check_in(&home, "rm -rf /tmp/omamori-486-read-only", false);
+    assert_eq!(exit, 2, "the block is recorded, so the store exists");
+    let log = home.join(".local/share/omamori/audit.jsonl");
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o400)).unwrap();
+
+    let out = run_in(&home, &["doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("Risk signals below need attention."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("audit log: not writable"), "{stdout}");
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
+    let _ = fs::remove_dir_all(&home);
+}
+
 fn copy_binary_to(dir: &std::path::Path) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let exe = dir.join("omamori");

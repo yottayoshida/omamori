@@ -119,6 +119,13 @@ pub(crate) fn run_status_command(args: &[OsString]) -> Result<i32, AppError> {
             // #509: before the "log created on first event" arm, which this
             // state used to reach.
             out!(o, "  {:<6} {:<36} {gone}", "[warn]", "Layer 3 (audit)");
+        } else if let Some(audit::AppendOutlook::NotWritable(reason)) = &summary.append_outlook {
+            out!(
+                o,
+                "  {:<6} {:<36} log not writable, appends fail: {reason}",
+                "[warn]",
+                "Layer 3 (audit)"
+            );
         } else if let Some(reason) = &summary.unprotected_reason {
             // #471: this arm used to print `HMAC secret missing` for every
             // reason `read_secret` could fail, and never fired at all for the
