@@ -256,6 +256,18 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 /// Phase 1B: token-level env var tampering / PATH override bypass.
 /// Returns `Err(BlockMeta)` on detection, `Ok(())` otherwise.
 fn check_phase_1b(command: &str) -> Result<(), HookCheckResult> {
+    check_phase_1b_reading(command)?;
+    for &shell in crate::shell_text::shells_reading(command) {
+        if let std::borrow::Cow::Owned(moved) =
+            crate::shell_text::redirects_moved_to_the_end(command, shell)
+        {
+            check_phase_1b_reading(&moved)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_phase_1b_reading(command: &str) -> Result<(), HookCheckResult> {
     let command = unwrap::prepare_for_splitting(command);
     let normalized = unwrap::normalize_compound_operators(&command);
     let tokens = unwrap::split_words(&normalized)

