@@ -2338,19 +2338,23 @@ message = "moved to trash"
         fs::create_dir_all(&dir).unwrap();
 
         let path = dir.join("config.toml");
-        fs::write(&path, "# test config\n").unwrap();
+        fs::write(&path, "[structural]\naction = \"block\"\n").unwrap();
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Set insecure permissions (world-readable)
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
             let result = load_config(Some(&path)).unwrap();
-            // Should warn about permissions and use default config
             assert!(
                 result.warnings.iter().any(|w| w.contains("permissions")),
                 "should warn about insecure permissions"
+            );
+            assert!(result.degraded, "an insecure config is a degraded load");
+            assert_eq!(
+                result.config.structural.action,
+                StructuralAction::Materialize,
+                "the file's own settings are not applied"
             );
         }
 
