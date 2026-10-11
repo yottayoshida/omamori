@@ -5,6 +5,7 @@
 //! to expose the real command for rule matching.
 
 use crate::rules::CommandInvocation;
+use std::borrow::Cow;
 
 // --- Limits (fail-close on exceed) ---
 
@@ -124,7 +125,8 @@ pub(crate) fn parse_at_depth(input: &str, depth: u8) -> ParseResult {
         return ParseResult::Block(BlockReason::DepthExceeded);
     }
 
-    let normalized = normalize_compound_operators(input);
+    let input = set_aside_data_heredocs(input);
+    let normalized = normalize_compound_operators(&input);
 
     if raw_has_verb_obfuscation(&normalized) {
         return ParseResult::Block(BlockReason::ObfuscatedExpansion);
@@ -682,32 +684,55 @@ fn raw_word_has_expansion(word: &str) -> bool {
 /// Preserves operators inside quotes (shell-words handles quote tracking,
 /// so we only need to handle the unquoted case).
 pub(crate) fn normalize_compound_operators(input: &str) -> String {
-    let mut result = String::with_capacity(input.len() + 32);
+    // Built as bytes: only ASCII is inserted, and only at ASCII positions, so
+    // the result is still UTF-8. Pushing each byte as a `char` would turn
+    // every multi-byte character into Latin-1.
+    let mut result: Vec<u8> = Vec::with_capacity(input.len() + 32);
     let bytes = input.as_bytes();
     let len = bytes.len();
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
+    let mut in_ansi = false;
 
     while i < len {
         let b = bytes[i];
 
+        if in_ansi {
+            if b == b'\\' && i + 1 < len {
+                result.extend_from_slice(&bytes[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            if b == b'\'' {
+                in_ansi = false;
+            }
+            result.push(b);
+            i += 1;
+            continue;
+        }
+
         // Track quote state
+        if b == b'$' && !in_single && !in_double && i + 1 < len && bytes[i + 1] == b'\'' {
+            in_ansi = true;
+            result.extend_from_slice(b"$'");
+            i += 2;
+            continue;
+        }
         if b == b'\'' && !in_double {
             in_single = !in_single;
-            result.push(b as char);
+            result.push(b);
             i += 1;
             continue;
         }
         if b == b'"' && !in_single {
             in_double = !in_double;
-            result.push(b as char);
+            result.push(b);
             i += 1;
             continue;
         }
         if b == b'\\' && !in_single && i + 1 < len {
-            result.push(b as char);
-            result.push(bytes[i + 1] as char);
+            result.extend_from_slice(&bytes[i..i + 2]);
             i += 2;
             continue;
         }
@@ -715,7 +740,7 @@ pub(crate) fn normalize_compound_operators(input: &str) -> String {
         // Only split operators outside quotes
         if !in_single && !in_double {
             if b == b'&' && i + 1 < len && bytes[i + 1] == b'&' {
-                result.push_str(" && ");
+                result.extend_from_slice(b" && ");
                 i += 2;
                 continue;
             }
@@ -726,22 +751,22 @@ pub(crate) fn normalize_compound_operators(input: &str) -> String {
             if b == b'&' {
                 if i + 1 < len && bytes[i + 1] == b'>' {
                     // &> redirect — pass through
-                    result.push(b as char);
+                    result.push(b);
                     i += 1;
                     continue;
                 }
                 if i > 0 && bytes[i - 1] == b'>' {
                     // >& or N>& redirect — pass through
-                    result.push(b as char);
+                    result.push(b);
                     i += 1;
                     continue;
                 }
-                result.push_str(" & ");
+                result.extend_from_slice(b" & ");
                 i += 1;
                 continue;
             }
             if b == b'|' && i + 1 < len && bytes[i + 1] == b'|' {
-                result.push_str(" || ");
+                result.extend_from_slice(b" || ");
                 i += 2;
                 continue;
             }
@@ -751,24 +776,24 @@ pub(crate) fn normalize_compound_operators(input: &str) -> String {
             // this, `cmd |& env bash` would slip past pipe-to-shell
             // detection (#146 P1-1, Codex Phase 6-A round 3).
             if b == b'|' && i + 1 < len && bytes[i + 1] == b'&' {
-                result.push_str(" | ");
+                result.extend_from_slice(b" | ");
                 i += 2;
                 continue;
             }
             if b == b';' {
-                result.push_str(" ; ");
+                result.extend_from_slice(b" ; ");
                 i += 1;
                 continue;
             }
             if b == b'|' {
-                result.push_str(" | ");
+                result.extend_from_slice(b" | ");
                 i += 1;
                 continue;
             }
             // Newline and carriage return — command separators in shell.
             // \r\n is consumed as a pair.
             if b == b'\n' || b == b'\r' {
-                result.push_str(" ; ");
+                result.extend_from_slice(b" ; ");
                 if b == b'\r' && i + 1 < len && bytes[i + 1] == b'\n' {
                     i += 2;
                 } else {
@@ -778,11 +803,162 @@ pub(crate) fn normalize_compound_operators(input: &str) -> String {
             }
         }
 
-        result.push(b as char);
+        result.push(b);
         i += 1;
     }
 
-    result
+    String::from_utf8(result).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+// Not an empty string: redirect handling must still see a heredoc here.
+const HEREDOC_MARK: &str = "<<OMAMORI_HEREDOC";
+
+pub(crate) fn set_aside_data_heredocs(text: &str) -> Cow<'_, str> {
+    let Some(heredocs) = crate::shell_text::certain_heredocs(text) else {
+        return Cow::Borrowed(text);
+    };
+    if heredocs.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let marked = mark_heredocs(text, &heredocs, &vec![true; heredocs.len()]);
+    let Some(data) = heredocs_read_as_data(&marked, heredocs.len()) else {
+        return Cow::Borrowed(text);
+    };
+    if !data.contains(&true) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(mark_heredocs(text, &heredocs, &data))
+}
+
+fn mark_heredocs(
+    text: &str,
+    heredocs: &[crate::shell_text::Heredoc],
+    set_aside: &[bool],
+) -> String {
+    let mut cuts: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (heredoc, _) in heredocs.iter().zip(set_aside).filter(|(_, aside)| **aside) {
+        cuts.push((heredoc.operator.clone(), format!(" {HEREDOC_MARK} ")));
+        cuts.push((heredoc.body.clone(), String::new()));
+    }
+    cuts.sort_by_key(|(range, _)| range.start);
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    for (range, replacement) in cuts {
+        out.push_str(&text[pos..range.start]);
+        out.push_str(&replacement);
+        pos = range.end;
+    }
+    out.push_str(&text[pos..]);
+    out
+}
+
+const COMPOUND_OPENERS: &[&str] = &[
+    "{", "!", "if", "while", "until", "for", "select", "case", "coproc",
+];
+
+fn heredocs_read_as_data(marked: &str, count: usize) -> Option<Vec<bool>> {
+    let tokens = shell_words::split(&normalize_compound_operators(marked)).ok()?;
+    let segments = split_on_operators(&tokens);
+    // A function or alias defined in the same command can stand in for any
+    // reader's name; a process substitution anywhere in it, or a group or
+    // compound command around the reader, can carry its output to a shell
+    // that only a later segment names (`{⏎cat <<EOF … } | bash`).
+    let rewired = tokens.iter().any(|t| {
+        t == "function"
+            || t == "alias"
+            || defines_a_function(t)
+            || t.contains(">(")
+            || t.contains("<(")
+            || COMPOUND_OPENERS.contains(&t.as_str())
+            || t.starts_with('(')
+    });
+    let mut data = Vec::with_capacity(count);
+    for (index, (_, segment)) in segments.iter().enumerate() {
+        let marks = segment
+            .iter()
+            .filter(|t| t.as_str() == HEREDOC_MARK)
+            .count();
+        if marks == 0 {
+            continue;
+        }
+        let feeds_a_pipe = segments
+            .get(index + 1)
+            .is_some_and(|(op, _)| *op == SegmentOp::Pipe);
+        let is_data = !rewired
+            && !feeds_a_pipe
+            && !opens_another_stream(segment)
+            && reader_takes_input_as_data(segment);
+        data.extend(std::iter::repeat_n(is_data, marks));
+    }
+    (data.len() == count).then_some(data)
+}
+
+// Not only `>` to a file: a device or descriptor path, a descriptor above 2,
+// a named descriptor or a duplication can hand the reader's output to
+// something the segment does not name.
+fn opens_another_stream(segment: &[String]) -> bool {
+    segment.iter().any(|t| {
+        let b = t.as_bytes();
+        let dup_target_unsure = t
+            .match_indices(">&")
+            .chain(t.match_indices("<&"))
+            .any(|(at, _)| !is_standard_stream(&b[at + 2..]));
+        t.contains("/dev/")
+            || t.contains("/proc/")
+            || (b.len() >= 2 && (b'3'..=b'9').contains(&b[0]) && matches!(b[1], b'<' | b'>'))
+            || (t.starts_with('{') && (t.contains("}>") || t.contains("}<")))
+            || dup_target_unsure
+    })
+}
+
+// Not only right after a name: `name ()` splits into two words, leaving the
+// `()` at the start of the second.
+fn defines_a_function(word: &str) -> bool {
+    let b = word.as_bytes();
+    word.match_indices("()").any(|(at, _)| {
+        at == 0
+            || b[at - 1].is_ascii_alphanumeric()
+            || matches!(b[at - 1], b'_' | b'-' | b'.' | b':')
+    })
+}
+
+// Not the first character alone: `>&13` is descriptor 13.
+fn is_standard_stream(target: &[u8]) -> bool {
+    matches!(target.first(), Some(b'0' | b'1' | b'2' | b'-'))
+        && !target
+            .get(1)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+// `sort` is not here: `--compress-program` runs a command over its input.
+// Nor are `awk`, `sed`, `sqlite3`, `psql`, `mysql`: each can run its input's
+// lines.
+fn reader_takes_input_as_data(segment: &[String]) -> bool {
+    let tokens = unwrap_transparent(segment);
+    let Some(program) = tokens.first() else {
+        return false;
+    };
+    let args: Vec<&str> = tokens[1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !RedirectToken::classify(t).is_redirect())
+        .collect();
+    let subcommand = args.iter().find(|a| !a.starts_with('-')).copied();
+    match basename(program) {
+        "cat" | "tee" | "jq" | "yq" | "grep" | "wc" => true,
+        "python" | "python3" | "node" | "ruby" | "perl" => args.iter().all(|a| *a == "-"),
+        "git" => {
+            !args
+                .iter()
+                .any(|a| *a == "-c" || a.starts_with("--config-env"))
+                && matches!(subcommand, Some("commit" | "tag" | "notes" | "hash-object"))
+        }
+        "gh" => matches!(
+            subcommand,
+            Some("pr" | "issue" | "api" | "release" | "gist")
+        ),
+        _ => false,
+    }
 }
 
 /// Split token list on compound operators (&&, ||, ;, |).
@@ -2073,6 +2249,124 @@ mod tests {
     // so future reviewers can find the rationale without re-deriving it.
 
     use super::*;
+
+    #[test]
+    fn a_heredoc_body_in_a_group_or_compound_command_is_read_as_commands() {
+        for input in [
+            "{\ncat <<'EOF'\nrm -rf /tmp/x\nEOF\n} | bash",
+            "{ :; cat <<'EOF'\nrm -rf /tmp/x\nEOF\n} | bash",
+            "if true; then\ncat <<'EOF'\nrm -rf /tmp/x\nEOF\nfi | bash",
+            "for i in 1; do\ncat <<'EOF'\nrm -rf /tmp/x\nEOF\ndone | sh",
+            "while true; do\ntee x <<'EOF'\nrm -rf /tmp/x\nEOF\nbreak; done | bash",
+        ] {
+            assert!(
+                set_aside_data_heredocs(input).contains("rm -rf /tmp/x"),
+                "{input:?}"
+            );
+        }
+        assert!(
+            !set_aside_data_heredocs("cat > notes.md <<'EOF'\nrm -rf /tmp/x\nEOF")
+                .contains("rm -rf /tmp/x")
+        );
+    }
+
+    fn programs(input: &str) -> Vec<String> {
+        match parse_command_string(input) {
+            ParseResult::Commands(cmds) => cmds.into_iter().map(|c| c.program).collect(),
+            ParseResult::Block(reason) => panic!("expected Commands for {input:?}, got {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn a_heredoc_body_a_data_reader_takes_is_not_read_as_commands() {
+        for input in [
+            "cat > notes.md <<'EOF'\ngit push --force\nEOF",
+            "tee notes.md <<EOF\ngit push --force\nEOF",
+            "python3 - <<'PY'\ngit push --force\nPY",
+            "git commit -F - <<'EOF'\ngit push --force\nEOF",
+            "gh pr create --body-file - <<'EOF'\ngit push --force\nEOF",
+            "sudo cat > /etc/x <<'EOF'\ngit push --force\nEOF",
+        ] {
+            let ParseResult::Commands(cmds) = parse_command_string(input) else {
+                panic!("expected Commands for {input:?}");
+            };
+            assert!(
+                !cmds.iter().any(|c| c.args.iter().any(|a| a == "--force")),
+                "{input:?}: {cmds:?}"
+            );
+        }
+        assert_eq!(
+            programs("cat > notes.md <<'EOF'\ngit push --force\nEOF\nls"),
+            vec!["cat", "ls"]
+        );
+    }
+
+    #[test]
+    fn a_heredoc_body_that_may_be_run_is_still_read_as_commands() {
+        for input in [
+            "bash <<EOF\ngit push --force\nEOF",
+            "sudo -s <<EOF\ngit push --force\nEOF",
+            "su <<EOF\ngit push --force\nEOF",
+            "time bash <<EOF\ngit push --force\nEOF",
+            "cat <<'EOF' | xargs -I{} sh -c '{}'\ngit push --force\nEOF",
+            "cat <<'EOF' | while read -r c; do $c; done\ngit push --force\nEOF",
+            "tee >(bash) <<'EOF'\ngit push --force\nEOF",
+            "exec 3> >(bash); cat >&3 <<'EOF'\ngit push --force\nEOF",
+            "cat() { bash; }; cat <<'EOF'\ngit push --force\nEOF",
+            "awk '{system($0)}' <<'EOF'\ngit push --force\nEOF",
+            "sort --compress-program=bash <<'EOF'\ngit push --force\nEOF",
+            "python3 -c 'import os,sys; [os.system(l) for l in sys.stdin]' <<'EOF'\ngit push --force\nEOF",
+            "git -c alias.x='!sh' x <<'EOF'\ngit push --force\nEOF",
+            "cat <<EOF\ngit push --force",
+            "echo $((1<<2))\ngit push --force",
+            "cat /dev/null ${x:1<<1}\ngit push --force\n1}",
+            "cat <<EOF\nb\nE\\\nOF\ngit push --force\nEOF",
+            "bash <<B; cat <<A\ngit push --force\nB\nfoo\nA",
+            "exec 3> >(bash); cat >/dev/fd/3 <<'EOF'\ngit push --force\nEOF",
+            "exec > >(bash); cat <<'EOF'\ngit push --force\nEOF",
+            "tee /dev/fd/3 <<'EOF'\ngit push --force\nEOF",
+            "cat >/proc/self/fd/3 <<'EOF'\ngit push --force\nEOF",
+            "cat >&$fd <<'EOF'\ngit push --force\nEOF",
+            "cat >& 3 <<'EOF'\ngit push --force\nEOF",
+            "cat {out}>x <<'EOF'\ngit push --force\nEOF",
+            "coproc bash; cat >&${COPROC[1]} <<'EOF'\ngit push --force\nEOF",
+            "git apply <<'EOF'\ngit push --force\nEOF",
+            "cat(){ bash;}; cat <<'EOF'\ngit push --force\nEOF",
+            "cat (){ bash;}; cat <<'EOF'\ngit push --force\nEOF",
+            "env(){ bash;}; env cat <<'EOF'\ngit push --force\nEOF",
+            "cat >&13 <<'EOF'\ngit push --force\nEOF",
+        ] {
+            assert!(
+                programs(input).iter().any(|p| p == "git"),
+                "{input:?}: {:?}",
+                programs(input)
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_heredocs_that_are_data_are_set_aside() {
+        assert_eq!(
+            programs("bash <<B; cat <<A\ngit push --force\nB\nrm -rf x\nA"),
+            vec!["bash", "cat", "git", "B"],
+            "B's body and closing line are read as commands, as before; A's are set aside"
+        );
+    }
+
+    #[test]
+    fn splitting_operators_keeps_non_ascii_text_whole() {
+        let normalized = normalize_compound_operators("echo 日本語;ls ü");
+        assert!(
+            normalized.contains("日本語") && normalized.contains('ü'),
+            "{normalized}"
+        );
+    }
+
+    #[test]
+    fn an_operator_inside_ansi_c_quotes_does_not_split() {
+        assert!(!normalize_compound_operators("echo $'a\\';b'").contains(" ; "));
+        assert!(normalize_compound_operators("echo $'a\\'';b").contains(" ; "));
+    }
 
     // --- Helper ---
 

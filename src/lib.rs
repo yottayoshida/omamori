@@ -10,6 +10,7 @@ mod engine;
 pub mod installer;
 pub mod integrity;
 pub mod rules;
+pub(crate) mod shell_text;
 pub mod unwrap;
 mod util;
 pub(crate) mod warn_throttle;

@@ -256,7 +256,8 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 /// Phase 1B: token-level env var tampering / PATH override bypass.
 /// Returns `Err(BlockMeta)` on detection, `Ok(())` otherwise.
 fn check_phase_1b(command: &str) -> Result<(), HookCheckResult> {
-    let normalized = unwrap::normalize_compound_operators(command);
+    let command = unwrap::set_aside_data_heredocs(command);
+    let normalized = unwrap::normalize_compound_operators(&command);
     if let Ok(tokens) = shell_words::split(&normalized) {
         if let Some(reason) = detect_env_var_tampering(&tokens) {
             return Err(HookCheckResult::BlockMeta {
