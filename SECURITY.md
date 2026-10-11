@@ -194,7 +194,7 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
 
 - `blocked`: always `true` (allow path uses Claude Code hook response, not this schema)
 - `layer`: forensic layer identifier prefixed with `layer2:` to match the audit log `detection_layer` field exactly. Stderr JSON `layer` and audit row `detection_layer` are interchangeable for correlation
-- `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`; for input validation it is `"invalid-input"`; for file protection it is `"protected-file"` when a `PROTECTED_FILE_PATTERNS` entry actually matched, or `"unresolvable-base"` (#175) when a *relative* `file_path` couldn't be evaluated at all because the process's working directory was unresolvable — see the `layer2:file-protection` row below
+- `rule_id`: for `BlockRule` it is the rule name (e.g. `omamori-config-modify-block`); for `BlockMeta` it is the reason string itself; for `BlockStructural` it is the constant string `"structural"`; for input validation it is `"invalid-input"`; for file protection it is `"protected-file"` when a `PROTECTED_FILE_PATTERNS` entry actually matched or the path is inside the location `~/.local/share/omamori` resolves to (#486 — then `matched_pattern` is `.local/share/omamori`, which the path itself need not contain), or `"unresolvable-base"` (#175) when a *relative* `file_path` couldn't be evaluated at all because the process's working directory was unresolvable — see the `layer2:file-protection` row below
 - `matched_pattern`: the protected pattern token when known. `null` for structural blocks, Phase 1B token-level detections, input validation errors, and the `"unresolvable-base"` fail-close case above (no pattern was ever evaluated, so none is reported)
 - `matched_position`: byte range `[start, end)` of the match in the original command string when known; `null` when position tracking is not available for the layer
 - `warnings` (optional, #494): the lines text mode would have printed while handling the block, in the same order — operator warnings from the audit layer (a key store it cannot use, an append that failed, a high-water-mark it could not advance), from the detector configuration (an invalid detector entry in `config.toml`), from the structural policy routing (a config that failed to load or is degraded, a staging write that failed under `[audit] strict = true`), from a break-glass bypass that could not be audited, and the notes that come with them (the audit log's periodic prune, `omamori: pruned N audit entries …`; the staging prune's count). Human text that may name paths, for display rather than parsing; the same lines reach the same session through stderr in text mode. Absent when there is nothing to report — with a healthy store and configuration that is every run except the one whose append triggers the audit log's periodic prune — so output that parsed before still parses the same
@@ -210,7 +210,7 @@ When `--json-error` is passed to `omamori hook-check`, **all deny paths** emit a
 | `layer2:pipe-to-shell:<wrapper>` | Phase 2 pipe-to-shell with wrapper (e.g. `env`, `bash`) |
 | `layer2:obfuscated-expansion` | Phase 2 obfuscated expansion detection |
 | `layer2:input-validation` | Malformed or incomplete hook input (JSON parse failure or missing fields) |
-| `layer2:file-protection` | Protected file modification attempt (`rule_id: "protected-file"`), or a relative path that couldn't be evaluated because the working directory was unresolvable (`rule_id: "unresolvable-base"`, #175 — fail-closed, not necessarily a real match) |
+| `layer2:file-protection` | Protected file modification attempt (`rule_id: "protected-file"`), including a write under the location a symlinked data directory resolves to, or a relative path that couldn't be evaluated because the working directory was unresolvable (`rule_id: "unresolvable-base"`, #175 — fail-closed, not necessarily a real match) |
 
 **Security note — input validation errors**: `MalformedJson` and `MalformedMissingField` emit identical JSON (same layer, rule_id, reason) to minimize oracle exposure. Attackers cannot distinguish JSON parse failures from missing-field errors, preventing incremental input refinement. The reason string is static and never includes raw stdin content to prevent reflection attacks.
 
@@ -1194,7 +1194,7 @@ The table below enumerates the **audit-file** operations specifically, because t
 
 | Limitation | Reason | Mitigation |
 |------------|--------|------------|
-| Parent directory symlinks not detected | `O_NOFOLLOW` only applies to the final path component | Partial, and narrower than it reads — see [Directories Are Not Covered By The Table Above](#directories-are-not-covered-by-the-table-above-486) ([#486](https://github.com/yottayoshida/omamori/issues/486)). `PROTECTED_FILE_PATTERNS` covers `.local/share/omamori` **at the hook layer only**, so it stops an AI agent's tool call and not a direct OS operation. omamori chooses the path it passes to `create_dir_all` itself, so it cannot be redirected to an attacker-named location — but that is a different question from whether a symlink is already sitting at its own path |
+| Parent directory symlinks not detected | `O_NOFOLLOW` only applies to the final path component | Accepted for the data directory, by decision — see [Directories Are Not Covered By The Table Above](#directories-are-not-covered-by-the-table-above-486) and [ADR-0024](docs/adr/0024-a-symlinked-data-directory-is-used-and-protected-where-it-points.md) ([#486](https://github.com/yottayoshida/omamori/issues/486)). `PROTECTED_FILE_PATTERNS` covers `.local/share/omamori`, and the hook also covers the location it resolves to, **at the hook layer only**, so it stops an AI agent's tool call and not a direct OS operation. omamori chooses the path it passes to `create_dir_all` itself, so it cannot be redirected to an attacker-named location — but that is a different question from whether a symlink is already sitting at its own path |
 | Hardlink attacks not detected | `O_NOFOLLOW` does not affect hardlinks | Same-user structural limitation. Hardlinks require same-partition + same-user |
 | Non-Unix platforms have no symlink protection | `O_NOFOLLOW` is Unix-specific (`#[cfg(unix)]`) | On non-Unix, audit operates without symlink protection. Document as known limitation |
 
@@ -1227,11 +1227,25 @@ directory is an operation on the entry above it, not on the directory itself —
 [Defense Boundary](#defense-boundary) already records direct OS operations by that user as
 **Not protected**. What the row above overstated was the mitigation, not the boundary.
 
-**Deliberately left open.** The fix is not a bug fix: refusing to run against a symlinked
-data directory changes what omamori will accept as an environment, and people do legitimately
-symlink `~/.local/share`. Warning instead trades that for a message on every guarded command.
-Which of the two omamori should do is a decision about the operator's setup, and it is being
-made separately rather than absorbed into a correctness patch.
+**Decided: a symlinked data directory is used, and protected where it points**
+([ADR-0024](docs/adr/0024-a-symlinked-data-directory-is-used-and-protected-where-it-points.md)).
+omamori does not refuse it and does not warn about it: refusing would stop recording for
+everyone who puts `~/.local/share/omamori` (or its parent) elsewhere on purpose, warning would
+land on every guarded command of that setup, and neither takes anything from the user who
+could plant the link, for the reason above. With a link to a directory that exists, appends,
+`audit verify` and `doctor` behave as on a plain directory. The hook's file protection follows
+the link: an agent's `Write` or `Edit` anywhere under the location `~/.local/share/omamori`
+resolves to is blocked as it is under `.local/share/omamori` itself. That holds when the
+location does not exist yet, through a dangling link or a linked `~/.local/share`, since a
+tool that creates missing parents would otherwise complete it with a file the agent wrote.
+The part of the location that exists is recognised under any spelling that reaches it (a
+macOS firmlink, another Unicode normalization); a part not created yet is compared as
+spelled, ignoring case only. Through
+1.4.0 the hook matched the data directory by its spelling only, so `break-glass.json`,
+`staging/` and the heartbeat, which are protected by location rather than by name, could be
+written through the link's target. Everything under the resolved location is protected, so
+the link is expected to point at a directory used only by omamori; pointed at a home
+directory or the root of a synced folder, it would block the agent's writes to all of it.
 
 A third finding filed under the same issue — a retired-key slot whose spelling the listing
 rejects but a path probe accepts — **was closed** by [#498](https://github.com/yottayoshida/omamori/pull/498),

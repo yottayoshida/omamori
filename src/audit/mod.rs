@@ -11461,6 +11461,62 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_data_directory_linked_to_an_existing_one_keeps_the_key_and_log_where_it_points() {
+        let root = test_dir("486-linked-data-dir");
+        let target = root.join("real");
+        fs::create_dir_all(&target).unwrap();
+        let link = root.join("data");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let config = verify_config(&link);
+
+        let mut warnings = Vec::new();
+        let logger = AuditLogger::from_config_collect(&config, true, &mut warnings)
+            .expect("a logger for a linked data directory");
+        logger
+            .append_collect(make_event("first"), &mut warnings)
+            .unwrap();
+        logger
+            .append_collect(make_event("second"), &mut warnings)
+            .unwrap();
+        let result = verify_chain(&config).unwrap();
+
+        assert_eq!(warnings, Vec::<String>::new());
+        assert_eq!(result.broken_at, None);
+        assert_eq!(result.chain_entries, 2);
+        assert!(
+            target.join("audit-secret").is_file(),
+            "the key is created where the link points"
+        );
+        assert!(
+            target.join("audit.jsonl").is_file(),
+            "the log is written where the link points"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_data_directory_linked_to_nothing_records_nothing_and_creates_nothing() {
+        let root = test_dir("486-dangling-data-dir");
+        let target = root.join("nowhere");
+        let link = root.join("data");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let config = verify_config(&link);
+
+        let mut warnings = Vec::new();
+        let appended = AuditLogger::from_config_collect(&config, true, &mut warnings)
+            .map(|logger| logger.append_collect(make_event("first"), &mut warnings));
+
+        assert!(
+            !matches!(appended, Some(Ok(()))),
+            "nothing can be recorded through a dangling link: {warnings:?}"
+        );
+        assert!(!target.exists(), "the link's target is not created");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn verify_chain_rejects_symlink() {
         let dir = test_dir("symlink-verify");
         let logger = test_logger(&dir);

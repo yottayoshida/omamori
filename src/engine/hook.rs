@@ -1953,6 +1953,9 @@ pub(crate) enum MatchKind {
     FilenamePrefix,
     /// Pattern is a suffix of the file's `file_name()`.
     FilenameSuffix,
+    // Not for `PROTECTED_FILE_PATTERNS` rows: `matches` never matches it. The location
+    // `$HOME/<pattern>` resolves to is judged in `is_protected_file_path`, after the table.
+    ResolvedLocation,
 }
 
 impl MatchKind {
@@ -1965,6 +1968,7 @@ impl MatchKind {
             MatchKind::ExactFile => "exact filename",
             MatchKind::FilenamePrefix => "filename starts with",
             MatchKind::FilenameSuffix => "filename ends with",
+            MatchKind::ResolvedLocation => "inside the resolved location of",
         }
     }
 
@@ -1985,7 +1989,7 @@ impl MatchKind {
             MatchKind::ExactFile => file_name == pattern,
             MatchKind::FilenamePrefix => file_name.starts_with(pattern),
             MatchKind::FilenameSuffix => file_name.ends_with(pattern),
-            MatchKind::Subpath => false,
+            MatchKind::Subpath | MatchKind::ResolvedLocation => false,
         }
     }
 }
@@ -1995,6 +1999,9 @@ impl MatchKind {
 /// the write-side pattern below and the read-side check (`reads_audit_secret`)
 /// cannot drift apart.
 const AUDIT_SECRET_PREFIX: &str = "audit-secret";
+
+const DATA_DIR_SUBPATH: &str = ".local/share/omamori";
+const DATA_DIR_DESCRIPTION: &str = "omamori data directory";
 
 /// Patterns that identify omamori's own files and external hook registrations.
 /// SECURITY: pub(crate) const, never pub const. See threat model T2.
@@ -2033,11 +2040,7 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
         MatchKind::FilenameSuffix,
         "audit log (prune in progress)",
     ),
-    (
-        ".local/share/omamori",
-        MatchKind::Subpath,
-        "omamori data directory",
-    ),
+    (DATA_DIR_SUBPATH, MatchKind::Subpath, DATA_DIR_DESCRIPTION),
     (
         "claude-pretooluse.sh",
         MatchKind::ExactFile,
@@ -2082,8 +2085,9 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
     ),
 ];
 
-/// Verdict from `is_protected_file_path`: either it identified which
-/// `PROTECTED_FILE_PATTERNS` entry matched, or the path could not be
+/// Verdict from `is_protected_file_path`: either it identified the protection
+/// that matched (a `PROTECTED_FILE_PATTERNS` entry, or the location the data
+/// directory resolves to, ADR-0024), or the path could not be
 /// evaluated at all (fail-closed) because `base` was unresolvable for a
 /// relative `path` (#175). Kept distinct from a fabricated `(pattern,
 /// kind, description)` tuple — /simplify Altitude review: jamming the
@@ -2197,7 +2201,9 @@ impl FileProtectionVerdict {
 /// substring matcher's dual coverage: a symlink whose *name* doesn't match
 /// any pattern but which resolves to a protected file is still caught via
 /// the canonical candidate, while a distinct, non-symlinked file that
-/// merely shares a substring (`audit.jsonl.md`) is not.
+/// merely shares a substring (`audit.jsonl.md`) is not. After the table, a
+/// path inside the location `$HOME/.local/share/omamori` resolves to is
+/// protected too (ADR-0024).
 ///
 /// `base` anchors relative `path`s (see `context::normalize_path` doc —
 /// security-load-bearing, must come only from the process's own CWD via
@@ -2245,7 +2251,92 @@ fn is_protected_file_path(path: &str, base: Option<&Path>) -> Option<FileProtect
             });
         }
     }
+
+    if paths
+        .first()
+        .is_some_and(|written| is_inside_resolved_data_dir(written))
+    {
+        return Some(FileProtectionVerdict::Matched {
+            pattern: DATA_DIR_SUBPATH,
+            kind: MatchKind::ResolvedLocation,
+            description: DATA_DIR_DESCRIPTION,
+        });
+    }
     None
+}
+
+fn is_inside_resolved_data_dir(written: &Path) -> bool {
+    let Some(data_dir) = crate::context::data_dir().and_then(|d| resolve_through_links(&d)) else {
+        return false;
+    };
+    let Some(written) = resolve_through_links(written) else {
+        return false;
+    };
+    // Not by comparing strings where the data directory exists: a second spelling of the same
+    // directory — a macOS firmlink under /System/Volumes/Data, a name in another Unicode
+    // normalization — is not a link, so resolving leaves it as spelled.
+    let Some((anchor, anchor_id)) = data_dir
+        .ancestors()
+        .find_map(|a| file_identity(a).map(|id| (a, id)))
+    else {
+        return false;
+    };
+    let unborn = data_dir.strip_prefix(anchor).unwrap_or(Path::new(""));
+    for ancestor in written.ancestors() {
+        if file_identity(ancestor).as_ref() == Some(&anchor_id) {
+            let rest = written.strip_prefix(ancestor).unwrap_or(written.as_path());
+            return fold_case(rest).starts_with(fold_case(unborn));
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+fn resolve_through_links(path: &Path) -> Option<std::path::PathBuf> {
+    // Not `canonicalize`: it fails for a location that does not exist yet — a dangling link, or a
+    // linked parent whose child is not created — and a tool that creates missing parents would
+    // complete exactly that location with a file the agent wrote.
+    const MAX_LINKS: usize = 40;
+    let mut pending: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+    let mut resolved = std::path::PathBuf::new();
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == std::path::Component::CurDir.as_os_str() {
+            continue;
+        }
+        if part == std::path::Component::ParentDir.as_os_str() {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(&part);
+        match std::fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                links += 1;
+                if links > MAX_LINKS {
+                    return None;
+                }
+                let link_target = std::fs::read_link(&next).ok()?;
+                for c in link_target.components().rev() {
+                    pending.push_front(c.as_os_str().to_os_string());
+                }
+            }
+            _ => resolved = next,
+        }
+    }
+    Some(resolved)
 }
 
 /// `path` case-folded, for matching against `PROTECTED_FILE_PATTERNS` and the
@@ -3288,6 +3379,175 @@ mod tests {
     fn protected_file_path_rejects_unrelated() {
         let result = is_protected_file_path("/tmp/myfile.txt");
         assert!(result.is_none(), "/tmp/myfile.txt should not be protected");
+    }
+
+    // Where the resolved-location check is under test, the written path keeps
+    // `.local/share/omamori` out: the Subpath rule would catch that spelling on its own and the
+    // check would go untested.
+    #[cfg(unix)]
+    type ProtectionMatch = Option<(&'static str, MatchKind, &'static str)>;
+
+    #[cfg(unix)]
+    fn protection_where_data_dir_points(
+        layout: impl FnOnce(&Path) -> PathBuf,
+    ) -> (ProtectionMatch, ProtectionMatch) {
+        let (old_xdg, old_home, dir) = isolate_config();
+        let written = layout(&dir);
+        let elsewhere = dir.join("unrelated").join("break-glass.json");
+        let verdict = is_protected_file_path(written.to_str().unwrap());
+        let control = is_protected_file_path(elsewhere.to_str().unwrap());
+        restore_config(old_xdg, old_home, dir);
+        (verdict, control)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_write_where_a_linked_data_directory_points_is_protected() {
+        let (verdict, control) = protection_where_data_dir_points(|home| {
+            let target = home.join("elsewhere");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(home.join(".local/share")).unwrap();
+            std::os::unix::fs::symlink(&target, home.join(".local/share/omamori")).unwrap();
+            target.join("break-glass.json")
+        });
+        assert!(
+            matches!(
+                verdict,
+                Some((DATA_DIR_SUBPATH, MatchKind::ResolvedLocation, _))
+            ),
+            "{verdict:?}"
+        );
+        assert_eq!(control, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_write_where_a_dangling_data_directory_link_points_is_protected() {
+        let (verdict, control) = protection_where_data_dir_points(|home| {
+            std::fs::create_dir_all(home.join(".local/share")).unwrap();
+            let target = home.join("nowhere");
+            std::os::unix::fs::symlink(&target, home.join(".local/share/omamori")).unwrap();
+            target.join("break-glass.json")
+        });
+        assert!(
+            matches!(verdict, Some((_, MatchKind::ResolvedLocation, _))),
+            "{verdict:?}"
+        );
+        assert_eq!(control, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_write_into_a_linked_share_before_the_data_directory_exists_is_protected() {
+        let (verdict, control) = protection_where_data_dir_points(|home| {
+            let share = home.join("share-elsewhere");
+            std::fs::create_dir_all(&share).unwrap();
+            std::fs::create_dir_all(home.join(".local")).unwrap();
+            std::os::unix::fs::symlink(&share, home.join(".local/share")).unwrap();
+            share.join("omamori").join("break-glass.json")
+        });
+        assert!(
+            matches!(verdict, Some((_, MatchKind::ResolvedLocation, _))),
+            "{verdict:?}"
+        );
+        assert_eq!(control, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_write_where_a_relative_data_directory_link_points_is_protected() {
+        let (verdict, control) = protection_where_data_dir_points(|home| {
+            let target = home.join("elsewhere");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(home.join(".local/share")).unwrap();
+            std::os::unix::fs::symlink("../../elsewhere", home.join(".local/share/omamori"))
+                .unwrap();
+            target.join("break-glass.json")
+        });
+        assert!(
+            matches!(verdict, Some((_, MatchKind::ResolvedLocation, _))),
+            "{verdict:?}"
+        );
+        assert_eq!(control, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_data_directory_link_that_loops_leaves_the_spelled_path_protected() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(protection_where_data_dir_points(|home| {
+                std::fs::create_dir_all(home.join(".local/share")).unwrap();
+                std::os::unix::fs::symlink("omamori", home.join(".local/share/omamori")).unwrap();
+                home.join(".local/share/omamori/break-glass.json")
+            }));
+        });
+        let (verdict, control) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("resolving a link that loops must terminate");
+        assert!(
+            matches!(verdict, Some((DATA_DIR_SUBPATH, MatchKind::Subpath, _))),
+            "{verdict:?}"
+        );
+        assert_eq!(control, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_write_through_a_firmlink_spelling_of_the_link_target_is_protected() {
+        let (verdict, control) = protection_where_data_dir_points(|home| {
+            let target = home.join("elsewhere");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(home.join(".local/share")).unwrap();
+            std::os::unix::fs::symlink(&target, home.join(".local/share/omamori")).unwrap();
+            let real = std::fs::canonicalize(&target).unwrap();
+            Path::new("/System/Volumes/Data")
+                .join(real.strip_prefix("/").unwrap())
+                .join("break-glass.json")
+        });
+        assert!(
+            matches!(verdict, Some((_, MatchKind::ResolvedLocation, _))),
+            "{verdict:?}"
+        );
+        assert_eq!(control, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_write_through_another_unicode_normalization_of_the_link_target_is_protected() {
+        let (verdict, control) = protection_where_data_dir_points(|home| {
+            let target = home.join("caf\u{e9}");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::create_dir_all(home.join(".local/share")).unwrap();
+            std::os::unix::fs::symlink(&target, home.join(".local/share/omamori")).unwrap();
+            home.join("cafe\u{301}").join("break-glass.json")
+        });
+        assert!(
+            matches!(verdict, Some((_, MatchKind::ResolvedLocation, _))),
+            "{verdict:?}"
+        );
+        assert_eq!(control, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_write_beside_a_plain_data_directory_is_not_protected_by_location() {
+        let (verdict, control) = protection_where_data_dir_points(|home| {
+            std::fs::create_dir_all(home.join(".local/share/omamori")).unwrap();
+            let beside = home.join("beside");
+            std::fs::create_dir_all(&beside).unwrap();
+            beside.join("break-glass.json")
+        });
+        assert_eq!(verdict, None);
+        assert_eq!(control, None);
     }
 
     #[test]
