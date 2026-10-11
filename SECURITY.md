@@ -1207,7 +1207,13 @@ directory it will live in with a plain `create_dir_all`, which asks for no such 
 
 What that costs is narrower than it first looks, and worth stating exactly. A **dangling**
 symlink at the data-directory path is not a silent redirect: `create_dir_all` returns
-`AlreadyExists` and the target is never created (measured, not assumed). The case that
+`AlreadyExists` and the target is never created (measured, not assumed). Nothing is recorded
+while it lasts: a hook append warns and fails each time, the PATH shim warns once per five
+minutes and points at `omamori doctor` (under `[audit] strict` it refuses every guarded
+command instead), `status` warns that no HMAC key is present, `audit
+verify` exits 2, and `doctor` reports the audit log as not writable. Through 1.4.0 `doctor`
+stayed quiet here — its writability probe followed the link with `Path::exists()`, read it as
+absent, and tested the directory above instead ([#486](https://github.com/yottayoshida/omamori/issues/486)). The case that
 passes quietly is a symlink pointing at a directory that **already exists** — it resolves,
 `create_dir_all` returns `Ok`, and every subsequent key read and write lands wherever the
 link points, with nothing said. Enumeration has the same shape from the other side:
