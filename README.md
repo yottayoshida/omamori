@@ -35,7 +35,7 @@ omamori explain -- rm -rf src/
 ## What it does
 
 - **Blocks destructive commands before they run.** `rm -rf` goes to the macOS Trash, `git reset --hard` stashes first, and `git push --force`, `git clean -f`, `chmod 777`, `find -delete` and `rsync --delete` are blocked. Hooks also block obfuscated and dynamically generated forms such as `$'rm'` and `bash -c "$(cmd)"`.
-- **Stops the agent from switching it off.** `config disable`, `uninstall`, PATH overrides and environment-variable tampering are blocked while an AI tool is detected. Built-in rules cannot be disabled from `config.toml`.
+- **Stops the agent from switching it off.** `config disable`, `uninstall`, PATH overrides and environment-variable tampering are blocked while an AI tool is detected (known gaps: [#586](https://github.com/yottayoshida/omamori/issues/586), [#593](https://github.com/yottayoshida/omamori/issues/593)). Built-in rules cannot be disabled from `config.toml`.
 - **Keeps a record you can check.** Hook denies from Claude Code and Codex go into an HMAC-signed, hash-chained audit log that `omamori audit verify` checks, and `omamori doctor` checks that every defense layer is still installed.
 
 Claude Code is supported at Tier 1, Codex CLI and Cursor at Tier 2; other tools get the PATH shim only ([tool compatibility](docs/how-it-works.md#tool-compatibility)).

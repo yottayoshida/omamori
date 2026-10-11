@@ -127,7 +127,7 @@ If you'd rather hard-block structural patterns than collect receipts:
 action = "block"     # default: "materialize"
 ```
 
-Named-rule matches (`rm -rf` etc.) are unaffected by this setting — those always follow their rule's action. Details on the `[structural]` config section: [Configuration → Rule configuration](configuration.md#rule-configuration).
+Named-rule matches (`rm -rf` etc.) follow their rule's action whatever this setting is — but as of 1.4.0, under the default `materialize`, when a line contains a materializable shape the whole line is allowed without matching rules against its other commands, so `true | bash; rm -rf …` is not refused by the hook ([#586](https://github.com/yottayoshida/omamori/issues/586)). Details on the `[structural]` config section: [Configuration → Rule configuration](configuration.md#rule-configuration).
 
 ---
 

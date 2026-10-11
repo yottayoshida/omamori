@@ -101,6 +101,8 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
 | Self-modification commands in command context (`omamori config disable/enable/add`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`, `break-glass`, `audit key rotate`) | supported (env guard) | supported (Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
 
+"Supported" in the rows above holds for the command as written in the shapes the tests cover. As of 1.4.0 there are shapes in which neither layer sees the command — a destructive command called by absolute path, or `env -i` before a self-modification command, combined with a redirect where the hook reads an argument, a structural shape elsewhere in the line, or a launcher the hook does not look inside: see [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586) ([#586](https://github.com/yottayoshida/omamori/issues/586), [#593](https://github.com/yottayoshida/omamori/issues/593)).
+
 #### Not caught — by design
 
 | Surface | Reason | Reference |
@@ -285,7 +287,7 @@ The built-in rules are structurally enforced in the binary. Config.toml cannot d
 For legitimate use cases (CI environments, solo developers), `omamori override disable <rule>`:
 - Writes to `[overrides]` section in config.toml
 - Blocked by `guard_ai_config_modification()` in AI context
-- Blocked by hook patterns (`omamori override` string match)
+- Blocked by the Phase 2 builtin rule `omamori-override-block` (DI-13) — except in the shapes under [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586)
 - Restores with `omamori override enable <rule>`
 
 ### Design Decision: Structural > Detection
@@ -305,30 +307,62 @@ wherever it appears rather than at the verb position specifically: for the rule 
 config mutation, `omamori config <anything> add` matches on the same grounds that
 `omamori config add` does.
 
-`match_all` has the same property, and there the gap is **already reachable**: the rule
-guarding `audit key rotate` requires both `key` and `rotate` among the arguments in any
-order, so `omamori audit show --rule key --action rotate` — a read-only command carrying
-both words as flag *values* — matches it and is blocked (#387). That case is pinned by a
-test as accepted current behaviour rather than left as a comment. No `match_any` rule has a
-reachable collision today: no subcommand under `config`, or under any other guarded
-subcommand, takes a protected verb as a non-verb argument.
+That is reachable with real subcommands: `omamori config list add` (`list` ignores extra
+arguments) and `omamori config validate add` (`validate` takes a path, which can be named
+`add`) are both blocked. `match_all` has the same property: the rule guarding `audit key
+rotate` requires both `key` and `rotate` among the arguments in any order, so `omamori audit
+show --rule key --action rotate` — a read-only command carrying both words as flag *values*
+— matches it and is blocked (#387). That case is pinned by a test as accepted current
+behaviour rather than left as a comment.
 
-The failure mode in both directions is an **over-block**, never a bypass — a legitimate
-command refused, not a destructive one allowed — which is why this is recorded rather than
-treated as urgent. What makes it worth stating is that nothing in a rule's own definition
-says the match is position-independent, so a collision looks arbitrary from the outside: a
-subcommand added later that happens to take one of these words as an argument would be
-blocked for a reason the rule does not explain.
+Within this axis the failure mode is an **over-block**, never a bypass — a legitimate command
+refused, not a destructive one allowed. (The first-position gate itself can be sidestepped:
+the hook does not split a command the way the shell does, so a redirect placed before the
+subcommand moves it out of the first position — see the next section.) What makes this worth
+stating is that nothing in a rule's own definition says the match is position-independent,
+so a collision looks arbitrary from the outside: a subcommand added later that happens to
+take one of these words as an argument would be blocked for a reason the rule does not
+explain.
 
-Closing it means giving rules a way to say "this verb belongs at argument N", which changes
-the matching engine every rule goes through, not only the self-protection ones. That is why
-it is deferred rather than patched — the ones that would need it are enumerated under
-[Hook Coverage](#recursive-unwrap-stack-v060).
+**Decided not to close it** (2026-10-11): every reachable collision is a command nobody needs
+to run that way, and closing it means giving rules a way to say "this verb belongs at
+argument N" — a change to the matching every rule goes through, where a mistake would turn
+some other rule's block into an allow (the direction the breaking-change policy freezes) to
+narrow over-blocks nobody hits. A new subcommand that takes one of these words as an argument
+is the reason to reopen it.
+
+### Rules That Never See the `omamori` Command (#586)
+
+The self-protection rules are what stands between an AI agent and `omamori override disable
+…` once `env -i` has removed the detector variables the CLI's own guard reads. As of 1.4.0
+several shapes keep the hook from matching any rule against the `omamori` invocation:
+
+- a redirect where the hook reads an argument by position, because the hook does not split a
+  command the way the shell does — right after `omamori` (`omamori 2>/dev/null override …`),
+  written without a space (`omamori>/dev/null …`), among a wrapper's own arguments
+  (`env 2>/dev/null -i …`), or in forms the parser splits wrongly (`<&-`, `>|`, a quoted
+  operand) ([#586](https://github.com/yottayoshida/omamori/issues/586));
+- a line containing a materializable structural shape (`true | bash; …`), because under the
+  default `materialize` policy the whole line is allowed without rule matching, or a line
+  padded past the parser's segment or token limits (#586);
+- a launcher the hook does not look inside — `time` (#586); `xargs`, `parallel`, `find -exec`,
+  `env -S '…'` outside a pipe, a `$(…)` or backtick inside an argument, `tcsh -c` and `su -c`
+  ([#593](https://github.com/yottayoshida/omamori/issues/593)); and interpreters such as
+  `perl -e`, out of scope since [#74](https://github.com/yottayoshida/omamori/issues/74).
+  These are allowed at Layer 2 on the assumption that the CLI's own guard still stops the
+  inner `omamori` command, which `env -i` defeats. The list is what has been measured, not a
+  bound: anything the hook passes without opening it has the same property.
+
+The destructive-command rules are no better off on these shapes when the command is called
+by absolute path (`/bin/rm>/dev/null -rf …`, `true | bash; /bin/rm -rf …`, `xargs /bin/rm
+-rf …`): the PATH shim only sees a command called by name through `PATH` with the detector
+variables present, so neither layer stops it. G-1 lists this as a known gap, as G-5 does the
+self-protection side.
 
 ## Structural Limits
 
-- Full-path execution such as `/bin/rm` or `/usr/bin/git` can bypass the PATH shim. Mitigated by Layer 2 hooks (Claude Code + Cursor).
-- `find -exec /bin/rm {} \;` bypasses both the find shim and the rm shim because rm is invoked via absolute path. Partially mitigated by Layer 2 hooks.
+- Full-path execution such as `/bin/rm` or `/usr/bin/git` can bypass the PATH shim. Mitigated by Layer 2 hooks (Claude Code + Cursor) — except in the shapes under [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586).
+- `find -exec /bin/rm {} \;` bypasses both the find shim and the rm shim because rm is invoked via absolute path, and the hook does not look inside `find -exec` either ([#593](https://github.com/yottayoshida/omamori/issues/593)).
 - `sudo` may change PATH before the shim runs.
 - Interpreter commands (`python -c "shutil.rmtree(...)"`) are not detected by the unwrap stack (which handles bash/sh/zsh/dash/ksh only). [Decided out of scope per #74](https://github.com/yottayoshida/omamori/issues/74): zero real-world incidents in target tools (Claude Code, Cursor, Codex CLI).
 - **Dynamic command generation** (`bash -c "$(cmd)"`, backtick substitution) inside shell launchers is **blocked** (fail-close) because the inner content cannot be statically analyzed.
@@ -538,7 +572,7 @@ Pre-v0.9.7, Layer 2 hook deny verdicts (`BlockMeta` / `BlockRule` / `BlockStruct
 
 Wrapper kind flows into the audit log only. Block-reason **stderr** text remains the v0.9.5 fixed string (`"pipe to shell interpreter"` for all pipe-to-shell variants regardless of wrapper). The two channels are deliberately separated: an AI agent observing only stderr cannot iterate on wrapper variants (`env bash` blocked → try `sudo bash` → blocked → try `nice bash` → ...) because the block message is identical, while a forensic operator reading the audit log gets full attribution including the specific wrapper basename.
 
-**Two carriers, both hashed on v2 entries (#177 B2/B3)**: the audit log records the wrapper basename twice — as the `:{wrapper}` suffix of `detection_layer` and as the standalone `AuditEvent.wrapper_kind` field. As of `CHAIN_VERSION` 2 (#177 B3), both carriers are part of `HashableEventV2` and are chain-protected on any entry that declares `chain_version: 2`. On a `chain_version: 1` entry, `wrapper_kind` is **not** hashed (`HashableEvent`, the v1 preimage, does not include it) — a same-user attacker can alter `wrapper_kind` on a v1 entry without breaking the hash chain, though `detection_layer`'s copy of the same fact remains chain-protected there too, since `detection_layer` has been part of the hashed struct since v1. This v1/v2 split is permanent: existing v1 audit.jsonl bytes are never rewritten (see ADR-0007), so v1 entries never retroactively gain `wrapper_kind` protection. Do not drop `detection_layer`'s `:{wrapper}` suffix (tracked separately for sunset in #459) while any v1 entries with a real wrapper attribution remain in a log — see #459 for the exact trigger condition.
+**Two carriers, both hashed on v2 entries (#177 B2/B3)**: the audit log records the wrapper basename twice — as the `:{wrapper}` suffix of `detection_layer` and as the standalone `AuditEvent.wrapper_kind` field. As of `CHAIN_VERSION` 2 (#177 B3), both carriers are part of `HashableEventV2` and are chain-protected on any entry that declares `chain_version: 2`. On a `chain_version: 1` entry, `wrapper_kind` is **not** hashed (`HashableEvent`, the v1 preimage, does not include it) — a same-user attacker can alter `wrapper_kind` on a v1 entry without breaking the hash chain, though `detection_layer`'s copy of the same fact remains chain-protected there too, since `detection_layer` has been part of the hashed struct since v1. This v1/v2 split is permanent: existing v1 audit.jsonl bytes are never rewritten (see ADR-0007), so v1 entries never retroactively gain `wrapper_kind` protection. The suffix therefore stays, on new entries too, with no sunset scheduled ([ADR-0022](docs/adr/0022-detection-layer-keeps-its-wrapper-suffix.md), closing #459): a reader of a log started before 0.16.0, when `CHAIN_VERSION` became 2, has to keep reading it for the v1 entries, so dropping it from new entries would remove nothing on the reading side and give consumers filtering on the documented values a second shape.
 
 #### Forensic semantics (v0.9.8+)
 
@@ -687,7 +721,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 
 - `config disable`, `config enable`, `config add`, `uninstall`, and `init --force` are blocked when AI detector env vars are present
 - Uses the same detector logic as the PATH shim (`evaluate_detectors()`)
-- Hooks also block these commands as string patterns (Claude Code + Cursor)
+- Hooks also block these commands with the Phase 2 builtin rules `omamori-*-block` (DI-13; Claude Code + Cursor) — except in the shapes listed under [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586)
 - **Shell commands that write omamori's files are not blocked** — `sed -i` or `echo >>` on `config.toml`, `touch` under `~/.omamori`, and `cat` of the audit secret all pass ([#577](https://github.com/yottayoshida/omamori/issues/577)). This line used to say the hooks blocked them; the substring patterns that did were removed in v0.10.4 and nothing took over the shell route.
 - **Edit/Write file_path guard** (v0.8.0 #110): AI Edit/Write/MultiEdit/NotebookEdit operations on protected files (config, hooks, audit, `settings.json`, `settings.local.json`, anything under `~/.omamori`) are blocked via `PROTECTED_FILE_PATTERNS` with path normalization and symlink resolution — in Claude Code, and from v0.9.7 through 1.3.0 in no session at all ([#576](https://github.com/yottayoshida/omamori/issues/576))
 
@@ -701,6 +735,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 | Direct config.toml editing (Bash: sed, echo >>) | **No** | Not recognised since v0.10.4 ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
 | Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
 | env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |
+| `env -i` → `config disable` / `override disable` in a shape the hook does not match rules against | **No** | A redirect where the hook reads an argument (it does not split a command as the shell does), a structural shape elsewhere in the line, a padded line ([#586](https://github.com/yottayoshida/omamori/issues/586)), or a launcher it does not look inside — `time` (#586); `xargs`, `parallel`, `find -exec`, `env -S`, a `$(…)` or backtick argument, `tcsh -c`, `su -c` ([#593](https://github.com/yottayoshida/omamori/issues/593)); interpreters such as `perl -e` (#74) |
 | Unknown AI tool (no env var) | **No** | Guard depends on known env vars |
 
 ### Design philosophy

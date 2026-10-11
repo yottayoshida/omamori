@@ -1817,9 +1817,8 @@ fn audit_log_hook_block_collect(
     // multi-step rewrite chains; today we only carry the single-line summary
     // produced by `format_unwrap_chain`, wrapped in a 1-element vec.
     event.unwrap_chain = unwrap_chain.map(|c| vec![c]);
-    // #177 B2: wrapper_kind promoted to its own field, alongside (not instead
-    // of) the existing detection_layer ":{wrapper}" suffix — see #459 for the
-    // separate, later sunset of that suffix.
+    // Not instead of the detection_layer ":{wrapper}" suffix: v1 entries carry
+    // the attribution protected only there, so readers keep it (ADR-0022).
     event.wrapper_kind = wrapper_kind.map(str::to_string);
 
     if let Err(e) = logger.append_collect(event, warnings) {

@@ -646,7 +646,8 @@ pub struct AuditEvent {
     // Promotes the wrapper name (e.g. "env", "sudo") that was previously
     // only embedded inside the detection_layer string
     // ("layer2:pipe-to-shell:{wrapper}") to its own field, alongside — not
-    // instead of — that suffix (see #459 for its later, separate sunset).
+    // instead of — that suffix: readers keep reading it for v1 entries anyway,
+    // so dropping it from new ones would only add a second shape (ADR-0022).
     // `None` for every block/allow path except BlockStructural's
     // PipeToShell origin and the materialize path derived from it.
     // `String`, not `&'static str`: AuditEvent round-trips through

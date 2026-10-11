@@ -61,6 +61,12 @@ by B3) for the current v1/v2 split, and ADR-0007 for why in-place rewriting was 
 table as a way to close it for existing entries. This ADR's Status stays `Accepted` rather than
 `Superseded`, because the v1 half of its Decision is not superseded — it is now permanent.
 
+**Update (#459, 2026-10-11)**: the `detection_layer` `:{wrapper}` suffix sunset that the #177 B2
+update above anticipated is not happening. With B3 shipped, both carriers are protected on v2
+entries, but on every v1 entry the suffix remains the only protected copy, so a reader keeps
+reading it regardless; [ADR-0022](0022-detection-layer-keeps-its-wrapper-suffix.md) records the
+decision to keep writing it.
+
 ## Alternatives Considered
 
 | Option | Rejected because |
