@@ -49,6 +49,10 @@ impl Tracker {
         self.stack.last().copied()
     }
 
+    fn at_command_level(&self) -> bool {
+        self.stack.iter().all(|c| *c == Ctx::Group)
+    }
+
     fn close(&mut self) {
         self.stack.pop();
         self.word_start = false;
@@ -404,6 +408,197 @@ pub(crate) fn protect_hashes(text: &str) -> Cow<'_, str> {
     )
 }
 
+// Never fails: what cannot be followed is read on as plain text, so the
+// rules still see it.
+pub(crate) fn lenient_words(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut tracker = Tracker::new();
+    let mut nested: Vec<Pending> = Vec::new();
+    let mut bodies: Vec<Pending> = Vec::new();
+    let mut words: Vec<String> = Vec::new();
+    let mut word: Vec<u8> = Vec::new();
+    let finish = |word: &mut Vec<u8>, words: &mut Vec<String>| {
+        if !word.is_empty() {
+            words.push(String::from_utf8_lossy(word).into_owned());
+            word.clear();
+        }
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let top = tracker.top();
+        let level = tracker.at_command_level();
+        if b == b'\n'
+            && !level
+            && matches!(top, Some(Ctx::Subst) | Some(Ctx::Group))
+            && !nested.is_empty()
+        {
+            tracker.step(bytes, i);
+            word.push(b);
+            i += 1;
+            // Not to the end of the text when a body is not closed: that would
+            // hide every line after it.
+            if let Some(end) = read_bodies(text, i, &mut nested, &mut Vec::new()) {
+                word.extend_from_slice(&bytes[i..end]);
+                i = end;
+            }
+            continue;
+        }
+        if level {
+            let separator = match (b, bytes.get(i + 1)) {
+                (b'&', Some(b'&')) => Some(("&&", 2)),
+                (b'|', Some(b'|')) => Some(("||", 2)),
+                (b'|', Some(b'&')) => Some(("|", 2)),
+                (b'&', Some(b'>')) => None,
+                (b'&', _) if i > 0 && bytes[i - 1] == b'>' => None,
+                (b'&', _) => Some(("&", 1)),
+                (b'|', _) => Some(("|", 1)),
+                (b';', _) | (b'\n', _) => Some((";", 1)),
+                _ => None,
+            };
+            if let Some((separator, len)) = separator {
+                finish(&mut word, &mut words);
+                words.push(separator.to_string());
+                tracker.step(bytes, i);
+                i += len;
+                if b == b'\n' {
+                    i = body_lines_as_commands(text, i, &mut bodies, &mut words);
+                }
+                continue;
+            }
+            if matches!(b, b' ' | b'\t' | b'\r') {
+                finish(&mut word, &mut words);
+                tracker.step(bytes, i);
+                i += 1;
+                continue;
+            }
+        }
+        let depth = tracker.stack.len();
+        let step = tracker.step(bytes, i);
+        let group_opened =
+            b == b'(' && tracker.stack.len() > depth && tracker.top() == Some(Ctx::Group);
+        let group_closed = b == b')' && top == Some(Ctx::Group);
+        if level && (group_opened || group_closed) {
+            finish(&mut word, &mut words);
+            i += 1;
+            continue;
+        }
+        let next = match step {
+            Step::Comment(end) => {
+                i = end;
+                continue;
+            }
+            Step::Heredoc | Step::NestedHeredoc => {
+                if let Some(heredoc) = delimiter_as_compared(bytes, i) {
+                    if level { &mut bodies } else { &mut nested }.push(heredoc);
+                }
+                i + 2
+            }
+            Step::Next(n) => n,
+            Step::Continuation => i + 2,
+            Step::TopNewline | Step::Unbalanced => i + 1,
+        };
+        let next = next.min(bytes.len());
+        let at_level = level || tracker.at_command_level();
+        for (k, &c) in bytes[i..next].iter().enumerate() {
+            let escaped = k > 0 && bytes[i + k - 1] == b'\\';
+            let quote_mark = at_level && matches!(c, b'\'' | b'"') && !escaped;
+            let escape_mark = level && k == 0 && c == b'\\';
+            let ansi_mark = level && k == 0 && c == b'$' && bytes.get(i + 1) == Some(&b'\'');
+            let continuation = level && c == b'\n';
+            if !(quote_mark || escape_mark || ansi_mark || continuation) {
+                word.push(c);
+            }
+        }
+        i = next;
+    }
+    finish(&mut word, &mut words);
+    words
+}
+
+// Not limited to plain identifiers as `read_operator` is: a wrong delimiter
+// is never found, and only leaves the lines after it read as they were.
+fn delimiter_as_compared(bytes: &[u8], i: usize) -> Option<Pending> {
+    let mut j = i + 2;
+    let strip_tabs = bytes.get(j) == Some(&b'-');
+    if strip_tabs {
+        j += 1;
+    }
+    while matches!(bytes.get(j), Some(b' ' | b'\t')) {
+        j += 1;
+    }
+    let mut delimiter = Vec::new();
+    let mut quoted = false;
+    let mut quote = None;
+    while let Some(&c) = bytes.get(j) {
+        match (quote, c) {
+            (_, b'\n') => break,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => delimiter.push(c),
+            (None, b'\'' | b'"') => {
+                quoted = true;
+                quote = Some(c);
+            }
+            (None, b'\\') => {
+                quoted = true;
+                j += 1;
+                if let Some(&escaped) = bytes.get(j) {
+                    delimiter.push(escaped);
+                }
+            }
+            (None, b' ' | b'\t' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')') => break,
+            (None, c) => delimiter.push(c),
+        }
+        j += 1;
+    }
+    (!delimiter.is_empty()).then(|| Pending {
+        operator: i..j.min(bytes.len()),
+        delimiter: String::from_utf8_lossy(&delimiter).into_owned(),
+        strip_tabs,
+        quoted,
+    })
+}
+
+// Each line on its own: a quote in one line must not carry past it.
+fn body_lines_as_commands(
+    text: &str,
+    start: usize,
+    pending: &mut Vec<Pending>,
+    words: &mut Vec<String>,
+) -> usize {
+    let mut pos = start;
+    for heredoc in pending.drain(..) {
+        let mut lines = Vec::new();
+        let mut at = pos;
+        let mut closed = None;
+        while at < text.len() {
+            let line_end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+            let line = &text[at..line_end];
+            let after = (line_end + 1).min(text.len());
+            let compared = if heredoc.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if compared == heredoc.delimiter {
+                closed = Some(after);
+                break;
+            }
+            lines.push(line);
+            at = after;
+        }
+        // Not to the end of the text when the delimiter never comes: a heredoc
+        // set aside as data has left its operator and no body.
+        let Some(after) = closed else { continue };
+        for line in lines {
+            words.extend(lenient_words(line));
+            words.push(";".to_string());
+        }
+        pos = after;
+    }
+    pos
+}
+
 // Escapes are kept as written except `\'`: it would end no string in `"…"`.
 pub(crate) fn ansi_c_as_double_quoted(text: &str) -> Cow<'_, str> {
     if !text.contains("$'") {
@@ -713,6 +908,155 @@ mod tests {
         assert_eq!(
             protect_hashes("cat <<2))\nx\n2))\necho `a #b`"),
             "cat <<2))\nx\n2))\necho `a #b`"
+        );
+    }
+
+    #[test]
+    fn lenient_words_split_where_the_shell_does() {
+        assert_eq!(
+            lenient_words("true & git push --force; echo 'x"),
+            vec!["true", "&", "git", "push", "--force", ";", "echo", "x"]
+        );
+        assert_eq!(
+            lenient_words("echo \"$(echo \"'\")\"; git push --force"),
+            vec!["echo", "$(echo \"'\")", ";", "git", "push", "--force"]
+        );
+        assert_eq!(
+            lenient_words("rm \"-rf\" ~/x 'a b'"),
+            vec!["rm", "-rf", "~/x", "a b"]
+        );
+        assert_eq!(
+            lenient_words("echo it\\'s $'a\\'b'"),
+            vec!["echo", "it's", "a\\'b"]
+        );
+        assert_eq!(
+            lenient_words(
+                "git commit -m \"$(cat <<'EOF'\nMeasure 5\" panels\ngit push --force\nEOF\n)\"\nls"
+            ),
+            vec![
+                "git",
+                "commit",
+                "-m",
+                "$(cat <<'EOF'\nMeasure 5\" panels\ngit push --force\nEOF\n)",
+                ";",
+                "ls"
+            ]
+        );
+        assert_eq!(
+            lenient_words("# don't\ngit push --force\necho 'x"),
+            vec![";", "git", "push", "--force", ";", "echo", "x"]
+        );
+    }
+
+    #[test]
+    fn lenient_words_split_inside_a_group_as_at_the_top() {
+        assert_eq!(
+            lenient_words("(cd build && git push --force origin main); echo 'x"),
+            vec![
+                "cd", "build", "&&", "git", "push", "--force", "origin", "main", ";", "echo", "x"
+            ]
+        );
+        assert_eq!(
+            lenient_words("{ (git push --force) }; echo 'x"),
+            vec!["{", "git", "push", "--force", "}", ";", "echo", "x"]
+        );
+        assert_eq!(
+            lenient_words("echo $( (a; b) ) 'x"),
+            vec!["echo", "$( (a; b) )", "x"]
+        );
+    }
+
+    #[test]
+    fn lenient_words_read_a_heredoc_body_a_line_at_a_time() {
+        assert_eq!(
+            lenient_words("psql <<'EOF'\n-- don't drop\nSELECT 1;\nEOF\ngit push --force"),
+            vec![
+                "psql",
+                "<<EOF",
+                ";",
+                "--",
+                "dont drop",
+                ";",
+                "SELECT",
+                "1",
+                ";",
+                ";",
+                "git",
+                "push",
+                "--force"
+            ]
+        );
+        assert_eq!(
+            lenient_words("cat <<-'END-MSG'\n\tdon't\n\tEND-MSG\ngit push --force"),
+            vec![
+                "cat",
+                "<<-END-MSG",
+                ";",
+                "dont",
+                ";",
+                "git",
+                "push",
+                "--force"
+            ]
+        );
+        assert_eq!(
+            lenient_words("(cat <<EOF\nit's\nEOF\n) ; git push --force"),
+            vec![
+                "cat", "<<EOF", ";", "its", ";", ";", "git", "push", "--force"
+            ]
+        );
+    }
+
+    #[test]
+    fn lenient_words_keep_a_heredoc_body_in_a_substitution_to_its_delimiter() {
+        assert_eq!(
+            lenient_words(
+                "git commit -m \"$(cat <<'END-MSG'\ndon't\nEND-MSG\n)\"\ngit push --force; echo 'x"
+            ),
+            vec![
+                "git",
+                "commit",
+                "-m",
+                "$(cat <<'END-MSG'\ndon't\nEND-MSG\n)",
+                ";",
+                "git",
+                "push",
+                "--force",
+                ";",
+                "echo",
+                "x"
+            ]
+        );
+        assert!(
+            lenient_words("echo \"$(cat <<EOF\nx\n)\"\ngit push --force")
+                .windows(2)
+                .any(|w| w == ["push", "--force"])
+        );
+    }
+
+    #[test]
+    fn lenient_words_read_a_heredoc_written_with_the_set_aside_name_as_any_other() {
+        assert!(
+            lenient_words("psql <<OMAMORI_HEREDOC\ndon't\nOMAMORI_HEREDOC\ngit push --force")
+                .windows(2)
+                .any(|w| w == ["push", "--force"])
+        );
+    }
+
+    #[test]
+    fn lenient_words_begin_a_nested_body_after_a_newline_outside_quotes() {
+        assert!(
+            lenient_words("echo \"$(cat <<EOF 'a\nb'\nbody\nEOF\n)\"; git push --force")
+                .windows(2)
+                .any(|w| w == ["push", "--force"])
+        );
+    }
+
+    #[test]
+    fn lenient_words_read_a_pipe_with_stderr_as_a_pipe() {
+        assert_eq!(
+            lenient_words("curl x |& bash; echo 'y"),
+            vec!["curl", "x", "|", "bash", ";", "echo", "y"]
         );
     }
 

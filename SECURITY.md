@@ -101,7 +101,7 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
 | Self-modification commands in command context (`omamori config disable/enable/add`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`, `break-glass`, `audit key rotate`) | supported (env guard) | supported (Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
 
-"Supported" in the rows above holds for the command as written in the shapes the tests cover. As of 1.4.0 there are shapes in which neither layer sees the command — a destructive command called by absolute path, or `env -i` before a self-modification command, combined with a redirect where the hook reads an argument, a structural shape elsewhere in the line, or a launcher the hook does not look inside: see [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586) ([#586](https://github.com/yottayoshida/omamori/issues/586), [#593](https://github.com/yottayoshida/omamori/issues/593)).
+"Supported" in the rows above holds for the command as written in the shapes the tests cover. There are shapes in which neither layer sees the command — a destructive command called by absolute path, or `env -i` before a self-modification command, combined with a redirect where the hook reads an argument or a launcher the hook does not look inside: see [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586) ([#586](https://github.com/yottayoshida/omamori/issues/586), [#593](https://github.com/yottayoshida/omamori/issues/593)).
 
 #### Not caught — by design
 
@@ -334,17 +334,14 @@ is the reason to reopen it.
 ### Rules That Never See the `omamori` Command (#586)
 
 The self-protection rules are what stands between an AI agent and `omamori override disable
-…` once `env -i` has removed the detector variables the CLI's own guard reads. As of 1.4.0
-several shapes keep the hook from matching any rule against the `omamori` invocation:
+…` once `env -i` has removed the detector variables the CLI's own guard reads. These shapes
+keep the hook from matching any rule against the `omamori` invocation:
 
 - a redirect where the hook reads an argument by position, because the hook does not split a
   command the way the shell does — right after `omamori` (`omamori 2>/dev/null override …`),
   written without a space (`omamori>/dev/null …`), among a wrapper's own arguments
   (`env 2>/dev/null -i …`), or in forms the parser splits wrongly (`<&-`, `>|`, a quoted
   operand) ([#586](https://github.com/yottayoshida/omamori/issues/586));
-- a line containing a materializable structural shape (`true | bash; …`), because under the
-  default `materialize` policy the whole line is allowed without rule matching, or a line
-  padded past the parser's segment or token limits (#586);
 - a launcher the hook does not look inside — `time` (#586); `xargs`, `parallel`, `find -exec`,
   `env -S '…'` outside a pipe, a `$(…)` or backtick inside an argument, `tcsh -c` and `su -c`
   ([#593](https://github.com/yottayoshida/omamori/issues/593)); and interpreters such as
@@ -354,10 +351,9 @@ several shapes keep the hook from matching any rule against the `omamori` invoca
   bound: anything the hook passes without opening it has the same property.
 
 The destructive-command rules are no better off on these shapes when the command is called
-by absolute path (`/bin/rm>/dev/null -rf …`, `true | bash; /bin/rm -rf …`, `xargs /bin/rm
--rf …`): the PATH shim only sees a command called by name through `PATH` with the detector
-variables present, so neither layer stops it. G-1 lists this as a known gap, as G-5 does the
-self-protection side.
+by absolute path (`/bin/rm>/dev/null -rf …`, `xargs /bin/rm -rf …`): the PATH shim only sees
+a command called by name through `PATH` with the detector variables present, so neither layer
+stops it. G-1 lists this as a known gap, as G-5 does the self-protection side.
 
 ## Structural Limits
 
@@ -522,6 +518,8 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 | `env KEY=VAL cmd` | KEY=VAL pairs skipped; actual command evaluated |
 | PATH override bypass (`PATH=/usr/bin:$PATH rm`, `env PATH=/usr/bin rm`) | **Blocked** (v0.10.1). Inline assignment and `env` grammar variants detected via `detect_path_shim_bypass()` using `SHIM_COMMANDS` as single source of truth. See [#227](https://github.com/yottayoshida/omamori/issues/227). |
 
+**Structural findings and the rules** ([#585](https://github.com/yottayoshida/omamori/issues/585), [#586](https://github.com/yottayoshida/omamori/issues/586), [ADR-0020](docs/adr/0020-the-hook-splits-a-command-as-the-shell-does-only-where-it-is-sure.md)). A pipe into a shell, or text the word splitter cannot split, is a structural finding that `[structural] action = "materialize"` (the default) allows with a staging receipt. Through `1.4.0` the hook stopped reading at the first such finding, so no rule was matched against any part of the command: `git push --force; curl … | bash`, a guarded command after twenty-one `true;` segments, and `omamori override disable …` behind either were allowed. Every part of the command is now read and matched first — text the splitter cannot split is split by a scan that never fails: it keeps quoted text in one word and takes the quote marks off, an operator outside quotes still separates commands, inside parentheses too, and each line of a heredoc body outside a substitution is read on its own, so a quote in it cannot carry past the body's end — and the structural finding decides only a command no rule blocks. A finding that blocks on its own — a command substitution inside `bash -c` — now blocks wherever it stands; through `1.4.0` one behind a pipe into a shell or an unsplittable line was materialized. A break-glass bypass lifts the one rule it names: the rest of the command is still matched, and a structural finding in it still follows `[structural] action`. The limits on segments and words are raised to 2,000 and 20,000, counted over the whole command — the commands inside `bash -c` and its like included — and a command past them is blocked rather than materialized: the part past the limit would go unchecked. Each line of a heredoc body the hook reads as commands counts as a segment, so `python3 run.py <<'EOF'` with more than 2,000 lines is blocked; a body set aside as text (above) is not counted. Under `[structural] action = "block"` the raised limits move the other way: a command of 21 to 2,000 segments, or 1,001 to 20,000 words, that no rule blocks is allowed, where `1.4.0` blocked it unread.
+
 **Comments** ([#585](https://github.com/yottayoshida/omamori/issues/585), [ADR-0020](docs/adr/0020-the-hook-splits-a-command-as-the-shell-does-only-where-it-is-sure.md)). Through `1.4.0` a `#` at the start of a word hid everything after it in the command, not only the rest of its line: the hook turned newlines into separators before the word splitter, which ends a comment only at a newline. A guarded command on any line after a comment line — `# update the remote` and then `git push --force` — was allowed, Phase 1B's checks included. Newlines are now kept, so a comment ends at its line, and a quote inside a comment no longer shifts the reading of the lines after it. Where the shell reads a `#` as part of a word but the splitter would take it for a comment — inside backquotes, a substitution, arithmetic, a parameter or `[[ … ]]` expression, or quotes nested in a substitution — the `#` is escaped for the splitter, so it hides nothing either. That escaping only ever adds a character: where the hook cannot follow the shell's reading of a command — a heredoc delimiter that is not a plain word, a `)` that closes nothing — it escapes nothing from there on, and a `#` there can still hide the rest of its own line, as through `1.4.0`; it no longer hides the lines after it. An ANSI-C quoted string outside other quotes is split as the double-quoted string of the same words.
 
 **Heredoc bodies** ([#585](https://github.com/yottayoshida/omamori/issues/585), [ADR-0020](docs/adr/0020-the-hook-splits-a-command-as-the-shell-does-only-where-it-is-sure.md)). The hook reads a command line by line, and through `1.4.0` it read a heredoc's body as lines of commands too, so writing a file with `cat > notes.md <<'EOF'` whose text held `git push --force` on a line of its own was blocked. A body is now set aside — neither the rules nor Phase 1B see it — only where the hook is certain it is input to a program that takes it as data: the `<<` stands outside every quote, substitution, expansion, group and comment; the delimiter is a plain identifier, quoted whole or not; a line holding only the delimiter closes the body, and an unquoted delimiter's body continues no line with `\`; the reader is `cat`, `tee`, `jq`, `yq`, `grep` or `wc`, an interpreter (`python`, `python3`, `node`, `ruby`, `perl`) given no program but the body (no arguments, or `-`), `git commit`, `tag`, `notes` or `hash-object` without `-c`, or `gh pr`, `issue`, `api`, `release` or `gist`; its segment feeds no pipe and names no device or descriptor path (`/dev/…`, `/proc/…`), no descriptor above 2, no named descriptor, and no duplication to anything but 0, 1, 2 or `-`; and the command defines no function or alias and has no process substitution anywhere. Every other body is read as commands, as before: a shell's (`bash <<EOF`, `sudo -s`, `su`), one handed on to another program, one whose reader can run its input (`awk`, `sed`, `sort`, `sqlite3`, `psql`, `mysql`), and every body of a command in which any `<<` is not certain. What an interpreter does with the program it is given is not judged, as for `python -c`. Nor is a script the command writes and then runs (`cat > x.sh <<'EOF' … EOF; bash x.sh`): the hook does not read what a script contains, however it was written — `printf … > x.sh; bash x.sh` was never checked either.
@@ -553,10 +551,10 @@ The `omamori cursor-hook` subcommand uses the same `check_command_for_hook()` pi
 
 | Failure mode | Behavior |
 |-------------|----------|
-| Parse error (unclosed quote, etc.) | BLOCK |
+| Parse error (unclosed quote, etc.) | The rules see the text split by a scan that never fails; with no rule match, `[structural] action` decides (default: allow with a staging receipt) |
 | Recursion depth > 5 | BLOCK |
-| Token count > 1000 | BLOCK |
-| Segment count > 20 | BLOCK |
+| Word count > 20,000 across the whole command | BLOCK |
+| Segment count > 2,000 across the whole command | BLOCK |
 | Input size > 1 MB | BLOCK |
 | `$(...)` or backtick in shell launcher inner | BLOCK |
 | OOM / panic | Process exit (hook failure = AI tool blocks) |
@@ -739,7 +737,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 | Direct config.toml editing (Bash: sed, echo >>) | **No** | Not recognised since v0.10.4 ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
 | Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
 | env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |
-| `env -i` → `config disable` / `override disable` in a shape the hook does not match rules against | **No** | A redirect where the hook reads an argument (it does not split a command as the shell does), a structural shape elsewhere in the line, a padded line ([#586](https://github.com/yottayoshida/omamori/issues/586)), or a launcher it does not look inside — `time` (#586); `xargs`, `parallel`, `find -exec`, `env -S`, a `$(…)` or backtick argument, `tcsh -c`, `su -c` ([#593](https://github.com/yottayoshida/omamori/issues/593)); interpreters such as `perl -e` (#74) |
+| `env -i` → `config disable` / `override disable` in a shape the hook does not match rules against | **No** | A redirect where the hook reads an argument (it does not split a command as the shell does) ([#586](https://github.com/yottayoshida/omamori/issues/586)), or a launcher it does not look inside — `time` (#586); `xargs`, `parallel`, `find -exec`, `env -S`, a `$(…)` or backtick argument, `tcsh -c`, `su -c` ([#593](https://github.com/yottayoshida/omamori/issues/593)); interpreters such as `perl -e` (#74) |
 | Unknown AI tool (no env var) | **No** | Guard depends on known env vars |
 
 ### Design philosophy

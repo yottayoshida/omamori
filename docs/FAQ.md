@@ -112,7 +112,7 @@ Read it as: which layer matched, which rule, and what action would apply (`trash
 
 ## "What is a staging file?" / What does "materialized" mean?
 
-Some command *shapes* — piping a download straight into a shell, unparseable input, extreme token counts — are structurally risky but very often legitimate. Hard-blocking all of them made omamori too noisy, so since v0.11.2 the default for these **structural patterns** is `materialize`:
+Some command *shapes* — piping a download straight into a shell, input the hook cannot split into words — are structurally risky but very often legitimate. Hard-blocking all of them made omamori too noisy, so since v0.11.2 the default for these **structural patterns** is `materialize`:
 
 - The command is **allowed to run**, and
 - an exact copy of it is written to a **staging file** under `~/.local/share/omamori/staging/`, so you can review after the fact what actually went through. (If the staging write itself fails — disk full, permissions — that's logged as a warning and, by default, the command still runs with the receipt missing. If you've set `[audit] strict = true`, a failed staging write blocks the command instead — strict mode treats "no receipt" as a reason not to allow.)
@@ -127,7 +127,7 @@ If you'd rather hard-block structural patterns than collect receipts:
 action = "block"     # default: "materialize"
 ```
 
-Named-rule matches (`rm -rf` etc.) follow their rule's action whatever this setting is — but as of 1.4.0, under the default `materialize`, when a line contains a materializable shape the whole line is allowed without matching rules against its other commands, so `true | bash; rm -rf …` is not refused by the hook ([#586](https://github.com/yottayoshida/omamori/issues/586)). Details on the `[structural]` config section: [Configuration → Rule configuration](configuration.md#rule-configuration).
+Named-rule matches (`rm -rf` etc.) are unaffected by this setting — those always follow their rule's action, also in a command that has such a shape: the rules see every part of the command first, and only a command no rule blocks is materialized ([#585](https://github.com/yottayoshida/omamori/issues/585)). A command longer than the hook reads — more than 2,000 segments or 20,000 words in all, the commands inside `bash -c` included — is blocked whatever this setting says, since the rest of it would go unchecked. Details on the `[structural]` config section: [Configuration → Rule configuration](configuration.md#rule-configuration).
 
 ---
 
