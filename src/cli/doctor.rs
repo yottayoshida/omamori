@@ -6,9 +6,8 @@
 //! short-lived probe subprocess (to verify a hook's embedded exe path still
 //! satisfies the hook-check contract). The risk-signal section — and, since
 //! #509, `--json` — verifies the audit chain as `audit verify` and `report`
-//! do, which can rewrite a missing or unusable high-water-mark sidecar and
-//! holds the log's shared lock while it walks (#579); it also probes the
-//! audit directory's writability with a temporary file.
+//! do, which can rewrite a missing or unusable high-water-mark sidecar; it
+//! also probes the audit directory's writability with a temporary file.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;

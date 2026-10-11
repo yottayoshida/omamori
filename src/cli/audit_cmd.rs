@@ -105,6 +105,12 @@ fn print_hwm_write_note(write: &audit::HwmWrite, existed: MarkExisted) {
                  chain, so it has no value it is entitled to write there."
             );
         }
+        (audit::HwmWrite::Withheld, _) => {
+            eprintln!(
+                "  No mark was written: the log or its mark changed while this run read \
+                 the log, and writing the end it reached could have lowered the mark."
+            );
+        }
     }
 }
 

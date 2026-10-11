@@ -6348,9 +6348,7 @@ mod tests {
     }
 
     /// A prune that cannot have the log's lock to publish gives up rather than
-    /// wait: what holds it for longer than a prune waits is `audit verify`,
-    /// for the length of its walk. The copy is thrown away and the log is as
-    /// it was.
+    /// wait. The copy is thrown away and the log is as it was.
     #[test]
     fn a_prune_gives_up_when_the_log_stays_locked() {
         let (dir, path, _logger) = store_with_a_logger("prune-lockfree-log-busy");
@@ -6530,6 +6528,258 @@ mod tests {
         );
         assert!(result.pruned, "and what was walked is the log as pruned");
         assert!(result.broken_at.is_none() && !result.halted());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_append_made_while_a_verdict_is_computed_is_recorded() {
+        let dir = test_dir("append-during-verify-walk");
+        let logger = test_logger(&dir);
+        for i in 0..5 {
+            logger.append(make_event(&format!("before {i}"))).unwrap();
+        }
+        let path = dir.join("audit.jsonl");
+
+        verify::BETWEEN_NOTE_AND_WALK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                logger.append(make_event("while verify walks")).unwrap();
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        let events = read_events(&path);
+        assert_eq!(events.len(), 6);
+        assert_eq!(
+            events.last().unwrap()["command"].as_str(),
+            Some("while verify walks")
+        );
+        assert_eq!(expect_hwm(&hwm_path_for(&path)), 5);
+        assert_eq!(
+            result.chain_entries, 5,
+            "the walk ends where the log ended when it began"
+        );
+        assert!(result.hwm_compared && !result.tail_truncated);
+        assert!(result.broken_at.is_none() && !result.halted());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_rewritten_in_place_during_the_walk_is_walked_again() {
+        let dir = test_dir("in-place-rewrite-during-verify");
+        let _logger = test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        write_hwm(&hwm_path_for(&path), PRUNE_HWM_TOP_SEQ).unwrap();
+
+        let copy = dir.join("pruned-copy.jsonl");
+        fs::copy(&path, &copy).unwrap();
+        assert_eq!(prune_as_another_process(&copy).unwrap(), 100);
+        let pruned = fs::read(&copy).unwrap();
+
+        let target = path.clone();
+        verify::BETWEEN_WALK_AND_CONFIRM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let inode = inode_of(&target);
+                fs::write(&target, &pruned).unwrap();
+                assert_eq!(inode_of(&target), inode, "rewritten in the same file");
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        assert!(
+            result.pruned,
+            "the verdict is for the log as it is now, not for what the first walk read"
+        );
+        assert!(result.broken_at.is_none() && !result.halted() && !result.tail_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mark_is_not_written_beside_a_log_a_prune_replaced_during_the_walk() {
+        let dir = test_dir("rename-prune-during-verify");
+        let _logger = test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        let hwm = hwm_path_for(&path);
+        assert!(matches!(read_hwm(&hwm), HwmState::Missing));
+
+        let racing = path.clone();
+        verify::BETWEEN_NOTE_AND_WALK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert_eq!(prune_as_another_process(&racing).unwrap(), 100);
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        assert!(
+            !result.pruned,
+            "what was walked is the log as it stood when the walk began"
+        );
+        assert!(result.hwm_missing);
+        assert!(matches!(result.hwm_write, verify::HwmWrite::Withheld));
+        assert!(matches!(read_hwm(&hwm), HwmState::Missing));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_error_from_a_walk_over_a_log_rewritten_in_place_is_not_the_verdict() {
+        let dir = test_dir("in-place-rewrite-breaks-the-walk");
+        let _logger = test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        write_hwm(&hwm_path_for(&path), PRUNE_HWM_TOP_SEQ).unwrap();
+
+        let copy = dir.join("pruned-copy.jsonl");
+        fs::copy(&path, &copy).unwrap();
+        assert_eq!(prune_as_another_process(&copy).unwrap(), 100);
+        let pruned = fs::read(&copy).unwrap();
+
+        let half_written = path.clone();
+        verify::BETWEEN_NOTE_AND_WALK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut file = OpenOptions::new().write(true).open(&half_written).unwrap();
+                let middle = file.metadata().unwrap().len() / 2;
+                file.seek(SeekFrom::Start(middle)).unwrap();
+                file.write_all(&[0xff, 0xfe]).unwrap();
+            }));
+        });
+        let finished = path.clone();
+        verify::BETWEEN_WALK_AND_CONFIRM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::write(&finished, &pruned).unwrap();
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir))
+            .expect("a read error over a log rewritten in place is not reported: it starts over");
+
+        assert!(result.pruned);
+        assert!(result.broken_at.is_none() && !result.halted() && !result.tail_truncated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_walk_over_a_file_rewritten_in_place_and_then_renamed_away_is_not_the_verdict() {
+        let dir = test_dir("in-place-then-rename-during-verify");
+        let _logger = test_logger(&dir);
+        let path = prune_hwm_fixture(&dir, &TEST_SECRET);
+        write_hwm(&hwm_path_for(&path), PRUNE_HWM_TOP_SEQ).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let copy = dir.join("pruned-copy.jsonl");
+        fs::copy(&path, &copy).unwrap();
+        assert_eq!(prune_as_another_process(&copy).unwrap(), 100);
+        let pruned = fs::read(&copy).unwrap();
+
+        let half_written = path.clone();
+        verify::BETWEEN_NOTE_AND_WALK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut file = OpenOptions::new().write(true).open(&half_written).unwrap();
+                file.write_all(&pruned[..pruned.len() / 2]).unwrap();
+            }));
+        });
+        let renamed_over = path.clone();
+        let staged = dir.join("whole.jsonl");
+        verify::BETWEEN_WALK_AND_CONFIRM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                fs::write(&staged, &original).unwrap();
+                fs::rename(&staged, &renamed_over).unwrap();
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir))
+            .expect("what the walk read was half of each, so it starts over");
+
+        assert!(result.broken_at.is_none() && !result.halted() && !result.tail_truncated);
+        assert!(
+            !result.pruned,
+            "the verdict is for the log the path names now"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_verdict_that_cannot_confirm_its_end_reports_the_lock() {
+        let dir = test_dir("confirm-lock-held-during-verify");
+        let logger = test_logger(&dir);
+        for i in 0..3 {
+            logger.append(make_event(&format!("entry {i}"))).unwrap();
+        }
+        let path = dir.join("audit.jsonl");
+
+        let holder: std::rc::Rc<std::cell::RefCell<Option<fs::File>>> = Default::default();
+        let holding = holder.clone();
+        verify::BETWEEN_WALK_AND_CONFIRM.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                flock_exclusive(&file).unwrap();
+                *holding.borrow_mut() = Some(file);
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir));
+        drop(holder.borrow_mut().take());
+
+        assert!(
+            matches!(
+                result,
+                Err(AuditError::StoreInaccessible {
+                    kind: "log_lock",
+                    ..
+                })
+            ),
+            "got {:?}",
+            result.map(|r| r.chain_entries)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mark_written_during_the_walk_is_not_lowered() {
+        let dir = test_dir("mark-written-during-verify");
+        let logger = test_logger(&dir);
+        for i in 0..5 {
+            logger.append(make_event(&format!("before {i}"))).unwrap();
+        }
+        let path = dir.join("audit.jsonl");
+        let hwm = hwm_path_for(&path);
+        fs::remove_file(&hwm).unwrap();
+
+        verify::BETWEEN_NOTE_AND_WALK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                logger.append(make_event("while verify walks")).unwrap();
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        assert!(result.hwm_missing, "the walk noted no mark");
+        assert!(matches!(result.hwm_write, verify::HwmWrite::Withheld));
+        assert_eq!(
+            expect_hwm(&hwm),
+            5,
+            "the mark the append wrote stands; the walk's end is 4"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_with_no_authenticated_end_writes_no_mark_whatever_changed_during_the_walk() {
+        let dir = halted_store("halted-mark-changed-during-verify", HaltAt::Middle, false);
+        let hwm = hwm_path_for(&dir.join("audit.jsonl"));
+        fs::write(&hwm, "not-a-number").unwrap();
+
+        let replaced = hwm.clone();
+        verify::BETWEEN_NOTE_AND_WALK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                write_hwm(&replaced, 1).unwrap();
+            }));
+        });
+        let result = verify_chain(&verify_config(&dir)).unwrap();
+
+        assert!(result.key_unavailable_at.is_some(), "sanity: it halted");
+        assert!(
+            matches!(result.hwm_write, verify::HwmWrite::NotAttempted),
+            "a halted run had nothing to write, got {:?}",
+            result.hwm_write
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

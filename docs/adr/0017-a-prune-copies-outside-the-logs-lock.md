@@ -1,6 +1,10 @@
 # ADR-0017: A prune copies outside the log's lock, and takes it only to publish
 
 - **Status**: Accepted
+- **Amended by**: [ADR-0019](0019-a-verdict-walks-the-log-without-its-lock.md) — `audit verify` holds
+  the shared lock only to note and to confirm the log's end, so Decision 4's "`audit verify` holds a
+  shared lock for the length of its walk" and the consequence that a prune is thrown away while
+  `audit verify` walks no longer hold.
 - **Date**: 2026-10-02
 - **Plan**: `.claude/plans/2026-10-02-omamori-568c-prune-copies-outside-the-lock.md`
 - **Supersedes**, in [ADR-0016](0016-a-prune-publishes-its-result-by-rename.md): Decision 5 (the

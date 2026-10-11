@@ -122,6 +122,16 @@ pub(super) fn flock_shared(_file: &fs::File) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+// A failure is not reported: dropping the descriptor lets go of the lock anyway.
+#[cfg(unix)]
+pub(super) fn unlock(file: &fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[cfg(not(unix))]
+pub(super) fn unlock(_file: &fs::File) {}
+
 // ---------------------------------------------------------------------------
 // HMAC targets (event field hashing)
 // ---------------------------------------------------------------------------
@@ -2489,11 +2499,9 @@ const LOG_REOPEN_ATTEMPTS: u32 = 3;
 /// A prune publishes its result by renaming a new file over the log. A process
 /// that opened the log before that rename and got the lock after it holds a
 /// file with no name: `flock` is on the inode, not on the path. An `append`
-/// writing there would lose its entry. A `verify_chain` reading there would
-/// read a complete log — the one the prune started from — but its shared lock
-/// would no longer hold off appends to the log `path` now names, and the
-/// high-water-mark it compares against afterwards is read by path: a mark
-/// raised meanwhile would stand above the end it walked, a false exit 3.
+/// writing there would lose its entry. A `verify_chain` noting the end there
+/// would note the end of a log that is no longer the one appends raise the
+/// high-water-mark for.
 ///
 /// So the comparison is made *after* the lock is held, which is the only order
 /// in which it says anything: once it passes, a rename cannot follow, because a
@@ -2501,11 +2509,8 @@ const LOG_REOPEN_ATTEMPTS: u32 = 3;
 /// on that inode can be taken past this one. On a mismatch the log is opened
 /// again.
 ///
-/// Only for callers that lock. The readers that take no lock — `audit show`,
-/// the entry counts, `report`'s tallies — are not routed through here (its
-/// verdict is `verify_chain`'s, which does lock; #579): the check means
-/// nothing without the lock, and holding one for a whole read would make every
-/// `append` in that time give up.
+/// Only for callers that lock. Do not hold the lock for a whole read: every
+/// `append` in that time gives up after 0.5 s.
 pub(super) fn open_log_locked(path: &Path, lock: LogLock) -> Result<fs::File, LockedLogError> {
     for _ in 0..LOG_REOPEN_ATTEMPTS {
         let file = match lock {

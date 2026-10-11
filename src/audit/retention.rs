@@ -17,6 +17,8 @@ use super::AuditEvent;
 use super::chain::{
     CHAIN_VERSION, compute_entry_hash_for_write, hmac_bytes, parse_line, prune_genesis_hash,
 };
+#[cfg(test)]
+use super::secret::unlock;
 use super::secret::{
     Keyring, SigningKey, flock_exclusive, load_keyring, names_this_file, open_read_nofollow,
     secret_path_for, try_flock_exclusive,
@@ -586,12 +588,6 @@ pub(super) fn prune_collecting(
     (result, warnings)
 }
 
-#[cfg(test)]
-fn unlock(file: &fs::File) {
-    use std::os::unix::io::AsRawFd;
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-}
-
 /// The prune itself. Its warnings are pushed onto `warnings` (ADR-0013).
 ///
 /// Nothing here writes into the log (ADR-0016). The result is built in
@@ -761,10 +757,9 @@ fn try_prune_at_collect(
 
     // --- Phase two: under the log's lock, for as long as it takes to publish. ---
     //
-    // One bounded attempt. The process waiting here is often a `hook-check`
-    // that has not printed its verdict, and what holds the lock for longer
-    // than this waits — `audit verify`, for the length of its walk — holds it
-    // for longer than any retry worth making. The next check starts over.
+    // One bounded attempt, never a retry loop: the process waiting here is
+    // often a `hook-check` that has not printed its verdict. The next check
+    // starts over.
     if let Err(e) = flock_exclusive(&log) {
         // Two different things, and only the first is someone else's doing.
         warnings.push(if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -871,7 +866,7 @@ fn exclude_other_prunes(path: &Path) -> Result<fs::File, String> {
 
 /// The first line of the log, newline included — what phase two compares
 /// against to know the head was not rewritten in between.
-fn first_line(log: &fs::File) -> std::io::Result<Vec<u8>> {
+pub(super) fn first_line(log: &fs::File) -> std::io::Result<Vec<u8>> {
     let mut reader = log;
     reader.seek(SeekFrom::Start(0))?;
     let mut line = Vec::new();
@@ -901,6 +896,14 @@ fn still_as_read(
     if !names_this_file(path, log) {
         return Err("the log was replaced while it ran");
     }
+    holds_as_read(log, copied_to, head)
+}
+
+pub(super) fn holds_as_read(
+    log: &fs::File,
+    copied_to: u64,
+    head: &[u8],
+) -> Result<(), &'static str> {
     let length = log.metadata().map(|meta| meta.len()).unwrap_or(0);
     if length < copied_to {
         return Err("the log became shorter while it ran");

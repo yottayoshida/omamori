@@ -9,7 +9,10 @@
   "copy outside the lock" that this ADR set aside. Decision 4 lists `report` among the readers
   that take no lock; that holds for its tallies, not for its verdict, which `verify_chain`
   computes under the shared lock — as `doctor`'s does. The cost that decision names is paid
-  there: see [#579](https://github.com/yottayoshida/omamori/issues/579).
+  there: see [#579](https://github.com/yottayoshida/omamori/issues/579). Since
+  [ADR-0019](0019-a-verdict-walks-the-log-without-its-lock.md) the verdict holds the lock only to note
+  and to confirm the log's end, and compares the end it walked with the mark it noted under the lock
+  rather than with one read by path afterwards.
 - **Date**: 2026-10-02
 - **Plan**: `.claude/plans/2026-10-02-omamori-568b-prune-publishes-by-rename.md`
 - **Supersedes**: the *Design decision* paragraph of SECURITY.md → Audit Retention ("In-place
