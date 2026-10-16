@@ -45,6 +45,11 @@ may be promoted from PR-template checklist to a repository ruleset.
 | `scripts/pre-pr-check.sh`           | Local gate (fmt / clippy / test, all `--locked`)               |
 | `scripts/pre-release-check.sh`      | Release gate (clean tree / tag match / package listing / dry-run) |
 
+Tests live under `tests/` or in a `#[cfg(test)]` module, are tracked, and run in CI unless marked
+`#[ignore]`. A local-only test script is seen by no one else and goes stale unseen;
+`scripts/check-invariants.sh` fails when `.gitignore` would ignore `tests/poc.sh`, a `.rs` or
+`.sh` file directly under `tests/`, or a `.rs` file one directory below it — the names it probes.
+
 ---
 
 ## Process CWD discipline (#175)

@@ -8815,9 +8815,19 @@ fn exec_git_as_ai(
     args: &[&str],
     env: &[(&str, String)],
 ) -> std::process::Output {
+    let command: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
+    exec_as_ai(cwd, home, &command, env)
+}
+
+fn exec_as_ai(
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+    command: &[&str],
+    env: &[(&str, String)],
+) -> std::process::Output {
     // Drop any installed omamori shim directory from PATH: with HOME
     // redirected, omamori would not recognise the developer's real
-    // `~/.omamori/shim` as its own and would resolve `git` to it.
+    // `~/.omamori/shim` as its own and would resolve the program to it.
     let path = std::env::var("PATH").unwrap_or_default();
     let path: Vec<&str> = path
         .split(':')
@@ -8828,11 +8838,11 @@ fn exec_git_as_ai(
     cmd.env("PATH", path.join(":"))
         .arg("exec")
         .arg("--")
-        .arg("git")
-        .args(args)
+        .args(command)
         .current_dir(cwd)
         .env("CLAUDECODE", "1")
-        .env("XDG_CONFIG_HOME", home.join(".config"));
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"));
     isolate_git(&mut cmd, home);
     for (key, value) in env {
         cmd.env(key, value);
@@ -8999,5 +9009,99 @@ fn stash_then_exec_is_not_downgraded_by_a_regenerable_looking_repository_path() 
     assert_eq!(stash_count(&a, &home), 0);
     assert_eq!(fs::read_to_string(a.join("f.txt")).unwrap(), "A-change\n");
 
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_ai_force_push_through_exec_is_blocked_before_git_runs() {
+    let root = unique_dir("exec-force-push");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let repo = fixture_repo(&root, &home, "repo", None);
+    fixture_git(&root, &home, &["init", "-q", "--bare", "remote.git"]);
+    let remote = root.join("remote.git");
+    fixture_git(
+        &repo,
+        &home,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    fixture_git(
+        &repo,
+        &home,
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    );
+    let pushed = fixture_git(&remote, &home, &["rev-parse", "main"]);
+    fixture_git(
+        &repo,
+        &home,
+        &["commit", "-q", "--amend", "-m", "rewritten"],
+    );
+
+    let output = exec_git_as_ai(
+        &repo,
+        &home,
+        &["push", "--force", "origin", "HEAD:main"],
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("omamori blocked a force push"), "{stderr}");
+    assert_eq!(fixture_git(&remote, &home, &["rev-parse", "main"]), pushed);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_ai_chmod_777_through_exec_leaves_the_mode_unchanged() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = unique_dir("exec-chmod-777");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let file = root.join("f.txt");
+    fs::write(&file, "x").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    let output = exec_as_ai(&root, &home, &["chmod", "777", file.to_str().unwrap()], &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("omamori blocked chmod 777"), "{stderr}");
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_ai_git_clean_through_exec_leaves_untracked_files() {
+    let root = unique_dir("exec-git-clean");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let repo = fixture_repo(&root, &home, "repo", None);
+    fs::write(repo.join("untracked.txt"), "keep").unwrap();
+    let output = exec_git_as_ai(&repo, &home, &["clean", "-fdx"], &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("omamori blocked git clean"), "{stderr}");
+    assert!(repo.join("untracked.txt").exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_ai_plain_rm_through_exec_removes_the_file() {
+    let root = unique_dir("exec-plain-rm");
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".config")).unwrap();
+    let file = root.join("single.txt");
+    fs::write(&file, "x").unwrap();
+    let output = exec_as_ai(&root, &home, &["rm", file.to_str().unwrap()], &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!file.exists());
+    // Removed by rm itself, not sent to a Trash that ignores HOME on macOS.
+    let audit = fs::read_to_string(home.join(".local/share/omamori/audit.jsonl")).unwrap();
+    let last = audit.lines().last().unwrap();
+    assert!(last.contains("\"action\":\"passthrough\""), "{last}");
     let _ = fs::remove_dir_all(&root);
 }
