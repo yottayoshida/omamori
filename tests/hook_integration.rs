@@ -1984,6 +1984,41 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         "parentheses-not-subshell-allow",
     ),
     (
+        "echo x >> ~/.config/omamori/config.toml",
+        Decision::Block,
+        "shell-write-redirect-config-block",
+    ),
+    (
+        "sed -i '' s/a/b/ ~/.config/omamori/config.toml",
+        Decision::Block,
+        "shell-write-sed-in-place-config-block",
+    ),
+    (
+        "touch ~/.omamori/audit-warn-throttle",
+        Decision::Block,
+        "shell-write-touch-base-dir-block",
+    ),
+    (
+        "cp x ~/.claude/settings.json",
+        Decision::Block,
+        "shell-write-copy-settings-block",
+    ),
+    (
+        "mv ~/.config/omamori ~/.config/omamori.off",
+        Decision::Block,
+        "shell-write-move-config-dir-block",
+    ),
+    (
+        "cat ~/.config/omamori/config.toml",
+        Decision::Allow,
+        "shell-read-config-allow",
+    ),
+    (
+        "git commit -m 'fix ~/.config/omamori/config.toml'",
+        Decision::Allow,
+        "shell-mention-config-allow",
+    ),
+    (
         "echo time omamori override disable rm-recursive-to-trash",
         Decision::Allow,
         "time-as-argument-allow",

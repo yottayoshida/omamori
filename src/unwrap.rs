@@ -1082,7 +1082,7 @@ pub(crate) fn split_words(normalized: &str) -> Result<Vec<String>, shell_words::
 }
 
 // Not an empty string: redirect handling must still see a heredoc here.
-const HEREDOC_MARK: &str = "<<OMAMORI_HEREDOC";
+pub(crate) const HEREDOC_MARK: &str = "<<OMAMORI_HEREDOC";
 
 pub(crate) fn set_aside_data_heredocs(text: &str) -> Cow<'_, str> {
     let Some(heredocs) = crate::shell_text::certain_heredocs(text) else {
@@ -1286,7 +1286,7 @@ fn split_on_operators(tokens: &[String]) -> Vec<(SegmentOp, Vec<String>)> {
 /// (single source of truth). Each basename listed there must have a
 /// matching match-arm below with its arg-consumption logic; otherwise
 /// `scripts/check-invariants.sh` invariant #9 fails in CI.
-fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
+pub(crate) fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
     let mut pos = 0;
     let len = tokens.len();
 
@@ -1849,7 +1849,7 @@ fn time_flag_takes_value(flag: &str) -> bool {
 
 /// If the tokens represent a shell launcher (bash -c "..."), extract the inner
 /// command string. Returns None if not a shell launcher.
-fn extract_shell_inner(tokens: &[String]) -> Option<String> {
+pub(crate) fn extract_shell_inner(tokens: &[String]) -> Option<String> {
     if tokens.is_empty() {
         return None;
     }

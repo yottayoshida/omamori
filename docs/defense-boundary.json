@@ -123,6 +123,15 @@
       "verified_by": "Hook integration file-protection tests, tool_calls_through_the_installed_hook, ACCEPTANCE_TEST.md live row"
     },
     {
+      "id": "config-hook-file-shell-write",
+      "category": "caught",
+      "surface": "Config/hook file editing from a shell command (the write positions under What a Shell Write Is)",
+      "layer1": "not applicable",
+      "layer2": "supported",
+      "layer2_note": "every provider whose shell commands reach the hook; forms not listed there are not reached, #577",
+      "verified_by": "Hook integration shell-write-* cases, a_shell_command_that_writes_a_protected_file_is_blocked"
+    },
+    {
       "id": "static-shell-expansion-obfuscation",
       "category": "caught",
       "surface": "Static shell expansion obfuscation (`$'rm'`, `$\"rm\"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`)",

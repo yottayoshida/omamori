@@ -174,7 +174,7 @@ pub fn load_config(path: Option<&Path>) -> Result<ConfigLoadResult, AppError> {
                 warnings.push(format!(
                     "config permissions are too open at {}\n  \
                      Built-in default rules are active for security.\n  \
-                     To fix, run: chmod 600 {}",
+                     To fix, run in your own terminal: chmod 600 {}",
                     path.display(),
                     path.display()
                 ));

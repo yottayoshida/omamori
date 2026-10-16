@@ -480,6 +480,30 @@ fn cursor_hook_blocks_bin_rm() {
 }
 
 #[test]
+fn cursor_hook_blocks_a_shell_write_to_omamori_files() {
+    let (stdout, _, success) = run_cursor_hook(
+        r#"{"command":"echo x >> ~/.config/omamori/config.toml","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#,
+    );
+    assert!(success);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["permission"], "deny");
+    assert!(
+        parsed["userMessage"]
+            .as_str()
+            .unwrap()
+            .contains("protected file")
+    );
+
+    let (stdout, _, _) = run_cursor_hook(
+        r#"{"command":"echo x >> /tmp/omamori-cursor-not-protected.txt","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#,
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(parsed["permission"], "allow");
+}
+
+#[test]
 fn cursor_hook_allows_safe_command() {
     let (stdout, _, success) = run_cursor_hook(
         r#"{"command":"ls /tmp","cwd":"/tmp","hook_event_name":"beforeShellExecution"}"#,
