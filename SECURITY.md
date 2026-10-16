@@ -504,6 +504,7 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 |-----------|-----------|
 | Shell wrappers (`sudo`, `env`, `nohup`, `timeout`, `nice`, `exec`, `command`, `doas`, `pkexec`, `time`) | Stripped recursively to expose inner command |
 | Reserved words at a command's head (`!`, `{`, `if`, `then`, `elif`, `else`, `while`, `until`, `do`) | Skipped, so the command after them is the one checked |
+| Subshells (`( … )`, `((cmd); …)`, `then(…)`) | Opened, so the commands inside are checked; the parentheses of `$( … )`, `<( … )`, `x=( … )`, `f()`, `[[ … ]]` and `(( … ))` arithmetic are left in their words |
 | Shell launchers (`bash -c`, `sh -c`, `zsh -c`, `dash -c`, `ksh -c`) | Inner command extracted and recursively parsed |
 | Full-path shells (`/usr/local/bin/bash -c`) | Recognized via basename matching |
 | Combined flags (`bash -lc`) | Detected via flag suffix matching |

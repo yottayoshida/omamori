@@ -1924,6 +1924,66 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         "group-newline-heredoc-into-shell-block",
     ),
     (
+        "(omamori override disable rm-recursive-to-trash)",
+        Decision::Block,
+        "subshell-block",
+    ),
+    (
+        "true && ( omamori override disable rm-recursive-to-trash )",
+        Decision::Block,
+        "subshell-spaced-block",
+    ),
+    (
+        "((omamori override disable rm-recursive-to-trash); true)",
+        Decision::Block,
+        "subshell-nested-block",
+    ),
+    (
+        "(unset CLAUDECODE; omamori override disable rm-recursive-to-trash)",
+        Decision::Block,
+        "subshell-unset-block",
+    ),
+    (
+        "((#x)); omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "subshell-hash-after-paren-block",
+    ),
+    (
+        "env -i -u ')' omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "quoted-close-paren-argument-block",
+    ),
+    (
+        "if true; then(omamori override disable rm-recursive-to-trash); fi",
+        Decision::Block,
+        "subshell-after-reserved-word-block",
+    ),
+    (
+        "(cd sub && cargo build)",
+        Decision::Allow,
+        "subshell-harmless-allow",
+    ),
+    (
+        "(( ${#arr[@]} > 0 )) && echo yes",
+        Decision::Allow,
+        "arithmetic-allow",
+    ),
+    (
+        "n=$(( ( ${a} + 1 ) ))",
+        Decision::Allow,
+        "arithmetic-expansion-group-allow",
+    ),
+    (
+        "(true) # it's\nomamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "subshell-then-quoted-comment-block",
+    ),
+    (
+        "echo $((1 + 2)); diff <(ls a) <(ls b)",
+        Decision::Allow,
+        "parentheses-not-subshell-allow",
+    ),
+    (
         "echo time omamori override disable rm-recursive-to-trash",
         Decision::Allow,
         "time-as-argument-allow",
