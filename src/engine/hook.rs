@@ -96,19 +96,44 @@ fn is_command_position(tokens: &[String], idx: usize) -> bool {
         return true;
     }
     let mut j = idx;
+    let mut walked = 0;
     while j > 0 {
+        walked += 1;
+        if walked > COMMAND_POSITION_WALK_LIMIT {
+            return true;
+        }
         let prev = &tokens[j - 1];
         if matches!(prev.as_str(), "&&" | "||" | ";" | "|" | "&") {
             return true;
         }
-        if unwrap::is_env_assignment(prev) {
+        // A reserved word or `time` is walked past, not taken as a start:
+        // only one at a command's head starts a command (`echo if unset X`
+        // unsets nothing).
+        if unwrap::is_env_assignment(prev) || unwrap::is_reserved_head(prev) {
             j -= 1;
+            continue;
+        }
+        // The farthest `time` first: a nearer one can be the value of a flag
+        // (`time -o time unset X`).
+        if let Some(k) = (j.saturating_sub(TIME_PREFIX_LOOKBACK)..j)
+            .find(|&k| unwrap::time_prefix_end(tokens, k) == Some(j))
+        {
+            j = k;
             continue;
         }
         return false;
     }
     true // walked all the way to start
 }
+
+// ponytail: a `time` with more flags than this ahead of a command is not
+// walked past, and an `unset` after it is not seen by Phase 1B.
+const TIME_PREFIX_LOOKBACK: usize = 16;
+
+// ponytail: past this many words of assignments, reserved words and `time`
+// a word is taken as a command's head. Phase 1B then blocks more, never less;
+// without the limit `! ! ! …` makes it quadratic in the command's length.
+const COMMAND_POSITION_WALK_LIMIT: usize = 64;
 
 /// Detect env var tampering at the token level.
 /// Only flags commands in command position to avoid false positives
@@ -4237,6 +4262,52 @@ mod tests {
             }
         }
         restore_config(old_xdg, old_home, dir);
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn unsetting_a_detector_var_behind_a_reserved_word_or_time_is_blocked() {
+        for command in [
+            "time unset CLAUDECODE",
+            "time -p unset CLAUDECODE",
+            "time env -u CLAUDECODE true",
+            "time -- unset CLAUDECODE",
+            "time -p -- unset CLAUDECODE",
+            "/usr/bin/time -p env -u CLAUDECODE true",
+            "time -ao f env -u CLAUDECODE true",
+            "FOO=1 time unset CLAUDECODE",
+            "/usr/bin/time -o time env -u CLAUDECODE true",
+            "! unset CLAUDECODE",
+            "{ unset CLAUDECODE; }",
+            "if unset CLAUDECODE; then :; fi",
+            "if true; then unset CLAUDECODE; fi",
+            "while ! unset CLAUDECODE; do break; done",
+            "for i in 1; do CLAUDECODE= true; done",
+        ] {
+            assert_blocks_meta(command);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_long_run_of_reserved_words_ahead_of_an_unset_is_still_read() {
+        assert_blocks_meta(&format!("{}unset CLAUDECODE", "! ".repeat(20_000)));
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_long_run_of_reserved_words_is_read_in_linear_time() {
+        let started = std::time::Instant::now();
+        assert_allows(&format!("{}true", "! ".repeat(19_999)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_reserved_word_or_time_as_an_argument_starts_no_command() {
+        assert_allows("echo if unset CLAUDECODE");
+        assert_allows("echo time unset CLAUDECODE");
+        assert_allows("echo time -p unset CLAUDECODE");
     }
 
     // --- BLOCK: whitespace bypass (#145) — all use assert_blocks_meta ---

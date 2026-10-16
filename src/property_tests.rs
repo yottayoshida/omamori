@@ -275,7 +275,7 @@ fn arb_destructive_core() -> impl Strategy<Value = (String, Vec<String>)> {
 /// pipe-to-shell case where the launcher is structurally blocked).
 ///
 /// The transparent-wrapper subset (`Sudo / Doas / Pkexec / EnvU /
-/// Timeout / Nice / Nohup / Command / Exec`) covers every entry in
+/// Timeout / Nice / Nohup / Command / Exec / Time`) covers every entry in
 /// `unwrap::TRANSPARENT_WRAPPERS`; this is pinned by
 /// [`wrapper_kinds_cover_transparent_wrappers_sot`] so SoT additions
 /// fail-loud here.
@@ -305,6 +305,7 @@ enum Wrapper {
     Command,
     /// `exec <inner>` — POSIX `exec` builtin (replaces shell). SoT entry.
     Exec,
+    Time,
     /// `bash -c "<inner>"` — shell launcher with `-c`.
     BashC,
     /// `echo "<inner>" | bash` — pipe-to-shell, classic v0.9.5 surface.
@@ -321,7 +322,7 @@ enum Wrapper {
 /// canonical SoT spelling. Pinned against `unwrap::TRANSPARENT_WRAPPERS`
 /// by [`wrapper_kinds_cover_transparent_wrappers_sot`].
 const WRAPPER_TRANSPARENT_NAMES: &[&str] = &[
-    "sudo", "doas", "pkexec", "env", "timeout", "nice", "nohup", "command", "exec",
+    "sudo", "doas", "pkexec", "env", "timeout", "nice", "nohup", "command", "exec", "time",
 ];
 
 fn arb_wrapper() -> impl Strategy<Value = Wrapper> {
@@ -336,6 +337,7 @@ fn arb_wrapper() -> impl Strategy<Value = Wrapper> {
         Just(Wrapper::Nohup),
         Just(Wrapper::Command),
         Just(Wrapper::Exec),
+        Just(Wrapper::Time),
         Just(Wrapper::BashC),
         Just(Wrapper::PipeBash),
         Just(Wrapper::PipeEnvS),
@@ -358,6 +360,7 @@ fn assemble_command(program: &str, args: &[String], wrapper: Wrapper) -> String 
         Wrapper::Nohup => format!("nohup {inner}"),
         Wrapper::Command => format!("command {inner}"),
         Wrapper::Exec => format!("exec {inner}"),
+        Wrapper::Time => format!("time -p {inner}"),
         Wrapper::BashC => format!("bash -c \"{inner}\""),
         Wrapper::PipeBash => format!("echo \"{inner}\" | bash"),
         Wrapper::PipeEnvS => format!("echo \"{inner}\" | env -S 'bash -e'"),
