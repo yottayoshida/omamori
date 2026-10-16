@@ -2014,6 +2014,26 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         "shell-read-config-allow",
     ),
     (
+        "cat ~/.local/share/omamori/audit-secret",
+        Decision::Block,
+        "shell-secret-cat-block",
+    ),
+    (
+        "ls -d ~/.local/share/omamori/audit-secret | xargs cat",
+        Decision::Block,
+        "shell-secret-name-through-pipe-block",
+    ),
+    (
+        "ls -la ~/.local/share/omamori",
+        Decision::Allow,
+        "shell-secret-directory-listing-allow",
+    ),
+    (
+        "grep -rn audit-secret src/",
+        Decision::Allow,
+        "shell-secret-word-in-search-allow",
+    ),
+    (
         "git commit -m 'fix ~/.config/omamori/config.toml'",
         Decision::Allow,
         "shell-mention-config-allow",

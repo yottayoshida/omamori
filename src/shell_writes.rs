@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use crate::engine::hook::FileProtectionVerdict;
+use crate::engine::hook::{FileProtectionVerdict, fold_name};
 
 const MAX_DEPTH: u8 = 5;
 const MAX_BRACE_WORDS: usize = 64;
@@ -19,9 +19,10 @@ pub(crate) struct Word {
 #[derive(Debug, PartialEq, Eq)]
 enum Lexed {
     Word(Word),
-    Separator { and: bool, or: bool },
+    Separator { and: bool, or: bool, pipe: bool },
     Open,
     Close,
+    Unsafe,
     Redirect(String),
     Nested(String),
 }
@@ -40,6 +41,16 @@ enum Event {
         target: Word,
         sure: bool,
     },
+    Mention {
+        word: Word,
+        exempt: bool,
+    },
+    Reads {
+        exempt: bool,
+    },
+    // Something in the command can carry a name reader's output on to a
+    // reader, or make a reader's name run something else.
+    Unsafe,
     Write {
         target: Word,
         reach: Reach,
@@ -60,6 +71,8 @@ pub(crate) struct Surroundings<'a> {
     pub(crate) bases: Vec<PathBuf>,
     pub(crate) tree_bases: Vec<PathBuf>,
     pub(crate) protected: &'a [PathBuf],
+    pub(crate) secret_files: &'a [PathBuf],
+    pub(crate) secret_dirs: &'a [PathBuf],
 }
 
 type Judge<'a> = &'a dyn Fn(&str, Option<&Path>) -> Option<FileProtectionVerdict>;
@@ -69,6 +82,7 @@ pub(crate) fn shell_write_verdict(
     command: &str,
     surroundings: &Surroundings<'_>,
     judge: Judge<'_>,
+    judge_secret: &dyn Fn(&str) -> Option<FileProtectionVerdict>,
 ) -> Option<(String, FileProtectionVerdict)> {
     let home = surroundings.home.map(|h| h.to_string_lossy().into_owned());
     let mut events = Vec::new();
@@ -78,8 +92,21 @@ pub(crate) fn shell_write_verdict(
     let mut before_sure: Option<Vec<PathBuf>> = None;
     let mut scopes: Vec<Saved> = Vec::new();
     let mut dirs_read = 0;
+    let mut canonical = std::collections::HashMap::new();
+    // Not exempt anywhere when the output of a name reader can go on to
+    // something that reads it (a pipe anywhere, a process substitution), or
+    // when the command defines what a reader's name runs.
+    let exemptions_hold = !events.iter().any(|e| matches!(e, Event::Unsafe));
+    let secret_ids: Vec<(u64, u64)> = surroundings
+        .secret_files
+        .iter()
+        .chain(surroundings.secret_dirs)
+        .filter_map(|p| identity(p))
+        .collect();
+    let mut secret_dirs_read = 0;
     for event in events {
         match event {
+            Event::Unsafe => {}
             Event::Enter => scopes.push((names.clone(), trees.clone(), before_sure.clone())),
             Event::Leave => {
                 if let Some((n, t, b)) = scopes.pop() {
@@ -95,6 +122,24 @@ pub(crate) fn shell_write_verdict(
             }
             Event::Cd { target, sure } => {
                 let Some(next_trees) = resolve_cd(&target, &trees) else {
+                    if target.glob {
+                        for anchor in anchors(&target.text, &names.clone()) {
+                            let pattern = lexical(&PathBuf::from(absolute_text(
+                                &target.text,
+                                anchor.as_deref(),
+                            )));
+                            let depth = folded_components(&pattern).len();
+                            for dir in surroundings.secret_dirs {
+                                let level: PathBuf = dir.components().take(depth).collect();
+                                if folded_components(dir).len() >= depth
+                                    && glob_reaches(&pattern, &level)
+                                {
+                                    push_new(&mut names, level.clone());
+                                    push_new(&mut trees, level);
+                                }
+                            }
+                        }
+                    }
                     continue;
                 };
                 for r in resolve_cd(&target, &names).unwrap_or_default() {
@@ -108,6 +153,36 @@ pub(crate) fn shell_write_verdict(
                 } else {
                     for r in next_trees {
                         push_new(&mut trees, r);
+                    }
+                }
+            }
+            Event::Mention { word, exempt } => {
+                if exempt && exemptions_hold {
+                    continue;
+                }
+                if let Some(hit) = judge_mention(
+                    &word,
+                    &names,
+                    surroundings,
+                    &secret_ids,
+                    judge_secret,
+                    &mut canonical,
+                    &mut secret_dirs_read,
+                ) {
+                    return Some(hit);
+                }
+            }
+            Event::Reads { exempt } => {
+                if exempt && exemptions_hold {
+                    continue;
+                }
+                // Where the command runs now, not every place a `cd` ever
+                // named: `cd <dir> && ls; cd ~/proj && make` reads in proj.
+                for base in &trees {
+                    let in_secret_dir = surroundings.secret_dirs.iter().any(|d| same_path(base, d))
+                        || identity(base).is_some_and(|id| secret_ids.contains(&id));
+                    if in_secret_dir && let Some(v) = judge_secret(&base.to_string_lossy()) {
+                        return Some((base.to_string_lossy().into_owned(), v));
                     }
                 }
             }
@@ -139,9 +214,181 @@ pub(crate) fn shell_write_verdict(
     None
 }
 
+fn same_path(a: &Path, b: &Path) -> bool {
+    folded_components(a) == folded_components(b)
+}
+
+// Not judged by which program reads: readers are unbounded and a renamed one
+// would pass, while naming the secret at all is rare.
+fn judge_mention(
+    word: &Word,
+    names: &[PathBuf],
+    surroundings: &Surroundings<'_>,
+    secret_ids: &[(u64, u64)],
+    judge_secret: &dyn Fn(&str) -> Option<FileProtectionVerdict>,
+    canonical: &mut std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    dirs_read: &mut usize,
+) -> Option<(String, FileProtectionVerdict)> {
+    let mut texts = vec![word.text.as_str()];
+    if let Some((_, value)) = word.text.split_once('=') {
+        texts.push(value);
+    }
+    // Not only a separate word: a short option takes its value attached
+    // (`curl -d@FILE`, `-T FILE` written `-TFILE`).
+    if word.text.starts_with('-')
+        && !word.text.starts_with("--")
+        && let Some(value) = word.text.get(2..).filter(|v| !v.is_empty())
+    {
+        texts.push(value);
+    }
+    // Not only the word as a path: `curl --data-binary @FILE`, `-F f=@FILE`
+    // and `-pass file:FILE` read FILE.
+    for at in 0..texts.len() {
+        for prefix in ["@", "file://", "file:"] {
+            if let Some(rest) = texts[at].strip_prefix(prefix) {
+                texts.push(rest);
+            }
+        }
+    }
+    for text in texts {
+        if text.is_empty() {
+            continue;
+        }
+        for anchor in anchors(text, names) {
+            let path = lexical(&PathBuf::from(absolute_text(text, anchor.as_deref())));
+            if word.glob {
+                for secret in surroundings.secret_files {
+                    let reaches_far_enough = surroundings
+                        .secret_dirs
+                        .iter()
+                        .any(|d| folded_components(&path).len() >= folded_components(d).len());
+                    if reaches_far_enough
+                        && glob_reaches(&path, secret)
+                        && let Some(v) = judge_secret(&secret.to_string_lossy())
+                    {
+                        return Some((text.to_string(), v));
+                    }
+                }
+                if let Some(hit) = secret_in_glob_directory(&path, judge_secret, dirs_read) {
+                    return Some((text.to_string(), hit));
+                }
+                if let Some(hit) = secret_name_below_glob(&path, judge_secret, dirs_read) {
+                    return Some((text.to_string(), hit));
+                }
+                continue;
+            }
+            // Not resolved from the lexical form alone: `link/../x` is where
+            // `link` points, then up.
+            let raw = PathBuf::from(absolute_text(text, anchor.as_deref()));
+            let mut resolved = Vec::new();
+            for spelling in [&path, &raw] {
+                if let Some(r) = canonical
+                    .entry(spelling.clone())
+                    .or_insert_with(|| std::fs::canonicalize(spelling).ok())
+                    .clone()
+                {
+                    resolved.push(r);
+                }
+            }
+            for candidate in std::iter::once(&path).chain(resolved.iter()) {
+                // Not by spelling alone: a macOS firmlink spelling of the same
+                // directory (`/System/Volumes/Data/...`) is no link.
+                let names_secret = surroundings
+                    .secret_files
+                    .iter()
+                    .chain(surroundings.secret_dirs)
+                    .any(|s| same_path(candidate, s))
+                    || identity(candidate).is_some_and(|id| secret_ids.contains(&id));
+                // Not only the configured key: a copy or a key elsewhere is
+                // as good to a forger, and a name alone that exists nowhere
+                // (`grep -rn audit-secret src/`) is no read.
+                let secret_named_file = candidate
+                    .file_name()
+                    .is_some_and(|f| fold_name(&f.to_string_lossy()).starts_with("audit-secret"))
+                    && candidate.symlink_metadata().is_ok();
+                if (names_secret || secret_named_file)
+                    && let Some(v) = judge_secret(&candidate.to_string_lossy())
+                {
+                    return Some((text.to_string(), v));
+                }
+            }
+        }
+    }
+    None
+}
+
 // ponytail: past this many places a command may run, a further `cd` is not
 // followed; each one would double the paths a later write is judged under.
 const MAX_BASES: usize = 16;
+
+// Not only the configured key: a retired key, an epoch or pending file, or a
+// copy elsewhere is found by its name when a glob's directory is read.
+fn secret_in_glob_directory(
+    pattern: &Path,
+    judge_secret: &dyn Fn(&str) -> Option<FileProtectionVerdict>,
+    dirs_read: &mut usize,
+) -> Option<FileProtectionVerdict> {
+    glob_matches_in_directory(pattern, dirs_read)
+        .into_iter()
+        .filter(|found| {
+            found
+                .file_name()
+                .is_some_and(|n| fold_name(&n.to_string_lossy()).starts_with("audit-secret"))
+        })
+        .find_map(|found| judge_secret(&found.to_string_lossy()))
+}
+
+// A secret-named file below a directory pattern: `/backup/*/audit-secret`,
+// `~/.local/share/omam*/audit-secret.1.retired`.
+fn secret_name_below_glob(
+    pattern: &Path,
+    judge_secret: &dyn Fn(&str) -> Option<FileProtectionVerdict>,
+    dirs_read: &mut usize,
+) -> Option<FileProtectionVerdict> {
+    let last = pattern.file_name()?.to_string_lossy();
+    if has_glob(&last) || !fold_name(&last).starts_with("audit-secret") {
+        return None;
+    }
+    glob_matches_in_directory(pattern.parent()?, dirs_read)
+        .into_iter()
+        .map(|dir| dir.join(last.as_ref()))
+        .filter(|candidate| candidate.symlink_metadata().is_ok())
+        .find_map(|candidate| judge_secret(&candidate.to_string_lossy()))
+}
+
+// Not a directory listed when it is itself a pattern, nor past the budget:
+// each read is a filesystem call the hook waits on.
+fn glob_matches_in_directory(pattern: &Path, dirs_read: &mut usize) -> Vec<PathBuf> {
+    let (Some(parent), Some(last)) = (pattern.parent(), pattern.file_name()) else {
+        return Vec::new();
+    };
+    let last = last.to_string_lossy();
+    if has_glob(&parent.to_string_lossy()) || *dirs_read >= MAX_GLOB_DIRS {
+        return Vec::new();
+    }
+    *dirs_read += 1;
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .take(MAX_GLOB_ENTRIES)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name_matches(last.as_bytes(), name.as_bytes()))
+        .map(|name| parent.join(name))
+        .collect()
+}
+
+#[cfg(unix)]
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
 
 fn push_new(list: &mut Vec<PathBuf>, path: PathBuf) {
     if list.len() < MAX_BASES && !list.contains(&path) {
@@ -303,28 +550,12 @@ fn judge_glob(
                 return Some((text.to_string(), v));
             }
         }
-        let (Some(parent), Some(last)) = (pattern.parent(), pattern.file_name()) else {
-            continue;
-        };
-        let last = last.to_string_lossy();
-        if has_glob(&parent.to_string_lossy()) || *dirs_read >= MAX_GLOB_DIRS {
-            continue;
-        }
-        *dirs_read += 1;
-        let Ok(entries) = std::fs::read_dir(parent) else {
-            continue;
-        };
-        for entry in entries.flatten().take(MAX_GLOB_ENTRIES) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name_matches(last.as_bytes(), name.as_bytes()) {
-                let found = parent.join(&name);
-                let found = found.to_string_lossy();
-                if let Some(v) = judge(&found, None) {
-                    return Some((text.to_string(), v));
-                }
-                if let Some(v) = tail_below(Path::new(found.as_ref()), judge) {
-                    return Some((text.to_string(), v));
-                }
+        for found in glob_matches_in_directory(&pattern, dirs_read) {
+            if let Some(v) = judge(&found.to_string_lossy(), None) {
+                return Some((text.to_string(), v));
+            }
+            if let Some(v) = tail_below(&found, judge) {
+                return Some((text.to_string(), v));
             }
         }
     }
@@ -360,10 +591,9 @@ fn lexical(path: &Path) -> PathBuf {
     out.iter().collect()
 }
 
-// Not compared case-sensitively: the default macOS filesystem ignores case.
 fn folded_components(path: &Path) -> Vec<String> {
     path.components()
-        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .map(|c| fold_name(&c.as_os_str().to_string_lossy()))
         .collect()
 }
 
@@ -487,8 +717,12 @@ fn collect_events(text: &str, home: Option<&str>, depth: u8, events: &mut Vec<Ev
     while let Some(item) = lexed.next() {
         match item {
             Lexed::Word(word) => segment.push(word),
-            Lexed::Separator { and, or } => {
-                flush(&segment, and, &mut after_or, home, depth, events);
+            Lexed::Unsafe => events.push(Event::Unsafe),
+            Lexed::Separator { and, or, pipe } => {
+                if pipe {
+                    events.push(Event::Unsafe);
+                }
+                flush(&segment, and, pipe, &mut after_or, home, depth, events);
                 segment.clear();
                 if or {
                     let cd =
@@ -513,6 +747,12 @@ fn collect_events(text: &str, home: Option<&str>, depth: u8, events: &mut Vec<Ev
                 let Some(Lexed::Word(target)) = lexed.next() else {
                     continue;
                 };
+                if (redirect_writes_to(&op, &target) && target.text != "/dev/null")
+                    || target.text.starts_with("<(")
+                    || target.text.starts_with(">(")
+                {
+                    events.push(Event::Unsafe);
+                }
                 if redirect_writes_to(&op, &target) {
                     events.push(Event::Write {
                         target,
@@ -520,17 +760,23 @@ fn collect_events(text: &str, home: Option<&str>, depth: u8, events: &mut Vec<Ev
                         sources: vec![],
                         into: false,
                     });
+                } else if op.starts_with('<') && !op.starts_with("<<") {
+                    events.push(Event::Mention {
+                        word: target,
+                        exempt: false,
+                    });
                 }
             }
         }
     }
-    flush(&segment, false, &mut after_or, home, depth, events);
+    flush(&segment, false, false, &mut after_or, home, depth, events);
 }
 
 // `cd x || exit` is as sure as `cd x &&`: what follows runs only in `x`.
 fn flush(
     segment: &[Word],
     then_and: bool,
+    then_pipe: bool,
     after_or: &mut Option<Option<usize>>,
     home: Option<&str>,
     depth: u8,
@@ -549,7 +795,7 @@ fn flush(
             _ => events.push(Event::Or),
         }
     }
-    segment_events(segment, then_and, home, depth, events);
+    segment_events(segment, then_and, then_pipe, home, depth, events);
 }
 
 fn redirect_writes_to(op: &str, target: &Word) -> bool {
@@ -563,11 +809,13 @@ fn redirect_writes_to(op: &str, target: &Word) -> bool {
 fn segment_events(
     words: &[Word],
     then_and: bool,
+    then_pipe: bool,
     home: Option<&str>,
     depth: u8,
     events: &mut Vec<Event>,
 ) {
     let texts: Vec<String> = words.iter().map(|w| w.text.clone()).collect();
+    mention_events(words, then_pipe, depth, events);
     let stripped = crate::unwrap::unwrap_transparent(&texts);
     let offset = if texts.ends_with(&stripped) {
         texts.len() - stripped.len()
@@ -586,6 +834,63 @@ fn segment_events(
     }
     let program = first.text.rsplit('/').next().unwrap_or(&first.text);
     program_events(program, &words[1..], then_and, home, depth, events);
+}
+
+const NAME_READERS: &[&str] = &[
+    "ls", "stat", "test", "[", "[[", "cd", "pushd", "popd", "realpath", "readlink", "basename",
+    "dirname", "du", "tree", "eza", "exa", "lsd", "fd", "find",
+];
+
+// Not exempt when its output goes on through a pipe (`ls -d <key> | xargs
+// cat`), nor `find` or `fd` when they run or write something.
+fn mention_events(words: &[Word], then_pipe: bool, depth: u8, events: &mut Vec<Event>) {
+    let texts: Vec<String> = words.iter().map(|w| w.text.clone()).collect();
+    let stripped = crate::unwrap::unwrap_transparent(&texts);
+    let Some(program) = stripped.first() else {
+        return;
+    };
+    let acts = match program.as_str() {
+        "find" => stripped.iter().any(|t| {
+            matches!(
+                t.as_str(),
+                "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-delete"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fls"
+                    | "-fprintf"
+            )
+        }),
+        "fd" => stripped.iter().any(|t| {
+            t.starts_with("--exec")
+                || (t.starts_with('-') && !t.starts_with("--") && t.contains(['x', 'X']))
+        }),
+        _ => false,
+    } || stripped
+        .iter()
+        .any(|t| t.contains("fromfile") || t.contains("files0-from"));
+    if words.iter().any(|w| {
+        matches!(
+            w.text.as_str(),
+            "function" | "alias" | "hash" | "coproc" | "mkfifo" | "enable"
+        ) || w.text.ends_with("()")
+            || w.text.starts_with("PATH=")
+            || w.text.starts_with("<(")
+            || w.text.starts_with(">(")
+    }) {
+        events.push(Event::Unsafe);
+    }
+    // Not by a path or inside a substitution: `/tmp/ls` may be `cat` renamed,
+    // and what a substitution prints is read by the command around it.
+    let exempt = NAME_READERS.contains(&program.as_str()) && !then_pipe && !acts && depth == 0;
+    events.push(Event::Reads { exempt });
+    events.extend(words.iter().map(|w| Event::Mention {
+        word: w.clone(),
+        exempt,
+    }));
 }
 
 fn operands(args: &[Word]) -> Vec<Word> {
@@ -1002,7 +1307,7 @@ fn find_events(args: &[Word], home: Option<&str>, depth: u8, events: &mut Vec<Ev
                     deletes |= FIND_WRITERS.contains(&base);
                 }
                 let literal: Vec<Word> = inner.into_iter().filter(|w| w.text != "{}").collect();
-                segment_events(&literal, false, home, depth + 1, events);
+                segment_events(&literal, false, false, home, depth + 1, events);
             }
             _ => {}
         }
@@ -1030,7 +1335,7 @@ fn xargs_events(args: &[Word], home: Option<&str>, depth: u8, events: &mut Vec<E
         i += if takes_value { 2 } else { 1 };
     }
     if i < args.len() {
-        segment_events(&args[i..], false, home, depth + 1, events);
+        segment_events(&args[i..], false, false, home, depth + 1, events);
     }
 }
 
@@ -1224,7 +1529,11 @@ impl Lexer<'_> {
 
     fn separator_of(&mut self, and: bool, or: bool) {
         self.end_word();
-        self.out.push(Lexed::Separator { and, or });
+        self.out.push(Lexed::Separator {
+            and,
+            or,
+            pipe: false,
+        });
     }
 
     // `close` is past the `)` that ends the group, or the end of the text
@@ -1320,6 +1629,9 @@ impl Lexer<'_> {
                     i += 1;
                 }
                 b')' => {
+                    if matches!(self.out.last(), Some(Lexed::Open)) && !self.word.started {
+                        self.out.push(Lexed::Unsafe);
+                    }
                     self.separator(false);
                     self.out.push(Lexed::Close);
                     i += 1;
@@ -1340,7 +1652,12 @@ impl Lexer<'_> {
                 }
                 b'|' => {
                     let or = b.get(i + 1) == Some(&b'|');
-                    self.separator_of(false, or);
+                    self.end_word();
+                    self.out.push(Lexed::Separator {
+                        and: false,
+                        or,
+                        pipe: !or,
+                    });
                     i += if matches!(b.get(i + 1), Some(b'|' | b'&')) {
                         2
                     } else {
@@ -1421,7 +1738,8 @@ impl Lexer<'_> {
                 }
                 b'$' => i = self.dollar(i),
                 b'`' => i = self.backquoted(i),
-                b'~' if !self.word.started
+                b'~' if (!self.word.started
+                    || matches!(self.word.bytes.last(), Some(b'=' | b':')))
                     && b.get(i + 1).is_none_or(|n| {
                         matches!(n, b'/' | b' ' | b'\t' | b'\n' | b';' | b'|' | b'&' | b')')
                     }) =>
