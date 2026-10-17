@@ -1591,6 +1591,207 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "rule-after-heredoc-with-odd-quote-block",
     ),
+    (
+        "omamori 2>/dev/null override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-after-program-block",
+    ),
+    (
+        "omamori>/dev/null override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-unspaced-block",
+    ),
+    (
+        "env -i HOME=/x /opt/homebrew/bin/omamori 2>/dev/null override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-env-i-full-path-block",
+    ),
+    (
+        "omamori </dev/null config disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-stdin-before-subcommand-block",
+    ),
+    (
+        "env 2>/dev/null -i omamori uninstall",
+        Decision::Block,
+        "redirect-inside-wrapper-args-block",
+    ),
+    (
+        "timeout 2>/dev/null 5 rm -rf /tmp/x",
+        Decision::Block,
+        "redirect-timeout-args-block",
+    ),
+    (
+        "bash -c \"omamori 2>/dev/null audit key rotate\"",
+        Decision::Block,
+        "redirect-nested-launcher-block",
+    ),
+    (
+        "bash -c \"omamori 10>/dev/null override disable rm-recursive-to-trash\"",
+        Decision::Block,
+        "redirect-multi-digit-fd-block",
+    ),
+    (
+        "omamori {fd}>/dev/null uninstall",
+        Decision::Block,
+        "redirect-named-fd-block",
+    ),
+    (
+        "unset 2>/dev/null CLAUDECODE",
+        Decision::Block,
+        "redirect-unset-block",
+    ),
+    (
+        "omamori <&- override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-dup-close-block",
+    ),
+    (
+        "omamori >| /tmp/omamori-x override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-clobber-block",
+    ),
+    (
+        "omamori 2>'-' override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-quoted-target-block",
+    ),
+    (
+        "omamori <<<x override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-herestring-block",
+    ),
+    (
+        "omamori <<EOF override disable rm-recursive-to-trash\nbody\nEOF",
+        Decision::Block,
+        "redirect-heredoc-operator-block",
+    ),
+    (
+        "echo | bash < /dev/null; omamori 2>/dev/null override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-after-stdin-shell-block",
+    ),
+    (
+        "echo hello 2>/dev/null",
+        Decision::Allow,
+        "redirect-echo-allow",
+    ),
+    (
+        "omamori config list 2>/dev/null",
+        Decision::Allow,
+        "redirect-config-list-allow",
+    ),
+    (
+        "cat setup.log | bash < setup.sh",
+        Decision::Allow,
+        "redirect-stdin-replaces-pipe-allow",
+    ),
+    (
+        "echo x >| out.txt",
+        Decision::Allow,
+        "redirect-clobber-file-allow",
+    ),
+    ("echo a>b", Decision::Allow, "redirect-unspaced-echo-allow"),
+    (
+        "echo \\>| omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "escaped-gt-then-pipe-block",
+    ),
+    (
+        "echo \\<& omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "escaped-lt-then-background-block",
+    ),
+    (
+        "2>/dev/null unset CLAUDECODE",
+        Decision::Block,
+        "leading-redirect-unset-block",
+    ),
+    (
+        "10>/dev/null omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "leading-multi-digit-fd-block",
+    ),
+    (
+        "{fd}>/dev/null omamori uninstall",
+        Decision::Block,
+        "leading-named-fd-block",
+    ),
+    (
+        "bash -c \"10>/dev/null omamori override disable rm-recursive-to-trash\"",
+        Decision::Block,
+        "leading-multi-digit-fd-in-launcher-block",
+    ),
+    (
+        "omamori < <(true) override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-from-process-substitution-block",
+    ),
+    (
+        "omamori 2> >(cat) override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-into-process-substitution-block",
+    ),
+    (
+        "omamori \\\n2>/dev/null override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-after-line-continuation-block",
+    ),
+    (
+        "omamori > \\\n /tmp/omamori-x override disable rm-recursive-to-trash",
+        Decision::Block,
+        "redirect-target-after-line-continuation-block",
+    ),
+    (
+        "zsh -c \"omamori >! /tmp/omamori-x override disable rm-recursive-to-trash\"",
+        Decision::Block,
+        "zsh-clobber-in-launcher-block",
+    ),
+    (
+        "omamori >! /tmp/omamori-x override disable rm-recursive-to-trash",
+        Decision::Block,
+        "zsh-clobber-block",
+    ),
+    (
+        "cat > notes.md <<'EOF' # notes\ngit push --force\nEOF",
+        Decision::Allow,
+        "comment-after-data-heredoc-allow",
+    ),
+    (
+        "cat setup.log | bash < setup.sh # run",
+        Decision::Allow,
+        "stdin-redirect-before-comment-allow",
+    ),
+    (
+        "cat <<EOF\nEO\\\nF\nomamori 2>/dev/null override disable rm-recursive-to-trash\nEOF",
+        Decision::Block,
+        "redirect-after-continued-delimiter-line-block",
+    ),
+    (
+        "omamori >>| /tmp/omamori-x override disable rm-recursive-to-trash",
+        Decision::Block,
+        "zsh-append-clobber-block",
+    ),
+    (
+        "omamori &>! /tmp/omamori-x override disable rm-recursive-to-trash",
+        Decision::Block,
+        "zsh-both-clobber-block",
+    ),
+    (
+        "omamori >&| /tmp/omamori-x override disable rm-recursive-to-trash",
+        Decision::Block,
+        "zsh-dup-clobber-block",
+    ),
+    (
+        "omamori >! override disable rm-recursive-to-trash",
+        Decision::Block,
+        "bash-bang-target-block",
+    ),
+    (
+        "unset >! CLAUDECODE",
+        Decision::Block,
+        "bash-bang-target-unset-block",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES

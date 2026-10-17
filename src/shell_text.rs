@@ -450,7 +450,8 @@ pub(crate) fn lenient_words(text: &str) -> Vec<String> {
                 (b'|', Some(b'|')) => Some(("||", 2)),
                 (b'|', Some(b'&')) => Some(("|", 2)),
                 (b'&', Some(b'>')) => None,
-                (b'&', _) if i > 0 && bytes[i - 1] == b'>' => None,
+                (b'&', _) if operator_char_before(bytes, i, b"<>") => None,
+                (b'|', _) if clobber_bar(bytes, i) => None,
                 (b'&', _) => Some(("&", 1)),
                 (b'|', _) => Some(("|", 1)),
                 (b';', _) | (b'\n', _) => Some((";", 1)),
@@ -595,6 +596,307 @@ fn body_lines_as_commands(
             words.push(";".to_string());
         }
         pos = after;
+    }
+    pos
+}
+
+// Moved, not removed: a stdin redirection on a shell after a pipe would go,
+// and `x | bash < f` would read as a pipe into a shell.
+pub(crate) fn redirects_moved_to_the_end(text: &str, shell: Shell) -> Cow<'_, str> {
+    if !text.contains(['<', '>']) {
+        return Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut tracker = Tracker::new();
+    let mut nested: Vec<Pending> = Vec::new();
+    let mut bodies: Vec<Pending> = Vec::new();
+    let mut commands: Vec<SimpleCommand> = Vec::new();
+    let mut current = SimpleCommand::at(0);
+    let mut word_begin: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        // Nothing inside parentheses moves: a redirection before `<(` would be
+        // split from its `(`.
+        if tracker.top().is_some() {
+            if b == b'\n'
+                && matches!(tracker.top(), Some(Ctx::Subst) | Some(Ctx::Group))
+                && !nested.is_empty()
+            {
+                tracker.step(bytes, i);
+                i = read_bodies(text, i + 1, &mut nested, &mut Vec::new()).unwrap_or(i + 1);
+                continue;
+            }
+            i = match tracker.step(bytes, i) {
+                Step::NestedHeredoc => {
+                    nested.extend(delimiter_as_compared(bytes, i));
+                    i + 2
+                }
+                step => step_end(step, i),
+            };
+            continue;
+        }
+        // Not a word boundary: the shell drops a `\` and its newline.
+        if b == b'\\' && next == Some(b'\n') {
+            tracker.step(bytes, i);
+            i += 2;
+            continue;
+        }
+        let redirect =
+            (matches!(b, b'<' | b'>') && next != Some(b'(')) || (b == b'&' && next == Some(b'>'));
+        if redirect {
+            // No descriptor for `&>`: bash reads the digits before it as a word.
+            let descriptor = word_begin
+                .filter(|&w| b != b'&' && is_io_number(&bytes[w..i]))
+                .inspect(|_| {
+                    current.word_starts.pop();
+                });
+            let start = descriptor.unwrap_or(i);
+            let operator = redirect_operator_len(&bytes[i..], shell);
+            let heredoc = bytes[i..].starts_with(b"<<") && !bytes[i..].starts_with(b"<<<");
+            let end = match heredoc.then(|| delimiter_as_compared(bytes, i)).flatten() {
+                Some(pending) => {
+                    let end = pending.operator.end;
+                    bodies.push(pending);
+                    end
+                }
+                None => word_end(&mut tracker, bytes, i + operator),
+            };
+            current.redirects.push(start..end);
+            word_begin = None;
+            i = end;
+            continue;
+        }
+        let terminator = match (b, next) {
+            (b'&', Some(b'&')) | (b'|', Some(b'|')) | (b'|', Some(b'&')) => 2,
+            (b';' | b'&' | b'|' | b'\n', _) => 1,
+            _ => 0,
+        };
+        if terminator > 0 {
+            current.end = i;
+            commands.push(std::mem::replace(&mut current, SimpleCommand::at(i)));
+            tracker.step(bytes, i);
+            i += terminator;
+            if b == b'\n' {
+                i = past_bodies(text, i, &mut bodies);
+            }
+            current.start = i;
+            word_begin = None;
+            continue;
+        }
+        if matches!(b, b' ' | b'\t' | b'\r') {
+            word_begin = None;
+            tracker.step(bytes, i);
+            i += 1;
+            continue;
+        }
+        let step = tracker.step(bytes, i);
+        // Not past a comment: a redirection moved behind `#` would be lost.
+        if let Step::Comment(comment_end) = step {
+            current.end = i;
+            commands.push(std::mem::replace(
+                &mut current,
+                SimpleCommand::at(comment_end),
+            ));
+            word_begin = None;
+            i = comment_end;
+            continue;
+        }
+        if word_begin.is_none() {
+            word_begin = Some(i);
+            current.word_starts.push(i);
+        }
+        i = step_end(step, i);
+    }
+    current.end = bytes.len();
+    commands.push(current);
+    if !commands.iter().any(SimpleCommand::moves) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut pos = 0;
+    for command in &commands {
+        out.push_str(&text[pos..command.start]);
+        if command.moves() {
+            let mut at = command.start;
+            for redirect in &command.redirects {
+                out.push_str(&text[at..redirect.start]);
+                at = redirect.end;
+            }
+            out.push_str(&text[at..command.end]);
+            for redirect in &command.redirects {
+                out.push(' ');
+                out.push_str(&text[redirect.clone()]);
+            }
+            // Not against what follows: a `#` there would join the last word.
+            out.push(' ');
+        } else {
+            out.push_str(&text[command.start..command.end]);
+        }
+        pos = command.end;
+    }
+    out.push_str(&text[pos..]);
+    Cow::Owned(out)
+}
+
+struct SimpleCommand {
+    start: usize,
+    end: usize,
+    redirects: Vec<Range<usize>>,
+    word_starts: Vec<usize>,
+}
+
+impl SimpleCommand {
+    fn at(start: usize) -> Self {
+        Self {
+            start,
+            end: start,
+            redirects: Vec::new(),
+            word_starts: Vec::new(),
+        }
+    }
+
+    fn moves(&self) -> bool {
+        self.redirects
+            .first()
+            .is_some_and(|first| self.word_starts.iter().any(|&w| w > first.start))
+    }
+}
+
+fn step_end(step: Step, i: usize) -> usize {
+    match step {
+        Step::Next(n) | Step::Comment(n) => n,
+        Step::Heredoc | Step::NestedHeredoc | Step::Continuation => i + 2,
+        Step::TopNewline | Step::Unbalanced => i + 1,
+    }
+}
+
+fn is_io_number(word: &[u8]) -> bool {
+    let mut joined = Vec::with_capacity(word.len());
+    let mut k = 0;
+    while k < word.len() {
+        if word[k] == b'\\' && word.get(k + 1) == Some(&b'\n') {
+            k += 2;
+            continue;
+        }
+        joined.push(word[k]);
+        k += 1;
+    }
+    let word = joined.as_slice();
+    let named = word.len() > 2
+        && word[0] == b'{'
+        && word[word.len() - 1] == b'}'
+        && (word[1].is_ascii_alphabetic() || word[1] == b'_')
+        && word[1..word.len() - 1]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == b'_');
+    named || (!word.is_empty() && word.iter().all(u8::is_ascii_digit))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shell {
+    Zsh,
+    Bash,
+}
+
+// Not bash as well without a `!`: the two readings would be the same.
+pub(crate) fn shells_reading(text: &str) -> &'static [Shell] {
+    if text.contains('!') {
+        &[Shell::Zsh, Shell::Bash]
+    } else {
+        &[Shell::Zsh]
+    }
+}
+
+fn redirect_operator_len(rest: &[u8], shell: Shell) -> usize {
+    [
+        "&>>|", "&>>!", ">>&|", ">>&!", "&>>", "&>|", "&>!", "<<<", "<<-", ">>&", ">>|", ">>!",
+        ">&|", ">&!", "&>", "<<", "<&", "<>", ">>", ">|", ">!", ">&", "<", ">",
+    ]
+    .iter()
+    // The `|` forms stay for bash: it rejects them, so nothing it runs is misread.
+    .filter(|op| shell == Shell::Zsh || !op.ends_with('!'))
+    .find(|op| rest.starts_with(op.as_bytes()))
+    .map_or(1, |op| op.len())
+}
+
+pub(crate) fn clobber_bar(bytes: &[u8], i: usize) -> bool {
+    operator_char_before(bytes, i, b">")
+        || (operator_char_before(bytes, i, b"&") && operator_char_before(bytes, i - 1, b">"))
+}
+
+pub(crate) fn operator_char_before(bytes: &[u8], i: usize, chars: &[u8]) -> bool {
+    i > 0
+        && chars.contains(&bytes[i - 1])
+        && bytes[..i - 1]
+            .iter()
+            .rev()
+            .take_while(|&&c| c == b'\\')
+            .count()
+            % 2
+            == 0
+}
+
+fn word_end(tracker: &mut Tracker, bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        match (bytes.get(i), bytes.get(i + 1)) {
+            (Some(b' ' | b'\t'), _) => {
+                tracker.step(bytes, i);
+                i += 1;
+            }
+            (Some(b'\\'), Some(b'\n')) => {
+                tracker.step(bytes, i);
+                i += 2;
+            }
+            _ => break,
+        }
+    }
+    while i < bytes.len() {
+        if tracker.top().is_none() {
+            if matches!(bytes[i], b'<' | b'>') && bytes.get(i + 1) == Some(&b'(') {
+                tracker.step(bytes, i);
+                tracker.step(bytes, i + 1);
+                i += 2;
+                continue;
+            }
+            if matches!(
+                bytes[i],
+                b' ' | b'\t' | b'\r' | b'\n' | b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')'
+            ) {
+                break;
+            }
+        }
+        let step = tracker.step(bytes, i);
+        i = step_end(step, i);
+    }
+    i.min(bytes.len())
+}
+
+fn past_bodies(text: &str, start: usize, pending: &mut Vec<Pending>) -> usize {
+    let mut pos = start;
+    for heredoc in pending.drain(..) {
+        let mut at = pos;
+        while at < text.len() {
+            let line_end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+            let line = &text[at..line_end];
+            let after = (line_end + 1).min(text.len());
+            let compared = if heredoc.strip_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if compared == heredoc.delimiter {
+                pos = after;
+                break;
+            }
+            // Not taken as a body: the shell joins a continued line before it
+            // compares, so where the body ends is not known.
+            if !heredoc.quoted && line.ends_with('\\') {
+                break;
+            }
+            at = after;
+        }
     }
     pos
 }
@@ -911,6 +1213,143 @@ mod tests {
         );
     }
 
+    fn moved(text: &str) -> String {
+        let out = redirects_moved_to_the_end(text, Shell::Zsh);
+        let mut collapsed = String::new();
+        for c in out.chars() {
+            if c == ' ' && (collapsed.is_empty() || collapsed.ends_with([' ', '\n'])) {
+                continue;
+            }
+            if c == '\n' && collapsed.ends_with(' ') {
+                collapsed.pop();
+            }
+            collapsed.push(c);
+        }
+        collapsed.trim_end_matches(' ').to_string()
+    }
+
+    #[test]
+    fn redirects_move_to_the_end_of_their_command() {
+        for (text, expected) in [
+            (
+                "omamori 2>/dev/null override disable x",
+                "omamori override disable x 2>/dev/null",
+            ),
+            (
+                "omamori>/dev/null override x",
+                "omamori override x >/dev/null",
+            ),
+            ("omamori 10>/dev/null x", "omamori x 10>/dev/null"),
+            ("omamori {fd}>/dev/null x", "omamori x {fd}>/dev/null"),
+            ("omamori <&- x", "omamori x <&-"),
+            ("omamori >| f x", "omamori x >| f"),
+            ("omamori 2>'-' x", "omamori x 2>'-'"),
+            ("omamori 2> \"/dev/null\" x", "omamori x 2> \"/dev/null\""),
+            ("omamori <<<x y", "omamori y <<<x"),
+            ("a 2>&1 >f b", "a b 2>&1 >f"),
+            ("a2>x b", "a2 b >x"),
+            ("echo a&>f b", "echo a b &>f"),
+            ("a 2>x; b >y c", "a 2>x; b c >y"),
+            ("a >x | b <y c && d 2>z e", "a >x | b c <y && d e 2>z"),
+            (
+                "env 2>/dev/null -i omamori uninstall",
+                "env -i omamori uninstall 2>/dev/null",
+            ),
+            (">f cmd a", "cmd a >f"),
+            (
+                "2>/dev/null unset CLAUDECODE",
+                "unset CLAUDECODE 2>/dev/null",
+            ),
+            ("10>/dev/null omamori x", "omamori x 10>/dev/null"),
+            ("omamori < <(true) x", "omamori x < <(true)"),
+            ("omamori 2> >(cat) x", "omamori x 2> >(cat)"),
+            ("omamori \\\n2>/dev/null x", "omamori \\\nx 2>/dev/null"),
+            ("omamori > \\\n f x", "omamori x > \\\nf"),
+            ("omamori 2\\\n>/dev/null x", "omamori x 2\\\n>/dev/null"),
+            ("omamori >! f x", "omamori x >! f"),
+            ("omamori >>! f x", "omamori x >>! f"),
+            ("x 2&>f y", "x 2 y &>f"),
+            ("omamori >>| f x", "omamori x >>| f"),
+            ("omamori &>! f x", "omamori x &>! f"),
+            ("omamori >&| f x", "omamori x >&| f"),
+            ("omamori >>&! f x", "omamori x >>&! f"),
+            ("omamori &>>| f x", "omamori x &>>| f"),
+        ] {
+            assert_eq!(moved(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn what_the_shell_does_not_read_as_a_redirect_stays() {
+        for text in [
+            "echo hello 2>/dev/null",
+            "echo 'a > b' \"c > d\" e\\>f",
+            "echo $((3 > 2)) x",
+            "[[ a > b ]] && echo x",
+            "diff <(ls a) >(wc) x",
+            "echo $(cat <f) x",
+            "true & false",
+            "cat x | bash < setup.sh",
+            "(omamori 2>/dev/null x) >f",
+            "cmd >/dev/null 2>&1",
+            "cat setup.log | bash < setup.sh # run",
+        ] {
+            assert!(
+                matches!(
+                    redirects_moved_to_the_end(text, Shell::Zsh),
+                    Cow::Borrowed(_)
+                ),
+                "{text:?}: {:?}",
+                redirects_moved_to_the_end(text, Shell::Zsh)
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirection_moves_ahead_of_a_comment_and_keeps_the_blanks_it_follows() {
+        assert_eq!(
+            redirects_moved_to_the_end("cat > notes.md <<'EOF' x # notes\nbody\nEOF", Shell::Zsh),
+            "cat   x  > notes.md <<'EOF' # notes\nbody\nEOF"
+        );
+        assert_eq!(
+            redirects_moved_to_the_end("cmd >f a\\\t", Shell::Zsh),
+            "cmd  a\\\t >f "
+        );
+    }
+
+    #[test]
+    fn bash_reads_a_bang_after_a_redirection_as_its_target() {
+        let moved = redirects_moved_to_the_end("omamori >! override disable x", Shell::Bash);
+        assert_eq!(
+            moved.split_whitespace().collect::<Vec<_>>(),
+            vec!["omamori", "override", "disable", "x", ">!"]
+        );
+    }
+
+    #[test]
+    fn a_body_whose_delimiter_line_may_be_continued_is_not_taken_as_one() {
+        assert_eq!(
+            moved("cat <<EOF\nEO\\\nF\nomamori 2>/dev/null x\nEOF"),
+            "cat <<EOF\nEO\\\nF\nomamori x 2>/dev/null\nEOF"
+        );
+        assert_eq!(
+            moved("cat <<'EOF'\nEO\\\nEOF\nomamori 2>/dev/null x"),
+            "cat <<'EOF'\nEO\\\nEOF\nomamori x 2>/dev/null"
+        );
+    }
+
+    #[test]
+    fn a_heredoc_body_is_left_as_it_is() {
+        assert_eq!(
+            moved("omamori <<EOF x\nbody 2>/dev/null y\nEOF\nnext 2>/dev/null z"),
+            "omamori x <<EOF\nbody 2>/dev/null y\nEOF\nnext z 2>/dev/null"
+        );
+        assert_eq!(
+            moved("cat <<'EOF' >out x\na > b\nEOF"),
+            "cat x <<'EOF' >out\na > b\nEOF"
+        );
+    }
+
     #[test]
     fn lenient_words_split_where_the_shell_does() {
         assert_eq!(
@@ -1057,6 +1496,30 @@ mod tests {
         assert_eq!(
             lenient_words("curl x |& bash; echo 'y"),
             vec!["curl", "x", "|", "bash", ";", "echo", "y"]
+        );
+    }
+
+    #[test]
+    fn lenient_words_read_an_escaped_operator_character_as_text() {
+        assert_eq!(
+            lenient_words("echo \\>| omamori x; echo 'y"),
+            vec!["echo", ">", "|", "omamori", "x", ";", "echo", "y"]
+        );
+    }
+
+    #[test]
+    fn lenient_words_keep_a_zsh_clobber_after_a_duplication_as_a_redirect() {
+        assert_eq!(
+            lenient_words("omamori >&| f x; echo 'y"),
+            vec!["omamori", ">&|", "f", "x", ";", "echo", "y"]
+        );
+    }
+
+    #[test]
+    fn lenient_words_keep_a_clobber_and_a_duplication_as_redirects() {
+        assert_eq!(
+            lenient_words("omamori >| f <&- x; echo 'y"),
+            vec!["omamori", ">|", "f", "<&-", "x", ";", "echo", "y"]
         );
     }
 
