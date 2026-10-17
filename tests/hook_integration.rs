@@ -1436,6 +1436,91 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "heredoc-compact-function-definition-block",
     ),
+    (
+        "# update the remote\ngit push --force",
+        Decision::Block,
+        "comment-line-before-command-block",
+    ),
+    (
+        "git status\n# now push\ngit push --force",
+        Decision::Block,
+        "comment-line-between-commands-block",
+    ),
+    (
+        "echo `echo a #b`; git push --force",
+        Decision::Block,
+        "hash-inside-backquotes-block",
+    ),
+    (
+        "echo $'\\' # '; git push --force",
+        Decision::Block,
+        "hash-inside-ansi-c-string-block",
+    ),
+    (
+        "cat /dev/null # see <<EOF\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-operator-in-comment-block",
+    ),
+    (
+        "# c\nunset CLAUDECODE",
+        Decision::Block,
+        "comment-line-before-env-tampering-block",
+    ),
+    (
+        "bash -c '# c\ngit push --force'",
+        Decision::Block,
+        "comment-line-inside-launcher-block",
+    ),
+    (
+        "# write notes\ncat > notes.md <<'EOF'\ngit push --force\nEOF",
+        Decision::Allow,
+        "comment-line-before-data-heredoc-allow",
+    ),
+    (
+        "# list files\nls -la",
+        Decision::Allow,
+        "comment-line-before-safe-command-allow",
+    ),
+    (
+        "echo $(date)#x; git push --force",
+        Decision::Block,
+        "hash-after-substitution-block",
+    ),
+    (
+        "[[ $x =~ (#a) ]]; git push --force",
+        Decision::Block,
+        "hash-inside-conditional-block",
+    ),
+    (
+        "msg=\"$(git log -1 --format=\"%s #%h\")\"; git push --force",
+        Decision::Block,
+        "hash-inside-nested-quotes-block",
+    ),
+    (
+        "ls \\\n# cleanup; rm -rf ~/projects",
+        Decision::Allow,
+        "comment-after-line-continuation-allow",
+    ),
+    (
+        "diff <(true)#x; git push --force",
+        Decision::Block,
+        "hash-after-process-substitution-block",
+    ),
+    (
+        "[[ a =~ ^[[:alpha:]]+(#|$) ]] && git push --force",
+        Decision::Block,
+        "hash-after-character-class-block",
+    ),
+    (
+        "git commit -m \"$(cat <<'EOF'\nit's\nEOF\n)\"; echo 'x #'; git push --force",
+        Decision::Block,
+        "hash-after-substituted-heredoc-block",
+    ),
+    (
+        "git commit -m \"$(cat <<'EOF'\nfix: don't crash\nEOF\n)\"\ngit status  # don't force",
+        Decision::Allow,
+        "comment-after-commit-heredoc-allow",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
