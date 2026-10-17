@@ -91,6 +91,8 @@ strict = true  # default: false. Hook-only commands (ls, cat, etc.) are not affe
 ```toml
 [structural]
 action = "block"     # default: "materialize". Set to "block" to hard-block all structural patterns.
+                     # Either way, a command no rule blocks is the only one this applies to, and a
+                     # command past the size limits (2,000 segments, 20,000 words) is always blocked.
 retention_days = 7   # auto-prune staging files older than N days. 0 = disabled.
 max_files = 500      # cap on staging file count; oldest deleted first. 0 = disabled.
 ```

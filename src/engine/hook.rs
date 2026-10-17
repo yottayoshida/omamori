@@ -56,9 +56,9 @@ pub(crate) enum HookCheckResult {
         rule_name: String,
         expires_at: String,
     },
-    /// Command is allowed via materialize policy: the structural block is
-    /// materializable (PipeToShell, ParseError, TooManyTokens, TooManySegments)
-    /// and config `[structural] action = "materialize"`.
+    /// Command is allowed via materialize policy: no rule blocked it, the
+    /// structural finding is materializable (PipeToShell, ParseError), and
+    /// config `[structural] action = "materialize"`.
     /// A staging file is written before allowing. #299.
     AllowMaterialize {
         wrapper_kind: Option<&'static str>,
@@ -258,21 +258,21 @@ fn detect_path_shim_bypass(tokens: &[String]) -> Option<&'static str> {
 fn check_phase_1b(command: &str) -> Result<(), HookCheckResult> {
     let command = unwrap::prepare_for_splitting(command);
     let normalized = unwrap::normalize_compound_operators(&command);
-    if let Ok(tokens) = unwrap::split_words(&normalized) {
-        if let Some(reason) = detect_env_var_tampering(&tokens) {
-            return Err(HookCheckResult::BlockMeta {
-                reason,
-                matched_pattern: None,
-                matched_position: None,
-            });
-        }
-        if let Some(reason) = detect_path_shim_bypass(&tokens) {
-            return Err(HookCheckResult::BlockMeta {
-                reason,
-                matched_pattern: None,
-                matched_position: None,
-            });
-        }
+    let tokens = unwrap::split_words(&normalized)
+        .unwrap_or_else(|_| crate::shell_text::lenient_words(&command));
+    if let Some(reason) = detect_env_var_tampering(&tokens) {
+        return Err(HookCheckResult::BlockMeta {
+            reason,
+            matched_pattern: None,
+            matched_position: None,
+        });
+    }
+    if let Some(reason) = detect_path_shim_bypass(&tokens) {
+        return Err(HookCheckResult::BlockMeta {
+            reason,
+            matched_pattern: None,
+            matched_position: None,
+        });
     }
     Ok(())
 }
@@ -432,14 +432,17 @@ fn match_invocations_against_rules(
     invocations: &[CommandInvocation],
     rules: &[crate::rules::RuleConfig],
 ) -> HookCheckResult {
+    let mut bypassed = None;
     for inv in invocations {
         if let Some(rule) = match_rule(rules, inv) {
-            // Break-glass: if rule is bypassed, allow instead of block
+            // Break-glass lifts one rule: a later command matching another
+            // still blocks.
             if let Some(entry) = crate::break_glass::bypass_info(&rule.name) {
-                return HookCheckResult::AllowByBreakGlass {
+                bypassed.get_or_insert(HookCheckResult::AllowByBreakGlass {
                     rule_name: rule.name.clone(),
                     expires_at: entry.expires_at,
-                };
+                });
+                continue;
             }
             let chain_desc = format_unwrap_chain(command, inv);
             let msg = rule
@@ -455,21 +458,23 @@ fn match_invocations_against_rules(
             };
         }
     }
-    HookCheckResult::Allow
+    bypassed.unwrap_or(HookCheckResult::Allow)
 }
 
 /// Three-phase hook check, evaluating against rules loaded from on-disk
 /// config with a `Config::default()` fail-safe fallback.
 ///
 /// Phase 1B: Token-level env var tampering / PATH override bypass detection
-/// Phase 2A: Structural block → policy routing (materialize or block)
-/// Phase 2B: Token-level unwrap stack → rule matching
+/// Phase 2A: Token-level unwrap stack; a structural finding that cannot be
+///           materialized blocks here
+/// Phase 2B: rule matching over every command read; only a command no rule
+///           blocks goes on to the structural policy (materialize or block)
 ///
 /// Config is loaded lazily:
 ///   - Phase 1B: no config load
 ///   - Phase 2A non-materializable: no config load (always blocked)
-///   - Phase 2A materializable: config loaded for structural.action
-///   - Phase 2B: config loaded for rule matching
+///   - Phase 2B: config loaded for rule matching, and again by the structural
+///     policy routing when there is a finding
 ///
 /// SECURITY (T8): The `Config::default()` fallback on `load_config` failure
 /// is intentional fail-safe behavior, not fail-open.
@@ -503,20 +508,33 @@ fn check_command_for_hook_inner(
         return verdict;
     }
 
-    // Phase 2A: structural check + policy routing
-    match unwrap::parse_command_string(command) {
-        unwrap::ParseResult::Block(reason) => {
+    // Phase 2A: a materializable finding is not routed here: the rules have
+    // not yet seen every command.
+    let parsed = match unwrap::parse_for_checks(command) {
+        Ok(parsed) => parsed,
+        Err(reason) => return resolve_structural_block(command, &reason, provider, dry_run, diag),
+    };
+    // Phase 2B: rule matching (lazy config load)
+    let load_result = load_config(None).unwrap_or_else(|_| ConfigLoadResult {
+        config: config::Config::default(),
+        warnings: vec![],
+        degraded: true,
+    });
+    let verdict =
+        match_invocations_against_rules(command, &parsed.commands, &load_result.config.rules);
+    match (verdict, parsed.structural) {
+        (HookCheckResult::Allow, Some(reason)) => {
             resolve_structural_block(command, &reason, provider, dry_run, diag)
         }
-        unwrap::ParseResult::Commands(invocations) => {
-            // Phase 2B: rule matching (lazy config load)
-            let load_result = load_config(None).unwrap_or_else(|_| ConfigLoadResult {
-                config: config::Config::default(),
-                warnings: vec![],
-                degraded: true,
-            });
-            match_invocations_against_rules(command, &invocations, &load_result.config.rules)
+        // Not returned as it stands: a structural block still blocks, and the
+        // bypass is still recorded as one.
+        (bypass @ HookCheckResult::AllowByBreakGlass { .. }, Some(reason)) => {
+            match resolve_structural_block(command, &reason, provider, dry_run, diag) {
+                HookCheckResult::AllowMaterialize { .. } => bypass,
+                blocked => blocked,
+            }
         }
+        (verdict, _) => verdict,
     }
 }
 
@@ -544,19 +562,25 @@ pub(crate) fn check_command_for_hook_with_rules(
     if let Err(verdict) = check_phase_1b(command) {
         return verdict;
     }
-    match unwrap::parse_command_string(command) {
-        unwrap::ParseResult::Block(reason) => {
-            // Test path: always block (no config to consult).
-            HookCheckResult::BlockStructural {
-                message: format!("omamori hook: blocked — {}", reason.message()),
-                reason,
-                matched_pattern: None,
-                matched_position: None,
-            }
+    let structural = |reason: unwrap::BlockReason| HookCheckResult::BlockStructural {
+        // Test path: always block (no config to consult).
+        message: format!("omamori hook: blocked — {}", reason.message()),
+        reason,
+        matched_pattern: None,
+        matched_position: None,
+    };
+    let parsed = match unwrap::parse_for_checks(command) {
+        Ok(parsed) => parsed,
+        Err(reason) => return structural(reason),
+    };
+    match (
+        match_invocations_against_rules(command, &parsed.commands, rules),
+        parsed.structural,
+    ) {
+        (HookCheckResult::Allow | HookCheckResult::AllowByBreakGlass { .. }, Some(reason)) => {
+            structural(reason)
         }
-        unwrap::ParseResult::Commands(invocations) => {
-            match_invocations_against_rules(command, &invocations, rules)
-        }
+        (verdict, _) => verdict,
     }
 }
 
@@ -888,18 +912,19 @@ fn run_hook_check_command(
     // the materialize audit — is collected rather than printed (ADR-0013). A
     // `--json-error` block carries it inside its one JSON object; every other
     // outcome prints it here, first, in the order it was produced, which is
-    // where it used to appear. (Nothing is collected before a break-glass
-    // verdict: the structural routing returns before rule matching.)
+    // where it used to appear. A break-glass verdict can still become a block,
+    // so its branch takes what was collected along with its own lines.
     let mut diag = Vec::new();
     let result = check_command_for_hook_inner(command, provider, false, &mut diag);
-    let json_block = json_error
+    let may_block_as_json = json_error
         && matches!(
             result,
             HookCheckResult::BlockMeta { .. }
                 | HookCheckResult::BlockRule { .. }
                 | HookCheckResult::BlockStructural { .. }
+                | HookCheckResult::AllowByBreakGlass { .. }
         );
-    if !json_block {
+    if !may_block_as_json {
         crate::audit::print_warnings(&diag);
         diag.clear();
     }
@@ -918,9 +943,10 @@ fn run_hook_check_command(
             // is collected (ADR-0013) and travels inside that object; every
             // other outcome prints it, in the same order, before the allow
             // response.
-            let mut lines = vec![format!(
+            let mut lines = std::mem::take(&mut diag);
+            lines.push(format!(
                 "omamori hook: break-glass bypass active for '{rule_name}' — allowing (expires {expires_at})"
-            )];
+            ));
             // Audit the bypass — in strict mode, audit failure blocks the command
             if let Some(logger) = crate::config::load_config(None).ok().and_then(|r| {
                 // #527: the verdict follows the configuration this load
