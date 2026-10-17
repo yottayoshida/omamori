@@ -1579,6 +1579,25 @@ if [ "$solo_fail" -ne 0 ]; then
     fail=1
 fi
 
+# ---------- Invariant: no test file under tests/ is ignored ----------
+# Probes, not `ls-files --ignored`: a fresh CI checkout holds no ignored
+# file, so listing them would pass there whatever .gitignore says.
+ignored_tests=0
+for probe in tests/probe.rs tests/probe.sh tests/poc.sh tests/sub/probe.rs; do
+    if git check-ignore -q "$probe"; then
+        echo "FAIL [invariant ignored-tests/#503]: $probe would be ignored by git"
+        ignored_tests=1
+        fail=1
+    elif [ $? -ne 1 ]; then
+        echo "FAIL [invariant ignored-tests/#503]: git check-ignore could not check $probe"
+        ignored_tests=1
+        fail=1
+    fi
+done
+if [ "$ignored_tests" -eq 0 ]; then
+    echo "ignored-tests OK: none of the probed test files under tests/ would be ignored by git"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo
     echo "invariants-check: FAIL"
