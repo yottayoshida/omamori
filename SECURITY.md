@@ -98,6 +98,7 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 | Env-var tampering (`unset CLAUDECODE`, `export -n`) | not covered | supported | Hook integration env-tampering corpus |
 | Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (Phase 2 builtin rules) | Acceptance tests |
 | Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code only — Codex CLI's hook sees shell commands alone; v0.9.7–1.3.0 the Claude Code entry routed `Bash` only and this never ran, [#576](https://github.com/yottayoshida/omamori/issues/576)) | Hook integration file-protection tests, `tool_calls_through_the_installed_hook`, ACCEPTANCE_TEST.md live row |
+| Config/hook file editing from a shell command (the write positions under What a Shell Write Is) | not applicable | supported (every provider whose shell commands reach the hook; forms not listed there are not reached, [#577](https://github.com/yottayoshida/omamori/issues/577)) | Hook integration `shell-write-*` cases, `a_shell_command_that_writes_a_protected_file_is_blocked` |
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
 | Self-modification commands in command context (`omamori config disable/enable/add`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`, `break-glass`, `audit key rotate`) | supported (env guard) | supported (Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
 
@@ -464,12 +465,15 @@ all recorded rather than fixed:
   resolve a path at all, not a degraded key store, and setting a path weakens no protection.
 - **The unknown-tool sentinels can be planted from a shell command** ([#577](https://github.com/yottayoshida/omamori/issues/577)). A sentinel under
   `~/.omamori` marks a tool name as already recorded today ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)); `touch`ing one for a name
-  ahead of time leaves that tool's first call of the day unrecorded. The editor tools cannot,
-  for the reason below. The record is marked only once it has been written, so a failed
+  ahead of time leaves that tool's first call of the day unrecorded. A `touch` or any other
+  write the hook recognises is refused since [ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md); a write it does not
+  recognise ([What a Shell Write Is](#what-a-shell-write-is-577)) still plants one. The editor tools cannot, for the
+  reason below. The record is marked only once it has been written, so a failed
   append is retried rather than lost.
 - **A throttle sentinel can be refreshed from a shell command**
   ([#520](https://github.com/yottayoshida/omamori/issues/520), [#577](https://github.com/yottayoshida/omamori/issues/577)). `~/.omamori` is protected as a whole since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md), so an editor tool can no longer
-  create or refresh the sentinel; a shell command (`touch`) still can — its name is a
+  create or refresh the sentinel, nor can a `touch` since [ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md); a shell write the hook
+  does not recognise ([What a Shell Write Is](#what-a-shell-write-is-577)) still can — its name is a
   truncated digest of the secret path, which follows from the config — and so keep the
   warning suppressed. This hides a notification, not the evidence: entries are still stamped
   `UNRESOLVED_KEY_ID`, and `verify`, `status` and `doctor` still report the state from the
@@ -723,7 +727,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 - `config disable`, `config enable`, `config add`, `uninstall`, and `init --force` are blocked when AI detector env vars are present
 - Uses the same detector logic as the PATH shim (`evaluate_detectors()`)
 - Hooks also block these commands with the Phase 2 builtin rules `omamori-*-block` (DI-13; Claude Code + Cursor) — except in the shapes listed under [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586)
-- **Shell commands that write omamori's files are not blocked** — `sed -i` or `echo >>` on `config.toml`, `touch` under `~/.omamori`, and `cat` of the audit secret all pass ([#577](https://github.com/yottayoshida/omamori/issues/577)). This line used to say the hooks blocked them; the substring patterns that did were removed in v0.10.4 and nothing took over the shell route.
+- **Shell commands that write omamori's files** are blocked when they write them in a position the hook recognises — a redirection, `tee`, `sed -i`, a `cp` or `mv` destination, `touch` and the rest under [What a Shell Write Is](#what-a-shell-write-is-577) ([#577](https://github.com/yottayoshida/omamori/issues/577), [ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md)). From v0.10.4, which removed the substring patterns, through 1.4.0 nothing looked at a shell command's write targets. `cat` of the audit secret still passes ([#577](https://github.com/yottayoshida/omamori/issues/577)).
 - **Edit/Write file_path guard** (v0.8.0 #110): AI Edit/Write/MultiEdit/NotebookEdit operations on protected files (config, hooks, audit, `settings.json`, `settings.local.json`, anything under `~/.omamori`) are blocked via `PROTECTED_FILE_PATTERNS` with path normalization and symlink resolution — in Claude Code, and from v0.9.7 through 1.3.0 in no session at all ([#576](https://github.com/yottayoshida/omamori/issues/576))
 
 ### Known limitations
@@ -733,11 +737,61 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 | `omamori config disable` | Yes — env var guard | All tools with known env vars |
 | `omamori uninstall` | Yes — env var guard | All tools with known env vars |
 | Direct config.toml editing (Edit/Write) | **Yes** — file_path guard (v0.8.0) | Claude Code PreToolUse, every tool since [ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md) (v0.9.7–1.3.0: not reached, [#576](https://github.com/yottayoshida/omamori/issues/576)). Codex CLI: Bash only (structural limitation) |
-| Direct config.toml editing (Bash: sed, echo >>) | **No** | Not recognised since v0.10.4 ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
+| Direct config.toml editing (Bash: sed, echo >>) | **Yes** — shell write guard ([ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md)) | Every provider whose shell commands reach the hook. The positions recognised, and the forms that are not, are under [What a Shell Write Is](#what-a-shell-write-is-577). v0.10.4–1.4.0: not recognised ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
 | Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
 | env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |
 | `env -i` → `config disable` / `override disable` in a shape the hook does not match rules against | **No** | A launcher the hook does not look inside — `xargs`, `parallel`, `find -exec`, `env -S`, a `$(…)` or backtick argument, `tcsh -c`, `su -c` ([#593](https://github.com/yottayoshida/omamori/issues/593)); interpreters such as `perl -e` (#74) |
 | Unknown AI tool (no env var) | **No** | Guard depends on known env vars |
+
+### What a Shell Write Is (#577)
+
+A shell command is refused when it names one of omamori's own files — the editor tools' protected
+list — or a directory above one, in a position where it writes ([ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md)). The hook reads the
+command; it does not run it.
+
+- **Write positions**: redirection targets outside quotes (`>`, `>>`, `>|`, `>!`, `&>`, `<>`,
+  `>&file`, zsh's `&>|`, `>&|` and `>>&|`, with a descriptor or written against the word before);
+  the files of `tee`, `sponge`, and in-place `sed` (`-i`, BSD `-I`), `perl` and `yq` (never their
+  expressions); the destination of `cp`, `install`, `rsync` and `ditto`, and that destination with
+  each source's name; every operand of `mv`, the sources of a hard link (`ln`, `cp -l`) and the
+  link itself; `dd of=`; the file options of `curl` (`-o`, `-D`, `-c`, `--trace`) and `wget`
+  (`-O`, `-o`, `-a`), bundled or not (`curl -fsSLo FILE`); every operand of `touch`, `truncate`,
+  `rm`, `unlink`, `rmdir`, `shred`, `mkdir`, `mkfifo`, `mknod` and `xattr`, and of `chmod`,
+  `chown`, `chgrp` and `chflags` after the mode or owner; the start points of a `find` that
+  deletes or runs one of these, and its `-fprint` files; the operands of an `xargs` that runs one
+  of these. The same inside `bash -c`, a subshell, a `$( … )`, a backquote or a process
+  substitution, in each line of a heredoc body that is not set aside as data, and behind the
+  wrappers and reserved words the rules see through.
+- **Paths**: `~` is expanded outside quotes and `$HOME`/`${HOME}` outside single quotes, as the
+  shell does; `{a,b}` braces are expanded. A glob outside quotes is matched against the protected
+  paths, a directory above them and the inside of `~/.omamori` and the data directory; when only
+  its last component is a pattern, the directory it names is read once to match its names
+  (up to 32 directories a command). A relative path is resolved against the hook process's
+  directory, the hook input's `cwd` when absolute, and each literal `cd` or `pushd` earlier in the
+  command; a protected name under any of these is refused, and with none of them known, a
+  relative write is.
+- **A directory above**: `mv`, `rm`, `chmod`, `cp` destinations and the rest refuse a directory
+  that holds a protected path (`mv ~/.config/omamori x`, `chmod -R 000 ~/.config`), and one whose
+  last components begin a protected name wherever it lies (`mv .claude x`, `rm -rf proj/.codex`).
+  It is judged where the command runs: the hook input's `cwd`, or the hook's directory when there
+  is none; a `cd x &&` moves it to `x`, and a `cd` that may fail adds `x` beside it — refused only
+  when it holds one under every place. `mkdir` and `touch` do not count a directory above, and
+  `mv x ~/` is judged as `~/x`.
+- **Order**: a command a rule blocks is reported by that rule, as before. Break-glass lifts a rule,
+  not this check.
+- **Not reached**: programs and subcommands not listed above (`git checkout`, `npm`, editors),
+  interpreters and scripts (`python -c`, `perl -e` without `-i`), `eval`, functions and aliases,
+  paths built from variables other than `HOME` or written with escapes (`$'\x2e…'`), targets
+  read from standard input (`… | xargs rm` with no literal operand), `curl -O` and `wget` without
+  an output option, other options that name a file to write, `sed`'s `w` command, zsh's `**` and
+  glob qualifiers, a glob in a directory component that only a listed directory would reveal,
+  wrappers the rules do not strip, a link created earlier in the same command (a symbolic link to
+  a protected file, then written through), moving or copying a tree that holds protected names
+  into a directory that does not exist yet, a `cd` to a glob or an expansion, a `cd` that fails
+  before a relative write to a directory above (`cd /nonexistent; rm -rf .config` from `HOME`,
+  or `cd x && a || rm -rf .config`),
+  and the omamori binary itself. Reading the audit
+  secret is a separate question ([#577](https://github.com/yottayoshida/omamori/issues/577)).
 
 ### Design philosophy
 
@@ -956,7 +1010,7 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 
 | Attack | Defense | Effectiveness |
 |--------|---------|---------------|
-| AI modifies log via omamori hook layer | `PROTECTED_FILE_PATTERNS` | Blocked for an editor-tool write in Claude Code ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)). **Not blocked through a shell command** — `>>`, `sed -i`, `cp` onto the log pass ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
+| AI modifies log via omamori hook layer | `PROTECTED_FILE_PATTERNS` | Blocked for an editor-tool write in Claude Code ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)), and for a shell command that writes the log in a position the hook recognises — `>>`, `sed -i`, `cp` onto it ([ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md)). **Not blocked**: a shell write the hook does not recognise ([What a Shell Write Is](#what-a-shell-write-is-577)) |
 | AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
 | AI deletes/reorders entries mid-chain | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` — **unless** a `chain_version` entry this binary doesn't recognize is also planted ahead of the tamper (#177 B1): verification stops at that entry and reports exit 4 ("unrecognized chain_version", not tamper language) instead of exit 1. The tamper is not hidden — the high-water-mark is preserved untouched, `report`/`doctor` are non-quiet, and removing the planted entry restores full detection — but the *language* softens from "broken" to "unverifiable" while it's present. See [Forward-Unknown Chain Versions](#forward-unknown-chain-versions-177) |
 | AI truncates log tail (removes last K entries) | Seq high-water-mark file (`<audit-log>.hwm`, e.g. `audit.jsonl.hwm`), symlink-safe atomic write/read | Detected by `omamori audit verify` (exit 3) — including a tail cut to nothing, the log emptied in place, which through 1.3.0 read as "no entries to verify" and exit 0 ([#509](https://github.com/yottayoshida/omamori/issues/509)) — with the key store unusable as well, and with the mark spoiled as well (reported as below). Symlink swap and torn writes are rejected. A same-user attacker who directly overwrites the `.hwm` file's content (not via symlink) can still defeat detection — structural limitation, same as row below. **Making the sidecar unusable reaches the same place by a second route** (#491 gave the state a name): a shape omamori refuses to read as a mark — mode `000`, a FIFO, content that is not an integer — is reported once at exit 3 and then *replaced* by the next run that can authenticate a chain end, since both `verify` and `append` re-bootstrap rather than treat tamper evidence as a fresh install. So truncate-then-spoil is one loud run followed by a mark set to the truncated end. The two shapes that are **not** replaced are a symlink (refused by `write_hwm`) and a directory (`rename` gives `EISDIR`); those keep reporting exit 3 on every run because nothing repairs them. The comparison **survives a verification halt** (#470): an entry whose `chain_version` or `key_id` this binary cannot resolve no longer suppresses it, so planting one ahead of the deletion does not buy silence and the verdict stays exit 3. What it compares against in that state is the end the surviving lines *state* rather than an authenticated one, so an attacker who also renumbers the tail can still hide the removal — and one who ends the file on an unrecognized-`chain_version` line stating no `seq` that reads as an unsigned 64-bit integer gets exit 4 instead, since nothing states an end to compare. See [Truncation Detection Across a Halt](#truncation-detection-across-a-halt-470). **The report lasts until the chain has grown back to the mark** — as many appends as entries were removed — and a prune does not shorten that ([#568](https://github.com/yottayoshida/omamori/issues/568)); see [The High-Water-Mark Across a Prune](#the-high-water-mark-across-a-prune-461-568) |

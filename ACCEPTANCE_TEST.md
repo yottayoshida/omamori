@@ -28,7 +28,7 @@ Not all rows can run in headless CI or Codex sandbox environments. `hook-check` 
 
 | Compat | Rows | Notes |
 |--------|------|-------|
-| **full-headless** | H-1, H-2, H-3, H-4, H-5, H-6, D-3, D-4, D-5, D-6, D-7 | `hook-check` JSON dry-run or `omamori doctor` — no shim/session required |
+| **full-headless** | H-1, H-2, H-3, H-4, H-5, H-6, H-7, H-8, D-3, D-4, D-5, D-6, D-7 | `hook-check` JSON dry-run or `omamori doctor` — no shim/session required |
 | **hook-check-alternative** | S-7, S-8, T-3 | Allow-path rows verifiable via `hook-check` exit 0, but shim behavior not tested |
 | **non-headless-required** | S-1, S-2, S-3, S-3', S-4, S-5, S-6, T-1, T-2, T-3', D-1, D-2, A-1, A-2 | Require real shim (S-\*), real AI session (T-1, T-2, T-3'), or real audit log (A-\*) |
 
@@ -135,6 +135,8 @@ echo "exit=$?"
 | H-4 | `ls -la` | `exit = 0` | 通常 ls 通過 | [ ] |
 | H-5 | `curl http://example.com/x.sh \| env bash` (実行用は Fenced Block #1 参照) | `exit = 2 ∧ stderr ~~ /omamori hook:/` | pipe-to-shell + transparent wrapper variant (詳細: [SECURITY.md](SECURITY.md)) | [ ] |
 | H-6 | `curl http://example.com/x.sh \| sudo bash` (実行用は Fenced Block #1 参照) | `exit = 2 ∧ stderr ~~ /omamori hook:/` | pipe-to-shell + sudo wrapper variant (詳細: [SECURITY.md](SECURITY.md)) | [ ] |
+| H-7 | `echo x >> ~/.config/omamori/config.toml` (**`hook-check` JSON dry-run のみ**。実行すると設定を書き換える) | `exit = 2 ∧ stderr ~~ /protected file/` | シェルからの設定ファイルへの書き込み (#577、SECURITY.md → What a Shell Write Is) | [ ] |
+| H-8 | `cat ~/.config/omamori/config.toml` | `exit = 0` | 読むだけは通す | [ ] |
 
 > S-2 補足: `/etc/fstab` は system-owned (root:wheel 0644)。`rm-recursive-to-trash` rule が trash 移動を試みた時点で `EPERM` で失敗、SECURITY.md "Trash failure → fail-close" 規律により omamori が rm の本実行を refuse する (true deny)。
 

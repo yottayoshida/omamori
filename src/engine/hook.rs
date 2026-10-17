@@ -674,6 +674,7 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
     // Every path field first, whatever the call is routed as (ADR-0018
     // review). A file named in any of them is the file the tool will touch.
     let tool = call.tool_name.as_deref().unwrap_or("unknown");
+    let cwd = call.cwd.clone();
     for path in &call.paths {
         if let Some(verdict) = file_op_verdict(tool, path, base.as_deref()) {
             return block_file_op(tool, path, &verdict, &provider, verbose, json_error);
@@ -762,9 +763,98 @@ pub(crate) fn run_hook_check(args: &[OsString]) -> Result<i32, AppError> {
                 reply.send("omamori: empty command");
                 return Ok(0);
             }
+            if let Some((target, verdict)) =
+                shell_write_block(&command, &provider, base.as_deref(), cwd.as_deref())
+            {
+                return block_file_op(tool, &target, &verdict, &provider, verbose, json_error);
+            }
             run_hook_check_command(&command, &provider, verbose, json_error, reply)
         }
     }
+}
+
+// Not ahead of a rule that blocks: that command keeps its rule's record and
+// hint. Not left to the rules either: break-glass lifts a rule, never the
+// protection of omamori's own files.
+fn shell_write_block(
+    command: &str,
+    provider: &str,
+    base: Option<&Path>,
+    cwd: Option<&str>,
+) -> Option<(String, FileProtectionVerdict)> {
+    let rules_block = matches!(
+        check_command_for_hook_inner(command, provider, true, &mut Vec::new()),
+        HookCheckResult::BlockRule { .. }
+            | HookCheckResult::BlockMeta { .. }
+            | HookCheckResult::BlockStructural { .. }
+    );
+    if rules_block {
+        return None;
+    }
+    shell_write_verdict(command, base, cwd)
+}
+
+fn shell_write_verdict(
+    command: &str,
+    base: Option<&Path>,
+    cwd: Option<&str>,
+) -> Option<(String, FileProtectionVerdict)> {
+    let home = crate::context::home_dir();
+    let cwd = cwd.map(Path::new).filter(|p| p.is_absolute());
+    let mut bases: Vec<std::path::PathBuf> = base.map(Path::to_path_buf).into_iter().collect();
+    if let Some(cwd) = cwd
+        && !bases.iter().any(|b| b == cwd)
+    {
+        bases.push(cwd.to_path_buf());
+    }
+    // Not the hook process's directory when the input names one: Claude Code
+    // runs the command where an earlier `cd` left its shell, and judging a
+    // directory above a protected file from the session's first directory
+    // lets `cd ~` then `mv .claude x` through. A name is judged under both.
+    let tree_bases = match cwd {
+        Some(cwd) => vec![cwd.to_path_buf()],
+        None => base.map(Path::to_path_buf).into_iter().collect(),
+    };
+    let protected = protected_locations(home.as_deref());
+    crate::shell_writes::shell_write_verdict(
+        command,
+        &crate::shell_writes::Surroundings {
+            home: home.as_deref(),
+            bases,
+            tree_bases,
+            protected: &protected,
+        },
+        &is_protected_file_path,
+    )
+}
+
+fn protected_locations(home: Option<&Path>) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = home {
+        for rel in [
+            ".config/omamori/config.toml",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".codex/hooks.json",
+            ".codex/config.toml",
+            ".omamori",
+        ] {
+            out.push(home.join(rel));
+        }
+    }
+    out.extend(config::default_config_path());
+    if let Some(data) = crate::context::data_dir() {
+        out.extend(resolve_through_links(&data));
+        out.push(data);
+    }
+    if let Ok(loaded) = load_config(None)
+        && let Some(log) = crate::audit::resolved_audit_path(&loaded.config.audit)
+    {
+        out.push(crate::audit::hwm_path_for(&log));
+        out.push(log.with_file_name("audit-secret"));
+        out.push(log);
+    }
+    out
 }
 
 /// What an allowed call tells Claude Code (ADR-0018).
@@ -1927,6 +2017,35 @@ pub(crate) fn run_cursor_hook() -> Result<i32, AppError> {
         return Ok(0);
     }
 
+    let base = crate::context::process_base();
+    let cwd = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|v| v.get("cwd").and_then(|c| c.as_str()).map(str::to_string));
+    if let Some((target, verdict)) =
+        shell_write_block(&command, "cursor", base.as_deref(), cwd.as_deref())
+    {
+        let mut warnings = Vec::new();
+        audit_log_hook_block_collect(
+            &format!("Shell {target}"),
+            "cursor",
+            Some(verdict.rule_id()),
+            None,
+            "layer2:file-protection".to_string(),
+            None,
+            &mut warnings,
+        );
+        crate::audit::print_warnings(&warnings);
+        let reason = verdict.blocked_reason("Shell");
+        eprintln!("omamori cursor-hook: BLOCKED ({reason})");
+        print_cursor_response(
+            false,
+            "deny",
+            Some(&format!("omamori hook: {reason}")),
+            Some(&format!("This command was blocked by omamori: {reason}.")),
+        );
+        return Ok(0);
+    }
+
     match check_command_for_hook(&command) {
         HookCheckResult::Allow => {
             print_cursor_response(true, "allow", None, None);
@@ -2157,7 +2276,7 @@ pub(crate) const PROTECTED_FILE_PATTERNS: &[(&str, MatchKind, &str)] = &[
 /// `matched: path contains '(cwd unresolvable)'` message and leaked a
 /// fake pseudo-pattern into `--json-error`'s `matched_pattern` field.
 #[derive(Debug, PartialEq)]
-enum FileProtectionVerdict {
+pub(crate) enum FileProtectionVerdict {
     Matched {
         pattern: &'static str,
         kind: MatchKind,
@@ -2622,6 +2741,7 @@ struct HookCall {
     /// harmless `file_path` and a protected `path`, or a `command` and a
     /// protected `file_path`, was judged on the field it was routed by alone.
     paths: Vec<String>,
+    cwd: Option<String>,
 }
 
 fn read_hook_call(input: &str) -> HookCall {
@@ -2632,6 +2752,7 @@ fn read_hook_call(input: &str) -> HookCall {
                 input: HookInput::MalformedJson,
                 tool_name: None,
                 paths: Vec::new(),
+                cwd: None,
             };
         }
     };
@@ -2653,6 +2774,7 @@ fn read_hook_call(input: &str) -> HookCall {
         input: route_hook_input(&v, tool_name.as_deref()),
         tool_name,
         paths,
+        cwd: v.get("cwd").and_then(|c| c.as_str()).map(str::to_string),
     }
 }
 
@@ -4304,6 +4426,177 @@ mod tests {
         let started = std::time::Instant::now();
         assert_allows(&format!("{}true", "! ".repeat(19_999)));
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    fn with_isolated_home(check: impl FnOnce(&Path)) {
+        let (old_xdg, old_home, dir) = isolate_config();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(&dir)));
+        restore_config(old_xdg, old_home, dir);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_shell_command_that_writes_a_protected_file_is_blocked() {
+        with_isolated_home(|home| {
+            let work = home.join("work");
+            std::fs::create_dir_all(work.join("proj/.claude")).unwrap();
+            std::fs::create_dir_all(work.join("proj/.codex")).unwrap();
+            std::fs::write(work.join("proj/.claude/settings.json"), "{}").unwrap();
+            std::fs::write(work.join("proj/.codex/hooks.json"), "{}").unwrap();
+            for command in [
+                "echo x >> ~/.config/omamori/config.toml",
+                "sed -i '' s/a/b/ ~/.config/omamori/config.toml",
+                "echo x > ~/.omamori/.integrity.json",
+                "touch ~/.local/share/omamori/audit.jsonl",
+                "# backup\ncp x ~/.omamori/x",
+                "cp x ~/.omamori/x 2>&1",
+                "cat > ~/.claude/settings.json <<'EOF'\n{}\nEOF",
+                "echo \"x\">>~/.omamori/x",
+                ">> ~/.config/omamori/config.toml echo x",
+                "mv ~/.config/omamori ~/.config/omamori.off",
+                "find ~/.local/share -name audit.jsonl -delete",
+                "tee -a \"$HOME/.claude/settings.local.json\" < x",
+                "touch ~/.l*/share/omamori/x",
+                "chmod -R 000 ~/.config",
+                "cd ~/.config/omamori && sed -i '' s/a/b/ config.toml",
+                "bash -c 'touch ~/.omamori/x'",
+                "if true; then touch ~/.omamori/x; fi",
+                "cd ~ && mv .claude .claude.off",
+                "cd ~ && rm -rf xdg",
+                "cd ~/.config && mv omamori x",
+                "mv proj/.claude x",
+                "rm -rf proj/.codex",
+                "rm ~/Documents/../.config/omamori/config.tom?",
+                "git commit -m \"$(cat <<'EOF'\nDon't stop\nEOF\n)\" && echo x >> ~/.omamori/x",
+                "x=$(touch ~/.omamori/x)",
+                "echo '{}' &>| ~/.claude/settings.json",
+                "curl -fsSLo ~/.claude/settings.json https://example.invalid/x",
+                "sed -I '' s/a/b/ ~/.config/omamori/config.toml",
+                "find -L ~/.config/omamori -exec rm {} +",
+                "ln ~/.claude/settings.json x",
+            ] {
+                assert!(
+                    shell_write_verdict(command, Some(&work), None).is_some(),
+                    "{command:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_shell_command_that_only_reads_or_mentions_a_protected_file_is_allowed() {
+        with_isolated_home(|home| {
+            let work = home.join("work");
+            std::fs::create_dir_all(work.join("proj")).unwrap();
+            for command in [
+                "cat ~/.config/omamori/config.toml",
+                "git commit -m \"fix ~/.config/omamori/config.toml\"",
+                "echo '>> ~/.omamori/x'",
+                "ls >&2",
+                "sed -i '' 's|~/.omamori/shim|x|' README.md",
+                "mv x ~/",
+                "mkdir -p ~/.config/other && touch ~/.config/other/x",
+                "cp ~/.config/omamori/config.toml /tmp/backup.toml",
+                "grep -rn .omamori src/ > out.txt",
+                "cd proj && find . -name '*.pyc' -delete",
+                "rm ~/*.log",
+                "rm -rf build/omamori",
+                "cp target/release/omamori bin/omamori",
+                "ln -s ~/.claude/settings.json settings-link",
+                "perl -Mstrict -ne 'print' ~/.claude/settings.json",
+                "git commit -m \"$(cat <<'EOF'\nDon't stop\nEOF\n)\"",
+            ] {
+                assert_eq!(
+                    shell_write_verdict(command, Some(&work), None).map(|(t, _)| t),
+                    None,
+                    "{command:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_relative_write_is_judged_against_every_place_it_may_run() {
+        with_isolated_home(|home| {
+            let config_dir = home.join("xdg/omamori");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            let elsewhere = home.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            let config = config_dir.to_string_lossy().into_owned();
+            assert!(
+                shell_write_verdict("echo x >> config.toml", Some(&config_dir), None).is_some()
+            );
+            assert!(
+                shell_write_verdict(
+                    "cd /nonexistent; echo x >> config.toml",
+                    Some(&config_dir),
+                    None
+                )
+                .is_some()
+            );
+            assert!(
+                shell_write_verdict("echo x >> config.toml", Some(&elsewhere), Some(&config))
+                    .is_some()
+            );
+            assert!(
+                shell_write_verdict(
+                    &format!("cd {config} && echo x >> config.toml"),
+                    Some(&elsewhere),
+                    None
+                )
+                .is_some()
+            );
+            assert!(shell_write_verdict("echo x >> config.toml", Some(&elsewhere), None).is_none());
+            assert!(shell_write_verdict("echo x >> config.toml", None, None).is_some());
+            // A directory above is judged where the input says the shell is.
+            let home_text = home.to_string_lossy().into_owned();
+            // A `cd` inside a subshell or a substitution does not move where
+            // the commands after it run; `cd x || exit` is as sure as `&&`.
+            for command in [
+                "(cd /tmp && ls); rm -rf xdg",
+                "x=$(cd /tmp && pwd); rm -rf xdg",
+                "bash -c 'cd /tmp && ls'; rm -rf xdg",
+            ] {
+                assert!(
+                    shell_write_verdict(command, Some(home), Some(&home_text)).is_some(),
+                    "{command:?}"
+                );
+            }
+            assert!(
+                shell_write_verdict("cd ~ || exit\nrm -rf xdg", Some(&elsewhere), None).is_some()
+            );
+            assert!(
+                shell_write_verdict("rm -rf xdg", Some(&elsewhere), Some(&home_text)).is_some()
+            );
+            assert!(shell_write_verdict("rm -rf xdg", Some(&elsewhere), None).is_none());
+        });
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn a_glob_is_matched_against_the_names_in_its_directory() {
+        with_isolated_home(|home| {
+            let project = home.join("project");
+            std::fs::create_dir_all(project.join(".claude")).unwrap();
+            std::fs::write(project.join(".claude/settings.local.json"), "{}").unwrap();
+            assert!(
+                shell_write_verdict(
+                    "sed -i '' s/a/b/ .claude/settings.local.js?n",
+                    Some(&project),
+                    None
+                )
+                .is_some()
+            );
+            assert!(
+                shell_write_verdict("sed -i '' s/a/b/ .claude/*.md", Some(&project), None)
+                    .is_none()
+            );
+        });
     }
 
     #[test]

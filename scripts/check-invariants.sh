@@ -346,7 +346,7 @@ else
     # (avoids matching `"sudo" =>` that might appear in a comment or test
     # fixture elsewhere in the file).
     ut_body=$(awk '
-        /^fn unwrap_transparent/ { inside=1 }
+        /^(pub(\([a-z]+\))?[[:space:]]+)?fn unwrap_transparent/ { inside=1 }
         inside { print }
         inside && /^}/ && !/^fn / { if (NR > 1) exit }
     ' "$uw")
