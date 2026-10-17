@@ -6,12 +6,15 @@ use super::chain::{
     NO_HMAC_SECRET, RecomputedHash, SeqPeek, VersionPeek, compute_entry_hash, genesis_hash,
     hmac_bytes, is_supported_chain_version, parse_line, prune_genesis_hash,
 };
-use super::retention::{PrunedFindings, decode_findings, is_prune_point};
+use super::retention::{
+    PrunedFindings, decode_findings, first_line, holds_as_read, is_prune_point,
+};
 use super::secret::{
     KeyStoreOutlook, Keyring, LockedLogError, LogLock, UNRESOLVED_KEY_ID, UnprotectedReason,
     classify_secret_failure, expected_key_file, interrupted_rotation_evidence, is_symlink_attack,
-    is_writer_emitted_key_id, key_store_outlook, load_keyring, open_audit_existing_rw,
-    open_log_locked, open_read_nofollow, read_secret, secret_path_for,
+    is_writer_emitted_key_id, key_store_outlook, load_keyring, names_this_file,
+    open_audit_existing_rw, open_log_locked, open_read_nofollow, read_secret, secret_path_for,
+    unlock,
 };
 use super::{AuditConfig, AuditEvent, resolved_audit_path};
 use super::{HwmState, HwmUnusable, hwm_path_for, read_hwm, write_hwm};
@@ -170,6 +173,10 @@ pub enum HwmWrite {
     Written,
     /// `write_hwm` returned an error, carried here so the sentence can say so.
     Failed(String),
+    /// Not written because the log or its mark changed while this run walked
+    /// it: the end this run reached could stand below a mark written
+    /// meanwhile.
+    Withheld,
 }
 
 #[derive(Default)]
@@ -1049,16 +1056,23 @@ pub struct VerifyOutcome {
 /// [`verify_chain`], keeping the keyring's warnings on every path.
 pub fn verify_chain_reporting(config: &AuditConfig) -> VerifyOutcome {
     let mut keyring_warnings = Vec::new();
-    let result = verify_chain_into(config, &mut keyring_warnings);
+    let result = verify_chain_into(config, &mut keyring_warnings, WalkLock::Released);
     VerifyOutcome {
         result,
         keyring_warnings,
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalkLock {
+    Released,
+    Held,
+}
+
 fn verify_chain_into(
     config: &AuditConfig,
     keyring_warnings_out: &mut Vec<String>,
+    walk_lock: WalkLock,
 ) -> Result<VerifyResult, AuditError> {
     // #471: not `FileNotFound`. That variant means "there is no log yet", which
     // is a quiet state; this is a configuration that cannot name a log at all,
@@ -1092,11 +1106,6 @@ fn verify_chain_into(
     // `open_read_nofollow` routes ELOOP through `symlink_attack_error`, so the
     // attack shape is recognisable here without inspecting the message for
     // anything but that one prefix.
-    //
-    // The lock is taken in the same step, and the file it is taken on checked
-    // against the path afterwards (ADR-0016): a prune replaces the log by
-    // rename, and a walk over the file it replaced would be compared against a
-    // high-water-mark that appends to the new one keep raising.
     let file = open_log_locked(&path, LogLock::Shared).map_err(|e| {
         let e = match e {
             LockedLogError::Open(e) => e,
@@ -1116,12 +1125,10 @@ fn verify_chain_into(
         log_open_error(&path, e)
     })?;
 
-    let reader = std::io::BufReader::new(&file);
-
-    let result = VerifyResult {
+    let seed = || VerifyResult {
         // The ring's own findings, kept even where the store's verdict
         // discarded the ring (#509 item 2).
-        keyring_warnings: resolved.keyring_warnings,
+        keyring_warnings: resolved.keyring_warnings.clone(),
         // #506: set before the first line is read, so `halted()` is already true
         // when the loop starts and every line takes the tally path — including
         // the one that keeps `last_structural_seq` moving, which is what the
@@ -1130,27 +1137,170 @@ fn verify_chain_into(
         // It is also why `unverified_entries_after` counts from zero in this
         // state where `mark_*` starts it at one: those two mark a *halting
         // entry* and count it, and this failure has no entry to be at.
-        key_store_failure,
+        key_store_failure: key_store_failure.clone(),
         ..Default::default()
     };
+
+    let hwm_file = hwm_path_for(&path);
+    let noted = note_end(&file, &hwm_file)?;
+    if walk_lock == WalkLock::Held {
+        let walk = walk_log(&file, None, &keyring, seed())?;
+        let (mut result, write) = judge_end(walk, noted.mark);
+        if let Some(end) = write {
+            result.hwm_write = record_mark(&hwm_file, end);
+        }
+        return Ok(result);
+    }
+
+    // Not held for the walk: every append in that time gives up after 0.5 s.
+    unlock(&file);
+    #[cfg(test)]
+    run_test_hook(&BETWEEN_NOTE_AND_WALK);
+    let walked = walk_log(&file, Some(noted.len), &keyring, seed());
+    #[cfg(test)]
+    run_test_hook(&BETWEEN_WALK_AND_CONFIRM);
+
+    let held = match open_log_locked(&path, LogLock::Shared) {
+        Ok(held) => Some(held),
+        Err(LockedLogError::Lock(e)) => {
+            return Err(AuditError::StoreInaccessible {
+                kind: "log_lock",
+                reason: e.to_string(),
+            });
+        }
+        Err(LockedLogError::Open(_)) => None,
+    };
+    let replaced = held.is_none() || !names_this_file(&path, &file);
+    // Not skipped when the path names another file: a release through 1.2.2
+    // can rewrite this one in place and a later one rename another over it,
+    // both during one walk.
+    if holds_as_read(&file, noted.len, &noted.head).is_err() {
+        // Not trusted: what was walked may be half of each version, so the
+        // walk starts over holding the lock. The keys are read again before
+        // the lock is taken, not under it: a rotation takes the two locks in
+        // that order.
+        drop(held);
+        drop(file);
+        return verify_chain_into(config, keyring_warnings_out, WalkLock::Held);
+    }
+    let (mut result, write) = judge_end(walked?, noted.mark);
+    if let Some(end) = write {
+        // Not written over a mark an append set meanwhile, nor beside a log
+        // that is no longer the one walked: either would lower it.
+        let unchanged = mark_identity(&hwm_file) == noted.mark_identity;
+        result.hwm_write = if end.is_none() || (!replaced && unchanged) {
+            record_mark(&hwm_file, end)
+        } else {
+            HwmWrite::Withheld
+        };
+    }
+    drop(held);
+    Ok(result)
+}
+
+struct NotedEnd {
+    len: u64,
+    head: Vec<u8>,
+    mark: HwmState,
+    mark_identity: Option<MarkIdentity>,
+}
+
+// Not compared by content: a mark written since can read the same, or be
+// unreadable both times. Every write renames a new file into place.
+#[derive(PartialEq, Eq)]
+struct MarkIdentity {
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    len: u64,
+}
+
+#[cfg(unix)]
+fn mark_identity(hwm_file: &std::path::Path) -> Option<MarkIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(hwm_file).ok()?;
+    Some(MarkIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        mtime: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec(),
+        len: meta.len(),
+    })
+}
+
+#[cfg(not(unix))]
+fn mark_identity(_hwm_file: &std::path::Path) -> Option<MarkIdentity> {
+    None
+}
+
+fn log_read_failed(e: std::io::Error) -> AuditError {
+    AuditError::StoreInaccessible {
+        kind: "log_read",
+        reason: e.to_string(),
+    }
+}
+
+fn note_end(file: &std::fs::File, hwm_file: &std::path::Path) -> Result<NotedEnd, AuditError> {
+    let len = file.metadata().map_err(log_read_failed)?.len();
+    let head = first_line(file).map_err(log_read_failed)?;
+    Ok(NotedEnd {
+        len,
+        head,
+        mark_identity: mark_identity(hwm_file),
+        mark: read_hwm(hwm_file),
+    })
+}
+
+fn walk_log(
+    file: &std::fs::File,
+    up_to: Option<u64>,
+    keyring: &Keyring,
+    seed: VerifyResult,
+) -> Result<Walk, AuditError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0)).map_err(log_read_failed)?;
+    let source: Box<dyn Read + '_> = match up_to {
+        Some(len) => Box::new(reader.take(len)),
+        None => Box::new(reader),
+    };
+    walk_lines(
+        // Not "there is no log": the file exists and stopped being readable.
+        std::io::BufReader::new(source)
+            .lines()
+            .map(|line| line.map_err(log_read_failed)),
+        keyring,
+        Walk::start(seed),
+    )
+}
+
+#[cfg(test)]
+type TestHook = std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static BETWEEN_NOTE_AND_WALK: TestHook = const { std::cell::RefCell::new(None) };
+    pub(super) static BETWEEN_WALK_AND_CONFIRM: TestHook = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_test_hook(slot: &'static std::thread::LocalKey<TestHook>) {
+    let hook = slot.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+fn judge_end(walk: Walk, mark: HwmState) -> (VerifyResult, Option<Option<u64>>) {
     let Walk {
         mut result,
         last_verified_seq,
         last_structural_seq,
         last_walked_seq,
         ..
-    } = walk_lines(
-        // #471: a read that fails partway through is not "there is no log"
-        // either — the file exists and stopped being readable.
-        reader.lines().map(|line| {
-            line.map_err(|e| AuditError::StoreInaccessible {
-                kind: "log_read",
-                reason: e.to_string(),
-            })
-        }),
-        &keyring,
-        Walk::start(result),
-    )?;
+    } = walk;
+    let mut write = None;
 
     // HWM check: detect tail truncation.
     //
@@ -1223,7 +1373,7 @@ fn verify_chain_into(
         && structural_end.is_none()
         && result.unverified_entries_after == 0
     {
-        match read_hwm(&hwm_path_for(&path)) {
+        match mark {
             HwmState::Valid(_) => {
                 result.hwm_compared = true;
                 result.tail_truncated = true;
@@ -1231,11 +1381,9 @@ fn verify_chain_into(
             HwmState::Unusable(reason) => result.hwm_unusable = Some(reason),
             HwmState::Missing => {}
         }
-    }
-    if result.broken_at.is_none()
+    } else if result.broken_at.is_none()
         && let Some(structural_end) = structural_end
     {
-        let hwm_file = hwm_path_for(&path);
         // The only end this run is entitled to record. `None` while halted,
         // and `None` when nothing verified — both mean "do not touch the
         // mark", which is why the two arms below check it rather than the
@@ -1249,7 +1397,7 @@ fn verify_chain_into(
         } else {
             last_verified_seq
         };
-        match read_hwm(&hwm_file) {
+        match mark {
             HwmState::Valid(hwm) => {
                 // #506: the two `Valid` arms were spelled as a guarded pair, and
                 // both of them — and only them — are a comparison having
@@ -1265,7 +1413,7 @@ fn verify_chain_into(
             HwmState::Missing => {
                 // Bootstrap: first verify on a chain without HWM
                 result.hwm_missing = true;
-                result.hwm_write = record_mark(&hwm_file, writable_end);
+                write = Some(writable_end);
             }
             HwmState::Unusable(reason) => {
                 // Something is at the path and this run got no mark out of it —
@@ -1284,12 +1432,12 @@ fn verify_chain_into(
                 // that fails on the two states worth reporting, and its result
                 // used to be discarded on the line that made it.
                 result.hwm_unusable = Some(reason);
-                result.hwm_write = record_mark(&hwm_file, writable_end);
+                write = Some(writable_end);
             }
         }
     }
 
-    Ok(result)
+    (result, write)
 }
 
 /// Why a walk set `broken_at`.

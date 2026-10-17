@@ -10,7 +10,7 @@ omamori doctor [--fix] [--verbose] [--json]  # Diagnose and auto-repair installa
                                          # --json: summary.risk_signals is null when the config cannot be loaded; otherwise its
                                          #   needs_attention is true exactly when `doctor` would print that line (with --fix:
                                          #   as run after the repair). The exit code reports the installation only.
-                                         #   Like `doctor`, it verifies the audit chain and holds the log's lock meanwhile (#579)
+                                         #   Like `doctor`, it verifies the audit chain; appends made meanwhile are recorded
 omamori explain [--json] -- <cmd...>     # Show what would happen to a command and why
 omamori test [--config PATH]             # Verify policy rules
 omamori status [--refresh]               # Health check all defense layers (exit 0/1/2)
