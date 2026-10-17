@@ -98,6 +98,7 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 | Env-var tampering (`unset CLAUDECODE`, `export -n`) | not covered | supported | Hook integration env-tampering corpus |
 | Self-disablement (`config disable`, `uninstall`) | supported (env guard) | supported (Phase 2 builtin rules) | Acceptance tests |
 | Config/hook file editing (Edit/Write operations) | not applicable | supported (Claude Code only — Codex CLI's hook sees shell commands alone; v0.9.7–1.3.0 the Claude Code entry routed `Bash` only and this never ran, [#576](https://github.com/yottayoshida/omamori/issues/576)) | Hook integration file-protection tests, `tool_calls_through_the_installed_hook`, ACCEPTANCE_TEST.md live row |
+| Audit secret read from a shell command (a word that names the secret or its directory, under What Names the Audit Secret) | not applicable | supported (every provider whose shell commands reach the hook; commands that only read names are exempt) | Hook integration `shell-secret-*` cases, `a_shell_command_that_names_the_audit_secret_is_blocked` |
 | Config/hook file editing from a shell command (the write positions under What a Shell Write Is) | not applicable | supported (every provider whose shell commands reach the hook; forms not listed there are not reached, [#577](https://github.com/yottayoshida/omamori/issues/577)) | Hook integration `shell-write-*` cases, `a_shell_command_that_writes_a_protected_file_is_blocked` |
 | Static shell expansion obfuscation (`$'rm'`, `$"rm"`, `${IFS}rm`, `{rm,-rf,/}`, `r$'m'`) | not covered | supported (v0.10.2) | Hook integration `obfuscated-*`, unit tests |
 | Self-modification commands in command context (`omamori config disable/enable/add`, `uninstall`, `init --force`, `override`, `doctor --fix`, `explain`, `break-glass`, `audit key rotate`) | supported (env guard) | supported (Phase 2 builtin rules `omamori-*-block`, v0.10.3+ DI-13) | `tests/config::omamori_self_protect_rules_match_via_phase2`, acceptance tests |
@@ -727,7 +728,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 - `config disable`, `config enable`, `config add`, `uninstall`, and `init --force` are blocked when AI detector env vars are present
 - Uses the same detector logic as the PATH shim (`evaluate_detectors()`)
 - Hooks also block these commands with the Phase 2 builtin rules `omamori-*-block` (DI-13; Claude Code + Cursor) — except in the shapes listed under [Rules That Never See the `omamori` Command](#rules-that-never-see-the-omamori-command-586)
-- **Shell commands that write omamori's files** are blocked when they write them in a position the hook recognises — a redirection, `tee`, `sed -i`, a `cp` or `mv` destination, `touch` and the rest under [What a Shell Write Is](#what-a-shell-write-is-577) ([#577](https://github.com/yottayoshida/omamori/issues/577), [ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md)). From v0.10.4, which removed the substring patterns, through 1.4.0 nothing looked at a shell command's write targets. `cat` of the audit secret still passes ([#577](https://github.com/yottayoshida/omamori/issues/577)).
+- **Shell commands that write omamori's files** are blocked when they write them in a position the hook recognises — a redirection, `tee`, `sed -i`, a `cp` or `mv` destination, `touch` and the rest under [What a Shell Write Is](#what-a-shell-write-is-577) ([#577](https://github.com/yottayoshida/omamori/issues/577), [ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md)). From v0.10.4, which removed the substring patterns, through 1.4.0 nothing looked at a shell command's write targets. A shell command that names the audit secret, or the directory holding it, is blocked unless it only reads names ([What Names the Audit Secret](#what-names-the-audit-secret-577)).
 - **Edit/Write file_path guard** (v0.8.0 #110): AI Edit/Write/MultiEdit/NotebookEdit operations on protected files (config, hooks, audit, `settings.json`, `settings.local.json`, anything under `~/.omamori`) are blocked via `PROTECTED_FILE_PATTERNS` with path normalization and symlink resolution — in Claude Code, and from v0.9.7 through 1.3.0 in no session at all ([#576](https://github.com/yottayoshida/omamori/issues/576))
 
 ### Known limitations
@@ -790,8 +791,37 @@ command; it does not run it.
   into a directory that does not exist yet, a `cd` to a glob or an expansion, a `cd` that fails
   before a relative write to a directory above (`cd /nonexistent; rm -rf .config` from `HOME`,
   or `cd x && a || rm -rf .config`),
-  and the omamori binary itself. Reading the audit
-  secret is a separate question ([#577](https://github.com/yottayoshida/omamori/issues/577)).
+  and the omamori binary itself.
+
+### What Names the Audit Secret (#577)
+
+Reading the secret is the step before forging a chain that verifies, and readers are unbounded,
+so a shell command is judged by whether it names the secret, not by which program it runs
+([ADR-0021](docs/adr/0021-a-shell-command-is-judged-by-where-it-writes.md)). Every word of the command — an option's value after `=` and what `<` reads
+included, in substitutions and heredoc bodies as above — is compared with the audit secret and
+the directory holding it, worked out from the configuration (both spellings when the data
+directory is a link), with the paths, bases and `cd` of the section above; a glob is matched
+against them. A file elsewhere whose name begins `audit-secret` counts when it exists, so
+`grep -rn audit-secret src/` and a commit message that mentions it pass. A command run where the
+secret's directory is the current directory counts as well (`cd ~/.local/share/omamori && cat *`).
+
+Commands that only read names are exempt — `ls`, `stat`, `test`, `[`, `[[`, `cd`, `pushd`,
+`popd`, `realpath`, `readlink`, `basename`, `dirname`, `du`, `tree`, `eza`, `exa`, `lsd`, and
+`fd` and `find` when they run or write nothing, none of them given a file of names to read
+(`--fromfile`, `--files0-from`) — when called by that bare name outside a substitution, and only
+while nothing in the command could carry their output on to a reader or give the name another
+meaning: a pipe or a process substitution anywhere in it (`{ ls -d <secret>; } | xargs cat`), a
+redirection to a file other than `/dev/null`, a function or alias defined in it, `hash`,
+`coproc`, `mkfifo`, `enable`, or a `PATH=` assignment. An option's value is read after `=`, `@`,
+`file:` and a short option's letter (`-d@FILE`), and a `~` after `=` or `:` is expanded as bash
+expands it. A directory is compared by its identity as well as its spelling, so a macOS firmlink
+spelling of it counts.
+
+**Not reached**: a directory above the one holding the secret (`tar c ~/.local`, as for `Grep`),
+paths built from variables other than `HOME` or written with escapes (`$'\x61udit-secret'`), a
+path inside a longer word — code handed to an interpreter (`python3 -c "open('…/audit-secret')"`)
+— scripts and interpreters that build the path themselves, a glob in a directory component that
+only a link would resolve, and a link to the secret file made earlier.
 
 ### Design philosophy
 
@@ -1014,7 +1044,7 @@ If a previous write was interrupted (partial JSON line), `append()` detects the 
 | AI modifies log entries (content change) | Hash chain (`entry_hash` mismatch) | Detected by `omamori audit verify` |
 | AI deletes/reorders entries mid-chain | Hash chain (seq gap / `prev_hash` mismatch) | Detected by `omamori audit verify` — **unless** a `chain_version` entry this binary doesn't recognize is also planted ahead of the tamper (#177 B1): verification stops at that entry and reports exit 4 ("unrecognized chain_version", not tamper language) instead of exit 1. The tamper is not hidden — the high-water-mark is preserved untouched, `report`/`doctor` are non-quiet, and removing the planted entry restores full detection — but the *language* softens from "broken" to "unverifiable" while it's present. See [Forward-Unknown Chain Versions](#forward-unknown-chain-versions-177) |
 | AI truncates log tail (removes last K entries) | Seq high-water-mark file (`<audit-log>.hwm`, e.g. `audit.jsonl.hwm`), symlink-safe atomic write/read | Detected by `omamori audit verify` (exit 3) — including a tail cut to nothing, the log emptied in place, which through 1.3.0 read as "no entries to verify" and exit 0 ([#509](https://github.com/yottayoshida/omamori/issues/509)) — with the key store unusable as well, and with the mark spoiled as well (reported as below). Symlink swap and torn writes are rejected. A same-user attacker who directly overwrites the `.hwm` file's content (not via symlink) can still defeat detection — structural limitation, same as row below. **Making the sidecar unusable reaches the same place by a second route** (#491 gave the state a name): a shape omamori refuses to read as a mark — mode `000`, a FIFO, content that is not an integer — is reported once at exit 3 and then *replaced* by the next run that can authenticate a chain end, since both `verify` and `append` re-bootstrap rather than treat tamper evidence as a fresh install. So truncate-then-spoil is one loud run followed by a mark set to the truncated end. The two shapes that are **not** replaced are a symlink (refused by `write_hwm`) and a directory (`rename` gives `EISDIR`); those keep reporting exit 3 on every run because nothing repairs them. The comparison **survives a verification halt** (#470): an entry whose `chain_version` or `key_id` this binary cannot resolve no longer suppresses it, so planting one ahead of the deletion does not buy silence and the verdict stays exit 3. What it compares against in that state is the end the surviving lines *state* rather than an authenticated one, so an attacker who also renumbers the tail can still hide the removal — and one who ends the file on an unrecognized-`chain_version` line stating no `seq` that reads as an unsigned 64-bit integer gets exit 4 instead, since nothing states an end to compare. See [Truncation Detection Across a Halt](#truncation-detection-across-a-halt-470). **The report lasts until the chain has grown back to the mark** — as many appends as entries were removed — and a prune does not shorten that ([#568](https://github.com/yottayoshida/omamori/issues/568)); see [The High-Water-Mark Across a Prune](#the-high-water-mark-across-a-prune-461-568) |
-| AI accesses secret via omamori hook layer | `PROTECTED_FILE_PATTERNS`, and for reading tools the secret check ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)) | Blocked when a Claude Code tool that reads (`Read`, `Grep`, `NotebookRead`) or writes names the secret, or a reading tool names the directory holding it, in `file_path`/`path`/`notebook_path` — compared without regard to case. A listing tool (`Glob`) is not checked: it reads names, not contents. **Not blocked**: a path in another field, a `Grep` started above that directory, and every shell command — `cat`, `xxd`, `cp` of the secret pass ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
+| AI accesses secret via omamori hook layer | `PROTECTED_FILE_PATTERNS`, and for reading tools the secret check ([ADR-0018](docs/adr/0018-every-claude-code-tool-reaches-the-hook.md)) | Blocked when a Claude Code tool that reads (`Read`, `Grep`, `NotebookRead`) or writes names the secret, or a reading tool names the directory holding it, in `file_path`/`path`/`notebook_path` — compared without regard to case. A listing tool (`Glob`) is not checked: it reads names, not contents. A shell command that names the secret or that directory is blocked as well, unless it only reads names ([What Names the Audit Secret](#what-names-the-audit-secret-577)). **Not blocked**: a path in another field, a `Grep` or a shell command started above that directory, and the shell forms that section lists as not reached |
 | AI Edit/Write to protected files (config, audit, hooks, settings.json, `~/.omamori`) | `is_protected_file_path` + `PROTECTED_FILE_PATTERNS` | **Blocked** in Claude Code (v0.8.0 #110; from v0.9.7 through 1.3.0 the hook was registered for `Bash` alone and this never ran, [#576](https://github.com/yottayoshida/omamori/issues/576)) |
 | AI directly operates on files via OS (bypassing hook layer) | None (same OS user) | **Not protected** (structural limitation) |
 | AI reads secret and forges valid chain | None (same OS user) | **Not protected** (structural limitation) |

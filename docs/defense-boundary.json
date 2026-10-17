@@ -123,6 +123,15 @@
       "verified_by": "Hook integration file-protection tests, tool_calls_through_the_installed_hook, ACCEPTANCE_TEST.md live row"
     },
     {
+      "id": "audit-secret-shell-read",
+      "category": "caught",
+      "surface": "Audit secret read from a shell command (a word that names the secret or its directory, under What Names the Audit Secret)",
+      "layer1": "not applicable",
+      "layer2": "supported",
+      "layer2_note": "every provider whose shell commands reach the hook; commands that only read names are exempt",
+      "verified_by": "Hook integration shell-secret-* cases, a_shell_command_that_names_the_audit_secret_is_blocked"
+    },
+    {
       "id": "config-hook-file-shell-write",
       "category": "caught",
       "surface": "Config/hook file editing from a shell command (the write positions under What a Shell Write Is)",
