@@ -1321,6 +1321,121 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Allow,
         "non-default-shell-launcher-su-allow",
     ),
+    (
+        "cat > notes.md <<'EOF'\nl1\nl2\nl3\nl4\nl5\ngit push --force\nEOF",
+        Decision::Allow,
+        "heredoc-data-reader-body-allow",
+    ),
+    (
+        "python3 - <<'PY'\ngit push --force\nPY",
+        Decision::Allow,
+        "heredoc-interpreter-program-body-allow",
+    ),
+    (
+        "cat > notes.md <<'EOF'\nunset CLAUDECODE\nEOF",
+        Decision::Allow,
+        "heredoc-data-body-env-text-allow",
+    ),
+    (
+        "bash <<EOF\nrm -rf ~/projects\nEOF",
+        Decision::Block,
+        "heredoc-shell-reader-body-block",
+    ),
+    (
+        "sudo -s <<EOF\nrm -rf ~/projects\nEOF",
+        Decision::Block,
+        "heredoc-sudo-shell-body-block",
+    ),
+    (
+        "su <<EOF\nrm -rf ~/projects\nEOF",
+        Decision::Block,
+        "heredoc-su-body-block",
+    ),
+    (
+        "time bash <<EOF\nrm -rf ~/projects\nEOF",
+        Decision::Block,
+        "heredoc-unlisted-wrapper-body-block",
+    ),
+    (
+        "cat <<'EOF' | xargs -I{} sh -c '{}'\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-reader-piped-body-block",
+    ),
+    (
+        "cat <<'EOF' | while read -r c; do $c; done\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-reader-piped-loop-body-block",
+    ),
+    (
+        "tee >(bash) <<'EOF'\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-process-substitution-body-block",
+    ),
+    (
+        "cat() { bash; }; cat <<'EOF'\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-redefined-reader-body-block",
+    ),
+    (
+        "awk '{system($0)}' <<'EOF'\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-executing-reader-body-block",
+    ),
+    (
+        "sqlite3 <<'EOF'\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-unlisted-reader-body-block",
+    ),
+    (
+        "bash <<'EOF'\nunset CLAUDECODE\nEOF",
+        Decision::Block,
+        "heredoc-shell-body-env-tampering-block",
+    ),
+    (
+        "cat <<EOF\ngit push --force",
+        Decision::Block,
+        "heredoc-unclosed-body-block",
+    ),
+    (
+        "echo $((1<<2))\ngit push --force",
+        Decision::Block,
+        "heredoc-lookalike-arithmetic-block",
+    ),
+    (
+        "cat /dev/null ${x:1<<1}\ngit push --force\n1}",
+        Decision::Block,
+        "heredoc-lookalike-parameter-block",
+    ),
+    (
+        "cat /dev/null $[1<<2]\ngit push --force\n2]",
+        Decision::Block,
+        "heredoc-lookalike-bracket-block",
+    ),
+    (
+        "cat <<EOF\nb\nE\\\nOF\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-continued-delimiter-block",
+    ),
+    (
+        "bash <<B; cat <<A\ngit push --force\nB\nfoo\nA",
+        Decision::Block,
+        "heredoc-shell-body-before-data-body-block",
+    ),
+    (
+        "exec 3> >(bash); cat >/dev/fd/3 <<'EOF'\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-reader-output-to-fd-path-block",
+    ),
+    (
+        "exec > >(bash); cat <<'EOF'\ngit push --force\nEOF",
+        Decision::Block,
+        "heredoc-reader-stdout-rewired-earlier-block",
+    ),
+    (
+        "cat(){ bash;}; cat <<'EOF'\nunset CLAUDECODE\nEOF",
+        Decision::Block,
+        "heredoc-compact-function-definition-block",
+    ),
 ];
 
 /// Per-category minimum floors for `meta-pattern-*` HOOK_DECISION_CASES
