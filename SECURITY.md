@@ -337,8 +337,8 @@ The self-protection rules are what stands between an AI agent and `omamori overr
 …` once `env -i` has removed the detector variables the CLI's own guard reads. These shapes
 keep the hook from matching any rule against the `omamori` invocation:
 
-- a launcher the hook does not look inside — `time` (#586); `xargs`, `parallel`, `find -exec`,
-  `env -S '…'` outside a pipe, a `$(…)` or backtick inside an argument, `tcsh -c` and `su -c`
+- a launcher the hook does not look inside — `xargs`, `parallel`, `find -exec`, `env -S '…'`
+  outside a pipe, a `$(…)` or backtick inside an argument, `tcsh -c` and `su -c`
   ([#593](https://github.com/yottayoshida/omamori/issues/593)); and interpreters such as
   `perl -e`, out of scope since [#74](https://github.com/yottayoshida/omamori/issues/74).
   These are allowed at Layer 2 on the assumption that the CLI's own guard still stops the
@@ -502,7 +502,8 @@ Layer 2 hooks use a **token-aware Recursive Unwrap Stack** implemented in Rust (
 
 | Capability | Detection |
 |-----------|-----------|
-| Shell wrappers (`sudo`, `env`, `nohup`, `timeout`, `nice`, `exec`, `command`, `doas`, `pkexec`) | Stripped recursively to expose inner command |
+| Shell wrappers (`sudo`, `env`, `nohup`, `timeout`, `nice`, `exec`, `command`, `doas`, `pkexec`, `time`) | Stripped recursively to expose inner command |
+| Reserved words at a command's head (`!`, `{`, `if`, `then`, `elif`, `else`, `while`, `until`, `do`) | Skipped, so the command after them is the one checked |
 | Shell launchers (`bash -c`, `sh -c`, `zsh -c`, `dash -c`, `ksh -c`) | Inner command extracted and recursively parsed |
 | Full-path shells (`/usr/local/bin/bash -c`) | Recognized via basename matching |
 | Combined flags (`bash -lc`) | Detected via flag suffix matching |
@@ -734,7 +735,7 @@ Real-world testing ([#22](https://github.com/yottayoshida/omamori/issues/22)) sh
 | Direct config.toml editing (Bash: sed, echo >>) | **No** | Not recognised since v0.10.4 ([#577](https://github.com/yottayoshida/omamori/issues/577)) |
 | Direct config.toml editing (other tools) | **No** | Codex CLI, Gemini CLI cannot prevent file editing |
 | env var unset → config disable | Partially | Hooks block env var unset. Without hooks, this attack succeeds |
-| `env -i` → `config disable` / `override disable` in a shape the hook does not match rules against | **No** | A launcher the hook does not look inside — `time` ([#586](https://github.com/yottayoshida/omamori/issues/586)); `xargs`, `parallel`, `find -exec`, `env -S`, a `$(…)` or backtick argument, `tcsh -c`, `su -c` ([#593](https://github.com/yottayoshida/omamori/issues/593)); interpreters such as `perl -e` (#74) |
+| `env -i` → `config disable` / `override disable` in a shape the hook does not match rules against | **No** | A launcher the hook does not look inside — `xargs`, `parallel`, `find -exec`, `env -S`, a `$(…)` or backtick argument, `tcsh -c`, `su -c` ([#593](https://github.com/yottayoshida/omamori/issues/593)); interpreters such as `perl -e` (#74) |
 | Unknown AI tool (no env var) | **No** | Guard depends on known env vars |
 
 ### Design philosophy

@@ -1218,7 +1218,17 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         Decision::Block,
         "fn-sudo-config-add-block",
     ),
-    // v0.10.4: non-TRANSPARENT wrappers (xargs/time/find/parallel) and
+    (
+        "time omamori uninstall",
+        Decision::Block,
+        "fn-time-uninstall-block",
+    ),
+    (
+        "time nohup omamori uninstall",
+        Decision::Block,
+        "fn-time-nohup-uninstall-block",
+    ),
+    // v0.10.4: non-TRANSPARENT wrappers (xargs/find/parallel) and
     // data-context vectors (echo "$(...)") were caught by the deleted
     // meta-pattern infrastructure. Now Allow at Layer 2; still blocked
     // at Layer 0 (binary env guard) when the inner omamori invocation
@@ -1232,16 +1242,6 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         "echo /tmp/base | xargs omamori uninstall --base-dir",
         Decision::Allow,
         "scope-narrow-pipe-xargs-allow",
-    ),
-    (
-        "time omamori uninstall",
-        Decision::Allow,
-        "scope-narrow-time-allow",
-    ),
-    (
-        "time nohup omamori uninstall",
-        Decision::Allow,
-        "scope-narrow-time-nohup-allow",
     ),
     (
         "xargs -I{} omamori uninstall {}",
@@ -1791,6 +1791,158 @@ const HOOK_DECISION_CASES: &[(&str, Decision, &str)] = &[
         "unset >! CLAUDECODE",
         Decision::Block,
         "bash-bang-target-unset-block",
+    ),
+    (
+        "time omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "time-wrapper-block",
+    ),
+    (
+        "time -p omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "time-p-wrapper-block",
+    ),
+    (
+        "/usr/bin/time -o /tmp/t omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "time-program-output-flag-block",
+    ),
+    (
+        "sudo time omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "time-inside-wrapper-block",
+    ),
+    (
+        "time rm -rf /tmp/x",
+        Decision::Block,
+        "time-destructive-block",
+    ),
+    ("time unset CLAUDECODE", Decision::Block, "time-unset-block"),
+    (
+        "time -p env -u CLAUDECODE true",
+        Decision::Block,
+        "time-p-env-u-block",
+    ),
+    (
+        "time bash -c \"omamori override disable rm-recursive-to-trash\"",
+        Decision::Block,
+        "time-shell-launcher-block",
+    ),
+    (
+        "! omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "reserved-bang-block",
+    ),
+    (
+        "{ omamori override disable rm-recursive-to-trash; }",
+        Decision::Block,
+        "reserved-brace-block",
+    ),
+    (
+        "if omamori override disable rm-recursive-to-trash; then :; fi",
+        Decision::Block,
+        "reserved-if-block",
+    ),
+    (
+        "if true; then omamori override disable rm-recursive-to-trash; fi",
+        Decision::Block,
+        "reserved-then-block",
+    ),
+    (
+        "if true\nthen omamori override disable rm-recursive-to-trash\nfi",
+        Decision::Block,
+        "reserved-then-newline-block",
+    ),
+    (
+        "if false; then :; elif omamori override disable rm-recursive-to-trash; then :; fi",
+        Decision::Block,
+        "reserved-elif-block",
+    ),
+    (
+        "if false; then :; else omamori override disable rm-recursive-to-trash; fi",
+        Decision::Block,
+        "reserved-else-block",
+    ),
+    (
+        "while omamori override disable rm-recursive-to-trash; do break; done",
+        Decision::Block,
+        "reserved-while-block",
+    ),
+    (
+        "until omamori override disable rm-recursive-to-trash; do :; done",
+        Decision::Block,
+        "reserved-until-block",
+    ),
+    (
+        "for i in 1; do omamori override disable rm-recursive-to-trash; done",
+        Decision::Block,
+        "reserved-do-block",
+    ),
+    (
+        "if unset CLAUDECODE; then :; fi",
+        Decision::Block,
+        "reserved-if-unset-block",
+    ),
+    (
+        "while ! unset CLAUDECODE; do break; done",
+        Decision::Block,
+        "reserved-while-bang-unset-block",
+    ),
+    (
+        "if ${RM} -rf /tmp/x; then :; fi",
+        Decision::Block,
+        "reserved-if-obfuscated-block",
+    ),
+    (
+        "if omamori 2>/dev/null override disable rm-recursive-to-trash; then :; fi",
+        Decision::Block,
+        "reserved-if-redirect-block",
+    ),
+    (
+        "/usr/bin/time -ao /tmp/t omamori override disable rm-recursive-to-trash",
+        Decision::Block,
+        "time-program-bundled-flag-block",
+    ),
+    (
+        "time -- unset CLAUDECODE",
+        Decision::Block,
+        "time-double-dash-unset-block",
+    ),
+    (
+        "{ cat <<'EOF'\nomamori override disable rm-recursive-to-trash\nEOF\n} | env -i bash",
+        Decision::Block,
+        "reserved-brace-heredoc-into-shell-block",
+    ),
+    (
+        "if true; then cat <<'EOF'\nomamori override disable rm-recursive-to-trash\nEOF\nfi | bash",
+        Decision::Block,
+        "reserved-then-heredoc-into-shell-block",
+    ),
+    (
+        "{\ncat <<'EOF'\nomamori override disable rm-recursive-to-trash\nEOF\n} | env -i bash",
+        Decision::Block,
+        "group-newline-heredoc-into-shell-block",
+    ),
+    (
+        "echo time omamori override disable rm-recursive-to-trash",
+        Decision::Allow,
+        "time-as-argument-allow",
+    ),
+    (
+        "echo if unset CLAUDECODE",
+        Decision::Allow,
+        "reserved-as-argument-unset-allow",
+    ),
+    ("time cargo build", Decision::Allow, "time-harmless-allow"),
+    (
+        "if [ -f x ]; then echo yes; else echo no; fi",
+        Decision::Allow,
+        "reserved-harmless-allow",
+    ),
+    (
+        "{ echo a; echo b; } > out.txt",
+        Decision::Allow,
+        "reserved-brace-harmless-allow",
     ),
 ];
 
