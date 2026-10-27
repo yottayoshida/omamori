@@ -392,14 +392,20 @@ fn effective_regenerable_paths(paths: &[String]) -> Vec<String> {
 /// Evaluate context for a matched rule.
 ///
 /// Evaluation priority (highest first):
-/// 1. protected_paths match → escalate to Block
-/// 2. NEVER_REGENERABLE match → ignore regenerable config, keep original
-/// 3. regenerable_paths match AND canonicalize succeeded → downgrade to LogOnly
-/// 4. regenerable_paths match AND canonicalize failed → no downgrade (fail-close)
-/// 5. No match → keep original
+/// 1. protected_paths match on any target → escalate to Block
+/// 2. NEVER_REGENERABLE patterns are dropped from regenerable_paths
+/// 3. Downgrade to LogOnly:
+///    - for an `rm` rule, only when every path `rm` would remove — both the entry and
+///      what it resolves to, resolved the way the kernel resolves it — is
+///      regenerable, or, for a trash rule, below the user's temporary
+///      directory. Never when the working directory is unresolvable.
+///    - for any other rule, a regenerable target that canonicalizes is enough.
+/// 4. Otherwise → keep original
 ///
-/// Relative target paths in `invocation` are resolved against `base` via
-/// `resolve_path`, so the verdict does not depend on the process CWD.
+/// For the protected check and for rules other than `rm`, relative target
+/// paths in `invocation` are resolved against `base` via `resolve_path`; an
+/// `rm` downgrade resolves `base` joined with each operand through `realpath`.
+/// Either way the verdict does not depend on the process CWD.
 /// `base` must be absolute (see [`normalize_path`] doc) — callers resolve it
 /// via `process_base`/`process_base_or_root` before calling. Priority 1
 /// (protected_paths) matches on path components, so it still functions
@@ -408,11 +414,12 @@ fn effective_regenerable_paths(paths: &[String]) -> Vec<String> {
 /// the narrower multi-component-entry caveat this does *not* cover.
 pub fn evaluate_context(
     invocation: &CommandInvocation,
-    _rule: &RuleConfig,
+    rule: &RuleConfig,
     config: &ContextConfig,
     base: Option<&Path>,
 ) -> ContextEvaluation {
     let targets = invocation.path_targets();
+    let base_known = base.is_some();
 
     // `#460`: the `/` fallback for an unresolvable CWD used to live in
     // `process_base_or_root` and applied unconditionally. It is only sound for
@@ -455,49 +462,195 @@ pub fn evaluate_context(
         };
     }
 
-    let effective_regenerable = effective_regenerable_paths(&config.regenerable_paths);
-
-    // Evaluate ALL targets and collect the most severe result.
-    // This prevents early-return on a regenerable path from skipping
-    // a later protected path (e.g., `rm -rf target/ src/`).
-    let mut result = ContextEvaluation {
-        action_override: None,
-        reason: "no context pattern matched".to_string(),
-    };
-
+    // Priority 1 is checked for every target before any downgrade, so a
+    // regenerable path cannot shadow a later protected one (`rm -rf target/ src/`).
     for target in &targets {
-        let (resolved, canonicalized) = resolve_path(target, base);
-
-        // Priority 1: protected_paths → escalate to Block (most severe, short-circuit)
+        let (resolved, _) = resolve_path(target, base);
         if let Some(pattern) = matches_any_pattern(&resolved, &config.protected_paths) {
             return ContextEvaluation {
                 action_override: Some(ActionKind::Block),
                 reason: format!("protected path (matched: {})", pattern),
             };
         }
+    }
 
-        // Priority 3+4: regenerable_paths check (only adopt if no override yet)
+    let effective_regenerable = effective_regenerable_paths(&config.regenerable_paths);
+    if rule.command != "rm" {
+        return any_target_regenerable(&targets, base, &effective_regenerable);
+    }
+
+    let downgrade = if base_known {
+        let temp_dir = (rule.action == ActionKind::Trash)
+            .then(user_temp_dir)
+            .flatten();
+        rm_downgrade(
+            &invocation.args,
+            base,
+            &effective_regenerable,
+            temp_dir.as_deref(),
+        )
+    } else {
+        None
+    };
+
+    match downgrade {
+        Some(reason) => ContextEvaluation {
+            action_override: Some(ActionKind::LogOnly),
+            reason,
+        },
+        // One reason for every "not downgraded" outcome: the shim warns on any
+        // other reason, which would fire on an agent's every ordinary `rm -rf`.
+        None => ContextEvaluation {
+            action_override: None,
+            reason: NO_PATTERN_REASON.to_string(),
+        },
+    }
+}
+
+// Not reworded: the shim stays quiet only for reasons containing "no context
+// pattern", and every other reason prints a warning.
+const NO_PATTERN_REASON: &str = "no context pattern matched";
+
+pub const USER_TEMP_DIR_REASON: &str = "inside the user's temporary directory";
+
+// Requiring every target here would count `chmod`'s mode, `find`'s predicates
+// and `rsync`'s source as targets and stop every downgrade of those rules.
+fn any_target_regenerable(targets: &[&str], base: &Path, patterns: &[String]) -> ContextEvaluation {
+    let mut result = ContextEvaluation {
+        action_override: None,
+        reason: NO_PATTERN_REASON.to_string(),
+    };
+    for target in targets {
+        let (resolved, canonicalized) = resolve_path(target, base);
         if result.action_override.is_none()
-            && let Some(pattern) = matches_any_pattern(&resolved, &effective_regenerable)
+            && let Some(pattern) = matches_any_pattern(&resolved, patterns)
         {
-            if canonicalized {
-                result = ContextEvaluation {
+            result = if canonicalized {
+                ContextEvaluation {
                     action_override: Some(ActionKind::LogOnly),
                     reason: format!("regenerable path (matched: {})", pattern),
-                };
+                }
             } else {
-                result = ContextEvaluation {
+                ContextEvaluation {
                     action_override: None,
                     reason: format!(
                         "regenerable pattern matched ({}) but path could not be resolved; keeping original action",
                         pattern
                     ),
-                };
-            }
+                }
+            };
         }
     }
-
     result
+}
+
+// Not `non_flag_args`: it reads only past a `--` and skips later words that
+// start with `-`, and `rm` removes both. A lone `-` is an operand too.
+fn rm_operands(args: &[String]) -> &[String] {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            return &args[i + 1..];
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            return &args[i..];
+        }
+    }
+    &[]
+}
+
+enum Removal {
+    Nothing,
+    At { entry: PathBuf, resolved: PathBuf },
+}
+
+fn removal(raw: &str, base: &Path) -> Option<Removal> {
+    if raw.is_empty() {
+        return None;
+    }
+    // Not `normalize_path`: folding `..` before following links, or expanding
+    // `~` from `HOME`, names a different path than the one `rm` removes.
+    let path = base.join(raw);
+    let name = path.file_name()?;
+    let entry = fs::canonicalize(path.parent()?).ok()?.join(name);
+    match fs::symlink_metadata(&entry) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Removal::Nothing),
+        Err(_) => return None,
+    }
+    let resolved = fs::canonicalize(&path).ok()?;
+    Some(Removal::At { entry, resolved })
+}
+
+fn rm_downgrade(
+    args: &[String],
+    base: &Path,
+    regenerable: &[String],
+    temp_dir: Option<&Path>,
+) -> Option<String> {
+    let below = |path: &Path, root: &Path| path.starts_with(root) && path != root;
+    let mut reason = None;
+    for raw in rm_operands(args) {
+        let Removal::At { entry, resolved } = removal(raw, base)? else {
+            continue;
+        };
+        let regenerable_pattern = matches_any_pattern(&entry, regenerable)
+            .filter(|_| matches_any_pattern(&resolved, regenerable).is_some());
+        let this = if let Some(pattern) = regenerable_pattern {
+            format!("regenerable path (matched: {pattern})")
+        } else if temp_dir.is_some_and(|root| below(&entry, root) && below(&resolved, root)) {
+            USER_TEMP_DIR_REASON.to_string()
+        } else {
+            return None;
+        };
+        reason.get_or_insert(this);
+    }
+    reason
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `confstr` writes at most `buf.len()` bytes, NUL included.
+    let len = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if len == 0 || len > buf.len() {
+        return None;
+    }
+    let value = std::ffi::CStr::from_bytes_until_nul(&buf).ok()?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    validate_user_temp_dir(
+        Path::new(std::ffi::OsStr::from_bytes(value.to_bytes())),
+        uid,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn user_temp_dir() -> Option<PathBuf> {
+    None
+}
+
+// Not trusted as returned: only `/var/folders/<a>` is root's and the directories
+// below it are the user's, so `T` itself can be swapped for a link, and confstr
+// can fall back to `TMPDIR`. The canonical shape check catches both.
+#[cfg(target_os = "macos")]
+fn validate_user_temp_dir(candidate: &Path, uid: u32) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let canonical = fs::canonicalize(candidate).ok()?;
+    let parts: Vec<Component> = canonical.components().collect();
+    let shaped = matches!(
+        parts.as_slice(),
+        [Component::RootDir, Component::Normal(p), Component::Normal(v), Component::Normal(f), Component::Normal(_), Component::Normal(_), Component::Normal(t)]
+            if *p == "private" && *v == "var" && *f == "folders" && *t == "T"
+    );
+    let meta = fs::symlink_metadata(&canonical).ok()?;
+    (shaped && meta.is_dir() && meta.uid() == uid).then_some(canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,6 +1622,227 @@ mod tests {
         );
         let result = evaluate_context(&inv, &test_rule(), &config, Some(&base));
         assert_eq!(result.action_override, Some(ActionKind::LogOnly));
+    }
+
+    // Not under the user's temporary directory, or every row would be let
+    // through as temporary. Every name must exist: a missing one removes
+    // nothing and drops out of the verdict for that reason instead.
+    fn escape_base() -> (PathBuf, PathBuf) {
+        let base = PathBuf::from(format!("/tmp/omamori-ctx-escape-{}", std::process::id()));
+        let outside = base.join("outside");
+        for dir in [
+            "target/Documents",
+            "target/x",
+            "other",
+            "-",
+            "outside/inner",
+            "outside/Documents",
+            "outside/x",
+            "outside/dir",
+        ] {
+            std::fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        for (link, to) in [
+            ("-x", outside.join("dir")),
+            ("target/l", outside.join("inner")),
+            ("~", outside.clone()),
+            ("outside/lnk", base.join("target")),
+        ] {
+            match std::os::unix::fs::symlink(&to, base.join(link)) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => panic!("{link}: {e}"),
+                _ => {}
+            }
+        }
+        (base, outside)
+    }
+
+    #[test]
+    #[serial_test::serial(home_env)]
+    fn rm_is_not_let_through_when_any_path_it_removes_is_outside_a_regenerable_path() {
+        use crate::test_support::with_home;
+        let (base, outside) = escape_base();
+        let home = base.join("target");
+        let lnk = outside.join("lnk");
+        let rows: [&[&str]; 7] = [
+            &["-rf", "target/", "other/"],
+            &["-rf", "other", "--", "target"],
+            &["-rf", "-", "target"],
+            &["-rf", "target", "-x/"],
+            &["-rf", "target/l/../Documents"],
+            &["-rf", "~/x"],
+            &["-rf", lnk.to_str().unwrap()],
+        ];
+        let mut let_through = Vec::new();
+        for args in rows {
+            let inv = CommandInvocation::new(
+                "rm".to_string(),
+                args.iter().map(|a| a.to_string()).collect(),
+            );
+            let result = with_home(home.to_str(), || {
+                evaluate_context(&inv, &test_rule(), &test_config(), Some(&base))
+            });
+            if result.action_override.is_some() {
+                let_through.push(format!("{args:?}: {}", result.reason));
+            }
+        }
+        assert!(let_through.is_empty(), "let through: {let_through:#?}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rm_below_the_user_temp_directory_is_let_through_and_nothing_else_is() {
+        let root = user_temp_dir().expect("macOS has a per-user temporary directory");
+        // Not the canonical root: `mktemp -d` hands out `/var/folders/...`, and a
+        // comparison against `/private/var/...` alone would never match it.
+        let as_mktemp_gives = Path::new("/").join(root.strip_prefix("/private").unwrap());
+        let x = as_mktemp_gives.join(format!("omamori-ctx-temp-{}", std::process::id()));
+        let (_, outside) = escape_base();
+        std::fs::create_dir_all(x.join("a")).unwrap();
+        for (link, to) in [
+            (x.join("out"), outside.join("dir")),
+            (outside.join("to-temp"), x.join("a")),
+        ] {
+            match std::os::unix::fs::symlink(&to, &link) {
+                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => panic!("{link:?}: {e}"),
+                _ => {}
+            }
+        }
+        let config = ContextConfig {
+            regenerable_paths: Vec::new(),
+            ..test_config()
+        };
+        let path = |p: PathBuf| p.to_str().unwrap().to_string();
+        let eval = |rule: &RuleConfig, targets: &[String], base: Option<&Path>| {
+            let mut args = vec!["-rf".to_string()];
+            args.extend_from_slice(targets);
+            evaluate_context(
+                &CommandInvocation::new("rm".to_string(), args),
+                rule,
+                &config,
+                base,
+            )
+        };
+        let any_base = Some(Path::new("/"));
+
+        for targets in [vec![path(x.join("a"))], vec![path(x.clone())]] {
+            let result = eval(&test_rule(), &targets, any_base);
+            assert_eq!(
+                result.action_override,
+                Some(ActionKind::LogOnly),
+                "{targets:?}"
+            );
+            assert_eq!(result.reason, USER_TEMP_DIR_REASON);
+        }
+
+        let block_rule = RuleConfig::new(
+            "my-rm-block",
+            "rm",
+            ActionKind::Block,
+            Vec::new(),
+            vec!["-rf".to_string()],
+            None,
+        );
+        for (rule, targets, base, why) in [
+            (
+                test_rule(),
+                vec![path(as_mktemp_gives.clone())],
+                any_base,
+                "the root itself",
+            ),
+            (
+                test_rule(),
+                vec![path(x.join("out"))],
+                any_base,
+                "a link inside to outside",
+            ),
+            (
+                test_rule(),
+                vec![path(outside.join("to-temp"))],
+                any_base,
+                "a link outside to inside",
+            ),
+            (
+                test_rule(),
+                vec![path(x.join("a")), path(outside.join("dir"))],
+                any_base,
+                "one target outside",
+            ),
+            (
+                test_rule(),
+                vec![path(x.join("a"))],
+                None,
+                "an unresolvable working directory",
+            ),
+            (
+                block_rule,
+                vec![path(x.join("a"))],
+                any_base,
+                "a rule that blocks",
+            ),
+        ] {
+            let result = eval(&rule, &targets, base);
+            assert_eq!(result.action_override, None, "{why}: {}", result.reason);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_user_temp_directory_that_is_swapped_or_not_the_users_is_not_used() {
+        let root = user_temp_dir().expect("macOS has a per-user temporary directory");
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(validate_user_temp_dir(&root, uid), Some(root.clone()));
+        assert_eq!(
+            validate_user_temp_dir(&root, uid + 1),
+            None,
+            "another user's"
+        );
+
+        let (base, outside) = escape_base();
+        let fake = base.join("fake");
+        std::fs::create_dir_all(fake.join("real/T")).unwrap();
+        match std::os::unix::fs::symlink(&outside, fake.join("T")) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => panic!("{e}"),
+            _ => {}
+        }
+        assert_eq!(
+            validate_user_temp_dir(&fake.join("T"), uid),
+            None,
+            "a link named T"
+        );
+        assert_eq!(
+            validate_user_temp_dir(&fake.join("real/T"), uid),
+            None,
+            "a T elsewhere"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_user_temp_directory_does_not_follow_tmpdir() {
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "context::tests::print_user_temp_dir",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TMPDIR", "/etc")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let printed = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("user_temp_dir="))
+            .unwrap_or_else(|| panic!("child printed nothing: {stdout}"));
+        assert_eq!(printed, format!("{:?}", user_temp_dir()));
+        assert!(user_temp_dir().is_some());
+    }
+
+    #[test]
+    #[ignore = "run in a child process by the_user_temp_directory_does_not_follow_tmpdir"]
+    fn print_user_temp_dir() {
+        println!("user_temp_dir={:?}", user_temp_dir());
     }
 
     // --- CI consistency check: NEVER_REGENERABLE ⊃ default_protected_paths ---

@@ -6460,8 +6460,10 @@ fn explain_relative_path_is_cwd_sensitive() {
     let _ = fs::remove_dir_all(&cwd_without_target);
 
     assert!(
-        stdout_with_target.contains("context override:") && stdout_with_target.contains("log-only"),
-        "target/ existing under the invocation dir must downgrade to log-only: {stdout_with_target}"
+        stdout_with_target.contains("context override:")
+            && stdout_with_target.contains("log-only")
+            && stdout_with_target.contains("regenerable path"),
+        "target/ existing under the invocation dir must downgrade to log-only as a regenerable path: {stdout_with_target}"
     );
     assert!(
         !stdout_without_target.contains("log-only"),

@@ -406,6 +406,18 @@ pub(crate) fn context_rows(
                  an override is the correct outcome"
             ),
         }),
+        None if evaluate(UNKNOWN_PATH_SAMPLE).reason == context::USER_TEMP_DIR_REASON => {
+            rows.push(ContextRow {
+                name: "unknown-path-unchanged",
+                verdict: ContextVerdict::NotChecked(
+                    "the sample path is inside the user's temporary directory here",
+                ),
+                detail: format!(
+                    "{UNKNOWN_PATH_SAMPLE} exists under the user's temporary directory, so an \
+                     override is the correct outcome"
+                ),
+            });
+        }
         None => {
             let result = evaluate(UNKNOWN_PATH_SAMPLE);
             let unchanged = result.action_override.is_none();
@@ -685,6 +697,27 @@ mod tests {
                 ContextVerdict::NotChecked(_)
             ),
             "the git line reports configuration; it is not an evaluation that could fail"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn context_rows_do_not_fail_when_run_from_inside_the_user_temp_directory() {
+        let cwd = context::user_temp_dir()
+            .expect("macOS has a per-user temporary directory")
+            .join(format!("omamori-policy-test-{}", std::process::id()));
+        std::fs::create_dir_all(cwd.join(UNKNOWN_PATH_SAMPLE)).unwrap();
+        let config = Config::default();
+        let ctx = config.context.clone().unwrap();
+
+        let rows = context_rows(&config, &ctx, Some(&cwd));
+        assert!(
+            matches!(
+                row(&rows, "unknown-path-unchanged").verdict,
+                ContextVerdict::NotChecked(_)
+            ),
+            "an existing sample under the temporary directory is let through by design, so the \
+             machine's state must not turn the row red"
         );
     }
 

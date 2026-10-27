@@ -228,7 +228,7 @@ Plain-language answers for common cases. The [Defense Boundary Matrix](../SECURI
 
 | Case | Protected? | How / why not |
 |------|-----------|---------------|
-| AI runs `rm -rf <dir>` | **Yes** | Layer 2 hooks — active in essentially every AI-agent session — deny the command outright. (If a command only reaches Layer 1, e.g. a plain terminal with no hook layer in front of it, the PATH shim converts it to a move-to-Trash instead of denying it.) |
+| AI runs `rm -rf <dir>` | **Yes** | Layer 2 hooks — active in essentially every AI-agent session — deny the command outright. (If a command only reaches Layer 1, e.g. a plain terminal with no hook layer in front of it, the PATH shim converts it to a move-to-Trash instead of denying it — except below the user's temporary directory, where it runs as log-only; see [Configuration](configuration.md#context-aware-actions).) |
 | AI runs `/bin/rm -rf <dir>` (full path, dodging the PATH shim) | **Yes** | Layer 2 hooks catch it; the shim alone would not |
 | AI wraps it: `sudo env bash -c "rm -rf …"` | **Yes** | Layer 2 unwraps wrapper chains before matching |
 | AI pipes a download into a shell (`curl … \| bash`) | **Yes*** | *Materialized by default (allowed + staging receipt), or hard-blocked if you set `[structural] action = "block"` |

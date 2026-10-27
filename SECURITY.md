@@ -85,7 +85,7 @@ A machine-readable projection of this matrix (surface list + per-layer status, o
 
 | Surface | Layer 1 (shim) | Layer 2 (hook) | Verified by |
 |---------|----------------|----------------|-------------|
-| Destructive recursive removal (`rm -rf`) | supported | supported | `omamori test`, CI, hook integration |
+| Destructive recursive removal (`rm -rf`) | supported (let through as log-only when everything removed is a regenerable path or below the user's temporary directory) | supported | `omamori test`, CI, hook integration |
 | `git reset --hard` | supported | supported | `omamori test`, CI, hook integration |
 | `git push --force` / `git clean -f` | supported | supported | `omamori test`, CI, hook integration |
 | `chmod 777` | supported | supported | `omamori test`, CI, hook integration |
@@ -835,9 +835,10 @@ Context-aware evaluation introduces dynamic action adjustment based on target pa
 
 | Threat | DREAD | Mitigation |
 |--------|-------|------------|
-| **T2: Symlink downgrade** | 9.0 | `canonicalize()` resolves symlinks before matching. Failure → no downgrade (fail-close) |
-| **T1: Path traversal** | 8.0 | Lexical normalization (`.`, `..`, `//`, trailing `/`) before matching. Raw path matching prohibited |
-| **T10: TOCTOU** | 7.8 | Accepted residual risk. evaluate→execute window minimized. Cannot be eliminated in userspace |
+| **T2: Symlink downgrade** | 9.0 | A downgrade of `rm` is decided on where `rm` acts: for every operand, both the entry itself (`realpath` of its parent joined with its name) and what it resolves to must qualify. Any resolution failure → no downgrade (fail-close). Other rules (`git clean`, `chmod`, `rsync`, `find`) still downgrade on one regenerable target whose `canonicalize()` succeeds — they do not yet get this treatment ([#617](https://github.com/yottayoshida/omamori/issues/617)) |
+| **T1: Path traversal** | 8.0 | `protected_paths` matching uses lexical normalization (`.`, `..`, `//`, trailing `/`) — it can only escalate. A downgrade of `rm` does **not**: `..` is resolved by `realpath` after following links, as the kernel does, and `~` is a literal name, as it is to `rm`. Folding `..` first, or expanding `~` from `HOME`, names a path other than the one `rm` removes |
+| **T11: Operand mismatch** | 8.0 | An `rm` is downgraded only on the operands its own `getopt` sees: options stop at the first non-option argument, a lone `-`, or a consumed `--`, and every argument after that is an operand. Up to 1.5.0, reading only what follows a `--`, or skipping later arguments that start with `-`, let paths outside a regenerable one through |
+| **T10: TOCTOU** | 7.8 | Accepted residual risk. evaluate→execute window minimized. Cannot be eliminated in userspace. The user's temporary directory is a place another of the user's processes can rearrange between the check and `rm`, the same as any directory the user owns |
 | **T4: Git status spoofing** | 7.2 | `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR` removed from git subprocess. The command itself still follows them and its own global options, so when any of these variables or any global option is present the no-changes downgrade is not applied at all |
 | **T3: Config poisoning** | 7.0 | AI config bypass guard (v0.3.2) + NEVER_REGENERABLE hardcoded list |
 
@@ -855,7 +856,16 @@ Escalation now happens instead of a decision made without the information, and o
 
 Measured against a `2ceade2` build with an unlinked working directory: a `protected_paths = ["some/nested/dir"]` config left the rule's own action in place (no escalation) where this build blocks and names the reason; a single-component config produced byte-identical output on both. The reason string is the same on all three surfaces that print it — the shim's block message, `omamori explain`, and `omamori test` — and `explain` reports the base as unresolved rather than as `/` (its `--json` field is `null`, not `"/"`, so a consumer can tell "resolved to the root" from "there was no base").
 
-This does not extend to `regenerable_paths`: a downgrade requires `canonicalize` to succeed, which a synthetic root generally will not, so an unresolvable directory can only ever suppress a downgrade — never cause one that should not happen.
+This does not extend to downgrades: an `rm` is never downgraded without a base, and any other rule's downgrade requires `canonicalize` to succeed, which a synthetic root generally will not, so an unresolvable directory can only ever suppress a downgrade — never cause one that should not happen.
+
+### User's Temporary Directory (#616, [ADR-0026](docs/adr/0026-a-trash-rule-lets-rm-through-inside-the-user-temp-directory.md))
+
+An `rm` caught by a trash rule is let through as log-only when everything it removes lies below the user's temporary directory — the per-user `/var/folders/<a>/<b>/T` that `mktemp -d` uses. A process started from an agent session keeps the session's detector variables for its whole life, so without this, every cleanup of a `mktemp -d` directory by such a process landed in the Trash.
+
+- The directory is `confstr(_CS_DARWIN_USER_TEMP_DIR)`, used only when its canonical form is exactly `/private/var/folders/<one>/<one>/T`, it is a real directory, and the current user owns it. `/var/folders/<a>` is root's but the directories below it are the user's, so `T` can be replaced by a link; the canonical shape check rejects that. `TMPDIR` is never read — an agent sets it.
+- `/private/tmp` is not included: it is shared between users and sessions.
+- Only rules whose action is trash are affected. An `rm` rule a user wrote to block or move is not.
+- **Residual**: a mount point placed inside the temporary directory (a bind mount or a disk image attached there) is removed through by `rm`, which crosses mount points unless given `-x`. Comparing devices would see only the top level, so this is not checked.
 
 ### Context Message Accuracy (v0.4.1)
 
