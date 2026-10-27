@@ -6,6 +6,17 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+
+- On macOS, a recursive `rm` caught by a trash rule runs as log-only when everything it removes is below the user's temporary directory (the per-user `/var/folders/…/T` that `mktemp -d` uses), instead of filling the Trash. A process started from an agent session keeps the session's detector variables, so a background helper that cleans up its own `mktemp -d` directory — Codex's update daemon does so on every hourly check — sent each one to the Trash. `/tmp` is not included, `TMPDIR` is not read, and an `rm` rule written to block or move is unaffected. Removals there cannot be recovered from the Trash. ([#616](https://github.com/yottayoshida/omamori/issues/616), [ADR-0026](docs/adr/0026-a-trash-rule-lets-rm-through-inside-the-user-temp-directory.md))
+
+### Fixed
+
+- A regenerable path no longer lets other paths in the same `rm` through. Layer 1 downgraded the whole command to log-only when one target was regenerable (`rm -rf target/ important/`), when the regenerable target came after a `--` (`rm -rf important -- target`), when another operand was a lone `-` or started with `-` after the first operand, when `..` followed a link (`target/link/../Documents`), and when `~` was expanded from an agent-set `HOME`. In each case `rm` then removed a path outside the regenerable one for good. The downgrade is now decided on every operand `rm` itself reads, at the place it resolves to. ([#616](https://github.com/yottayoshida/omamori/issues/616))
+- An `rm` is no longer downgraded when the working directory cannot be resolved, including an absolute regenerable target.
+- For an `rm`, the shim no longer prints the warning "regenerable pattern matched (…) but path could not be resolved": every outcome that is not let through now gives the same reason, so the warning does not fire on each ordinary `rm -rf` that this change judges. Other rules print it as before.
+- `omamori test` reports the unknown-path row as not checked, instead of failing, when it runs inside the user's temporary directory and the sample path exists there.
+
 ## [1.5.0] - 2026-10-17
 
 **Summary**: A shell command can no longer edit omamori's own files or read its audit key: the hook now reads where a Bash command writes and which of its words name the audit secret, as it already did for Claude Code's file tools. Commands the hook used to read past are checked like any other — after `time` or a reserved word, inside a subshell, behind a redirection, after a comment line, beside a pipe into a shell — while a heredoc that only writes data no longer trips the rules on its text. `audit verify`, `report` and `doctor` no longer lose a guarded command's audit entry while they walk the log, and `doctor` and `status` report an audit log that cannot be written.

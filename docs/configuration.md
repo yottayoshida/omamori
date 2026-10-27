@@ -9,8 +9,13 @@ omamori can adjust actions based on what the command targets:
 | Command | Without context | With context |
 |---------|----------------|-------------|
 | `rm -rf target/` | trash | **log-only** (regenerable) |
+| `rm -rf "$(mktemp -d)"` | trash | **log-only** (inside the user's temporary directory; macOS) |
 | `rm -rf src/` | trash | **block** (protected) |
 | `git reset --hard` (no changes) | stash-then-exec | **log-only** (git-aware; not applied when the command picks its repository with a global option or a `GIT_*` variable) |
+
+A recursive `rm` that a trash rule catches runs as log-only only when every path rm would remove is a regenerable path or lies inside the user's temporary directory; otherwise it goes to Trash. "Every path rm would remove" is every operand `rm` itself reads — including one before a `--` or one starting with `-` after the first — at the place it resolves to after following links. One operand outside is enough to send the whole command to Trash.
+
+The user's temporary directory is the per-user `/var/folders/…/T` that `mktemp -d` and `$TMPDIR` normally point to; `/tmp` is not included. What an agent removes there is gone for good — it does not go to Trash. Only trash rules are affected: an `rm` rule you wrote to block or move keeps doing so there. See SECURITY.md → User's Temporary Directory.
 
 **Enabled by default.** Built-in lists for regenerable (`target/`, `node_modules/`, etc.) and protected (`src/`, `.git/`, `.env`, etc.) paths are active out of the box. To customize, add a `[context]` section to `~/.config/omamori/config.toml`:
 

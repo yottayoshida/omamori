@@ -18,6 +18,7 @@
       "category": "caught",
       "surface": "Destructive recursive removal (`rm -rf`)",
       "layer1": "supported",
+      "layer1_note": "let through as log-only when everything removed is a regenerable path or below the user's temporary directory",
       "layer2": "supported",
       "verified_by": "`omamori test`, CI, hook integration"
     },
